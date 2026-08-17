@@ -10,6 +10,52 @@ sit inside the training loop:
 Both produce a student for `walk_stand_place_grasp_turn_homie` (bottle → tray).
 Code lives in `GR00T-VisualSim2Real/`; launchers and assets live here in `fast_roborender/`.
 
+## Setup
+
+Three separate Python environments, because the trainer and the renderers cannot share one
+(the render bundles pin their own torch/TensorRT builds):
+
+| Environment | Built by | Used for |
+|---|---|---|
+| conda `viral` | `scripts/setup/setup_viral_env.sh` | Isaac Sim, IsaacLab, `gr00t` — all training and eval |
+| `roborender-acceleration/.venv` | the bundle's `bin/create_baremetal_env.sh` | teacher video model, LADD students, offline rendering |
+| `<image3f bundle>/.venv` | `scripts/server/image3f_ft_setup.sbatch` | Image3F per-frame renderer (DAgger) |
+
+```bash
+# 1. trainer environment (~30 min; clones IsaacLab, installs Isaac Sim 5.1)
+bash scripts/setup/setup_viral_env.sh
+
+# 2. Image3F bundle: venv, ONNX export, TensorRT engine, doctor + smoke test.
+#    Must run on the GPU you will deploy on — engines are arch- and TRT-version-specific.
+sbatch scripts/server/image3f_ft_setup.sbatch
+
+# 3. verify everything before submitting real jobs
+bash scripts/setup/check_env.sh
+```
+
+`check_env.sh` is read-only and prints PASS/WARN/FAIL for the trainer env and its imports,
+all three render environments, the Image3F adapter and foundation weights, TensorRT engines
+present per GPU arch, the anchor pool and dataset, the baseline checkpoint and config that
+`eval_policy.sbatch` stages against, any running render servers (flagging **stale endpoint
+files**, whose host no longer has a server), and the viscam Slurm account. WARN means "fine
+unless you need that stage". Exit status is non-zero only on hard failures.
+
+### Setup gotchas
+
+- **Engines are per GPU arch and per TensorRT version.** `sm120` (RTX PRO 6000), `sm89`
+  (L40S), `sm86` (A40) each need their own build, and a LoRA change requires a fresh ONNX
+  export. Nothing is shipped prebuilt — `assets/generated/` starts empty by design.
+- **The bundles hash-verify their own source tree.** Never leave edits in a bundle: patch,
+  run, restore. `PYTHONDONTWRITEBYTECODE=1` is required, since stray `.pyc` files fail the
+  release-tree check, and the package-stage doctor demands an empty `assets/generated/`
+  (clear any orphaned staging after a failed export).
+- **Extract archives inside a Slurm job.** The login-node process reaper kills long
+  unzips (a 22 GB extract died with exit 137).
+- The Image3F bundle ships only the LoRA delta; foundation weights are attached via
+  `ROBORENDER_MODEL_BASE`, pointing at the older portable bundle's `assets/models`.
+- Model load is ~110 s with a warm page cache but up to ~40 min cold from NFS, which is why
+  the render server is a persistent job rather than something each run starts.
+
 ## Repository layout
 
 ```
@@ -18,6 +64,7 @@ run_raven_server.sh           render-server entrypoint (bundle-relative; stays a
 setup_viral_env.sh            conda env for the trainer
 
 scripts/
+  setup/    setup_viral_env.sh  check_env.sh
   data/     collect_data.sbatch  offline_render.sbatch  render_shard.sbatch
             offline_render_dataset.py  renormalize_depth.py
   anchors/  anchor_pool.sbatch  render_anchor_pool.py  rich_prompts.py
