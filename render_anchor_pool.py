@@ -1,0 +1,60 @@
+#!/usr/bin/env python
+"""Render teacher anchor pool with rich prompts. Shardable."""
+import argparse, os, sys, time
+import numpy as np
+sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
+sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+from gr00t.rl.utils.videogen_client import VideoGenRenderClient
+from rich_prompts import build_rich_prompt
+
+VIEWS = ["hand_left", "hand_right", "head_color"]
+POOL = "/svl/u/ravenh/fast_roborender/videogen_dataset"
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--start", type=int, required=True)
+ap.add_argument("--end", type=int, required=True)
+ap.add_argument("--out", required=True)
+ap.add_argument("--port", type=int, required=True)
+args = ap.parse_args()
+os.makedirs(args.out, exist_ok=True)
+
+import glob
+chunks = sorted(glob.glob(os.path.join(POOL, "chunk_*.npz")))
+client = VideoGenRenderClient(host="127.0.0.1", port=args.port,
+                              connect_retries=1, connect_retry_interval_s=5)
+
+def render_retry(depths, masks, prompt, seed, tries=90, wait=30):
+    global client
+    for i in range(tries):
+        try:
+            return client.render_chunk(depths, mask_per_view=masks, prompt=prompt, seed=seed)
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            print(f"attempt {i} failed ({exc}); retry in {wait}s", flush=True)
+            try:
+                client.close()
+            except Exception:
+                pass
+            time.sleep(wait)
+            client = VideoGenRenderClient(host="127.0.0.1", port=args.port,
+                                          connect_retries=1, connect_retry_interval_s=5)
+    raise RuntimeError("teacher server never became ready")
+
+for idx in range(args.start, args.end):
+    outp = os.path.join(args.out, f"anchor_{idx:05d}.npz")
+    if os.path.exists(outp):
+        continue
+    src = chunks[idx % len(chunks)]
+    prompt = build_rich_prompt(idx)
+    with np.load(src, allow_pickle=True) as z:
+        depths = {v: z[f"depth_ctrl__{v}"].copy() for v in VIEWS}
+        masks = {v: z[f"rgb_robot__{v}"].copy() for v in VIEWS}
+    t0 = time.time()
+    resp = render_retry(depths, masks, prompt, seed=idx)
+    np.savez_compressed(outp + ".tmp.npz",
+                        **{f"gen__{v}": np.stack([np.asarray(resp[v][0], dtype=np.uint8),
+                                                  np.asarray(resp[v][40], dtype=np.uint8)])
+                           for v in VIEWS},
+                        frames=np.array([0, 40]), prompt=prompt, src=os.path.basename(src))
+    os.replace(outp + ".tmp.npz", outp)
+    print(f"anchor {idx}: {time.time()-t0:.1f}s", flush=True)
+print("ANCHOR_SHARD_DONE", flush=True)

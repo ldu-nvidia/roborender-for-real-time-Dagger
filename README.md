@@ -56,21 +56,48 @@ stack, batch size fixed at 1 (the DiT is compute-bound there, so scale by adding
 by batching). More denoising steps make it *worse* for this use — 50 steps drifts off the
 anchor's colours and materials and costs ~2.8 dB of teacher fidelity for 8× the latency.
 
-## A. Offline BC
+## Data generation (shared by A, and by B's anchors)
+
+**1. Collect depth/mask chunks.** Roll out the teacher and save the control signals the
+renderer needs — per-view depth, robot-body masks, teacher actions — in 81-frame chunks
+(the video model's clip length).
 
 ```bash
-# 1. collect depth/mask chunks from teacher rollouts
 sbatch collect_data.sbatch                  # +exp=loco_manip/wsdpt_videogen_collect
-
-# 2. render RGB for the chunks (50-step teacher video model, or Image3F)
-sbatch offline_render.sbatch                # -> offline_render_dataset.py
-
-# 3. behaviour-clone on the rendered dataset
-sbatch offline_bc_train.sbatch              # +exp=loco_manip/wsdpt_videogen_offline_bc
+                                            # NUM_ENVS (default 32)
 ```
 
-`offline_bc_train.sbatch` takes `NUM_ENVS` (default 16). Checkpoints land in
-`logs_rl/videogen_offline_bc/<run>/`.
+Chunks land in `videogen_dataset/` as `chunk_<jobid>_<NNNNNNN>.npz`, each holding
+`depth_raw__<view>`, `depth_ctrl__<view>`, `rgb_robot__<view>` for `head_color`,
+`hand_left`, `hand_right`, plus the prompt. The production set is ~2000 chunks / 31 GB.
+
+**2. Render RGB.** A standing render server converts depth+mask into photoreal RGB.
+Start the server first, then stream the dataset through it:
+
+```bash
+sbatch raven_server.sbatch                  # or teacher_anchor_render.sbatch for the 50-step teacher
+sbatch offline_render.sbatch                # -> offline_render_dataset.py --follow
+                                            # RENDER_VIEWS, RENDER_ARGS
+```
+
+`--follow` keeps the renderer consuming chunks as collection produces them, so steps 1 and 2
+can overlap. Scene text comes from `render_prompt.txt` (single fixed scene) or
+`videogen_prompts.py` / `rich_prompts.py` for randomized scenes. `render_shard.sbatch` splits
+the dataset across several servers.
+
+Depth is normalized with the `h5_v4` recipe before it reaches the model
+(`renormalize_depth.py`); per-view clip ranges differ between the head and wrist cameras.
+
+## A. Offline BC
+
+Behaviour-clone on the rendered dataset — no renderer in the loop, so this is the cheap path.
+
+```bash
+sbatch offline_bc_train.sbatch              # +exp=loco_manip/wsdpt_videogen_offline_bc
+                                            # NUM_ENVS (default 16)
+```
+
+Checkpoints land in `logs_rl/videogen_offline_bc/<run>/`. This produced the 57.3% baseline.
 
 ## Anchors (FT-FIXED conditioning)
 
@@ -132,60 +159,108 @@ from the renderer — the pool already contains the data, so switching costs one
 
 ## B. Online image-model DAgger
 
-```bash
-# 1. teacher anchor pool (one content-rich RGB triplet per episode; FT-FIXED needs it)
-sbatch anchor_pool.sbatch                   # render_anchor_pool.py + rich_prompts.py
+The student acts, the teacher supplies the supervision, and Image3F relabels observations
+inside the rollout — so the student sees generated pixels on the states its own policy visits,
+which offline BC cannot give you.
 
-# 2. warm renderers — ONE PER ~5 ENVS, each with its own endpoint file and queue
-for i in 1 2 3; do
-  EP=.../image3f_server_endpoint${i:+_$i}.txt; Q=.../image3f_queue${i:+_$i}
-  sbatch --time=3-00:00:00 --export=ALL,ENDPOINT_FILE=$EP,IMAGE3F_QUEUE=$Q image3f_server.sbatch
+```bash
+# 1. anchor pool (see Anchors above) — only needed once
+sbatch anchor_pool.sbatch
+
+# 2. warm renderers: ~1 per 5 relabelled envs, each with its own endpoint file and queue
+for i in '' _2 _3; do
+  sbatch --time=3-00:00:00 \
+    --export=ALL,ENDPOINT_FILE=$PWD/image3f_server_endpoint$i.txt,IMAGE3F_QUEUE=$PWD/image3f_queue$i \
+    image3f_server.sbatch
 done
 
-# 3. train (wait until every endpoint file names the node its job is running on)
-sbatch image_dagger_r4.sbatch               # +exp=loco_manip/wsdpt_image_dagger
+# 3. train
+sbatch --export=ALL,MIX=0.5 dagger_train.sbatch
 ```
 
-Key config (`gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml`):
+### Observation mixing
+
+`MIX` is the fraction of environments left on **ray-traced** observations
+(`videogen.raytraced_mix_prob`):
+
+| `MIX` | Regime | Renderers for 16 envs | Notes |
+|---|---|---|---|
+| `0.0` | **fully image-generated** | ~3 | every env relabelled; trains purely on the generated distribution |
+| `0.5` | **mixed** (default) | ~2 | what round 4 used → 69.3%; hedges against renderer artefacts |
+| `1.0` | fully ray-traced | 0 | no relabelling; plain DAgger, useful as a control |
+
+`dagger_train.sbatch` validates `MIX ∈ [0,1]`, discovers endpoint files whose host still runs
+an `i3f_warm_server` (a stale endpoint otherwise kills the run hours in), refuses to start if
+relabelling is requested with no live renderer, and warns when there are fewer servers than
+`ceil(envs × (1 − MIX) / 5)`. Too few servers does not fail — it serialises the rollout, so
+watch `Iteration time` (expect ~145 s at 16 envs / 3 servers / `MIX=0.5`).
+
+Other variables: `CKPT` (warm start, defaults to the round-4 final), `NUM_ENVS` (16),
+`ANCHORS`, `ANCHOR_IDX`, `EXP`/`PROJ`. Run names default to the mix
+(`dagger_fullgen`, `dagger_mix0.5`, `dagger_fullrt`).
+
+### Config that matters
+
+`gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml`:
 
 | Key | Value | Why |
 |---|---|---|
 | `algo.config.value_loss_coef` / `entropy_coef` | `0.0` | pure BC; RL terms with an untrained value head corrupt the policy |
 | `videogen.mode` | `image_dagger` | per-step 3-view relabel in `distill_trainer_videogen.py` |
-| `videogen.image3f_endpoint_files` | one path per renderer | envs are sharded round-robin across them |
-| `videogen.anchor_pool_dir` / `anchor_index` | `anchor_pool_2048` / `0` | fixed anchor per episode (FT-FIXED); chaining on own outputs collapses |
-| `videogen.raytraced_mix_prob` | `0.5` | fraction of envs left on ray-traced RGB |
+| `videogen.raytraced_mix_prob` | via `MIX` | see above |
+| `videogen.image3f_endpoint_files` | one per renderer | envs are sharded round-robin across them |
+| `videogen.anchor_pool_dir` / `anchor_index` | `anchor_pool_2048` / `0` | fixed anchor per episode; chaining on own outputs collapses |
 | `num_steps_per_env` | `81` | one BC update per video-model clip length |
 
-Throughput: ~145 s/iteration at 16 envs / 3 renderers. Warm-start from the previous
-round's `last.pt` — round 4 started from round 3 and reached `dagger_bc_loss` 0.146
-within ~900 iterations (round 3 ended at 0.67).
+Warm-start from the previous round's `last.pt`: round 4 started from round 3 and reached
+`dagger_bc_loss` 0.146 within ~900 iterations (round 3 ended at 0.67, and finished at 0.134).
 
 ## Evaluation — read this first
 
 **`eval_agent_trl.py` loads `config.yaml` from the checkpoint's own directory.** A DAgger
-run's config carries simulator settings that differ from the baseline's, so scoring a
-DAgger checkpoint against its own config compares two different environments and the
-number is meaningless. This invalidated three rounds of results before it was caught.
+run's config describes a different environment than the baseline's, so scoring a DAgger
+checkpoint out of its run directory compares two different worlds and the number means
+nothing. This invalidated three rounds of results before it was caught.
 
-Always stage the checkpoint next to the **baseline's** config:
+`eval_policy.sbatch` exists so that cannot happen: it always stages the checkpoint beside an
+explicit reference config.
 
 ```bash
-D=diag_eval; mkdir -p $D
-cp <run>/last.pt $D/last.pt
-cp logs_rl/videogen_offline_bc/<baseline_run>/config.yaml $D/config.yaml
-python gr00t/rl/eval_agent_trl.py +checkpoint=$D/last.pt \
-    +num_envs=4 +headless=True \
-    algo.config.eval.num_eval_episodes=300 \
-    +simulator.config.render_results=true
+# headline number: ray-traced obs, baseline config, 300 episodes
+sbatch --export=ALL,CKPT=<run>/last.pt eval_policy.sbatch
+
+# quick check
+sbatch --export=ALL,CKPT=<run>/last.pt,EPISODES=50 eval_policy.sbatch
+
+# generated obs (needs a live renderer)
+sbatch --export=ALL,CKPT=<run>/last.pt,OBS=generated eval_policy.sbatch
 ```
 
-- Default is 150 episodes (SE ≈ 4 pts). Use **300** for any number you intend to quote (SE ≈ 2.7).
-- To evaluate on generated observations instead, set `IMAGE_DAGGER_EVAL_RELABEL=1` with a
-  live renderer and `raytraced_mix_prob: 0.0`.
-- **One eval saturates one renderer** (~52 episodes/h). Two evals sharing a server each
-  run at half speed and overrun the 3 h job limit with no output — the success rate is
-  only printed at the end.
+| Variable | Default | Notes |
+|---|---|---|
+| `CKPT` | *(required)* | checkpoint `.pt`; fails fast if missing |
+| `EPISODES` | `300` | SE ≈ 2.7 pts. 150 gives ≈ 4.0 — too coarse for a 10-pt claim |
+| `OBS` | `raytraced` | `generated` sets `IMAGE_DAGGER_EVAL_RELABEL=1` and forces `raytraced_mix_prob: 0.0` |
+| `CONFIG` | per `OBS` | override the reference config |
+| `ENDPOINT` | `image3f_server_endpoint.txt` | `OBS=generated` only |
+| `NUM_ENVS` | `4` | |
+
+The script also fails loudly on the traps that previously ate whole runs: a missing
+checkpoint or config, and — for `OBS=generated` — an endpoint file whose host has no
+`i3f_warm_server` running on it, which is what a stale endpoint looks like. It excludes
+viscam10/viscam12 (NFS hangs), logs to `logs_archive/eval_policy_<jobid>.log`, prints a
+one-line `RESULT ...` summary, and cleans up its staging directory.
+
+Reference configs it stages against:
+
+- `raytraced` → `logs_rl/videogen_offline_bc/videogen_offline_bc-20260721_204447/config.yaml`
+  — the environment every number in [Results](#results) was measured in.
+- `generated` → `logs_rl/image_dagger_r4/image_dagger_run4-20260814_131202/config.yaml`
+  — same environment plus the `videogen`/`image_dagger` block that relabelling needs.
+
+**One eval saturates one renderer** (~52 episodes/h). Two evals sharing a server each run at
+half speed and overrun the job limit with no output, since the success rate is only printed
+at the end. Give each concurrent `OBS=generated` eval its own server and `ENDPOINT`.
 
 ## Gotchas
 
