@@ -12,7 +12,7 @@ set -x
 export HOME=/sailhome/ravenh
 cd /svl/u/ravenh/fast_roborender
 PORT=$((18000 + SLURM_JOB_ID % 1000))
-./run_raven_server.sh --host 127.0.0.1 --port $PORT \
+/svl/u/ravenh/fast_roborender/run_raven_server.sh --host 127.0.0.1 --port $PORT \
   --student_pth /svl/u/ravenh/fast_roborender/roborender-acceleration/assets/student/raven_native3view_ladd_5step_iter5250.pth &
 SERVER_PID=$!
 FR=/svl/u/ravenh/fast_roborender

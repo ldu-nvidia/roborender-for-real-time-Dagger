@@ -71,7 +71,7 @@ if [ "$MIX" = "1.0" ]; then
     echo "MIX=1.0 (fully ray-traced): no renderers required"
 elif [ ${#ENDPOINTS[@]} -eq 0 ]; then
     echo "FATAL: MIX=$MIX needs relabelling but no live image3f server was found."
-    echo "       Start them first:  sbatch --time=3-00:00:00 image3f_server.sbatch"
+    echo "       Start them first:  sbatch --time=3-00:00:00 scripts/server/image3f_server.sbatch"
     exit 1
 else
     NEED=$(python3 -c "import math; print(max(1, math.ceil($NUM_ENVS * (1 - $MIX) / 5)))")

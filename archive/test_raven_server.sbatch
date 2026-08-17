@@ -10,7 +10,7 @@
 set -e
 cd /svl/u/ravenh/fast_roborender
 SERVER_LOG=/svl/u/ravenh/fast_roborender/raven_server_test.log
-./run_raven_server.sh --port 18913 > "$SERVER_LOG" 2>&1 &
+/svl/u/ravenh/fast_roborender/run_raven_server.sh --port 18913 > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 until grep -q RAVEN_SERVER_READY "$SERVER_LOG" 2>/dev/null; do
   if ! kill -0 $SERVER_PID 2>/dev/null; then echo "SERVER_DIED"; tail -40 "$SERVER_LOG"; exit 1; fi

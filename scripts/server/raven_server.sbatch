@@ -13,4 +13,4 @@ cd /svl/u/ravenh/fast_roborender
 PORT=$((18000 + SLURM_JOB_ID % 1000))
 echo "$(hostname) $PORT" > ${ENDPOINT_FILE:-/svl/u/ravenh/fast_roborender/raven_server_endpoint.txt}
 echo "endpoint: $(hostname):$PORT"
-exec ./run_raven_server.sh --host 0.0.0.0 --port $PORT ${RAVEN_SERVER_ARGS:-}
+exec /svl/u/ravenh/fast_roborender/run_raven_server.sh --host 0.0.0.0 --port $PORT ${RAVEN_SERVER_ARGS:-}

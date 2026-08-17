@@ -10,6 +10,35 @@ sit inside the training loop:
 Both produce a student for `walk_stand_place_grasp_turn_homie` (bottle → tray).
 Code lives in `GR00T-VisualSim2Real/`; launchers and assets live here in `fast_roborender/`.
 
+## Repository layout
+
+```
+README.md                     this file
+run_raven_server.sh           render-server entrypoint (bundle-relative; stays at root)
+setup_viral_env.sh            conda env for the trainer
+
+scripts/
+  data/     collect_data.sbatch  offline_render.sbatch  render_shard.sbatch
+            offline_render_dataset.py  renormalize_depth.py
+  anchors/  anchor_pool.sbatch  render_anchor_pool.py  rich_prompts.py
+            teacher_anchor_render.sbatch  render_teacher_fullres.py  videogen_prompts.py
+  train/    offline_bc_train.sbatch  dagger_train.sbatch  image_dagger_*.sbatch
+  eval/     eval_policy.sbatch  eval_latest.sbatch  eval_student.sbatch
+  server/   image3f_server.py  image3f_server.sbatch  raven_server.sbatch
+            image3f_ft_setup.sbatch  image3f_ft_eval.sbatch
+
+tools/      benchmarks, sample/preview builders, the 5-vs-50-step A/B (step_ab*.py)
+archive/    superseded one-off diagnostics and earlier experiments
+
+GR00T-VisualSim2Real/         trainer, configs, simulator (own git repo, branch
+                              videogen-image-dagger)
+roborender-acceleration/      LADD student bundle + TensorRT engines (own repo)
+```
+
+Everything else at the top level is gitignored run-time state or data:
+`videogen_dataset/`, `teacher_fullres/`, `logs_archive/`, `image3f_queue*/`,
+`*_endpoint*.txt`, `logs_rl/`.
+
 ## Results
 
 All evaluated on **ray-traced** observations under the **offline-BC eval config** (see
@@ -48,7 +77,7 @@ per 3-view frame it sustains ~145 s/iteration at 16 envs across 3 servers.
 
 Note that **B still needs the teacher model**, indirectly: Image3F runs in FT-FIXED mode,
 where every frame is conditioned on a fixed teacher-rendered RGB triplet for that episode.
-That is what `anchor_pool.sbatch` produces (2048 anchors, `rich_prompts.py`). Conditioning
+That is what `scripts/anchors/anchor_pool.sbatch` produces (2048 anchors, `scripts/anchors/rich_prompts.py`). Conditioning
 Image3F on its own previous outputs instead collapses around frame 20 — do not chain.
 
 Image3F specifics: 5 denoising steps, CFG 1.0, TeaCache 0.3, TensorRT on the 30-block DiT
@@ -63,7 +92,7 @@ renderer needs — per-view depth, robot-body masks, teacher actions — in 81-f
 (the video model's clip length).
 
 ```bash
-sbatch collect_data.sbatch                  # +exp=loco_manip/wsdpt_videogen_collect
+sbatch scripts/data/collect_data.sbatch                  # +exp=loco_manip/wsdpt_videogen_collect
                                             # NUM_ENVS (default 32)
 ```
 
@@ -75,25 +104,25 @@ Chunks land in `videogen_dataset/` as `chunk_<jobid>_<NNNNNNN>.npz`, each holdin
 Start the server first, then stream the dataset through it:
 
 ```bash
-sbatch raven_server.sbatch                  # or teacher_anchor_render.sbatch for the 50-step teacher
-sbatch offline_render.sbatch                # -> offline_render_dataset.py --follow
+sbatch scripts/server/raven_server.sbatch                  # or scripts/anchors/teacher_anchor_render.sbatch for the 50-step teacher
+sbatch scripts/data/offline_render.sbatch                # -> scripts/data/offline_render_dataset.py --follow
                                             # RENDER_VIEWS, RENDER_ARGS
 ```
 
 `--follow` keeps the renderer consuming chunks as collection produces them, so steps 1 and 2
 can overlap. Scene text comes from `render_prompt.txt` (single fixed scene) or
-`videogen_prompts.py` / `rich_prompts.py` for randomized scenes. `render_shard.sbatch` splits
+`scripts/anchors/videogen_prompts.py` / `scripts/anchors/rich_prompts.py` for randomized scenes. `scripts/data/render_shard.sbatch` splits
 the dataset across several servers.
 
 Depth is normalized with the `h5_v4` recipe before it reaches the model
-(`renormalize_depth.py`); per-view clip ranges differ between the head and wrist cameras.
+(`scripts/data/renormalize_depth.py`); per-view clip ranges differ between the head and wrist cameras.
 
 ## A. Offline BC
 
 Behaviour-clone on the rendered dataset — no renderer in the loop, so this is the cheap path.
 
 ```bash
-sbatch offline_bc_train.sbatch              # +exp=loco_manip/wsdpt_videogen_offline_bc
+sbatch scripts/train/offline_bc_train.sbatch              # +exp=loco_manip/wsdpt_videogen_offline_bc
                                             # NUM_ENVS (default 16)
 ```
 
@@ -125,18 +154,18 @@ anchor_00000.npz
   src               <U26                     # source depth chunk
 ```
 
-**Building it.** `render_anchor_pool.py` is shardable; `anchor_pool.sbatch` starts a teacher
+**Building it.** `scripts/anchors/render_anchor_pool.py` is shardable; `scripts/anchors/anchor_pool.sbatch` starts a teacher
 server (LoRA path is required — the server dies instantly without it) and renders a range:
 
 ```bash
 # START/END/OUT are read from the environment; the render server's port is derived
 # from the job id inside the script, so parallel shards never collide.
 for SH in 0 1 2; do
-  sbatch --export=ALL,START=$((SH*683)),END=$(((SH+1)*683)),OUT=/vision/u/ravenh/anchor_pool_2048          anchor_pool.sbatch
+  sbatch --export=ALL,START=$((SH*683)),END=$(((SH+1)*683)),OUT=/vision/u/ravenh/anchor_pool_2048          scripts/anchors/anchor_pool.sbatch
 done
 ```
 
-Prompts come from `rich_prompts.py::build_rich_prompt(seed)`, which composes walls (16) ×
+Prompts come from `scripts/anchors/rich_prompts.py::build_rich_prompt(seed)`, which composes walls (16) ×
 floors (14) × tables (14) × objects (16) × containers (12) × lighting (6) ≈ 29M combinations,
 each with explicit texture wording ("industrial exposed red-brick walls with worn white paint
 patches", "translucent amber plastic bottle with a white flip-top cap"). At 2048 draws
@@ -165,17 +194,17 @@ which offline BC cannot give you.
 
 ```bash
 # 1. anchor pool (see Anchors above) — only needed once
-sbatch anchor_pool.sbatch
+sbatch scripts/anchors/anchor_pool.sbatch
 
 # 2. warm renderers: ~1 per 5 relabelled envs, each with its own endpoint file and queue
 for i in '' _2 _3; do
   sbatch --time=3-00:00:00 \
     --export=ALL,ENDPOINT_FILE=$PWD/image3f_server_endpoint$i.txt,IMAGE3F_QUEUE=$PWD/image3f_queue$i \
-    image3f_server.sbatch
+    scripts/server/image3f_server.sbatch
 done
 
 # 3. train
-sbatch --export=ALL,MIX=0.5 dagger_train.sbatch
+sbatch --export=ALL,MIX=0.5 scripts/train/dagger_train.sbatch
 ```
 
 ### Observation mixing
@@ -189,7 +218,7 @@ sbatch --export=ALL,MIX=0.5 dagger_train.sbatch
 | `0.5` | **mixed** (default) | ~2 | what round 4 used → 69.3%; hedges against renderer artefacts |
 | `1.0` | fully ray-traced | 0 | no relabelling; plain DAgger, useful as a control |
 
-`dagger_train.sbatch` validates `MIX ∈ [0,1]`, discovers endpoint files whose host still runs
+`scripts/train/dagger_train.sbatch` validates `MIX ∈ [0,1]`, discovers endpoint files whose host still runs
 an `i3f_warm_server` (a stale endpoint otherwise kills the run hours in), refuses to start if
 relabelling is requested with no live renderer, and warns when there are fewer servers than
 `ceil(envs × (1 − MIX) / 5)`. Too few servers does not fail — it serialises the rollout, so
@@ -222,18 +251,18 @@ run's config describes a different environment than the baseline's, so scoring a
 checkpoint out of its run directory compares two different worlds and the number means
 nothing. This invalidated three rounds of results before it was caught.
 
-`eval_policy.sbatch` exists so that cannot happen: it always stages the checkpoint beside an
+`scripts/eval/eval_policy.sbatch` exists so that cannot happen: it always stages the checkpoint beside an
 explicit reference config.
 
 ```bash
 # headline number: ray-traced obs, baseline config, 300 episodes
-sbatch --export=ALL,CKPT=<run>/last.pt eval_policy.sbatch
+sbatch --export=ALL,CKPT=<run>/last.pt scripts/eval/eval_policy.sbatch
 
 # quick check
-sbatch --export=ALL,CKPT=<run>/last.pt,EPISODES=50 eval_policy.sbatch
+sbatch --export=ALL,CKPT=<run>/last.pt,EPISODES=50 scripts/eval/eval_policy.sbatch
 
 # generated obs (needs a live renderer)
-sbatch --export=ALL,CKPT=<run>/last.pt,OBS=generated eval_policy.sbatch
+sbatch --export=ALL,CKPT=<run>/last.pt,OBS=generated scripts/eval/eval_policy.sbatch
 ```
 
 | Variable | Default | Notes |

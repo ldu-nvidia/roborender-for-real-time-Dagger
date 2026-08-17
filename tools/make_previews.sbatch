@@ -9,4 +9,4 @@
 set -e
 export HOME=/sailhome/ravenh
 cd /svl/u/ravenh/fast_roborender
-exec roborender-acceleration/.venv/bin/python make_previews.py
+exec /svl/u/ravenh/fast_roborender/roborender-acceleration/.venv/bin/python /svl/u/ravenh/fast_roborender/tools/make_previews.py

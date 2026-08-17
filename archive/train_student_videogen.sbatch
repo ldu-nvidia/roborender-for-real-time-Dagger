@@ -16,7 +16,7 @@ cd /svl/u/ravenh/fast_roborender
 SERVER_LOG=/svl/u/ravenh/fast_roborender/raven_server_${SLURM_JOB_ID}.log
 RAVEN_PORT=$((18000 + SLURM_JOB_ID % 1000))
 echo "raven port $RAVEN_PORT"
-CUDA_VISIBLE_DEVICES=1 ./run_raven_server.sh --port $RAVEN_PORT > "$SERVER_LOG" 2>&1 &
+CUDA_VISIBLE_DEVICES=1 /svl/u/ravenh/fast_roborender/run_raven_server.sh --port $RAVEN_PORT > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 echo "raven server pid $SERVER_PID, log $SERVER_LOG"
 until grep -q RAVEN_SERVER_READY "$SERVER_LOG" 2>/dev/null; do

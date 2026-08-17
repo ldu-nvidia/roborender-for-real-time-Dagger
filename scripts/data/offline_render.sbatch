@@ -10,7 +10,7 @@
 set -e
 export HOME=/sailhome/ravenh
 cd /svl/u/ravenh/fast_roborender
-exec roborender-acceleration/.venv/bin/python offline_render_dataset.py \
+exec /svl/u/ravenh/fast_roborender/roborender-acceleration/.venv/bin/python /svl/u/ravenh/fast_roborender/scripts/data/offline_render_dataset.py \
     --dataset_dir /svl/u/ravenh/fast_roborender/videogen_dataset \
     --prompt_override "$(cat /svl/u/ravenh/fast_roborender/render_prompt.txt)" \
     --views "${RENDER_VIEWS:-hand_left,hand_right,head_color}" \

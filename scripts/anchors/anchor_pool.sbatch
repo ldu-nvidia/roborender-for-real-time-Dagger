@@ -12,9 +12,9 @@ set -x
 export HOME=/sailhome/ravenh
 cd /svl/u/ravenh/fast_roborender
 PORT=$((18000 + SLURM_JOB_ID % 1000))
-./run_raven_server.sh --host 127.0.0.1 --port $PORT --teacher_lora /svl/u/ravenh/renderscale/Sim2RealGen_Video_Model/lora_ckpts/Wan2.1-Fun-V1.1-1.3B-Mixed-DROID-AGIBOT-3View-DualControl-PrevFrame-droidnew_continue_lora/step-5294.safetensors &
+/svl/u/ravenh/fast_roborender/run_raven_server.sh --host 127.0.0.1 --port $PORT --teacher_lora /svl/u/ravenh/renderscale/Sim2RealGen_Video_Model/lora_ckpts/Wan2.1-Fun-V1.1-1.3B-Mixed-DROID-AGIBOT-3View-DualControl-PrevFrame-droidnew_continue_lora/step-5294.safetensors &
 SERVER_PID=$!
-/svl/u/ravenh/miniconda3/envs/gr00t/bin/python render_anchor_pool.py \
+/svl/u/ravenh/miniconda3/envs/gr00t/bin/python /svl/u/ravenh/fast_roborender/scripts/anchors/render_anchor_pool.py \
   --start ${START:-0} --end ${END:-8} --out ${OUT:-/vision/u/ravenh/anchor_pool_2048} --port $PORT
 RC=$?
 kill $SERVER_PID 2>/dev/null
