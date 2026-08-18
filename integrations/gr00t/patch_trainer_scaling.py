@@ -12,8 +12,11 @@ import re
 
 
 MARKER = "FAST_ROBORENDER_SCALING_V1"
-RUNTIME_GATES_MARKER = "FAST_ROBORENDER_PRODUCTION_GATES_V1"
+RUNTIME_GATES_MARKER = "FAST_ROBORENDER_PRODUCTION_GATES_V2"
+LEGACY_RUNTIME_GATES_MARKER = "FAST_ROBORENDER_PRODUCTION_GATES_V1"
 TELEMETRY_MARKER = "FAST_ROBORENDER_DAGGER_TELEMETRY_V1"
+LEGACY_REQUEST_MARKER = "reqs = []"
+DICT_REQUEST_MARKER = "reqs = {}"
 SCALING_REQUIRED_LITERALS = (
     "FAST_ROBORENDER_SCALING_V1: explicit ordered stream metadata",
     'self.vg_reference_lag = int(vg.get("reference_lag", 0))',
@@ -50,12 +53,63 @@ def _require_literals_once(source: str, literals: tuple[str, ...], label: str) -
             )
 
 
+def _request_batch_shape(source: str) -> str:
+    """Identify one exact supported Raven parallel-render implementation."""
+    legacy_literals = (
+        LEGACY_REQUEST_MARKER,
+        "gens = list(pool.map(_render, range(B)))",
+    )
+    dictionary_literals = (
+        DICT_REQUEST_MARKER,
+        "gens = {}",
+        "for b, g in zip(gen_envs, pool.map(_render, gen_envs)):",
+        "gens[b] = g",
+    )
+    legacy = all(source.count(literal) == 1 for literal in legacy_literals)
+    dictionary = all(source.count(literal) == 1 for literal in dictionary_literals)
+    if legacy == dictionary:
+        raise PatchError(
+            "trainer must contain exactly one supported Raven request/generation "
+            "batch shape (legacy list or generated-environment dictionary)"
+        )
+    literals = legacy_literals if legacy else dictionary_literals
+    _require_literals_once(source, literals, f"{'legacy list' if legacy else 'dictionary'} batch")
+    return "legacy" if legacy else "dictionary"
+
+
+def _remove_legacy_runtime_gates(source: str) -> str:
+    """Remove the exact V1 block before installing the stricter V2 gates."""
+    if LEGACY_RUNTIME_GATES_MARKER not in source:
+        return source
+    if source.count(LEGACY_RUNTIME_GATES_MARKER) != 1:
+        raise PatchError("invalid legacy production runtime gates marker count")
+    lines = source.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if LEGACY_RUNTIME_GATES_MARKER in line]
+    ends = [
+        i
+        for i, line in enumerate(lines)
+        if i >= starts[0]
+        and "production gate failed: entropy coefficient mismatch" in line
+    ]
+    if len(ends) != 1 or ends[0] < starts[0]:
+        raise PatchError("could not locate exact legacy production runtime gates block")
+    return "".join(lines[: starts[0]] + lines[ends[0] + 1 :])
+
+
 def _patch_runtime_gates(source: str) -> str:
     """Add fail-fast checks for the controls pinned by the production launcher."""
     required_literals = (
         RUNTIME_GATES_MARKER,
         "IMAGE_DAGGER_EXPECT_PRIMARY_VIEW",
         "production gate failed: primary view mismatch",
+        "IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE",
+        "production gate failed: rollout action source mismatch",
+        "IMAGE_DAGGER_EXPECT_BETA_SCHEDULE",
+        "production gate failed: beta schedule mismatch",
+        "IMAGE_DAGGER_EXPECT_BETA_START",
+        "production gate failed: beta start mismatch",
+        "IMAGE_DAGGER_EXPECT_BETA_END",
+        "production gate failed: beta end mismatch",
         "IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS",
         "production gate failed: teacher warmup mismatch",
         "IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER",
@@ -72,14 +126,27 @@ def _patch_runtime_gates(source: str) -> str:
     if RUNTIME_GATES_MARKER in source:
         _require_literals_once(source, required_literals, "production runtime gates")
         return source
+    source = _remove_legacy_runtime_gates(source)
     source = _sub_once(
         r"^(?P<i>\s*)self\._id_episode_steps\s*=\s*None\s*$",
         (
             r"\g<i>self._id_episode_steps = None\n"
-            r"\g<i># FAST_ROBORENDER_PRODUCTION_GATES_V1\n"
+            r"\g<i># FAST_ROBORENDER_PRODUCTION_GATES_V2\n"
             r"\g<i>_gate_primary = os.environ.get('IMAGE_DAGGER_EXPECT_PRIMARY_VIEW')\n"
             r"\g<i>if _gate_primary and str(self.vg_primary_view) != _gate_primary:\n"
             r"\g<i>    raise RuntimeError('production gate failed: primary view mismatch')\n"
+            r"\g<i>_gate_rollout_source = os.environ.get('IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE')\n"
+            r"\g<i>if _gate_rollout_source is not None and str(getattr(self, 'vg_rollout_action_source', None)) != _gate_rollout_source:\n"
+            r"\g<i>    raise RuntimeError('production gate failed: rollout action source mismatch')\n"
+            r"\g<i>_gate_beta_schedule = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_SCHEDULE')\n"
+            r"\g<i>if _gate_beta_schedule is not None and str(getattr(self, 'vg_beta_schedule', None)) != _gate_beta_schedule:\n"
+            r"\g<i>    raise RuntimeError('production gate failed: beta schedule mismatch')\n"
+            r"\g<i>_gate_beta_start = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_START')\n"
+            r"\g<i>if _gate_beta_start is not None and abs(float(getattr(self, 'vg_beta_start', -1.0)) - float(_gate_beta_start)) > 1e-9:\n"
+            r"\g<i>    raise RuntimeError('production gate failed: beta start mismatch')\n"
+            r"\g<i>_gate_beta_end = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_END')\n"
+            r"\g<i>if _gate_beta_end is not None and abs(float(getattr(self, 'vg_beta_end', -1.0)) - float(_gate_beta_end)) > 1e-9:\n"
+            r"\g<i>    raise RuntimeError('production gate failed: beta end mismatch')\n"
             r"\g<i>_gate_warmup = os.environ.get('IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS')\n"
             r"\g<i>if _gate_warmup is not None and int(self.config.get('rollout_with_teacher_num_steps', -1)) != int(_gate_warmup):\n"
             r"\g<i>    raise RuntimeError('production gate failed: teacher warmup mismatch')\n"
@@ -117,14 +184,15 @@ def _patch_telemetry(source: str) -> str:
         "self._id_telemetry.record(",
         "depth=reqs[0][0], mask=reqs[0][1]",
         "client_anchor=reqs[0][2], generated=gens[0]",
+        "not isinstance(gens, dict) or 0 in gens",
+        "_id_metadata['parallel_batch_size'] = len(gens)",
         "IMAGE_DAGGER_TELEMETRY_REQUIRED",
         "self._id_telemetry_step += 1",
     )
     if TELEMETRY_MARKER in source:
         _require_literals_once(source, required_literals, "DAgger telemetry integration")
         return source
-    if "reqs = []" not in source:
-        raise PatchError("trainer lacks required Raven request-batch marker 'reqs = []'")
+    _request_batch_shape(source)
     source = _sub_once(
         r"^(?P<i>\s*)self\._id_episode_steps\s*=\s*None\s*$",
         (
@@ -148,16 +216,15 @@ def _patch_telemetry(source: str) -> str:
     )
     source = _sub_once(
         (
-            r"^(?P<i>\s*)gens\s*=\s*list\(pool\.map\(_render, range\(B\)\)\)\s*\n"
-            r"(?P=i)# Advance only after every environment response succeeded\.\s*\n"
+            r"^(?P<i>\s*)# Advance only after every environment response succeeded\.\s*\n"
             r"(?P=i)self\._id_episode_steps \+= 1\s*$"
         ),
         (
-            r"\g<i>gens = list(pool.map(_render, range(B)))\n"
-            r"\g<i>if self._id_telemetry is not None:\n"
+            r"\g<i>if self._id_telemetry is not None and (\n"
+            r"\g<i>        not isinstance(gens, dict) or 0 in gens):\n"
             r"\g<i>    _id_metadata = dict(getattr(self._id_env_clients[0], 'last_metadata', {}))\n"
             r"\g<i>    _id_metadata['parallel_batch_wall_ms'] = (time.perf_counter() - t0) * 1000.0\n"
-            r"\g<i>    _id_metadata['parallel_batch_size'] = B\n"
+            r"\g<i>    _id_metadata['parallel_batch_size'] = len(gens)\n"
             r"\g<i>    try:\n"
             r"\g<i>        self._id_telemetry.record(\n"
             r"\g<i>            trainer_step=int(self._id_telemetry_step),\n"
@@ -187,10 +254,10 @@ def patch_source(source: str) -> str:
             "_image_dagger_relabel",
             "_id_env_clients",
             "ThreadPoolExecutor",
-            "reqs = []",
         ):
             if required not in source:
                 raise PatchError(f"trainer lacks required Raven marker {required!r}")
+        batch_shape = _request_batch_shape(source)
 
         source = _sub_once(
             r"^(?P<i>\s*)self\._id_gen_ms\s*=\s*\[\]\s*$",
@@ -258,16 +325,38 @@ def patch_source(source: str) -> str:
             "parallel render call",
         )
 
-        source = _sub_once(
-            r"^(?P<i>\s*)gens\s*=\s*list\(pool\.map\(_render, range\(B\)\)\)\s*$",
-            (
-                r"\g<i>gens = list(pool.map(_render, range(B)))\n"
-                r"\g<i># Advance only after every environment response succeeded.\n"
-                r"\g<i>self._id_episode_steps += 1"
-            ),
-            source,
-            "parallel render completion",
-        )
+        if batch_shape == "legacy":
+            source = _sub_once(
+                r"^(?P<i>\s*)gens\s*=\s*list\(pool\.map\(_render, range\(B\)\)\)\s*$",
+                (
+                    r"\g<i>gens = list(pool.map(_render, range(B)))\n"
+                    r"\g<i># Advance only after every environment response succeeded.\n"
+                    r"\g<i>self._id_episode_steps += 1"
+                ),
+                source,
+                "legacy parallel render completion",
+            )
+        else:
+            source = _sub_once(
+                (
+                    r"^(?P<i>\s*)gens\s*=\s*\{\}\s*\n"
+                    r"(?P=i)if gen_envs:\s*\n"
+                    r"(?P=i)    with ThreadPoolExecutor\(max_workers=len\(gen_envs\)\) as pool:\s*\n"
+                    r"(?P=i)        for b, g in zip\(gen_envs, pool\.map\(_render, gen_envs\)\):\s*\n"
+                    r"(?P=i)            gens\[b\] = g\s*$"
+                ),
+                (
+                    r"\g<i>gens = {}\n"
+                    r"\g<i>if gen_envs:\n"
+                    r"\g<i>    with ThreadPoolExecutor(max_workers=len(gen_envs)) as pool:\n"
+                    r"\g<i>        for b, g in zip(gen_envs, pool.map(_render, gen_envs)):\n"
+                    r"\g<i>            gens[b] = g\n"
+                    r"\g<i># Advance only after every environment response succeeded.\n"
+                    r"\g<i>self._id_episode_steps += 1"
+                ),
+                source,
+                "dictionary parallel render completion",
+            )
     source = _patch_telemetry(source)
     _require_literals_once(source, SCALING_REQUIRED_LITERALS, "scaling integration")
     return _patch_runtime_gates(source)

@@ -15,7 +15,7 @@ PORT=$((18000 + SLURM_JOB_ID % 1000))
 /svl/u/ravenh/fast_roborender/run_raven_server.sh --host 127.0.0.1 --port $PORT --teacher_lora /svl/u/ravenh/renderscale/Sim2RealGen_Video_Model/lora_ckpts/Wan2.1-Fun-V1.1-1.3B-Mixed-DROID-AGIBOT-3View-DualControl-PrevFrame-droidnew_continue_lora/step-5294.safetensors &
 SERVER_PID=$!
 CHUNKS="${CHUNKS_OVERRIDE:- /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000123.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000404.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000777.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001111.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001666.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001999.npz}"
-/svl/u/ravenh/miniconda3/envs/gr00t/bin/python scripts/anchors/render_teacher_fullres.py \
+/svl/u/ravenh/miniconda3/envs/gr00t/bin/python /svl/u/ravenh/fast_roborender/scripts/anchors/render_teacher_fullres.py \
   --chunks $CHUNKS --out "$FR/teacher_fullres" --port $PORT
 RC=$?
 kill $SERVER_PID 2>/dev/null

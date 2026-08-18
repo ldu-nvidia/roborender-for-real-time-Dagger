@@ -39,6 +39,44 @@ class Trainer:
 '''
 
 
+RAVEN_DICT_REPRESENTATIVE = '''
+class Trainer:
+    def __init__(self):
+        self._id_env_clients = None
+        self._id_gen_ms = []
+
+    def _image_dagger_relabel(self, obs_dict, cur_dones):
+        if self._id_anchors is None:
+            self._id_anchors = [None] * B
+            self._id_prompts = [None] * B
+            for b in range(B):
+                self._id_sample_anchor(b)
+        if cur_dones is not None:
+            done_idx = torch.nonzero(cur_dones.reshape(-1)).reshape(-1).tolist()
+            for b in done_idx:
+                if b < B:
+                    self._id_sample_anchor(b)
+
+        gen_envs = [b for b in range(B) if b not in self._id_use_raytraced]
+        reqs = {}
+        for b in gen_envs:
+            reqs[b] = ({}, {}, {})
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _render(b):
+            depth_d, mask_d, prev_d = reqs[b]
+            return self._id_env_clients[b].render_frame(
+                depth_d, mask_d, prev_d, prompt=self._id_prompts[b], seed=self.vg_seed)
+
+        gens = {}
+        if gen_envs:
+            with ThreadPoolExecutor(max_workers=len(gen_envs)) as pool:
+                for b, g in zip(gen_envs, pool.map(_render, gen_envs)):
+                    gens[b] = g
+'''
+
+
 class TrainerPatchTest(unittest.TestCase):
     def test_patches_known_parallel_trainer(self):
         patched = patch_source(REPRESENTATIVE)
@@ -50,6 +88,11 @@ class TrainerPatchTest(unittest.TestCase):
         self.assertIn("episode_id=int(self._id_episode_ids[b])", patched)
         self.assertIn("self._id_episode_steps += 1", patched)
         self.assertIn("IMAGE_DAGGER_EXPECT_PRIMARY_VIEW", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE", patched)
+        self.assertIn("production gate failed: rollout action source mismatch", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_BETA_SCHEDULE", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_BETA_START", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_BETA_END", patched)
         self.assertIn("IMAGE_DAGGER_EXPECT_TEACHER_RATIO", patched)
         self.assertIn("IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF", patched)
         self.assertIn("IMAGE_DAGGER_EXPECT_ENTROPY_COEF", patched)
@@ -58,6 +101,26 @@ class TrainerPatchTest(unittest.TestCase):
         self.assertIn("client_anchor=reqs[0][2]", patched)
         self.assertIn("DaggerTelemetry.from_environment(rank=self._id_rank)", patched)
         self.assertEqual(patch_source(patched), patched)
+
+    def test_patches_raven_generated_environment_dictionary_trainer(self):
+        patched = patch_source(RAVEN_DICT_REPRESENTATIVE)
+        ast.parse(patched)
+        self.assertIn(MARKER, patched)
+        self.assertIn(RUNTIME_GATES_MARKER, patched)
+        self.assertIn(TELEMETRY_MARKER, patched)
+        self.assertIn("gens = {}", patched)
+        self.assertIn("gens[b] = g", patched)
+        self.assertIn("not isinstance(gens, dict) or 0 in gens", patched)
+        self.assertIn("_id_metadata['parallel_batch_size'] = len(gens)", patched)
+        self.assertIn("depth=reqs[0][0], mask=reqs[0][1]", patched)
+        self.assertIn("client_anchor=reqs[0][2], generated=gens[0]", patched)
+        self.assertIn("self._id_episode_steps += 1", patched)
+        self.assertEqual(patch_source(patched), patched)
+
+    def test_refuses_unknown_dictionary_completion_shape(self):
+        malformed = RAVEN_DICT_REPRESENTATIVE.replace("gens[b] = g", "gens.append(g)")
+        with self.assertRaisesRegex(PatchError, "exactly one supported Raven"):
+            patch_source(malformed)
 
     def test_upgrades_existing_scaling_patch_with_runtime_gates(self):
         lines = patch_source(REPRESENTATIVE).splitlines()
@@ -77,6 +140,27 @@ class TrainerPatchTest(unittest.TestCase):
         ast.parse(upgraded)
         self.assertIn(RUNTIME_GATES_MARKER, upgraded)
 
+    def test_upgrades_v1_runtime_gates_to_v2(self):
+        current = patch_source(REPRESENTATIVE)
+        lines = current.splitlines(keepends=True)
+        beta_start = next(
+            i for i, line in enumerate(lines) if "_gate_beta_schedule =" in line
+        )
+        beta_end = next(
+            i
+            for i, line in enumerate(lines[beta_start:], start=beta_start)
+            if "production gate failed: beta end mismatch" in line
+        )
+        legacy = "".join(lines[:beta_start] + lines[beta_end + 1 :]).replace(
+            "FAST_ROBORENDER_PRODUCTION_GATES_V2",
+            "FAST_ROBORENDER_PRODUCTION_GATES_V1",
+        )
+        upgraded = patch_source(legacy)
+        ast.parse(upgraded)
+        self.assertIn("FAST_ROBORENDER_PRODUCTION_GATES_V2", upgraded)
+        self.assertNotIn("FAST_ROBORENDER_PRODUCTION_GATES_V1", upgraded)
+        self.assertIn("IMAGE_DAGGER_EXPECT_BETA_SCHEDULE", upgraded)
+
     def test_refuses_unknown_source(self):
         with self.assertRaises(PatchError):
             patch_source("def train(): pass")
@@ -92,6 +176,15 @@ class TrainerPatchTest(unittest.TestCase):
         corrupted = patched.replace(
             "production gate failed: primary view mismatch",
             "production gate failed: removed assertion",
+        )
+        with self.assertRaisesRegex(PatchError, "invalid production runtime gates"):
+            patch_source(corrupted)
+
+    def test_refuses_runtime_patch_missing_rollout_action_source_gate(self):
+        patched = patch_source(REPRESENTATIVE)
+        corrupted = patched.replace(
+            "IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE",
+            "IMAGE_DAGGER_EXPECT_REMOVED_ACTION_SOURCE",
         )
         with self.assertRaisesRegex(PatchError, "invalid production runtime gates"):
             patch_source(corrupted)
@@ -117,7 +210,9 @@ class TrainerPatchTest(unittest.TestCase):
             "                trainer_step=int(self._id_telemetry_step))",
             "                reference_lag=self.vg_reference_lag)",
         )
-        telemetry_start = legacy.index("            if self._id_telemetry is not None:\n")
+        telemetry_start = legacy.index(
+            "            if self._id_telemetry is not None and (\n"
+        )
         advance_start = legacy.index(
             "            # Advance only after every environment response succeeded.\n",
             telemetry_start,

@@ -55,7 +55,16 @@ export HOME=/sailhome/ravenh
 export XDG_CACHE_HOME=/svl/u/ravenh/.cache_xdg XDG_DATA_HOME=/svl/u/ravenh/.share_xdg
 export TMPDIR=/svl/u/ravenh/tmp OMNI_KIT_ACCEPT_EULA=YES
 
-[ -f "$CKPT" ] || { echo "FATAL: no such warm-start checkpoint: $CKPT"; exit 1; }
+# CKPT=none trains without a warm start. Required for the 3-view policy: its vision_obs
+# is 3x taller, so single-view checkpoints (offline BC, image DAgger rounds 1-4) carry
+# incompatible vision weights and cannot be loaded.
+if [ "$CKPT" = none ]; then
+    CKPT_ARG=()
+    echo "warm start: none (vision trained from scratch)"
+else
+    [ -f "$CKPT" ] || { echo "FATAL: no such warm-start checkpoint: $CKPT"; exit 1; }
+    CKPT_ARG=(checkpoint="$CKPT")
+fi
 
 # Collect every endpoint file whose host currently runs an i3f_warm_server. A stale endpoint
 # left over from a finished job points the trainer at a dead host and kills the run hours in.
@@ -97,7 +106,7 @@ HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
     +exp=loco_manip/wsdpt_image_dagger \
     num_envs="$NUM_ENVS" \
     headless=True \
-    checkpoint="$CKPT" \
+    "${CKPT_ARG[@]}" \
     algo.config.videogen.raytraced_mix_prob="$MIX" \
     algo.config.videogen.anchor_pool_dir="$ANCHORS" \
     algo.config.videogen.anchor_index="$ANCHOR_IDX" \

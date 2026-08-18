@@ -33,6 +33,10 @@ class ScalePlan:
     total_collected_transitions: int
     total_optimizer_steps: int
     behavior_source: str
+    rollout_action_source: str
+    beta_schedule: str
+    beta_start: float
+    beta_end: float
     rollout_with_teacher_num_steps: int
     enforce_teacher_rollout: bool
     teacher_rollout_ratio: float
@@ -142,8 +146,18 @@ def build_plan(
             num_mini_batches * num_learning_epochs * num_rollout_iterations
         ),
         behavior_source=behavior_source,
+        rollout_action_source={
+            "student": "student",
+            "mixed": "beta",
+            "teacher": "teacher",
+        }[behavior_source],
+        beta_schedule="constant",
+        beta_start=teacher_rollout_ratio,
+        beta_end=teacher_rollout_ratio,
         rollout_with_teacher_num_steps=0,
-        enforce_teacher_rollout=behavior_source != "student",
+        # Raven's videogen rollout_action_source is authoritative. Keep the
+        # legacy parent-trainer mixer disabled to avoid applying two mixtures.
+        enforce_teacher_rollout=False,
         teacher_rollout_ratio=teacher_rollout_ratio,
         primary_view=primary_view,
     )
@@ -231,7 +245,8 @@ def main() -> int:
             f"{plan.optimizer_steps_per_rollout_iteration} optimizer steps/rollout "
             f"iteration, {plan.transitions_per_optimizer_step:,} transitions/optimizer "
             f"step; behavior={plan.behavior_source} "
-            f"(teacher ratio {plan.teacher_rollout_ratio:.3f}), "
+            f"(videogen rollout source {plan.rollout_action_source}, "
+            f"teacher ratio {plan.teacher_rollout_ratio:.3f}), "
             f"primary view={plan.primary_view}"
         )
         print(

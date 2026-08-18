@@ -17,7 +17,7 @@ PORT=$((18000 + SLURM_JOB_ID % 1000))
 SERVER_PID=$!
 FR=/svl/u/ravenh/fast_roborender
 CHUNKS="$FR/videogen_dataset/chunk_16222830_0001309.npz $FR/videogen_dataset/chunk_16222830_0000051.npz $FR/videogen_dataset/chunk_16222830_0000501.npz"
-/svl/u/ravenh/miniconda3/envs/gr00t/bin/python scripts/anchors/render_teacher_fullres.py \
+/svl/u/ravenh/miniconda3/envs/gr00t/bin/python /svl/u/ravenh/fast_roborender/scripts/anchors/render_teacher_fullres.py \
   --chunks $CHUNKS --out "$FR/student3v_fullres" --port $PORT
 RC=$?
 kill $SERVER_PID 2>/dev/null

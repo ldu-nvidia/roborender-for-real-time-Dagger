@@ -184,6 +184,10 @@ TRANSITIONS_PER_ROLLOUT_ITERATION=$(python3 "$ROOT/scripts/scaling/scale_plan.py
 TRANSITIONS_PER_OPTIMIZER_STEP=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --field transitions_per_optimizer_step)
 OPTIMIZER_STEPS_PER_ROLLOUT_ITERATION=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --field optimizer_steps_per_rollout_iteration)
 ENFORCE_TEACHER_ROLLOUT=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --field enforce_teacher_rollout)
+VG_ROLLOUT_ACTION_SOURCE=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --field rollout_action_source)
+VG_BETA_SCHEDULE=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --field beta_schedule)
+VG_BETA_START=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --field beta_start)
+VG_BETA_END=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --field beta_end)
 [[ "$NUM_ROLLOUT_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || {
     echo "FATAL: NUM_ROLLOUT_ITERATIONS must be a positive integer, got $NUM_ROLLOUT_ITERATIONS"
     exit 2
@@ -272,6 +276,10 @@ export IMAGE3F_RUN_ID=${IMAGE3F_RUN_ID:-$SLURM_JOB_ID}
 export IMAGE3F_REQUEST_TIMEOUT_S=${IMAGE3F_REQUEST_TIMEOUT_S:-120}
 export BASE_RENDER_SEED=${BASE_RENDER_SEED:-42}
 export IMAGE_DAGGER_EXPECT_PRIMARY_VIEW="$VG_PRIMARY_VIEW"
+export IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE="$VG_ROLLOUT_ACTION_SOURCE"
+export IMAGE_DAGGER_EXPECT_BETA_SCHEDULE="$VG_BETA_SCHEDULE"
+export IMAGE_DAGGER_EXPECT_BETA_START="$VG_BETA_START"
+export IMAGE_DAGGER_EXPECT_BETA_END="$VG_BETA_END"
 export IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS=0
 export IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER="$ENFORCE_TEACHER_ROLLOUT"
 export IMAGE_DAGGER_EXPECT_TEACHER_RATIO="$TEACHER_ROLLOUT_RATIO"
@@ -284,7 +292,8 @@ export LOCAL_NUM_ENVS REQUIRED_RENDERERS GRADIENT_ACCUMULATION_STEPS EP_LIST CKP
 export PROJ EXP TRAIN_RUN_DIR MASTER_ADDR MASTER_PORT TRAINER_NODES
 export NUM_MINI_BATCHES PER_DEVICE_TRAIN_BATCH_SIZE
 export NUM_ROLLOUT_ITERATIONS NUM_LEARNING_EPOCHS
-export BEHAVIOR_SOURCE TEACHER_ROLLOUT_RATIO ENFORCE_TEACHER_ROLLOUT VG_PRIMARY_VIEW
+export BEHAVIOR_SOURCE VG_ROLLOUT_ACTION_SOURCE VG_BETA_SCHEDULE VG_BETA_START VG_BETA_END
+export TEACHER_ROLLOUT_RATIO ENFORCE_TEACHER_ROLLOUT VG_PRIMARY_VIEW
 export SAVE_FREQUENCY
 
 [ -x "$WANDB_PYTHON" ] || {
@@ -376,6 +385,10 @@ trainer_num_total_batches=$NUM_ROLLOUT_ITERATIONS
 num_rollout_iterations=$NUM_ROLLOUT_ITERATIONS
 num_learning_epochs=$NUM_LEARNING_EPOCHS
 behavior_source=$BEHAVIOR_SOURCE
+videogen_rollout_action_source=$VG_ROLLOUT_ACTION_SOURCE
+videogen_beta_schedule=$VG_BETA_SCHEDULE
+videogen_beta_start=$VG_BETA_START
+videogen_beta_end=$VG_BETA_END
 rollout_with_teacher_num_steps=0
 enforce_teacher_rollout=$ENFORCE_TEACHER_ROLLOUT
 teacher_rollout_ratio=$TEACHER_ROLLOUT_RATIO
@@ -396,7 +409,7 @@ echo " rollout: ${ROLLOUT_STEPS} steps, ${TRANSITIONS_PER_ROLLOUT_ITERATION} tra
 echo " learning: ${NUM_LEARNING_EPOCHS} epoch(s), ${OPTIMIZER_STEPS_PER_ROLLOUT_ITERATION} optimizer steps/rollout iteration"
 echo " optimizer step: ${TRANSITIONS_PER_OPTIMIZER_STEP} global transitions"
 echo " rollout iterations: ${NUM_ROLLOUT_ITERATIONS} (trainer num_total_batches)"
-echo " behavior: ${BEHAVIOR_SOURCE}, teacher ratio=${TEACHER_ROLLOUT_RATIO}, warmup teacher steps=0"
+echo " behavior: ${BEHAVIOR_SOURCE}, videogen rollout source=${VG_ROLLOUT_ACTION_SOURCE}, beta=${VG_BETA_SCHEDULE}:${VG_BETA_START}, legacy teacher mixer=false, warmup teacher steps=0"
 echo " objective: pure DAgger BC (value_loss_coef=0.0, entropy_coef=0.0)"
 echo " actor RGB input: generated primary view=${VG_PRIMARY_VIEW}"
 echo " renderers: ${REQUIRED_RENDERERS}, ray-traced mix=${MIX}, RGB lag=${REFERENCE_LAG}"
@@ -436,6 +449,10 @@ srun --nodes="$TRAINER_NODES" --ntasks="$TRAINER_NODES" --ntasks-per-node=1 \
                 algo.config.ratio_teacher_rollout="$TEACHER_ROLLOUT_RATIO" \
                 algo.config.value_loss_coef=0.0 \
                 algo.config.entropy_coef=0.0 \
+                algo.config.videogen.rollout_action_source="$VG_ROLLOUT_ACTION_SOURCE" \
+                algo.config.videogen.beta_schedule="$VG_BETA_SCHEDULE" \
+                algo.config.videogen.beta_start="$VG_BETA_START" \
+                algo.config.videogen.beta_end="$VG_BETA_END" \
                 algo.trl.per_device_train_batch_size="$PER_DEVICE_TRAIN_BATCH_SIZE" \
                 algo.trl.gradient_accumulation_steps="$GRADIENT_ACCUMULATION_STEPS" \
                 algo.trl.num_total_batches="$NUM_ROLLOUT_ITERATIONS" \

@@ -17,6 +17,6 @@ until grep -q RAVEN_SERVER_READY "$SERVER_LOG" 2>/dev/null; do
   sleep 5
 done
 echo "server ready, running client test"
-roborender-acceleration/.venv/bin/python test_raven_server.py
+roborender-acceleration/.venv/bin/python /svl/u/ravenh/fast_roborender/archive/test_raven_server.py
 kill $SERVER_PID
 echo SERVER_TEST_DONE

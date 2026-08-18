@@ -163,8 +163,42 @@ sbatch scripts/data/offline_render.sbatch                # -> scripts/data/offli
 
 `--follow` keeps the renderer consuming chunks as collection produces them, so steps 1 and 2
 can overlap. Scene text comes from `render_prompt.txt` (single fixed scene) or
-`scripts/anchors/videogen_prompts.py` / `scripts/anchors/rich_prompts.py` for randomized scenes. `scripts/data/render_shard.sbatch` splits
-the dataset across several servers.
+`scripts/anchors/videogen_prompts.py` / `scripts/anchors/rich_prompts.py` for randomized
+scenes. `scripts/data/render_shard.sbatch` splits the dataset across several servers.
+
+**What the renderer writes.** Each chunk gains
+
+```
+rgb_gen                (81, 108, 192, 3)   the primary view, for single-view policies
+rgb_gen__head_color    (81, 108, 192, 3)   per-view, for multi-view policies
+rgb_gen__hand_left     (81, 108, 192, 3)
+rgb_gen__hand_right    (81, 108, 192, 3)
+```
+
+The per-view keys are what a 3-view offline BC policy tiles. Resume is view-aware: a chunk
+counts as done only when `rgb_gen` **and** every requested `rgb_gen__<view>` is present, so
+pointing the renderer at a dataset rendered before per-view support re-renders it rather
+than skipping it.
+
+**Re-rendering an existing dataset for multi-view.** Start one teacher server per shard,
+each writing its own `teacher_endpoint_<i>.txt`, then launch the shards:
+
+```bash
+LORA=.../droidnew_continue_lora/step-5294.safetensors
+for i in 0 1 2 3; do
+  sbatch --time=12:00:00 --job-name=teach_srv_$i \
+    --export=ALL,ENDPOINT_FILE=$PWD/teacher_endpoint_$i.txt,RAVEN_SERVER_ARGS="--teacher_lora $LORA" \
+    scripts/server/raven_server.sbatch
+done
+# once every endpoint file names the node its server runs on:
+for i in 0 1 2 3; do
+  sbatch --export=ALL,SHARD=$i,NSHARDS=4 scripts/data/rerender_3view.sbatch
+done
+```
+
+`rerender_3view.sbatch` is finite (no `--follow`), so each shard exits when its slice is
+done. ~32 s per chunk with the 50-step teacher, so 2000 chunks over 4 shards is roughly
+4.5 h. Budget ~10 MB per chunk of extra storage for the three per-view arrays.
 
 Depth is normalized with the `h5_v4` recipe before it reaches the model
 (`scripts/data/renormalize_depth.py`); per-view clip ranges differ between the head and wrist cameras.
@@ -240,9 +274,39 @@ from the renderer — the pool already contains the data, so switching costs one
 
 ## B. Online image-model DAgger
 
-The student acts, the teacher supplies the supervision, and Image3F relabels observations
-inside the rollout — so the student sees generated pixels on the states its own policy visits,
-which offline BC cannot give you.
+Image3F relabels observations inside the rollout, so the student is trained on generated
+pixels over a live state distribution rather than a fixed dataset.
+
+**Who drives the rollout is a config choice, and the default is the teacher.**
+`videogen.rollout_action_source: teacher` (the default, and what every round so far used)
+overrides the student's actions with the teacher's each step:
+
+```python
+# distill_trainer_videogen.py
+if self._in_train_rollout and self.vg_rollout_action_source == "teacher" \
+   and "gt_actions" in policy_state_dict:
+    policy_state_dict["actions"] = policy_state_dict["gt_actions"].clone()
+```
+
+So the student learns on the *teacher's* state distribution — DAgger at β=1, i.e. on-policy
+BC over teacher-visited states, not the student-state correction that classic DAgger
+performs. The 69.3% result was obtained this way.
+
+`rollout_action_source: student` makes the student drive, which is the classic β=0 setting.
+It used to carry a caveat — the student saw the previous chunk's last generated frame as
+stale vision — but that path is gated to `videogen.mode: online`. In `image_dagger` the
+relabel happens per step *before* the policy acts, so a student-driven rollout sees fresh
+generated frames. It is untested at scale; every result to date uses the teacher-driven default.
+
+For the annealed mixture the paper actually prescribes, set `rollout_action_source: beta`.
+Each environment then follows the teacher with probability β at **each decision** (Ross et
+al. sample the mixture per decision, not per trajectory), with β annealed from `beta_start`
+to `beta_end` over `beta_decay_iters`. The paper starts at β=1 and decays toward 0 —
+expert-driven while the student is still random, student-driven by the end — and its
+recommended practical setting is β=1 on the first iteration and 0 thereafter. A fixed
+`beta_schedule: constant` with `beta_start: 0.5` gives an even split, but never collects
+the student's undiluted state distribution, which is the point of DAgger. β affects
+training rollouts only; evaluation always runs the student.
 
 ```bash
 # 1. anchor pool (see Anchors above) — only needed once
@@ -291,6 +355,10 @@ Other variables: `CKPT` (warm start, defaults to the round-4 final), `NUM_ENVS` 
 | `videogen.raytraced_mix_prob` | via `MIX` | see above |
 | `videogen.image3f_endpoint_files` | one per renderer | envs are sharded round-robin across them |
 | `videogen.anchor_pool_dir` / `anchor_index` | `anchor_pool_2048` / `0` | fixed anchor per episode; chaining on own outputs collapses |
+| `videogen.rollout_action_source` | `teacher` | who drives the rollout: `teacher` (β=1), `student` (β=0), `beta` (annealed) |
+| `videogen.beta_schedule` | `linear` | `constant` / `linear` / `exponential`, used when the source is `beta` |
+| `videogen.beta_start` / `beta_end` | `1.0` / `0.0` | DAgger mixture endpoints |
+| `videogen.beta_decay_iters` / `beta_decay_rate` | `500` / `0.99` | linear horizon / exponential rate |
 | `num_steps_per_env` | `81` | one BC update per video-model clip length |
 
 Warm-start from the previous round's `last.pt`: round 4 started from round 3 and reached
@@ -373,9 +441,14 @@ trainer's legacy `algo.trl.num_total_batches` setting. `NUM_TOTAL_BATCHES` remai
 environment alias; setting both names to different values is a fatal error.
 
 Production behavior is explicit and recorded in both manifests. The default is
-`BEHAVIOR_SOURCE=student`, which pins `rollout_with_teacher_num_steps=0`,
-`enforce_teacher_rollout=false`, and `TEACHER_ROLLOUT_RATIO=0.0`. An intentional mixed run must
-set `BEHAVIOR_SOURCE=mixed` and a ratio strictly between zero and one; a teacher-only run must
+`BEHAVIOR_SOURCE=student`, which pins the Image3F trainer's actual action selector
+`videogen.rollout_action_source=student` as well as `rollout_with_teacher_num_steps=0`,
+`enforce_teacher_rollout=false`, and `TEACHER_ROLLOUT_RATIO=0.0`. The launcher derives and
+runtime-gates that Image3F selector separately so the trainer's default `teacher` behavior
+cannot silently override a run labeled as student-driven. An intentional mixed run must
+set `BEHAVIOR_SOURCE=mixed` and a ratio strictly between zero and one; this maps to Raven's
+`rollout_action_source=beta` with a constant per-decision β equal to that ratio while keeping
+the legacy parent-trainer mixer disabled. A teacher-only run must
 set `BEHAVIOR_SOURCE=teacher` and ratio `1.0`. Inconsistent combinations fail before any Slurm
 submission. `NUM_LEARNING_EPOCHS=1` and `VG_PRIMARY_VIEW=head_color` are also pinned explicitly.
 The supported primary views are `hand_left`, `hand_right`, and `head_color`. Image3F still
@@ -455,7 +528,45 @@ Before the full job, validate progressively: 4×4, 32×16, 64×75, 128×75, 256�
 256×260 (the lag transition), then 256×300. Acceptance requires exact global transition
 counts, finite BC loss, balanced endpoint request counts, zero render errors, correct anchor
 reset/t−256 telemetry, and synchronized policy checkpoints across ranks.
+## Multi-view policies
 
+By default the policy sees one camera (the ego/head view). Image3F renders three
+synchronized views regardless, so the wrist views were being generated and discarded.
+
+Set `cameras.policy_views` and the matching `policy_view_count` and the views are tiled
+vertically into a single image:
+
+```
+[ head_color ]  108x192
+[ hand_left  ]  108x192   ->  vision_obs (324, 192, 3)  ->  ResNet18
+[ hand_right ]  108x192
+```
+
+Ready-made configs: `wsdpt_image_dagger_3view` and `wsdpt_videogen_offline_bc_3view`.
+
+```bash
+sbatch --export=ALL,MIX=0.0,CKPT=none,NUM_ENVS=4 scripts/train/dagger_train_3view.sbatch
+```
+
+Ray-traced envs take the tiles from the conditioning cameras (already rendered for the
+renderer, just downsampled), generated envs from Image3F — identical layout either way.
+
+Things that follow from the taller observation:
+
+- **Single-view checkpoints cannot be warm-started.** The vision weights have the wrong
+  shape, so launch with `CKPT=none`. The 57.3% and 69.3% baselines do not transfer, and a
+  3-view baseline has to be re-established.
+- **Offline BC needs the dataset re-rendered.** Chunks must carry `rgb_gen__<view>` per
+  view; older ones have only the primary `rgb_gen`. `offline_render_dataset.py` writes the
+  per-view keys and its resume check treats a chunk as done only when every requested view
+  is present, so pointing it at an old dataset re-renders it.
+- `policy_view_count` must equal `len(policy_views)`. The obs dims scale by the former and
+  the trainer tiles by the latter; a mismatch mis-reshapes rather than erroring cleanly.
+- Renderer load scales with relabelled envs, not views — one server per ~5 envs still holds,
+  but each request now returns three views instead of one.
+
+Verified end to end (`MIX=0.0`, 4 envs, from scratch): history buffer `(324, 192, 3)`,
+storage `obs_dim=186624`, two learning iterations with `dagger_bc_loss` 1.089 -> 0.873.
 ## Evaluation — read this first
 
 **`eval_agent_trl.py` loads `config.yaml` from the checkpoint's own directory.** A DAgger
@@ -502,6 +613,111 @@ Reference configs it stages against:
 **One eval saturates one renderer** (~52 episodes/h). Two evals sharing a server each run at
 half speed and overrun the job limit with no output, since the success rate is only printed
 at the end. Give each concurrent `OBS=generated` eval its own server and `ENDPOINT`.
+
+## Running on another machine
+
+The trainer, configs and simulator changes live in `GR00T-VisualSim2Real/`, which is a
+checkout of the public NVlabs repo with our work on the `videogen-image-dagger` branch.
+A fresh clone elsewhere has none of it, and the preflight will refuse to run.
+
+`transfer/` holds the branch as patches against public revision `92bf0863`, which is an
+ancestor of the branch, so they apply without a rebase:
+
+```bash
+cd GR00T-VisualSim2Real
+git am ../transfer/0001-*.patch ../transfer/0002-*.patch ../transfer/0003-*.patch
+```
+
+0001 = videogen pipeline (trainer, render clients, conditioning cameras, scene walls,
+configs) · 0002 = three-view policy · 0003 = DAgger beta schedule.
+
+The patches carry code only. Also needed on the target machine, none of it in this repo:
+
+| Asset | Where it comes from |
+|---|---|
+| Image3F bundle + adapter | `/vision/u/ravenh/roborender_image_model_accelerated` |
+| Foundation weights | `ROBORENDER_MODEL_BASE`, see [Setup](#setup) |
+| TensorRT engines | built locally per GPU arch — never shipped |
+| Anchor pool | `scripts/anchors/anchor_pool.sbatch` |
+| Rendered dataset | `scripts/data/` (offline BC only) |
+| Launchers and this README | `fast_roborender/` |
+
+Every launcher in `scripts/` is an sbatch script written for this cluster (viscam
+partitions, `/svl` and `/vision` paths). On a workstation with no Slurm, run the training
+command directly — the launchers are thin wrappers around it:
+
+```bash
+cd GR00T-VisualSim2Real
+HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
+    gr00t/rl/train_agent_trl.py \
+    +exp=loco_manip/wsdpt_image_dagger_3view \
+    num_envs=4 headless=True \
+    algo.config.videogen.raytraced_mix_prob=0.0 \
+    algo.config.videogen.anchor_pool_dir=/path/to/anchor_pool \
+    algo.config.videogen.image3f_endpoint_files=[/path/to/endpoint.txt] \
+    experiment_name=dagger_3view project_name=my_project
+```
+
+Omit `checkpoint=` entirely for a 3-view run: single-view weights cannot be loaded.
+Start the renderer first with `runtime/image3f_deploy.py` behind
+`scripts/server/image3f_server.py`, and point `image3f_endpoint_files` at the file it
+writes.
+
+`bash scripts/setup/check_env.sh` reports which assets are missing. Its paths default to
+the sc layout and are overridable:
+
+```bash
+ROOT=/your/checkout IMAGE3F=/your/image3f_bundle VIRAL_PY=$CONDA_PREFIX/bin/python \
+  bash scripts/setup/check_env.sh
+```
+
+The environment installer is portable as well: set `CONDA`, `ROOT`, and optionally
+`VIRAL_ENV_NAME`, `VIRAL_PY`, or `ROBORENDER_CACHE_ROOT` before running
+`bash scripts/setup/setup_viral_env.sh`.
+
+`python3 scripts/setup/check_paths.py` verifies no script references a file that moved.
+
+> Note for reviewers: `archive/` contains superseded one-off scripts, including the
+> `patch_*.py` snapshots that were applied once to produce the current code. **They are not
+> the integration** — read `distill_trainer_videogen.py` and the simulator's
+> `get_policy_view_stack` instead. See `archive/README.md`.
+
+## Depth control recipe
+
+Depth is what the renderer conditions on, and the exact h5_v4 parameters matter. They live
+in the experiment config (`videogen.depth_h5v4_per_view`) and are applied by
+`_h5v4_control` in the trainer:
+
+```yaml
+head_color: {raw_clip: [0.05, 10.0], inv_clip: [1.0, 40.0], norm_range: [0.05, 2.6]}
+hand_left:  {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
+hand_right: {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
+```
+
+`norm_range` on the head view is load-bearing: with fixed normalization bounds a close
+object no longer anchors the range to white, so object shape survives. Views without
+`norm_range` fall back to per-video min/max, and views without `raw_pct` skip percentile
+clipping (the built-in default carries neither).
+
+Denoising steps, measured with the correct recipe (6 frames, 2 chunks, FT-FIXED, fixed
+seed; PSNR against the 50-step video teacher):
+
+| steps | ms | PSNR | SSIM |
+|---|---|---|---|
+| **5** (production) | 212 | **17.91** | 0.792 |
+| 20 | 689 | 15.01 | 0.659 |
+| 50 | 1598 | 14.53 | 0.634 |
+
+More denoising is worse here: geometry stays correct and textures sharpen, but the output
+drifts off the anchor's colours and materials, which is exactly what FT-FIXED depends on.
+The same ranking held under the earlier incorrect depth, 0.7-1.2 dB lower across the board.
+
+**Offline analysis must use `tools/depth_recipe.py`**, which loads these params from the
+config and reproduces `_h5v4_control` byte-for-byte (`tools/test_depth_recipe.py` asserts
+equality against the trainer's own code). Hand-copying the recipe into a script is how the
+A/B evals ended up inverting raw metric depth and min-maxing per frame: a 37/255 mean
+difference on real head-view data, 61% of pixels off by more than 32 levels, understating
+every arm by 0.7-1.2 dB. Training was never affected -- it always went through the config.
 
 ## Gotchas
 

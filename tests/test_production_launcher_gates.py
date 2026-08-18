@@ -29,6 +29,10 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             "algo.config.rollout_with_teacher_num_steps=0",
             'algo.config.enforce_teacher_rollout="$ENFORCE_TEACHER_ROLLOUT"',
             'algo.config.ratio_teacher_rollout="$TEACHER_ROLLOUT_RATIO"',
+            'algo.config.videogen.rollout_action_source="$VG_ROLLOUT_ACTION_SOURCE"',
+            'algo.config.videogen.beta_schedule="$VG_BETA_SCHEDULE"',
+            'algo.config.videogen.beta_start="$VG_BETA_START"',
+            'algo.config.videogen.beta_end="$VG_BETA_END"',
             'algo.config.num_learning_epochs="$NUM_LEARNING_EPOCHS"',
             '++algo.config.videogen.primary_view="$VG_PRIMARY_VIEW"',
         )
@@ -38,6 +42,10 @@ class ProductionLauncherGatesTest(unittest.TestCase):
 
         for runtime_assertion in (
             'IMAGE_DAGGER_EXPECT_PRIMARY_VIEW="$VG_PRIMARY_VIEW"',
+            'IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE="$VG_ROLLOUT_ACTION_SOURCE"',
+            'IMAGE_DAGGER_EXPECT_BETA_SCHEDULE="$VG_BETA_SCHEDULE"',
+            'IMAGE_DAGGER_EXPECT_BETA_START="$VG_BETA_START"',
+            'IMAGE_DAGGER_EXPECT_BETA_END="$VG_BETA_END"',
             "IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS=0",
             'IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER="$ENFORCE_TEACHER_ROLLOUT"',
             'IMAGE_DAGGER_EXPECT_TEACHER_RATIO="$TEACHER_ROLLOUT_RATIO"',

@@ -43,11 +43,19 @@ SCALING_TRAINER_MARKERS = (
     "reference_lag=self.vg_reference_lag,",
     "self._id_episode_steps += 1",
 )
-RUNTIME_GATES_MARKER = "FAST_ROBORENDER_PRODUCTION_GATES_V1"
+RUNTIME_GATES_MARKER = "FAST_ROBORENDER_PRODUCTION_GATES_V2"
 RUNTIME_GATE_TRAINER_MARKERS = (
     RUNTIME_GATES_MARKER,
     "IMAGE_DAGGER_EXPECT_PRIMARY_VIEW",
     "production gate failed: primary view mismatch",
+    "IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE",
+    "production gate failed: rollout action source mismatch",
+    "IMAGE_DAGGER_EXPECT_BETA_SCHEDULE",
+    "production gate failed: beta schedule mismatch",
+    "IMAGE_DAGGER_EXPECT_BETA_START",
+    "production gate failed: beta start mismatch",
+    "IMAGE_DAGGER_EXPECT_BETA_END",
+    "production gate failed: beta end mismatch",
     "IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS",
     "production gate failed: teacher warmup mismatch",
     "IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER",

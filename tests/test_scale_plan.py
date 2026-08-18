@@ -25,6 +25,10 @@ class ScalePlanTest(unittest.TestCase):
         self.assertEqual(plan.total_collected_transitions, 76_800)
         self.assertEqual(plan.total_optimizer_steps, 4)
         self.assertEqual(plan.behavior_source, "student")
+        self.assertEqual(plan.rollout_action_source, "student")
+        self.assertEqual(plan.beta_schedule, "constant")
+        self.assertEqual(plan.beta_start, 0.0)
+        self.assertEqual(plan.beta_end, 0.0)
         self.assertEqual(plan.rollout_with_teacher_num_steps, 0)
         self.assertFalse(plan.enforce_teacher_rollout)
         self.assertEqual(plan.teacher_rollout_ratio, 0.0)
@@ -48,11 +52,16 @@ class ScalePlanTest(unittest.TestCase):
 
     def test_behavior_source_is_explicit_and_consistent(self):
         mixed = build_plan(behavior_source="mixed", teacher_rollout_ratio=0.25)
-        self.assertTrue(mixed.enforce_teacher_rollout)
+        self.assertFalse(mixed.enforce_teacher_rollout)
         self.assertEqual(mixed.teacher_rollout_ratio, 0.25)
+        self.assertEqual(mixed.rollout_action_source, "beta")
+        self.assertEqual(mixed.beta_schedule, "constant")
+        self.assertEqual(mixed.beta_start, 0.25)
+        self.assertEqual(mixed.beta_end, 0.25)
 
         teacher = build_plan(behavior_source="teacher", teacher_rollout_ratio=1.0)
-        self.assertTrue(teacher.enforce_teacher_rollout)
+        self.assertFalse(teacher.enforce_teacher_rollout)
+        self.assertEqual(teacher.rollout_action_source, "teacher")
 
         invalid = (
             {"behavior_source": "student", "teacher_rollout_ratio": 0.5},

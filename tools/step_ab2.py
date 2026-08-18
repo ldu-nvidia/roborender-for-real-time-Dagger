@@ -11,6 +11,27 @@ import time, json
 from pathlib import Path
 import numpy as _np
 
+import sys as _sys
+if "/svl/u/ravenh/fast_roborender/tools" not in _sys.path:
+    _sys.path.insert(0, "/svl/u/ravenh/fast_roborender/tools")
+from depth_recipe import load_view_params as _load_view_params, h5v4_control as _h5v4_ctrl
+
+# Per-view params come from the production config, so these renders match training.
+# The previous hand-copied DROID_PARAMS inverted RAW depth and min-maxed per frame,
+# while production normalizes with fixed norm_range first -- a 17/255 mean difference
+# on head_color, worst where a close object anchored the range to white.
+DROID_PARAMS = _load_view_params()
+
+
+def h5v4(d, **_ignored):
+    """[T,H,W] metric depth -> uint8 control, exactly as the trainer does it."""
+    raise RuntimeError("call h5v4_view(d, view) so the production params are used")
+
+
+def h5v4_view(d, view):
+    return _h5v4_ctrl(d.astype("float32"), DROID_PARAMS[view])
+
+
 W, H = 416, 240
 VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]
 DATA = Path("/svl/u/ravenh/fast_roborender/videogen_dataset")
@@ -23,11 +44,6 @@ FRAMES = [10, 40, 70]
 PROD_SCHED = [1.0, 0.7539682388305664, 0.6122448446350098,
               0.44871795177459717, 0.24193546175956726, 0.0]
 
-DROID_PARAMS = {
-    "head_color": dict(raw_clip=(0.0, 10.0), inv_clip=(1.0, 20.0), raw_pct=None),
-    "hand_left": dict(raw_clip=(0.0, 5.0), inv_clip=(1.0, 100.0), raw_pct=(1, 99)),
-    "hand_right": dict(raw_clip=(0.0, 5.0), inv_clip=(1.0, 100.0), raw_pct=(1, 99)),
-}
 
 
 def interp_sched(base, n):
@@ -41,21 +57,6 @@ def interp_sched(base, n):
     return [float(v) for v in s]
 
 
-def h5v4(d, raw_clip, inv_clip, raw_pct=None, invalid_fill="far"):
-    d = d.astype(np.float32).copy()
-    bad = ~np.isfinite(d) | (d <= 0)
-    lo, hi = raw_clip
-    if raw_pct is not None:
-        v = d[~bad]
-        if v.size:
-            lo = max(lo, float(np.percentile(v, raw_pct[0])))
-            hi = min(hi, float(np.percentile(v, raw_pct[1])))
-    d[bad] = hi if invalid_fill == "far" else lo
-    d = np.clip(d, lo, hi)
-    inv = np.clip(1.0 / (d + 1e-3), inv_clip[0], inv_clip[1])
-    lg = np.log(inv)
-    lg = (lg - lg.min()) / max(lg.max() - lg.min(), 1e-6)
-    return (lg * 255).astype(np.uint8)
 
 
 def to_pil(a):
@@ -98,7 +99,7 @@ for cname in CHUNKS:
     anchor = np.load(TEACH / f"{cname}_teacher3v.npz", allow_pickle=True)
     prompt = str(d["prompt"])
     prev = tuple(Image.fromarray(anchor[f"gen__{v}"][0]) for _, v in VIEW_MAP)
-    depth_seq = {v: h5v4(d[f"depth_raw__{v}"].astype(np.float32), **DROID_PARAMS[v])
+    depth_seq = {v: h5v4_view(d[f"depth_raw__{v}"].astype(np.float32), v)
                  for _, v in VIEW_MAP}
 
     for t in FRAMES:
