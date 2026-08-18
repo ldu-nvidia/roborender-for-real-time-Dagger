@@ -440,9 +440,36 @@ The patches carry code only. Also needed on the target machine, none of it in th
 | Rendered dataset | `scripts/data/` (offline BC only) |
 | Launchers and this README | `fast_roborender/` |
 
-Run `bash scripts/setup/check_env.sh` there first; it reports exactly which of the above
-are missing. `scripts/setup/check_paths.py` verifies no script references a file that
-moved.
+Every launcher in `scripts/` is an sbatch script written for this cluster (viscam
+partitions, `/svl` and `/vision` paths). On a workstation with no Slurm, run the training
+command directly — the launchers are thin wrappers around it:
+
+```bash
+cd GR00T-VisualSim2Real
+HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
+    gr00t/rl/train_agent_trl.py \
+    +exp=loco_manip/wsdpt_image_dagger_3view \
+    num_envs=4 headless=True \
+    algo.config.videogen.raytraced_mix_prob=0.0 \
+    algo.config.videogen.anchor_pool_dir=/path/to/anchor_pool \
+    algo.config.videogen.image3f_endpoint_files=[/path/to/endpoint.txt] \
+    experiment_name=dagger_3view project_name=my_project
+```
+
+Omit `checkpoint=` entirely for a 3-view run: single-view weights cannot be loaded.
+Start the renderer first with `runtime/image3f_deploy.py` behind
+`scripts/server/image3f_server.py`, and point `image3f_endpoint_files` at the file it
+writes.
+
+`bash scripts/setup/check_env.sh` reports which assets are missing. Its paths default to
+the sc layout and are overridable:
+
+```bash
+ROOT=/your/checkout IMAGE3F=/your/image3f_bundle VIRAL_PY=$CONDA_PREFIX/bin/python \
+  bash scripts/setup/check_env.sh
+```
+
+`python3 scripts/setup/check_paths.py` verifies no script references a file that moved.
 
 > Note for reviewers: `archive/` contains superseded one-off scripts, including the
 > `patch_*.py` snapshots that were applied once to produce the current code. **They are not

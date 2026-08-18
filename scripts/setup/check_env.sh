@@ -8,12 +8,16 @@
 # WARN means "fine unless you need that stage" (e.g. no dataset if you only run DAgger).
 set -uo pipefail
 
-ROOT=/svl/u/ravenh/fast_roborender
-ACCEL=$ROOT/roborender-acceleration
-IMAGE3F=/vision/u/ravenh/roborender_image_model_accelerated
-MODEL_BASE=/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models
-ANCHORS=/vision/u/ravenh/anchor_pool_2048
-VIRAL_PY=/svl/u/ravenh/miniconda3/envs/viral/bin/python
+# Paths default to the sc layout; override any of them for another machine, e.g.
+#   ROOT=/mnt/data1/ldu/research/fast_roborender \
+#   IMAGE3F=/opt/roborender_image_model_accelerated \
+#   VIRAL_PY=$CONDA_PREFIX/bin/python  bash scripts/setup/check_env.sh
+ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+ACCEL=${ACCEL:-$ROOT/roborender-acceleration}
+IMAGE3F=${IMAGE3F:-/vision/u/ravenh/roborender_image_model_accelerated}
+MODEL_BASE=${MODEL_BASE:-/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models}
+ANCHORS=${ANCHORS:-/vision/u/ravenh/anchor_pool_2048}
+VIRAL_PY=${VIRAL_PY:-/svl/u/ravenh/miniconda3/envs/viral/bin/python}
 FAIL=0
 
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
@@ -94,14 +98,14 @@ else
 fi
 
 sec "baseline checkpoints"
-BC=$ROOT/GR00T-VisualSim2Real/logs_rl/videogen_offline_bc/videogen_offline_bc-20260721_204447
+BC=${BASELINE_RUN:-$ROOT/GR00T-VisualSim2Real/logs_rl/videogen_offline_bc/videogen_offline_bc-20260721_204447}
 [ -f "$BC/config.yaml" ] && pass "baseline eval config (eval_policy.sbatch stages against it)" \
                          || fail "baseline config missing: $BC/config.yaml"
 [ -f "$BC/model_step_011000.pt" ] && pass "offline-BC baseline checkpoint (57.3%)" \
                                   || warn "offline-BC baseline checkpoint missing"
 
 sec "renderers currently running"
-LIVE=$(squeue -u "$USER" -h -n i3f_warm_server -o '%N %M' 2>/dev/null)
+LIVE=$(command -v squeue >/dev/null 2>&1 && squeue -u "$USER" -h -n i3f_warm_server -o '%N %M' 2>/dev/null || true)
 if [ -n "$LIVE" ]; then
     while read -r n t; do pass "i3f_warm_server on $n (up $t)"; done <<<"$LIVE"
     for EP in "$ROOT"/image3f_server_endpoint*.txt; do
@@ -115,8 +119,12 @@ else
 fi
 
 sec "slurm"
-sacctmgr -n show assoc user="$USER" format=account 2>/dev/null | tr -d ' ' | sort -u \
-  | grep -q viscam && pass "viscam account available" || warn "viscam account not found"
+if command -v sacctmgr >/dev/null 2>&1; then
+    sacctmgr -n show assoc user="$USER" format=account 2>/dev/null | tr -d ' ' | sort -u \
+      | grep -q viscam && pass "viscam account available" || warn "viscam account not found"
+else
+    warn "no Slurm on this machine - launch training directly (see README, Running on another machine)"
+fi
 df -h /svl/u/ravenh 2>/dev/null | tail -1 | awk '{print "  INFO  /svl/u/ravenh " $4 " free (" $5 " used)"}'
 
 printf '\n'
