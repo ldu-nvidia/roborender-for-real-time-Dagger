@@ -53,6 +53,7 @@ class Image3FFrameClientTest(unittest.TestCase):
             conditions,
             prompt="scene",
             reference_lag=3,
+            trainer_step=17,
         )
         client.render_frame(
             conditions,
@@ -77,6 +78,8 @@ class Image3FFrameClientTest(unittest.TestCase):
         self.assertEqual([request["step"] for request in renders], [0, 1, 0])
         self.assertEqual([request["episode_id"] for request in renders], ["0", "0", "1"])
         self.assertTrue(all(request["reference_lag"] == 3 for request in renders))
+        self.assertEqual(renders[0]["trainer_step"], 17)
+        self.assertNotIn("trainer_step", renders[1])
 
 
 if __name__ == "__main__":

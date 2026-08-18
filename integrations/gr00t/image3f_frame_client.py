@@ -242,6 +242,7 @@ class Image3FFrameClient:
         episode_id: str | int | None = None,
         step: int | None = None,
         reference_lag: int | None = None,
+        trainer_step: int | None = None,
     ) -> dict[str, np.ndarray]:
         reference_lag = int(
             reference_lag
@@ -270,6 +271,10 @@ class Image3FFrameClient:
                 reference_lag=reference_lag,
                 request_id=f"{stream_id}|{episode_id}|{step}",
             )
+        if trainer_step is not None:
+            if isinstance(trainer_step, bool) or int(trainer_step) < 0:
+                raise ValueError("trainer_step must be a non-negative integer")
+            payload["trainer_step"] = int(trainer_step)
         started = time.perf_counter()
         response = self._request(payload)
         self.last_metadata = {

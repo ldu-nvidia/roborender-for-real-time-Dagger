@@ -5,14 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
+import re
 import socket
 import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -73,6 +78,13 @@ def capability_error(
     minimum_protocol_version: int,
     required_reference_lag: int,
     require_reference_history: bool,
+    expected_release_id: str | None = None,
+    expected_adapter_sha256: str | None = None,
+    expected_inference_steps: int | None = None,
+    expected_teacache_threshold: float | None = None,
+    expected_cfg_scale: float | None = None,
+    expected_cuda_graph: bool | None = None,
+    require_tensorrt_engine: bool = False,
 ) -> str | None:
     """Return why a healthy endpoint is incompatible, or ``None``."""
     capabilities = response.get("capabilities", {})
@@ -90,6 +102,110 @@ def capability_error(
         return "lagged reference history is not supported"
     if history_required and max_lag < required_reference_lag:
         return f"maximum reference lag {max_lag} < required {required_reference_lag}"
+
+    identity_required = any(
+        value is not None
+        for value in (
+            expected_release_id,
+            expected_adapter_sha256,
+            expected_inference_steps,
+            expected_teacache_threshold,
+            expected_cfg_scale,
+            expected_cuda_graph,
+        )
+    ) or require_tensorrt_engine
+    if not identity_required:
+        return None
+    identity = response.get("runtime_identity")
+    if not isinstance(identity, dict):
+        return "runtime_identity must be a mapping"
+    if identity.get("schema_version") != 1:
+        return f"runtime identity schema {identity.get('schema_version')!r} != required 1"
+    if expected_release_id is not None and identity.get("release_id") != expected_release_id:
+        return (
+            f"release {identity.get('release_id')!r} != required "
+            f"{expected_release_id!r}"
+        )
+    adapter_sha256 = identity.get("adapter_sha256")
+    if not isinstance(adapter_sha256, str) or not _SHA256_RE.fullmatch(adapter_sha256):
+        return "runtime adapter SHA-256 is missing or malformed"
+    if expected_adapter_sha256 is not None and adapter_sha256 != expected_adapter_sha256:
+        return f"adapter SHA-256 {adapter_sha256} != required {expected_adapter_sha256}"
+
+    generation = identity.get("generation")
+    if not isinstance(generation, dict):
+        return "runtime generation identity must be a mapping"
+    try:
+        steps = int(generation.get("steps"))
+        tea_cache_threshold = float(generation.get("tea_cache_threshold"))
+        cfg_scale = float(generation.get("cfg_scale"))
+    except (TypeError, ValueError) as exc:
+        return f"malformed generation identity: {exc}"
+    if expected_inference_steps is not None and steps != expected_inference_steps:
+        return f"inference steps {steps} != required {expected_inference_steps}"
+    if expected_teacache_threshold is not None and not math.isclose(
+        tea_cache_threshold, expected_teacache_threshold, rel_tol=0.0, abs_tol=1e-9
+    ):
+        return (
+            f"TeaCache threshold {tea_cache_threshold} != required "
+            f"{expected_teacache_threshold}"
+        )
+    if expected_cfg_scale is not None and not math.isclose(
+        cfg_scale, expected_cfg_scale, rel_tol=0.0, abs_tol=1e-9
+    ):
+        return f"CFG scale {cfg_scale} != required {expected_cfg_scale}"
+    if expected_cuda_graph is not None:
+        cuda_graph = generation.get("cuda_graph")
+        if not isinstance(cuda_graph, bool):
+            return "CUDA graph identity must be boolean"
+        if cuda_graph is not expected_cuda_graph:
+            return f"CUDA graph enabled={cuda_graph} != required {expected_cuda_graph}"
+
+    if require_tensorrt_engine:
+        runtime = identity.get("runtime")
+        engine = identity.get("engine")
+        if not isinstance(runtime, dict):
+            return "runtime accelerator identity must be a mapping"
+        if not isinstance(engine, dict):
+            return "TensorRT engine identity must be a mapping"
+        if runtime.get("backend") != "tensorrt":
+            return f"runtime backend {runtime.get('backend')!r} is not TensorRT"
+        if runtime.get("engine_loaded") is not True:
+            return "TensorRT engine is not loaded"
+        if runtime.get("engine_verified_at_load") is not True:
+            return "TensorRT engine was not verified at load"
+        if not isinstance(runtime.get("engine_path"), str) or not runtime["engine_path"].strip():
+            return "TensorRT engine path is missing or malformed"
+        engine_sha256 = engine.get("sha256")
+        if not isinstance(engine_sha256, str) or not _SHA256_RE.fullmatch(engine_sha256):
+            return "TensorRT engine SHA-256 is missing or malformed"
+        if engine.get("adapter_sha256") != adapter_sha256:
+            return "TensorRT engine adapter SHA-256 does not match the runtime adapter"
+        for field in (
+            "engine_key",
+            "export_key",
+            "status",
+            "precision",
+            "gpu",
+            "compute_capability",
+            "tensorrt",
+            "cuda",
+            "torch",
+            "driver",
+        ):
+            if not isinstance(engine.get(field), str) or not engine[field].strip():
+                return f"TensorRT engine {field} is missing or malformed"
+        if engine.get("status") != "built_microbenchmarked_and_correctness_checked":
+            return f"TensorRT engine status {engine.get('status')!r} is not qualified"
+        if engine.get("precision") != "bf16_fp16":
+            return f"TensorRT engine precision {engine.get('precision')!r} is unsupported"
+        if engine.get("cuda_graph_enabled_for_runtime") is not generation.get(
+            "cuda_graph"
+        ):
+            return "TensorRT CUDA graph identity does not match the loaded runtime"
+        for field in ("gpu", "compute_capability"):
+            if runtime.get(field) != engine.get(field):
+                return f"TensorRT engine {field} does not match the loaded runtime"
     return None
 
 
@@ -103,7 +219,17 @@ def main() -> int:
     parser.add_argument("--require-reference-history", action="store_true")
     parser.add_argument("--required-reference-lag", type=int, default=0)
     parser.add_argument("--minimum-protocol-version", type=int, default=2)
+    parser.add_argument("--expected-release-id")
+    parser.add_argument("--expected-adapter-sha256")
+    parser.add_argument("--expected-inference-steps", type=int)
+    parser.add_argument("--expected-teacache-threshold", type=float)
+    parser.add_argument("--expected-cfg-scale", type=float)
+    parser.add_argument(
+        "--expected-cuda-graph", choices=("enabled", "disabled"), default=None
+    )
+    parser.add_argument("--require-tensorrt-engine", action="store_true")
     parser.add_argument("--write-manifest", type=Path, default=None)
+    parser.add_argument("--write-report", type=Path, default=None)
     parser.add_argument("--hydra-list", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -111,6 +237,20 @@ def main() -> int:
         raise SystemExit("--expected must be non-negative")
     if args.required_reference_lag < 0:
         raise SystemExit("--required-reference-lag must be non-negative")
+    if args.expected_inference_steps is not None and args.expected_inference_steps < 1:
+        raise SystemExit("--expected-inference-steps must be positive")
+    if args.expected_adapter_sha256 is not None and not _SHA256_RE.fullmatch(
+        args.expected_adapter_sha256
+    ):
+        raise SystemExit("--expected-adapter-sha256 must be 64 lowercase hex characters")
+    if args.expected_release_id is not None and not args.expected_release_id.strip():
+        raise SystemExit("--expected-release-id must be non-empty")
+    for flag, value in (
+        ("--expected-teacache-threshold", args.expected_teacache_threshold),
+        ("--expected-cfg-scale", args.expected_cfg_scale),
+    ):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise SystemExit(f"{flag} must be finite and non-negative")
     if args.expected == 0:
         print("[]" if args.hydra_list else json.dumps({"healthy": [], "count": 0}))
         return 0
@@ -130,6 +270,17 @@ def main() -> int:
                 minimum_protocol_version=args.minimum_protocol_version,
                 required_reference_lag=args.required_reference_lag,
                 require_reference_history=args.require_reference_history,
+                expected_release_id=args.expected_release_id,
+                expected_adapter_sha256=args.expected_adapter_sha256,
+                expected_inference_steps=args.expected_inference_steps,
+                expected_teacache_threshold=args.expected_teacache_threshold,
+                expected_cfg_scale=args.expected_cfg_scale,
+                expected_cuda_graph=(
+                    args.expected_cuda_graph == "enabled"
+                    if args.expected_cuda_graph is not None
+                    else None
+                ),
+                require_tensorrt_engine=args.require_tensorrt_engine,
             )
             if incompatible is None:
                 capable.append(item)
@@ -147,6 +298,7 @@ def main() -> int:
         }
         if len(capable) >= args.expected and duplicate_count == 0:
             selected = capable[: args.expected]
+            last_report["selected"] = selected
             if args.write_manifest:
                 args.write_manifest.parent.mkdir(parents=True, exist_ok=True)
                 tmp = args.write_manifest.with_name(
@@ -156,6 +308,16 @@ def main() -> int:
                     "".join(f"{item['file']}\n" for item in selected), encoding="utf-8"
                 )
                 os.replace(tmp, args.write_manifest)
+            if args.write_report:
+                args.write_report.parent.mkdir(parents=True, exist_ok=True)
+                tmp = args.write_report.with_name(
+                    f".{args.write_report.name}.{os.getpid()}.tmp"
+                )
+                tmp.write_text(
+                    json.dumps(last_report, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp, args.write_report)
             if args.hydra_list:
                 print("[" + ",".join(item["file"] for item in selected) + "]")
             elif args.json:

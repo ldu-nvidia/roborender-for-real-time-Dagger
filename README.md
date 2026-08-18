@@ -300,9 +300,12 @@ Warm-start from the previous round's `last.pt`: round 4 started from round 3 and
 
 The production launcher uses **eight synchronized trainer ranks with 32 Isaac environments
 per rank**. `num_envs` is rank-local in GR00T, so passing 256 to every rank would accidentally
-create 2,048 environments. The requested update contains 76,800 transitions; rank sharding
-also avoids the unsafe single-L40S rollout allocation. Accelerate/DDP synchronizes the
+create 2,048 environments. Each outer rollout-and-learning iteration collects 76,800
+transitions; rank sharding also avoids the unsafe single-L40S rollout allocation.
+Accelerate/DDP synchronizes the
 student's supervised DAgger gradients after each rank collects its local trajectories.
+With the pinned production settings (`num_learning_epochs=1`, four minibatches), that outer
+iteration performs four optimizer steps, each covering 19,200 global transitions.
 
 The production-safe default is `MIX=0.0`: all 256 environments render every simulator tick,
 requiring 52 independent RTX PRO 6000 Image3F servers at five environments per server. This
@@ -337,16 +340,116 @@ DRY_RUN=1 bash scripts/scaling/submit_production.sh
 
 # submit 52 renderer array elements plus the 8-rank trainer (MIX=0 default)
 bash scripts/scaling/submit_production.sh
+
+# pinned production campaign: 256 environments, 300-step rollouts, 8-hour wall time
+bash scripts/scaling/submit_8h_256env.sh
 ```
 
+The eight-hour value is the trainer allocation wall time, not a promise of eight full hours of
+optimizer execution: endpoint readiness and final cleanup happen inside that allocation. The
+trainer is submitted with an `after:<renderer-array>` dependency so Slurm does not allocate its
+eight trainer GPUs until every renderer-array task has at least started; it still verifies every
+endpoint before the first rollout. Renderer workers use a longer lease as scheduling/startup
+headroom, but that lease is a bounded safeguard rather than a gang-scheduling guarantee. The
+launcher records renderer and trainer job IDs incrementally in `slurm_jobs.json`; if trainer
+submission fails it cancels only the renderer array it just created. Once trainer submission
+succeeds, that renderer ID is passed to the trainer, which cancels the fleet on every success or
+failure exit. Slurm sends the batch shell `USR1` five minutes before the trainer limit; the shell
+stops the distributed step, retains the latest five-iteration periodic checkpoint, drains
+telemetry, and records a nonzero outcome instead of waiting for a hard time-limit kill. A separate
+`afterany:<trainer_job>` cleanup watchdog also owns the renderer job ID; this covers a trainer
+cancelled while still pending, which never enters its batch shell and therefore cannot run that
+EXIT trap.
+
 Useful overrides are `GLOBAL_NUM_ENVS`, `ROLLOUT_STEPS`, `TRAINER_NODES`, `MIX`,
-`REFERENCE_LAG`, `CKPT`, `NUM_TOTAL_BATCHES`, `PROJ`, and `EXP`. The trainer launcher logs a
+`REFERENCE_LAG`, `CKPT`, `NUM_ROLLOUT_ITERATIONS`, `PROJ`, and `EXP`. The trainer launcher logs a
 machine-readable scale plan, both repository revisions, the checkpoint, endpoint fleet, and
 rank-specific stdout/stderr under its run directory. It uses microbatch 1 with gradient
 accumulation 8 by default, preserving the effective local mini-batch while limiting 300-frame
-sequence memory. `ROLLOUT_STEPS=300` is the horizon of each optimizer batch; it is distinct
-from run length. `NUM_TOTAL_BATCHES` defaults to 1 for a bounded scale-validation run and must
-be set explicitly for a longer training campaign.
+sequence memory. `ROLLOUT_STEPS=300` is the collection horizon of each outer rollout
+iteration; it is not an optimizer-batch size and is distinct from run length.
+`NUM_ROLLOUT_ITERATIONS` defaults to 1 for a bounded scale-validation run and maps to the
+trainer's legacy `algo.trl.num_total_batches` setting. `NUM_TOTAL_BATCHES` remains a deprecated
+environment alias; setting both names to different values is a fatal error.
+
+Production behavior is explicit and recorded in both manifests. The default is
+`BEHAVIOR_SOURCE=student`, which pins `rollout_with_teacher_num_steps=0`,
+`enforce_teacher_rollout=false`, and `TEACHER_ROLLOUT_RATIO=0.0`. An intentional mixed run must
+set `BEHAVIOR_SOURCE=mixed` and a ratio strictly between zero and one; a teacher-only run must
+set `BEHAVIOR_SOURCE=teacher` and ratio `1.0`. Inconsistent combinations fail before any Slurm
+submission. `NUM_LEARNING_EPOCHS=1` and `VG_PRIMARY_VIEW=head_color` are also pinned explicitly.
+The supported primary views are `hand_left`, `hand_right`, and `head_color`. Image3F still
+generates all three synchronized views, but this trainer supplies only the selected primary
+view to the actor. The GR00T integration patch installs matching runtime assertions inside the
+trainer, so a composed Hydra configuration that disagrees with the launch manifest fails before
+its first rollout. The production command also pins `value_loss_coef=0.0` and
+`entropy_coef=0.0`; both source-config inspection and the composed trainer assert exact numeric
+zero, so a prefix such as `0.1` cannot pass as pure behavior cloning.
+
+### Explicit production gates
+
+| Gate | Must pass before/while running |
+|---|---|
+| Source and assets | Clean, run-pinned `fast_roborender` and private GR00T revisions; versioned Image3F client/telemetry integration; launch-time checkpoint and reference-config SHA-256 values unchanged |
+| Scale and behavior | 8 ranks × 32 environments = 256; 300-step rollout; 52 renderers; `MIX=0`; lag 256; student behavior; one learning epoch; pure DAgger BC |
+| Renderer provenance | All 52 live endpoints report the exact fine-tuned release/adapter SHA, five-step sampler, TeaCache 0.3, CFG 1.0, CUDA graph setting, and a load-verified TensorRT engine compatible with the serving GPU/software stack |
+| W&B observability | Online personal workspace authenticated as `ldu@nvidia.com`; stable resumable sidecar run; scalar, condition/generated image, and MP4 producers ready; repeated upload/encoding errors terminate training |
+| Runtime semantics | The composed private trainer agrees with every behavior, primary-view, epoch, and loss-coefficient assertion before its first rollout |
+| Scientific result | Baseline/early/mid/final fixed-seed evaluation is complete; the final policy improves success by at least 2 absolute points and the paired 95% bootstrap interval has a lower bound above zero |
+
+The full `MIX=0` topology asks Slurm for 8 L40S trainer GPUs plus 52 RTX PRO 6000
+renderer GPUs. The orchestration repository, two-GPU workstation, or an otherwise idle cluster is
+not by itself sufficient: the Raven private GR00T trainer/config, actor checkpoint, Image3F model
+assets, compatible per-GPU TensorRT builds, and W&B authentication must also be present. A failed
+gate never becomes a nominal production run; transactional submission cancels only jobs created by
+that submission.
+
+### W&B production telemetry
+
+Production submission fails closed unless W&B is online, the authenticated account email is
+`ldu@nvidia.com`, and the resolved entity is that account's personal entity rather than a team.
+The trainer's rank-zero process logs optimization and environment scalars, including DAgger BC
+loss, learning rate, rewards, episode lengths, FPS, collection time, and learning time. A separate
+rank-zero sidecar uploads stable telemetry files from `telemetry/scalars`, `telemetry/images`, and
+`telemetry/videos` on a shared `trainer_step` axis; it is restart-safe and does not log partially
+written media. Production checkpoints are saved every five rollout iterations so early and late
+policy behavior can be evaluated with fixed seeds and the same expert/reference configuration.
+The media watcher is a production gate: if it exits while the trainer is live, the distributed
+step is stopped. `RUN_DONE` is written only after a successful trainer and telemetry drain;
+failures write `RUN_FAILED` with the preserved trainer exit status.
+
+### Fixed-seed policy-improvement gate
+
+The pinned eight-hour launcher also schedules a ray-traced policy evaluation with
+`afterany:<trainer_job>`, so a useful checkpoint can still be measured when the eight-hour
+wall-time ends the trainer. It selects four distinct policies—warm-start baseline, first saved
+checkpoint, midpoint checkpoint, and latest checkpoint—and evaluates each on the same eight
+Isaac seed blocks with 32 environments per block. Each environment contributes exactly one
+episode, giving 256 matched episodes per checkpoint without letting fast-terminating policies
+advance the reset RNG to different scenarios. All checkpoints use the same offline-BC reference
+config. The baseline checkpoint and reference-config hashes are captured before training;
+both the trainer and delayed evaluator fail if those paths later resolve to different bytes.
+Evaluation atomically rebuilds each staged checkpoint, removes only environment, optimizer,
+and scheduler state, and records the actual staged checkpoint/config hashes before reset. A strict
+in-tree adapter captures the mapping returned by `trainer.eval()` and writes it atomically; the
+gate does not rely on a particular private trainer variant happening to emit `metrics_eval.json`.
+Generic bounded smoke runs automatically disable this statistical gate when their configured
+run length cannot produce three distinct saved snapshots; the pinned campaign explicitly
+enables it.
+
+The machine-readable report is
+`<training_run>/fixed_seed_eval/fixed_seed_improvement_report.json`. The gate passes only when
+final-minus-baseline success is at least two absolute percentage points and the lower bound of
+its paired seed-block bootstrap 95% interval is above zero. Reward and its paired interval are
+reported as a diagnostic but are not silently mixed into the success criterion. Training loss
+is explicitly excluded as evidence of closed-loop improvement. Baseline/early/mid/final success,
+Wilson intervals, reward intervals, and the gate result are logged to a separate evaluation run
+in the same personal W&B project. `slurm_jobs.json` starts with the evaluation-orchestrator ID;
+the orchestrator atomically adds the four-task evaluation-array and report job IDs after Slurm
+accepts them. Failure to submit that dependent gate rolls back both the newly submitted trainer
+and renderer fleet, so an ungated production run is not left alive. The launcher transfers
+ownership only after Slurm accepts the trainer, renderer-cleanup watchdog, and evaluation
+orchestrator.
 
 Before the full job, validate progressively: 4×4, 32×16, 64×75, 128×75, 256×75,
 256×260 (the lag transition), then 256×300. Acceptance requires exact global transition

@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,68 @@ REQUIRED_TRAINER_MARKERS = (
     "raytraced_mix_prob",
 )
 SCALING_MARKER = "FAST_ROBORENDER_SCALING_V1"
+SCALING_TRAINER_MARKERS = (
+    "FAST_ROBORENDER_SCALING_V1: explicit ordered stream metadata",
+    'self.vg_reference_lag = int(vg.get("reference_lag", 0))',
+    'self._id_rank = int(getattr(self.accelerator, "process_index", 0))',
+    "self._id_episode_ids = np.zeros(B, dtype=np.int64)",
+    "self._id_episode_steps = np.zeros(B, dtype=np.int64)",
+    "self._id_episode_ids[b] += 1",
+    "self._id_episode_steps[b] = 0",
+    "stream_id=(f\"{os.environ.get('IMAGE3F_RUN_ID', 'run')}:\"",
+    "episode_id=int(self._id_episode_ids[b])",
+    "step=int(self._id_episode_steps[b])",
+    "reference_lag=self.vg_reference_lag,",
+    "self._id_episode_steps += 1",
+)
+RUNTIME_GATES_MARKER = "FAST_ROBORENDER_PRODUCTION_GATES_V1"
+RUNTIME_GATE_TRAINER_MARKERS = (
+    RUNTIME_GATES_MARKER,
+    "IMAGE_DAGGER_EXPECT_PRIMARY_VIEW",
+    "production gate failed: primary view mismatch",
+    "IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS",
+    "production gate failed: teacher warmup mismatch",
+    "IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER",
+    "production gate failed: behavior source mismatch",
+    "IMAGE_DAGGER_EXPECT_TEACHER_RATIO",
+    "production gate failed: teacher ratio mismatch",
+    "IMAGE_DAGGER_EXPECT_LEARNING_EPOCHS",
+    "production gate failed: learning epochs mismatch",
+    "IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF",
+    "production gate failed: value loss coefficient mismatch",
+    "IMAGE_DAGGER_EXPECT_ENTROPY_COEF",
+    "production gate failed: entropy coefficient mismatch",
+)
+
+
+def yaml_numeric_scalar(document: str, key: str) -> float | None:
+    """Read one unquoted top-level/nested YAML numeric scalar exactly.
+
+    This intentionally handles only the numeric form required by the production
+    configuration.  It rejects duplicate keys, expressions, quoted values, and
+    prefix matches such as ``0.1`` being mistaken for zero.
+    """
+
+    matches = re.findall(
+        rf"(?m)^\s*{re.escape(key)}\s*:\s*([^\s#]+)\s*(?:#.*)?$", document
+    )
+    if len(matches) != 1:
+        return None
+    try:
+        return float(matches[0])
+    except ValueError:
+        return None
+TELEMETRY_MARKER = "FAST_ROBORENDER_DAGGER_TELEMETRY_V1"
+TELEMETRY_TRAINER_MARKERS = (
+    TELEMETRY_MARKER,
+    "DaggerTelemetry.from_environment(rank=self._id_rank)",
+    "trainer_step=int(self._id_telemetry_step))",
+    "self._id_telemetry.record(",
+    "depth=reqs[0][0], mask=reqs[0][1]",
+    "client_anchor=reqs[0][2], generated=gens[0]",
+    "IMAGE_DAGGER_TELEMETRY_REQUIRED",
+    "self._id_telemetry_step += 1",
+)
 
 
 def sha256(path: Path) -> str:
@@ -56,22 +119,34 @@ def git_revision(root: Path) -> tuple[str | None, bool | None]:
         return None, None
 
 
-def inspect(gr00t_root: Path, source: Path) -> dict[str, object]:
+def inspect(
+    gr00t_root: Path, source: Path, telemetry_source: Path | None = None
+) -> dict[str, object]:
+    telemetry_source = telemetry_source or source.with_name("dagger_telemetry.py")
     trainer = gr00t_root / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
     config = gr00t_root / "gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml"
     target = gr00t_root / "gr00t/rl/utils/image3f_frame_client.py"
+    telemetry_target = gr00t_root / "gr00t/rl/utils/dagger_telemetry.py"
     revision, dirty = git_revision(gr00t_root)
     trainer_text = trainer.read_text(encoding="utf-8") if trainer.is_file() else ""
     config_text = config.read_text(encoding="utf-8") if config.is_file() else ""
     missing_markers = [marker for marker in REQUIRED_TRAINER_MARKERS if marker not in trainer_text]
-    pure_bc = (
-        "value_loss_coef" in config_text
-        and "entropy_coef" in config_text
-        and ("value_loss_coef: 0" in config_text or "value_loss_coef: 0.0" in config_text)
-        and ("entropy_coef: 0" in config_text or "entropy_coef: 0.0" in config_text)
-    )
+    missing_scaling_markers = [
+        marker for marker in SCALING_TRAINER_MARKERS if trainer_text.count(marker) != 1
+    ]
+    missing_telemetry_markers = [
+        marker for marker in TELEMETRY_TRAINER_MARKERS if trainer_text.count(marker) != 1
+    ]
+    missing_runtime_gate_markers = [
+        marker for marker in RUNTIME_GATE_TRAINER_MARKERS if trainer_text.count(marker) != 1
+    ]
+    value_loss_coef = yaml_numeric_scalar(config_text, "value_loss_coef")
+    entropy_coef = yaml_numeric_scalar(config_text, "entropy_coef")
+    pure_bc = value_loss_coef == 0.0 and entropy_coef == 0.0
     source_hash = sha256(source)
     target_hash = sha256(target) if target.is_file() else None
+    telemetry_source_hash = sha256(telemetry_source)
+    telemetry_target_hash = sha256(telemetry_target) if telemetry_target.is_file() else None
     trainer_syntax_error = None
     if trainer_text:
         try:
@@ -87,15 +162,27 @@ def inspect(gr00t_root: Path, source: Path) -> dict[str, object]:
         "trainer_syntax_ok": trainer.is_file() and trainer_syntax_error is None,
         "trainer_syntax_error": trainer_syntax_error,
         "missing_trainer_markers": missing_markers,
-        "trainer_scaling_integrated": SCALING_MARKER in trainer_text,
+        "trainer_scaling_integrated": not missing_scaling_markers,
+        "missing_trainer_scaling_markers": missing_scaling_markers,
+        "trainer_runtime_gates_integrated": not missing_runtime_gate_markers,
+        "missing_trainer_runtime_gate_markers": missing_runtime_gate_markers,
+        "trainer_telemetry_integrated": not missing_telemetry_markers,
+        "missing_trainer_telemetry_markers": missing_telemetry_markers,
         "config": str(config),
         "config_exists": config.is_file(),
         "pure_bc_config": pure_bc,
+        "value_loss_coef": value_loss_coef,
+        "entropy_coef": entropy_coef,
         "client": str(target),
         "client_exists": target.is_file(),
         "client_source_sha256": source_hash,
         "client_installed_sha256": target_hash,
         "client_matches": target_hash == source_hash,
+        "telemetry_utility": str(telemetry_target),
+        "telemetry_utility_exists": telemetry_target.is_file(),
+        "telemetry_source_sha256": telemetry_source_hash,
+        "telemetry_installed_sha256": telemetry_target_hash,
+        "telemetry_utility_matches": telemetry_target_hash == telemetry_source_hash,
     }
 
 
@@ -113,7 +200,7 @@ def validate_base(report: dict[str, object], *, allow_dirty: bool) -> list[str]:
     if not report["config_exists"]:
         errors.append("wsdpt_image_dagger.yaml is missing")
     elif not report["pure_bc_config"]:
-        errors.append("DAgger config does not visibly set value and entropy losses to zero")
+        errors.append("DAgger config does not set value and entropy losses exactly to zero")
     if report["gr00t_dirty"] and not allow_dirty:
         errors.append("GR00T worktree is dirty (pass --allow-dirty only for an intentional run)")
     return errors
@@ -145,7 +232,8 @@ def main() -> int:
     args = parser.parse_args()
 
     source = repo_root / "integrations/gr00t/image3f_frame_client.py"
-    report = inspect(args.gr00t_root.resolve(), source)
+    telemetry_source = repo_root / "integrations/gr00t/dagger_telemetry.py"
+    report = inspect(args.gr00t_root.resolve(), source, telemetry_source)
     errors = validate_base(report, allow_dirty=args.allow_dirty)
     if args.expected_revision and report["gr00t_revision"] != args.expected_revision:
         errors.append(
@@ -173,11 +261,21 @@ def main() -> int:
                 if tmp.exists():
                     tmp.unlink()
             install_file(source, Path(report["client"]))
-        report = inspect(args.gr00t_root.resolve(), source)
+            install_file(telemetry_source, Path(report["telemetry_utility"]))
+        report = inspect(args.gr00t_root.resolve(), source, telemetry_source)
     if not report["trainer_scaling_integrated"]:
-        errors.append("explicit episode/step trainer integration is not installed")
+        errors.append(
+            "explicit episode/step trainer integration is incomplete: "
+            + ", ".join(report["missing_trainer_scaling_markers"])
+        )
+    if not report["trainer_runtime_gates_integrated"]:
+        errors.append("production runtime configuration gates are not installed")
+    if not report["trainer_telemetry_integrated"]:
+        errors.append("rank-zero DAgger telemetry integration is not installed")
     if not report["client_matches"]:
         errors.append("versioned production Image3F client is not installed")
+    if not report["telemetry_utility_matches"]:
+        errors.append("versioned DAgger telemetry utility is not installed")
 
     report["status"] = "ok" if not errors else "error"
     report["errors"] = errors
@@ -189,6 +287,19 @@ def main() -> int:
         print(
             "scaling: "
             + ("EXPLICIT EPISODE/STEPS" if report["trainer_scaling_integrated"] else "NOT INSTALLED")
+        )
+        print(
+            "runtime gates: "
+            + ("INSTALLED" if report["trainer_runtime_gates_integrated"] else "NOT INSTALLED")
+        )
+        print(
+            "telemetry: "
+            + (
+                "INSTALLED"
+                if report["trainer_telemetry_integrated"]
+                and report["telemetry_utility_matches"]
+                else "NOT INSTALLED"
+            )
         )
         print(f"config:  {'OK' if report['config_exists'] else 'MISSING'}")
         print(f"client:  {'MATCH' if report['client_matches'] else 'NOT INSTALLED'}")

@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from reference_history import LaggedReferenceStore
+from runtime_identity import describe_runtime_identity
 
 BUNDLE = Path(os.environ.get("IMAGE3F_ROOT", "/vision/u/ravenh/roborender_image_model_accelerated"))
 sys.path.insert(0, str(BUNDLE))
@@ -153,7 +154,9 @@ def _recv_msg(sock):
     return pickle.loads(_recv_exact(sock, n))
 
 
-def handle_conn(sock, addr, session, session_lock, references, metrics):
+def handle_conn(
+    sock, addr, session, session_lock, references, metrics, runtime_identity
+):
     print(f"tcp client {addr}", flush=True)
     try:
         while True:
@@ -169,6 +172,7 @@ def handle_conn(sock, addr, session, session_lock, references, metrics):
                         "reference_lag_max": int(os.environ.get("IMAGE3F_MAX_REFERENCE_LAG", "512")),
                         "serialized_inference": True,
                     },
+                    "runtime_identity": runtime_identity,
                     "history": references.stats(),
                     "metrics": metrics.snapshot(),
                 })
@@ -331,14 +335,22 @@ def create_tcp_server(port):
     return srv, int(srv.getsockname()[1])
 
 
-def tcp_listener(srv, session, session_lock, references, metrics):
+def tcp_listener(srv, session, session_lock, references, metrics, runtime_identity):
     print(f"tcp listening on {srv.getsockname()[1]}", flush=True)
     while True:
         sock, addr = srv.accept()
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         threading.Thread(
             target=handle_conn,
-            args=(sock, addr, session, session_lock, references, metrics),
+            args=(
+                sock,
+                addr,
+                session,
+                session_lock,
+                references,
+                metrics,
+                runtime_identity,
+            ),
             daemon=True,
         ).start()
 
@@ -350,6 +362,7 @@ def main():
     t0 = time.time()
     session = Image3FSession(memory_mode="auto", vae_mode="untiled",
                              model_root=os.environ["ROBORENDER_MODEL_BASE"])
+    runtime_identity = describe_runtime_identity(session)
     session_lock = threading.Lock()
     references = LaggedReferenceStore(
         max_streams=int(os.environ.get("IMAGE3F_MAX_STREAMS", "64"))
@@ -362,7 +375,7 @@ def main():
     srv, port = create_tcp_server(requested_port)
     threading.Thread(
         target=tcp_listener,
-        args=(srv, session, session_lock, references, metrics),
+        args=(srv, session, session_lock, references, metrics, runtime_identity),
         daemon=True,
     ).start()
     import subprocess
