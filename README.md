@@ -158,8 +158,42 @@ sbatch scripts/data/offline_render.sbatch                # -> scripts/data/offli
 
 `--follow` keeps the renderer consuming chunks as collection produces them, so steps 1 and 2
 can overlap. Scene text comes from `render_prompt.txt` (single fixed scene) or
-`scripts/anchors/videogen_prompts.py` / `scripts/anchors/rich_prompts.py` for randomized scenes. `scripts/data/render_shard.sbatch` splits
-the dataset across several servers.
+`scripts/anchors/videogen_prompts.py` / `scripts/anchors/rich_prompts.py` for randomized
+scenes. `scripts/data/render_shard.sbatch` splits the dataset across several servers.
+
+**What the renderer writes.** Each chunk gains
+
+```
+rgb_gen                (81, 108, 192, 3)   the primary view, for single-view policies
+rgb_gen__head_color    (81, 108, 192, 3)   per-view, for multi-view policies
+rgb_gen__hand_left     (81, 108, 192, 3)
+rgb_gen__hand_right    (81, 108, 192, 3)
+```
+
+The per-view keys are what a 3-view offline BC policy tiles. Resume is view-aware: a chunk
+counts as done only when `rgb_gen` **and** every requested `rgb_gen__<view>` is present, so
+pointing the renderer at a dataset rendered before per-view support re-renders it rather
+than skipping it.
+
+**Re-rendering an existing dataset for multi-view.** Start one teacher server per shard,
+each writing its own `teacher_endpoint_<i>.txt`, then launch the shards:
+
+```bash
+LORA=.../droidnew_continue_lora/step-5294.safetensors
+for i in 0 1 2 3; do
+  sbatch --time=12:00:00 --job-name=teach_srv_$i \
+    --export=ALL,ENDPOINT_FILE=$PWD/teacher_endpoint_$i.txt,RAVEN_SERVER_ARGS="--teacher_lora $LORA" \
+    scripts/server/raven_server.sbatch
+done
+# once every endpoint file names the node its server runs on:
+for i in 0 1 2 3; do
+  sbatch --export=ALL,SHARD=$i,NSHARDS=4 scripts/data/rerender_3view.sbatch
+done
+```
+
+`rerender_3view.sbatch` is finite (no `--follow`), so each shard exits when its slice is
+done. ~32 s per chunk with the 50-step teacher, so 2000 chunks over 4 shards is roughly
+4.5 h. Budget ~10 MB per chunk of extra storage for the three per-view arrays.
 
 Depth is normalized with the `h5_v4` recipe before it reaches the model
 (`scripts/data/renormalize_depth.py`); per-view clip ranges differ between the head and wrist cameras.
