@@ -61,7 +61,7 @@ export TMPDIR=/svl/u/ravenh/tmp OMNI_KIT_ACCEPT_EULA=YES
 # left over from a finished job points the trainer at a dead host and kills the run hours in.
 LIVE_NODES=$(squeue -u "$USER" -h -n i3f_warm_server -o '%N' | tr ',' '\n' | sort -u)
 ENDPOINTS=()
-for EP in "$ROOT"/image3f_server_endpoint.txt "$ROOT"/image3f_server_endpoint_[0-9].txt; do
+for EP in "$ROOT"/image3f_server_endpoint*.txt; do
     [ -f "$EP" ] || continue
     H=$(awk '{print $1}' "$EP" | cut -d. -f1)
     grep -qx "$H" <<<"$LIVE_NODES" && ENDPOINTS+=("$EP") && echo "  live renderer: $(cat "$EP")"

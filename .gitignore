@@ -24,6 +24,7 @@ anchor_pool*/
 image3f_queue*/
 *_endpoint*.txt
 diag_*/
+runtime/
 
 # ---- logs ----
 *.log

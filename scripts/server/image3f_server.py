@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from reference_history import LaggedReferenceStore
 
 BUNDLE = Path(os.environ.get("IMAGE3F_ROOT", "/vision/u/ravenh/roborender_image_model_accelerated"))
 sys.path.insert(0, str(BUNDLE))
@@ -26,6 +27,7 @@ from runtime import Image3FRequest, Image3FSession  # noqa: E402
 QUEUE = Path(os.environ.get("IMAGE3F_QUEUE", "/svl/u/ravenh/fast_roborender/image3f_queue"))
 VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]
 W, H = 416, 240
+PROTOCOL_VERSION = 2
 
 DROID_PARAMS = {
     "head_color": dict(raw_clip=(0.0, 10.0), inv_clip=(1.0, 20.0)),
@@ -55,7 +57,7 @@ def to_pil(a):
     return Image.fromarray(a).convert("RGB").resize((W, H), Image.BILINEAR)
 
 
-def run_request(session, req):
+def run_request(session, session_lock, req):
     mode = req.get("prev_mode", "fixed")
     if mode == "zero":
         raise ValueError("zero mode not supported in persistent server (global patch)")
@@ -97,7 +99,8 @@ def run_request(session, req):
                 seed=seed,
             )
             t0 = time.perf_counter()
-            imgs, timing = session.generate(r, output_type="rgb")
+            with session_lock:
+                imgs, timing = session.generate(r, output_type="rgb")
             wall = (time.perf_counter() - t0) * 1000
             stacked = np.asarray(imgs[0])
             for vi, (_, view) in enumerate(VIEW_MAP):
@@ -150,20 +153,81 @@ def _recv_msg(sock):
     return pickle.loads(_recv_exact(sock, n))
 
 
-def handle_conn(sock, addr, session):
+def handle_conn(sock, addr, session, session_lock, references, metrics):
     print(f"tcp client {addr}", flush=True)
     try:
         while True:
             req = _recv_msg(sock)
             cmd = req.get("cmd", "render_frame")
             if cmd == "ping":
-                _send_msg(sock, {"ok": True})
+                _send_msg(sock, {
+                    "ok": True,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "server_id": os.environ.get("IMAGE3F_SERVER_ID", "legacy"),
+                    "capabilities": {
+                        "lagged_reference_history": True,
+                        "reference_lag_max": int(os.environ.get("IMAGE3F_MAX_REFERENCE_LAG", "512")),
+                        "serialized_inference": True,
+                    },
+                    "history": references.stats(),
+                    "metrics": metrics.snapshot(),
+                })
                 continue
+            if cmd == "reset_stream":
+                try:
+                    removed = references.reset(str(req.get("stream_id", "")))
+                    _send_msg(sock, {"ok": True, "removed": removed})
+                except Exception as exc:
+                    _send_msg(sock, {"ok": False, "error": f"{exc}"})
+                continue
+            prepared = False
+            stream_id = str(req.get("stream_id", ""))
+            episode_id = str(req.get("episode_id", ""))
+            step = int(req.get("step", -1))
             try:
                 t0 = time.perf_counter()
                 depth = {v: decode_array(req["depth"][v]) for v in req["depth"]}
                 mask = {v: decode_array(req["mask"][v]) for v in req["mask"]}
                 prev = {v: decode_array(req["prev"][v]) for v in req["prev"]}
+                reference_lag = int(req.get("reference_lag", 0))
+                reference_source = "client"
+                if reference_lag:
+                    request_id = str(req.get("request_id", ""))
+                    if not request_id:
+                        raise ValueError("request_id is required with reference_lag")
+                    max_lag = int(os.environ.get("IMAGE3F_MAX_REFERENCE_LAG", "512"))
+                    if reference_lag > max_lag:
+                        raise ValueError(
+                            f"reference_lag {reference_lag} exceeds server maximum {max_lag}"
+                        )
+                    replay = references.replay(
+                        stream_id=stream_id,
+                        episode_id=episode_id,
+                        step=step,
+                        request_id=request_id,
+                    )
+                    if replay is not None:
+                        metrics.record_replay()
+                        _send_msg(sock, {
+                            "ok": True,
+                            "views": {v: encode_array(image) for v, image in replay.items()},
+                            "ms": 0.0,
+                            "queue_ms": 0.0,
+                            "inference_ms": 0.0,
+                            "reference_source": "idempotent_replay",
+                            "stream_step": step,
+                            "replayed": True,
+                        })
+                        continue
+                    prev, reference_source = references.prepare(
+                        stream_id=stream_id,
+                        episode_id=episode_id,
+                        step=step,
+                        lag=reference_lag,
+                        anchor=prev,
+                        request_id=request_id,
+                    )
+                    prepared = True
                 order = [v for _, v in VIEW_MAP]
                 r = Image3FRequest(
                     prompt=str(req["prompt"]),
@@ -172,30 +236,111 @@ def handle_conn(sock, addr, session):
                     previous_rgb=tuple(to_pil(prev[v]) for v in order),
                     seed=int(req.get("seed", 42)),
                 )
-                imgs, timing = session.generate(r, output_type="rgb")
+                queue_start = time.perf_counter()
+                with session_lock:
+                    queue_ms = (time.perf_counter() - queue_start) * 1000
+                    infer_start = time.perf_counter()
+                    imgs, timing = session.generate(r, output_type="rgb")
+                    inference_ms = (time.perf_counter() - infer_start) * 1000
                 stacked = np.asarray(imgs[0])
-                out = {v: encode_array(stacked[i * H:(i + 1) * H]) for i, v in enumerate(order)}
+                out_arrays = {
+                    v: np.ascontiguousarray(stacked[i * H:(i + 1) * H])
+                    for i, v in enumerate(order)
+                }
+                if prepared:
+                    references.commit(
+                        stream_id=stream_id,
+                        episode_id=episode_id,
+                        step=step,
+                        generated=out_arrays,
+                        request_id=request_id,
+                    )
+                    prepared = False
+                out = {v: encode_array(image) for v, image in out_arrays.items()}
                 ms = (time.perf_counter() - t0) * 1000
-                _send_msg(sock, {"ok": True, "views": out, "ms": ms})
+                metrics.record(ms=ms, queue_ms=queue_ms, inference_ms=inference_ms)
+                _send_msg(sock, {
+                    "ok": True,
+                    "views": out,
+                    "ms": ms,
+                    "queue_ms": queue_ms,
+                    "inference_ms": inference_ms,
+                    "reference_source": reference_source,
+                    "stream_step": step if reference_lag else None,
+                })
             except Exception as exc:
-                _send_msg(sock, {"ok": False, "error": f"{exc}"})
-    except (ConnectionError, ConnectionResetError, struct.error):
+                if prepared:
+                    references.abort(stream_id=stream_id, episode_id=episode_id, step=step)
+                metrics.record_error()
+                error = f"{exc}"
+                _send_msg(sock, {
+                    "ok": False,
+                    "error": error,
+                    "retryable": "in flight" in error,
+                })
+    except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError, struct.error):
         pass
     finally:
         sock.close()
         print(f"tcp client {addr} gone", flush=True)
 
 
-def tcp_listener(session, port):
+class ServerMetrics:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.requests = 0
+        self.errors = 0
+        self.replays = 0
+        self.total_ms = 0.0
+        self.total_queue_ms = 0.0
+        self.total_inference_ms = 0.0
+
+    def record(self, *, ms, queue_ms, inference_ms):
+        with self._lock:
+            self.requests += 1
+            self.total_ms += float(ms)
+            self.total_queue_ms += float(queue_ms)
+            self.total_inference_ms += float(inference_ms)
+
+    def record_error(self):
+        with self._lock:
+            self.errors += 1
+
+    def record_replay(self):
+        with self._lock:
+            self.replays += 1
+
+    def snapshot(self):
+        with self._lock:
+            denom = max(1, self.requests)
+            return {
+                "requests": self.requests,
+                "errors": self.errors,
+                "replays": self.replays,
+                "mean_ms": self.total_ms / denom,
+                "mean_queue_ms": self.total_queue_ms / denom,
+                "mean_inference_ms": self.total_inference_ms / denom,
+            }
+
+
+def create_tcp_server(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
-    srv.listen(8)
-    print(f"tcp listening on {port}", flush=True)
+    srv.listen(int(os.environ.get("IMAGE3F_LISTEN_BACKLOG", "256")))
+    return srv, int(srv.getsockname()[1])
+
+
+def tcp_listener(srv, session, session_lock, references, metrics):
+    print(f"tcp listening on {srv.getsockname()[1]}", flush=True)
     while True:
         sock, addr = srv.accept()
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        threading.Thread(target=handle_conn, args=(sock, addr, session), daemon=True).start()
+        threading.Thread(
+            target=handle_conn,
+            args=(sock, addr, session, session_lock, references, metrics),
+            daemon=True,
+        ).start()
 
 
 def main():
@@ -205,15 +350,36 @@ def main():
     t0 = time.time()
     session = Image3FSession(memory_mode="auto", vae_mode="untiled",
                              model_root=os.environ["ROBORENDER_MODEL_BASE"])
+    session_lock = threading.Lock()
+    references = LaggedReferenceStore(
+        max_streams=int(os.environ.get("IMAGE3F_MAX_STREAMS", "64"))
+    )
+    metrics = ServerMetrics()
     print(f"SESSION_READY in {time.time()-t0:.0f}s", flush=True)
-    port = 18500 + int(os.environ.get("SLURM_JOB_ID", "0")) % 1000
-    threading.Thread(target=tcp_listener, args=(session, port), daemon=True).start()
+    job_digits = "".join(c for c in os.environ.get("SLURM_JOB_ID", "0") if c.isdigit())
+    default_port = 18500 + int(job_digits or "0") % 1000
+    requested_port = int(os.environ.get("IMAGE3F_PORT", str(default_port)))
+    srv, port = create_tcp_server(requested_port)
+    threading.Thread(
+        target=tcp_listener,
+        args=(srv, session, session_lock, references, metrics),
+        daemon=True,
+    ).start()
     import subprocess
     host = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
-    Path(os.environ.get("ENDPOINT_FILE", "/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt")).write_text(f"{host} {port}\n")
+    endpoint = Path(os.environ.get(
+        "ENDPOINT_FILE", "/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt"
+    ))
+    endpoint.parent.mkdir(parents=True, exist_ok=True)
+    endpoint_tmp = endpoint.with_name(f".{endpoint.name}.{os.getpid()}.tmp")
+    endpoint_tmp.write_text(f"{host} {port}\n")
+    os.replace(endpoint_tmp, endpoint)
     (QUEUE / "READY").write_text(str(time.time()))
     while True:
-        reqs = sorted(list(inbox.glob("*.json")) + list(inbox.glob("*.py")))
+        reqs = list(inbox.glob("*.json"))
+        if os.environ.get("IMAGE3F_ALLOW_PY_QUEUE", "1") == "1":
+            reqs += list(inbox.glob("*.py"))
+        reqs = sorted(reqs)
         if not reqs:
             time.sleep(2)
             continue
@@ -234,7 +400,7 @@ def main():
                 result["result"] = g.get("RESULT", {})
             else:
                 req = json.loads(rp.read_text())
-                result.update(run_request(session, req))
+                result.update(run_request(session, session_lock, req))
             result["seconds"] = time.time() - t0
         except Exception as exc:
             result["status"] = "error"

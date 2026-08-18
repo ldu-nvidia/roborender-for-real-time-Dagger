@@ -16,4 +16,4 @@ export ROBORENDER_MODEL_BASE=/vision/u/ravenh/roborender_image3f_portable_buildo
 export ENDPOINT_FILE=${ENDPOINT_FILE:-/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt}
 export IMAGE3F_QUEUE=${IMAGE3F_QUEUE:-/svl/u/ravenh/fast_roborender/image3f_queue}
 rm -f $IMAGE3F_QUEUE/READY
-exec "$ROOT/.venv/bin/python" /svl/u/ravenh/fast_roborender/image3f_server.py
+exec "$ROOT/.venv/bin/python" /svl/u/ravenh/fast_roborender/scripts/server/image3f_server.py

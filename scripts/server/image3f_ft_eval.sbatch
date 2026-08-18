@@ -17,9 +17,9 @@ FR=/svl/u/ravenh/fast_roborender
 CHUNKS="${CHUNKS_OVERRIDE:- /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000123.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000404.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000777.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001111.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001666.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001999.npz}"
 export IMAGE3F_ROOT="$ROOT"
 export ROBORENDER_MODEL_BASE=/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models
-"$PYTHON" "$FR/image3f_eval2.py" --chunks $CHUNKS --out "$FR/image3f_eval_out" \
+"$PYTHON" "$FR/tools/image3f_eval2.py" --chunks $CHUNKS --out "$FR/image3f_eval_out" \
   --prev_modes ${PREV_MODES:-fixed} --tag_prefix ${TAG_PREFIX:-ftx_} \
   --model_root "$ROBORENDER_MODEL_BASE" ${EXTRA_ARGS:-} || { echo EVAL_FAIL; exit 1; }
 GPY=/svl/u/ravenh/miniconda3/envs/gr00t/bin/python
-"$GPY" "$FR/build_image3f_comparison.py" --gen_npz "$FR"/image3f_eval_out/chunk_*_gen_ft_*.npz --out "$FR/image3f_eval_out/cmp" || echo CMP_FAIL
+"$GPY" "$FR/tools/build_image3f_comparison.py" --gen_npz "$FR"/image3f_eval_out/chunk_*_gen_ft_*.npz --out "$FR/image3f_eval_out/cmp" || echo CMP_FAIL
 echo ALL_DONE

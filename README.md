@@ -61,20 +61,25 @@ unless you need that stage". Exit status is non-zero only on hard failures.
 ```
 README.md                     this file
 run_raven_server.sh           render-server entrypoint (bundle-relative; stays at root)
-setup_viral_env.sh            conda env for the trainer
 
 scripts/
   setup/    setup_viral_env.sh  check_env.sh
+  scaling/  scale_plan.py  image3f_probe.py  install_gr00t_integration.py
+            submit_production.sh
   data/     collect_data.sbatch  offline_render.sbatch  render_shard.sbatch
             offline_render_dataset.py  renormalize_depth.py
   anchors/  anchor_pool.sbatch  render_anchor_pool.py  rich_prompts.py
             teacher_anchor_render.sbatch  render_teacher_fullres.py  videogen_prompts.py
   train/    offline_bc_train.sbatch  dagger_train.sbatch  image_dagger_*.sbatch
+            dagger_scale_256x300.sbatch
   eval/     eval_policy.sbatch  eval_latest.sbatch  eval_student.sbatch
   server/   image3f_server.py  image3f_server.sbatch  raven_server.sbatch
             image3f_ft_setup.sbatch  image3f_ft_eval.sbatch
 
 tools/      benchmarks, sample/preview builders, the 5-vs-50-step A/B (step_ab*.py)
+integrations/gr00t/
+            versioned Image3F client and strict private-trainer source transform
+tests/      login-node unit tests for scale math and lag-reference semantics
 archive/    superseded one-off diagnostics and earlier experiments
 
 GR00T-VisualSim2Real/         trainer, configs, simulator (own git repo, branch
@@ -290,6 +295,63 @@ Other variables: `CKPT` (warm start, defaults to the round-4 final), `NUM_ENVS` 
 
 Warm-start from the previous round's `last.pt`: round 4 started from round 3 and reached
 `dagger_bc_loss` 0.146 within ~900 iterations (round 3 ended at 0.67, and finished at 0.134).
+
+### Production scale: 256 environments × 300 rollout steps
+
+The production launcher uses **eight synchronized trainer ranks with 32 Isaac environments
+per rank**. `num_envs` is rank-local in GR00T, so passing 256 to every rank would accidentally
+create 2,048 environments. The requested update contains 76,800 transitions; rank sharding
+also avoids the unsafe single-L40S rollout allocation. Accelerate/DDP synchronizes the
+student's supervised DAgger gradients after each rank collects its local trajectories.
+
+The production-safe default is `MIX=0.0`: all 256 environments render every simulator tick,
+requiring 52 independent RTX PRO 6000 Image3F servers at five environments per server. This
+guarantees contiguous lag histories. The previously validated `MIX=0.5` recipe needs only 26
+servers, but it is gated behind `ALLOW_EXPERIMENTAL_MIXED_LAG=1` until Raven's private trainer
+is verified to use an episode-sticky generated cohort; per-tick Bernoulli mixing would make
+`t-256` histories discontinuous. Endpoints live in a run-scoped selected manifest and are
+actively pinged. Training refuses to start until every required server advertises protocol 2
+and a maximum reference lag at least as large as the requested lag.
+
+The 300-step horizon crosses Image3F's training-time reference boundary. The production client
+and server therefore implement the exact policy: use the episode anchor at `t < 256`, then use
+the generated RGB from `t-256`. History is bounded and held server-side; environment streams
+remain sticky to endpoints. Legacy 81-step launchers keep their stateless behavior unless
+`IMAGE3F_REFERENCE_LAG` is set.
+
+The core trainer is a separate, gitignored Raven GR00T fork. Public NVlabs GR00T does not have
+`distill_trainer_videogen.py`, `image3f_frame_client.py`, or `wsdpt_image_dagger.yaml`. The
+installer patches the known parallel trainer to pass explicit episode/step IDs and installs
+the versioned client. Run it only after checking out that exact fork, review both changes, then
+commit them in the GR00T repository so production sees a clean, pinned revision:
+
+```bash
+python scripts/scaling/install_gr00t_integration.py \
+  --gr00t-root GR00T-VisualSim2Real --install
+
+# inspect the exact 256x300 capacity calculation
+python scripts/scaling/scale_plan.py
+
+# validate commands without submitting jobs
+DRY_RUN=1 bash scripts/scaling/submit_production.sh
+
+# submit 52 renderer array elements plus the 8-rank trainer (MIX=0 default)
+bash scripts/scaling/submit_production.sh
+```
+
+Useful overrides are `GLOBAL_NUM_ENVS`, `ROLLOUT_STEPS`, `TRAINER_NODES`, `MIX`,
+`REFERENCE_LAG`, `CKPT`, `NUM_TOTAL_BATCHES`, `PROJ`, and `EXP`. The trainer launcher logs a
+machine-readable scale plan, both repository revisions, the checkpoint, endpoint fleet, and
+rank-specific stdout/stderr under its run directory. It uses microbatch 1 with gradient
+accumulation 8 by default, preserving the effective local mini-batch while limiting 300-frame
+sequence memory. `ROLLOUT_STEPS=300` is the horizon of each optimizer batch; it is distinct
+from run length. `NUM_TOTAL_BATCHES` defaults to 1 for a bounded scale-validation run and must
+be set explicitly for a longer training campaign.
+
+Before the full job, validate progressively: 4×4, 32×16, 64×75, 128×75, 256×75,
+256×260 (the lag transition), then 256×300. Acceptance requires exact global transition
+counts, finite BC loss, balanced endpoint request counts, zero render errors, correct anchor
+reset/t−256 telemetry, and synchronized policy checkpoints across ranks.
 
 ## Evaluation — read this first
 

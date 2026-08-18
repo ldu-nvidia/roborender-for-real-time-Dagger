@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import os
 import sys
 import time
@@ -27,12 +28,21 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
-from gr00t.rl.utils.videogen_client import VideoGenRenderClient  # noqa: E402
 
 CHUNK_T = 81
 
 
+def shard_for(tag: str, env_id: int, nshards: int) -> int:
+    """Stable shard for an entire collector/env stream, not an individual chunk."""
+    shard_key = f"{tag}:{env_id}"
+    return int.from_bytes(
+        hashlib.blake2b(shard_key.encode(), digest_size=8).digest(), "big"
+    ) % nshards
+
+
 def main():
+    from gr00t.rl.utils.videogen_client import VideoGenRenderClient
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset_dir", required=True)
     ap.add_argument("--endpoint_file",
@@ -56,6 +66,10 @@ def main():
     ap.add_argument("--shard", type=int, default=0, help="this renderer's slot")
     ap.add_argument("--nshards", type=int, default=1, help="total render shards")
     args = ap.parse_args()
+    if args.nshards < 1:
+        ap.error("--nshards must be positive")
+    if not 0 <= args.shard < args.nshards:
+        ap.error(f"--shard must be in [0, {args.nshards}), got {args.shard}")
     view_names = [v.strip() for v in args.views.split(",") if v.strip()]
     primary_view = args.primary_view if args.primary_view in view_names else view_names[0]
 
@@ -102,7 +116,8 @@ def main():
       try:
           # ---- scan and group -------------------------------------------------
           todo_meta = []
-          for path in sorted(glob.glob(os.path.join(args.dataset_dir, "chunk_*.npz"))):
+          all_paths = sorted(glob.glob(os.path.join(args.dataset_dir, "chunk_*.npz")))
+          for path in all_paths:
               try:
                   with np.load(path, allow_pickle=False) as z:
                       if "rgb_gen" in z.files:
@@ -116,6 +131,12 @@ def main():
                       }
               except Exception as exc:
                   print(f"skip unreadable {path}: {exc}", flush=True)
+                  continue
+              # Keep every consecutive chunk for one collector/env on the same
+              # renderer so --max_chain preserves autoregressive conditioning.
+              # The key remains stable as --follow discovers new files.
+              slot = shard_for(meta["tag"], meta["env_id"], args.nshards)
+              if slot != args.shard:
                   continue
               todo_meta.append(meta)
 
