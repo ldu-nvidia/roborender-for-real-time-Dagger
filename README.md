@@ -449,6 +449,43 @@ moved.
 > the integration** — read `distill_trainer_videogen.py` and the simulator's
 > `get_policy_view_stack` instead. See `archive/README.md`.
 
+## Depth control recipe
+
+Depth is what the renderer conditions on, and the exact h5_v4 parameters matter. They live
+in the experiment config (`videogen.depth_h5v4_per_view`) and are applied by
+`_h5v4_control` in the trainer:
+
+```yaml
+head_color: {raw_clip: [0.05, 10.0], inv_clip: [1.0, 40.0], norm_range: [0.05, 2.6]}
+hand_left:  {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
+hand_right: {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
+```
+
+`norm_range` on the head view is load-bearing: with fixed normalization bounds a close
+object no longer anchors the range to white, so object shape survives. Views without
+`norm_range` fall back to per-video min/max, and views without `raw_pct` skip percentile
+clipping (the built-in default carries neither).
+
+Denoising steps, measured with the correct recipe (6 frames, 2 chunks, FT-FIXED, fixed
+seed; PSNR against the 50-step video teacher):
+
+| steps | ms | PSNR | SSIM |
+|---|---|---|---|
+| **5** (production) | 212 | **17.91** | 0.792 |
+| 20 | 689 | 15.01 | 0.659 |
+| 50 | 1598 | 14.53 | 0.634 |
+
+More denoising is worse here: geometry stays correct and textures sharpen, but the output
+drifts off the anchor's colours and materials, which is exactly what FT-FIXED depends on.
+The same ranking held under the earlier incorrect depth, 0.7-1.2 dB lower across the board.
+
+**Offline analysis must use `tools/depth_recipe.py`**, which loads these params from the
+config and reproduces `_h5v4_control` byte-for-byte (`tools/test_depth_recipe.py` asserts
+equality against the trainer's own code). Hand-copying the recipe into a script is how the
+A/B evals ended up inverting raw metric depth and min-maxing per frame: a 37/255 mean
+difference on real head-view data, 61% of pixels off by more than 32 levels, understating
+every arm by 0.7-1.2 dB. Training was never affected -- it always went through the config.
+
 ## Gotchas
 
 - **Scene walls must not be collidable.** `cameras.add_scene_walls` gives the head camera a
