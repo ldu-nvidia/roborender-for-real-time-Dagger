@@ -235,9 +235,39 @@ from the renderer — the pool already contains the data, so switching costs one
 
 ## B. Online image-model DAgger
 
-The student acts, the teacher supplies the supervision, and Image3F relabels observations
-inside the rollout — so the student sees generated pixels on the states its own policy visits,
-which offline BC cannot give you.
+Image3F relabels observations inside the rollout, so the student is trained on generated
+pixels over a live state distribution rather than a fixed dataset.
+
+**Who drives the rollout is a config choice, and the default is the teacher.**
+`videogen.rollout_action_source: teacher` (the default, and what every round so far used)
+overrides the student's actions with the teacher's each step:
+
+```python
+# distill_trainer_videogen.py
+if self._in_train_rollout and self.vg_rollout_action_source == "teacher" \
+   and "gt_actions" in policy_state_dict:
+    policy_state_dict["actions"] = policy_state_dict["gt_actions"].clone()
+```
+
+So the student learns on the *teacher's* state distribution — DAgger at β=1, i.e. on-policy
+BC over teacher-visited states, not the student-state correction that classic DAgger
+performs. The 69.3% result was obtained this way.
+
+`rollout_action_source: student` makes the student drive, which is the classic β=0 setting.
+It used to carry a caveat — the student saw the previous chunk's last generated frame as
+stale vision — but that path is gated to `videogen.mode: online`. In `image_dagger` the
+relabel happens per step *before* the policy acts, so a student-driven rollout sees fresh
+generated frames. It is untested at scale; every result to date uses the teacher-driven default.
+
+For the annealed mixture the paper actually prescribes, set `rollout_action_source: beta`.
+Each environment then follows the teacher with probability β at **each decision** (Ross et
+al. sample the mixture per decision, not per trajectory), with β annealed from `beta_start`
+to `beta_end` over `beta_decay_iters`. The paper starts at β=1 and decays toward 0 —
+expert-driven while the student is still random, student-driven by the end — and its
+recommended practical setting is β=1 on the first iteration and 0 thereafter. A fixed
+`beta_schedule: constant` with `beta_start: 0.5` gives an even split, but never collects
+the student's undiluted state distribution, which is the point of DAgger. β affects
+training rollouts only; evaluation always runs the student.
 
 ```bash
 # 1. anchor pool (see Anchors above) — only needed once
@@ -286,10 +316,54 @@ Other variables: `CKPT` (warm start, defaults to the round-4 final), `NUM_ENVS` 
 | `videogen.raytraced_mix_prob` | via `MIX` | see above |
 | `videogen.image3f_endpoint_files` | one per renderer | envs are sharded round-robin across them |
 | `videogen.anchor_pool_dir` / `anchor_index` | `anchor_pool_2048` / `0` | fixed anchor per episode; chaining on own outputs collapses |
+| `videogen.rollout_action_source` | `teacher` | who drives the rollout: `teacher` (β=1), `student` (β=0), `beta` (annealed) |
+| `videogen.beta_schedule` | `linear` | `constant` / `linear` / `exponential`, used when the source is `beta` |
+| `videogen.beta_start` / `beta_end` | `1.0` / `0.0` | DAgger mixture endpoints |
+| `videogen.beta_decay_iters` / `beta_decay_rate` | `500` / `0.99` | linear horizon / exponential rate |
 | `num_steps_per_env` | `81` | one BC update per video-model clip length |
 
 Warm-start from the previous round's `last.pt`: round 4 started from round 3 and reached
 `dagger_bc_loss` 0.146 within ~900 iterations (round 3 ended at 0.67, and finished at 0.134).
+
+## Multi-view policies
+
+By default the policy sees one camera (the ego/head view). Image3F renders three
+synchronized views regardless, so the wrist views were being generated and discarded.
+
+Set `cameras.policy_views` and the matching `policy_view_count` and the views are tiled
+vertically into a single image:
+
+```
+[ head_color ]  108x192
+[ hand_left  ]  108x192   ->  vision_obs (324, 192, 3)  ->  ResNet18
+[ hand_right ]  108x192
+```
+
+Ready-made configs: `wsdpt_image_dagger_3view` and `wsdpt_videogen_offline_bc_3view`.
+
+```bash
+sbatch --export=ALL,MIX=0.0,CKPT=none,NUM_ENVS=4 scripts/train/dagger_train_3view.sbatch
+```
+
+Ray-traced envs take the tiles from the conditioning cameras (already rendered for the
+renderer, just downsampled), generated envs from Image3F — identical layout either way.
+
+Things that follow from the taller observation:
+
+- **Single-view checkpoints cannot be warm-started.** The vision weights have the wrong
+  shape, so launch with `CKPT=none`. The 57.3% and 69.3% baselines do not transfer, and a
+  3-view baseline has to be re-established.
+- **Offline BC needs the dataset re-rendered.** Chunks must carry `rgb_gen__<view>` per
+  view; older ones have only the primary `rgb_gen`. `offline_render_dataset.py` writes the
+  per-view keys and its resume check treats a chunk as done only when every requested view
+  is present, so pointing it at an old dataset re-renders it.
+- `policy_view_count` must equal `len(policy_views)`. The obs dims scale by the former and
+  the trainer tiles by the latter; a mismatch mis-reshapes rather than erroring cleanly.
+- Renderer load scales with relabelled envs, not views — one server per ~5 envs still holds,
+  but each request now returns three views instead of one.
+
+Verified end to end (`MIX=0.0`, 4 envs, from scratch): history buffer `(324, 192, 3)`,
+storage `obs_dim=186624`, two learning iterations with `dagger_bc_loss` 1.089 -> 0.873.
 
 ## Evaluation — read this first
 
@@ -337,6 +411,43 @@ Reference configs it stages against:
 **One eval saturates one renderer** (~52 episodes/h). Two evals sharing a server each run at
 half speed and overrun the job limit with no output, since the success rate is only printed
 at the end. Give each concurrent `OBS=generated` eval its own server and `ENDPOINT`.
+
+## Running on another machine
+
+The trainer, configs and simulator changes live in `GR00T-VisualSim2Real/`, which is a
+checkout of the public NVlabs repo with our work on the `videogen-image-dagger` branch.
+A fresh clone elsewhere has none of it, and the preflight will refuse to run.
+
+`transfer/` holds the branch as patches against public revision `92bf0863`, which is an
+ancestor of the branch, so they apply without a rebase:
+
+```bash
+cd GR00T-VisualSim2Real
+git am ../transfer/0001-*.patch ../transfer/0002-*.patch ../transfer/0003-*.patch
+```
+
+0001 = videogen pipeline (trainer, render clients, conditioning cameras, scene walls,
+configs) · 0002 = three-view policy · 0003 = DAgger beta schedule.
+
+The patches carry code only. Also needed on the target machine, none of it in this repo:
+
+| Asset | Where it comes from |
+|---|---|
+| Image3F bundle + adapter | `/vision/u/ravenh/roborender_image_model_accelerated` |
+| Foundation weights | `ROBORENDER_MODEL_BASE`, see [Setup](#setup) |
+| TensorRT engines | built locally per GPU arch — never shipped |
+| Anchor pool | `scripts/anchors/anchor_pool.sbatch` |
+| Rendered dataset | `scripts/data/` (offline BC only) |
+| Launchers and this README | `fast_roborender/` |
+
+Run `bash scripts/setup/check_env.sh` there first; it reports exactly which of the above
+are missing. `scripts/setup/check_paths.py` verifies no script references a file that
+moved.
+
+> Note for reviewers: `archive/` contains superseded one-off scripts, including the
+> `patch_*.py` snapshots that were applied once to produce the current code. **They are not
+> the integration** — read `distill_trainer_videogen.py` and the simulator's
+> `get_policy_view_stack` instead. See `archive/README.md`.
 
 ## Gotchas
 

@@ -1,0 +1,1754 @@
+From 209b5c5ea12c2d1f328214335d10e466b9dbb2d6 Mon Sep 17 00:00:00 2001
+From: qingh097 <qingh097@gmail.com>
+Date: Mon, 17 Aug 2026 15:41:21 -0700
+Subject: [PATCH 1/3] Add videogen observation pipeline: offline BC and online
+ image-model DAgger
+
+Train the vision student on generated RGB instead of ray-traced rendering.
+
+- distill_trainer_videogen.py: TRLDistillTrainerVideoGen with collect / offline /
+  online / image_dagger modes. image_dagger relabels all three camera views every
+  rollout step via a warm Image3F server, rendering envs in parallel and mixing in
+  ray-traced envs at videogen.raytraced_mix_prob.
+- image3f_frame_client.py / videogen_client.py: length-prefixed pickle clients for
+  the render servers. The frame client re-reads its endpoint file on every reconnect
+  so a restarted server heals a run in progress.
+- isaacsim.py: conditioning cameras for the renderer (per-view depth, robot RGB and
+  semantic masks), and optional scene walls giving the head camera real background
+  geometry. Walls default to non-collidable: collidable walls sit in the robot's
+  walking path and cost ~40 points of success rate (16.7% collidable, 56.0% none,
+  60.0% visible but non-collidable). Set cameras.wall_collisions to restore the old
+  behaviour.
+- configs for collection, offline BC and image DAgger.
+
+Measured on walk_stand_place_grasp_turn_homie, ray-traced observations under the
+offline-BC eval config: offline BC 57.3% (150 eps), image DAgger 69.3% (300 eps).
+Generated observations are policy-equivalent to ray tracing -- a policy that never
+trained on them scores 59.3% vs 57.3%.
+
+Note eval_agent_trl.py loads config.yaml from the checkpoint's own directory, so a
+DAgger checkpoint must be staged beside the baseline config or it is scored in a
+different environment.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ README.md                                     |  24 +
+ .../exp/loco_manip/wsdpt_image_dagger.yaml    |  99 +++
+ .../loco_manip/wsdpt_student_videogen.yaml    |  66 ++
+ .../loco_manip/wsdpt_videogen_collect.yaml    |  91 +++
+ .../loco_manip/wsdpt_videogen_offline_bc.yaml |  70 ++
+ .../config/trainer/trl_distill_videogen.yaml  |   1 +
+ gr00t/rl/simulator/isaacsim/isaacsim.py       | 202 +++++
+ .../trl/trainer/distill_trainer_videogen.py   | 763 ++++++++++++++++++
+ gr00t/rl/utils/image3f_frame_client.py        | 111 +++
+ gr00t/rl/utils/videogen_client.py             | 109 +++
+ gr00t/rl/utils/videogen_prompts.py            |  74 ++
+ 11 files changed, 1610 insertions(+)
+ create mode 100644 gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
+ create mode 100644 gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
+ create mode 100644 gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
+ create mode 100644 gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
+ create mode 100644 gr00t/rl/config/trainer/trl_distill_videogen.yaml
+ create mode 100644 gr00t/rl/trl/trainer/distill_trainer_videogen.py
+ create mode 100644 gr00t/rl/utils/image3f_frame_client.py
+ create mode 100644 gr00t/rl/utils/videogen_client.py
+ create mode 100644 gr00t/rl/utils/videogen_prompts.py
+
+diff --git a/README.md b/README.md
+index c037513..6c8823b 100644
+--- a/README.md
++++ b/README.md
+@@ -211,6 +211,30 @@ python gr00t/rl/eval_agent_trl.py \
+     +checkpoint=logs_rl/<student_experiment_dir>/model_step_XXXXXX.pt
+ ```
+ 
++### Student Training Without Ray Tracing (generated observations)
++
++Ray-traced RGB is too slow to keep inside the DAgger loop at scale. Two alternatives are
++implemented here, both documented with launch commands, configs and pitfalls in
++[`../README.md`](../README.md) (`fast_roborender/`):
++
++- **Offline BC** (`+exp=loco_manip/wsdpt_videogen_offline_bc`) — behaviour-clone on a
++  pre-rendered dataset of generated frames.
++- **Online image-model DAgger** (`+exp=loco_manip/wsdpt_image_dagger`) — a warm Image3F
++  server relabels all three camera views every step
++  (`gr00t/rl/trl/trainer/distill_trainer_videogen.py`, `videogen.mode: image_dagger`).
++
++Generated observations are policy-equivalent to ray tracing on this task (59.3% vs 57.3%
++for a policy that never trained on them), and online DAgger reaches 69.3% vs 57.3% for the
++offline-BC baseline (300 vs 150 episodes).
++
++> **Two traps worth knowing before you run either.**
++> `eval_agent_trl.py` loads `config.yaml` from the *checkpoint's own directory*, so
++> evaluating a DAgger checkpoint against its own run config silently compares two
++> different environments — always stage the checkpoint beside the baseline's config.
++> And `cameras.add_scene_walls` must be paired with `cameras.wall_collisions: false`
++> (the default): collidable backdrop walls block the robot's path and cost ~40 points
++> of success rate.
++
+ ## Configuration
+ 
+ This project uses [Hydra](https://hydra.cc/) for configuration. Configs are composed from YAML files in `gr00t/rl/config/`. Override any value from the command line:
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
+new file mode 100644
+index 0000000..6109601
+--- /dev/null
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
+@@ -0,0 +1,99 @@
++# @package _global_
++# Student DAgger distillation with video-model-generated RGB (Raven LADD 5-step)
++# instead of ray-traced RGB. See gr00t/rl/trl/trainer/distill_trainer_videogen.py.
++#
++# The Raven render server must be running (fast_roborender/run_raven_server.sh);
++# use fast_roborender/train_student_videogen.sbatch to launch both together.
++
++defaults:
++  - loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay
++  - _self_
++
++exp_var: videogen_collect
++
++# Swap in the videogen trainer (keeps everything else from the homie API trainer).
++trainer:
++  _target_: gr00t.rl.trl.trainer.distill_trainer_videogen.TRLDistillTrainerVideoGen
++
++# Each env chunk costs one video generation (~4-8 s on the render GPU), so run
++# few envs. Override on the CLI with num_envs=N as needed.
++num_envs: 32
++
++simulator:
++  config:
++    cameras:
++      enable_cameras: true
++      # Depth is required: it is the control signal sent to the video model.
++      # RGB stays enabled because the obs pipeline still reads it (the frames
++      # are overwritten with generated RGB before every BC update).
++      camera_types:
++        - rgb: true
++        - depth: true
++      camera_resolutions: [108, 192]
++      stack_depth_image: false
++      depth_hi_resolution: [480, 832]
++      depth_hi_robot_rgb: true
++      add_scene_walls: true
++      wall_distance: 2.5
++      wall_height: 2.5
++      # native3view conditioning: head + both wrist cameras. Head pose matches
++      # the calibrated d435 mount; wrist extrinsics are initial guesses — tune
++      # pos/rot after inspecting the first dumped frames.
++      conditioning_views:
++        # wrist mounts derived from kinematic probe (palm = +4.2cm along +X of
++        # wrist_yaw_link) + orientation sweep: camera 2cm along hand axis, 3cm
++        # up, looking along the hand (identity in world convention).
++        - {name: hand_left, link: left_wrist_yaw_link, pos: [-0.08, 0.0, -0.06], rot: [1.0, 0.0, 0.0, 0.0]}
++        - {name: hand_right, link: right_wrist_yaw_link, pos: [-0.08, 0.0, -0.06], rot: [1.0, 0.0, 0.0, 0.0]}
++        - {name: head_color, link: d435_link, pos: [0.0, 0.035, 0.0], rot: [0.99955, 0.0, 0.0299955, 0.0]}
++algo:
++  config:
++    num_mini_batches: 1
++    value_loss_coef: 0.0
++    entropy_coef: 0.0
++
++    # One DAgger/BC update per 81-step chunk (= the video model's clip length)
++    # instead of every step.
++    num_steps_per_env: 81
++
++    videogen:
++      enable: true
++      mode: image_dagger
++      image3f_endpoint_files:
++        - /svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt
++        - /svl/u/ravenh/fast_roborender/image3f_server_endpoint_2.txt
++        - /svl/u/ravenh/fast_roborender/image3f_server_endpoint_3.txt
++      anchor_pool_dir: /vision/u/ravenh/anchor_pool_2048
++      anchor_index: 0
++      raytraced_mix_prob: 0.5
++      save_raw_depth: false
++      save_raw_depth_native: false
++      host: 127.0.0.1
++      port: 18913
++      prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
++      seed: 42
++      # Metric depth -> uint8 control-video normalization.
++      control_resolution: [240, 416]
++      depth_mode: h5_v4   # exact Sim2RealGen training recipe (depth_methods.py)
++      depth_h5v4_per_view:
++        head_color: {raw_clip: [0.05, 10.0], inv_clip: [1.0, 40.0], norm_range: [0.05, 2.6]}
++        hand_left:  {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
++        hand_right: {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
++      depth_near: 0.25
++      depth_near_per_view:
++        hand_left: 0.08
++        hand_right: 0.08
++        head_color: 0.25
++      depth_far: 6.0
++      invert_depth: true
++      # teacher: teacher's actions drive the env during the rollout (student is
++      #          trained purely from the relabeled BC loss).
++      # student: student drives, seeing the last generated frame of the
++      #          previous chunk as (stale) vision input.
++      rollout_action_source: teacher
++      # The TRT engine contract is exactly two 416x240 views; the single ego
++      # view is duplicated into both slots and primary_view is used for obs.
++      dump_first_n_chunks: 0
++      dump_dir: /svl/u/ravenh/fast_roborender/videogen_frames
++      view_names: [head_color, hand_left, hand_right]
++      primary_view: head_color
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
+new file mode 100644
+index 0000000..2e743f5
+--- /dev/null
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
+@@ -0,0 +1,66 @@
++# @package _global_
++# Student DAgger distillation with video-model-generated RGB (Raven LADD 5-step)
++# instead of ray-traced RGB. See gr00t/rl/trl/trainer/distill_trainer_videogen.py.
++#
++# The Raven render server must be running (fast_roborender/run_raven_server.sh);
++# use fast_roborender/train_student_videogen.sbatch to launch both together.
++
++defaults:
++  - loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay
++  - _self_
++
++exp_var: videogen
++
++# Swap in the videogen trainer (keeps everything else from the homie API trainer).
++trainer:
++  _target_: gr00t.rl.trl.trainer.distill_trainer_videogen.TRLDistillTrainerVideoGen
++
++# Each env chunk costs one video generation (~4-8 s on the render GPU), so run
++# few envs. Override on the CLI with num_envs=N as needed.
++num_envs: 4
++
++simulator:
++  config:
++    cameras:
++      enable_cameras: true
++      # Depth is required: it is the control signal sent to the video model.
++      # RGB stays enabled because the obs pipeline still reads it (the frames
++      # are overwritten with generated RGB before every BC update).
++      camera_types:
++        - rgb: true
++        - depth: true
++      camera_resolutions: [108, 192]
++      stack_depth_image: false
++      depth_hi_resolution: [240, 416]
++      depth_hi_robot_rgb: true
++
++algo:
++  config:
++    num_mini_batches: 1
++
++    # One DAgger/BC update per 81-step chunk (= the video model's clip length)
++    # instead of every step.
++    num_steps_per_env: 81
++
++    videogen:
++      enable: true
++      host: 127.0.0.1
++      port: 18913
++      prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
++      seed: 42
++      # Metric depth -> uint8 control-video normalization.
++      depth_mode: disparity   # brightness ~ 1/z, matches training depth renders
++      depth_near: 0.25
++      depth_far: 6.0
++      invert_depth: true
++      # teacher: teacher's actions drive the env during the rollout (student is
++      #          trained purely from the relabeled BC loss).
++      # student: student drives, seeing the last generated frame of the
++      #          previous chunk as (stale) vision input.
++      rollout_action_source: teacher
++      # The TRT engine contract is exactly two 416x240 views; the single ego
++      # view is duplicated into both slots and primary_view is used for obs.
++      dump_first_n_chunks: 4
++      dump_dir: /svl/u/ravenh/fast_roborender/videogen_frames
++      view_names: [ext1, wrist]
++      primary_view: ext1
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
+new file mode 100644
+index 0000000..40a888f
+--- /dev/null
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
+@@ -0,0 +1,91 @@
++# @package _global_
++# Student DAgger distillation with video-model-generated RGB (Raven LADD 5-step)
++# instead of ray-traced RGB. See gr00t/rl/trl/trainer/distill_trainer_videogen.py.
++#
++# The Raven render server must be running (fast_roborender/run_raven_server.sh);
++# use fast_roborender/train_student_videogen.sbatch to launch both together.
++
++defaults:
++  - loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay
++  - _self_
++
++exp_var: videogen_collect
++
++# Swap in the videogen trainer (keeps everything else from the homie API trainer).
++trainer:
++  _target_: gr00t.rl.trl.trainer.distill_trainer_videogen.TRLDistillTrainerVideoGen
++
++# Each env chunk costs one video generation (~4-8 s on the render GPU), so run
++# few envs. Override on the CLI with num_envs=N as needed.
++num_envs: 32
++
++simulator:
++  config:
++    cameras:
++      enable_cameras: true
++      # Depth is required: it is the control signal sent to the video model.
++      # RGB stays enabled because the obs pipeline still reads it (the frames
++      # are overwritten with generated RGB before every BC update).
++      camera_types:
++        - rgb: true
++        - depth: true
++      camera_resolutions: [108, 192]
++      stack_depth_image: false
++      depth_hi_resolution: [480, 832]
++      depth_hi_robot_rgb: true
++      add_scene_walls: true
++      wall_distance: 2.5
++      wall_height: 2.5
++      # native3view conditioning: head + both wrist cameras. Head pose matches
++      # the calibrated d435 mount; wrist extrinsics are initial guesses — tune
++      # pos/rot after inspecting the first dumped frames.
++      conditioning_views:
++        # wrist mounts derived from kinematic probe (palm = +4.2cm along +X of
++        # wrist_yaw_link) + orientation sweep: camera 2cm along hand axis, 3cm
++        # up, looking along the hand (identity in world convention).
++        - {name: hand_left, link: left_wrist_yaw_link, pos: [-0.08, 0.0, -0.06], rot: [1.0, 0.0, 0.0, 0.0]}
++        - {name: hand_right, link: right_wrist_yaw_link, pos: [-0.08, 0.0, -0.06], rot: [1.0, 0.0, 0.0, 0.0]}
++        - {name: head_color, link: d435_link, pos: [0.0, 0.035, 0.0], rot: [0.99955, 0.0, 0.0299955, 0.0]}
++algo:
++  config:
++    num_mini_batches: 1
++
++    # One DAgger/BC update per 81-step chunk (= the video model's clip length)
++    # instead of every step.
++    num_steps_per_env: 81
++
++    videogen:
++      enable: true
++      mode: collect
++      save_raw_depth: true
++      save_raw_depth_native: true
++      collect_dir: /svl/u/ravenh/fast_roborender/videogen_dataset
++      host: 127.0.0.1
++      port: 18913
++      prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
++      seed: 42
++      # Metric depth -> uint8 control-video normalization.
++      control_resolution: [240, 416]
++      depth_mode: h5_v4   # exact Sim2RealGen training recipe (depth_methods.py)
++      depth_h5v4_per_view:
++        head_color: {raw_clip: [0.05, 10.0], inv_clip: [1.0, 40.0], norm_range: [0.05, 2.6]}
++        hand_left:  {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
++        hand_right: {raw_clip: [0.0, 1.5],  inv_clip: [0.7, 100.0], raw_pct: [1, 99]}
++      depth_near: 0.25
++      depth_near_per_view:
++        hand_left: 0.08
++        hand_right: 0.08
++        head_color: 0.25
++      depth_far: 6.0
++      invert_depth: true
++      # teacher: teacher's actions drive the env during the rollout (student is
++      #          trained purely from the relabeled BC loss).
++      # student: student drives, seeing the last generated frame of the
++      #          previous chunk as (stale) vision input.
++      rollout_action_source: teacher
++      # The TRT engine contract is exactly two 416x240 views; the single ego
++      # view is duplicated into both slots and primary_view is used for obs.
++      dump_first_n_chunks: 0
++      dump_dir: /svl/u/ravenh/fast_roborender/videogen_frames
++      view_names: [ext1, wrist]
++      primary_view: ext1
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
+new file mode 100644
+index 0000000..4f094a6
+--- /dev/null
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
+@@ -0,0 +1,70 @@
++# @package _global_
++# Student DAgger distillation with video-model-generated RGB (Raven LADD 5-step)
++# instead of ray-traced RGB. See gr00t/rl/trl/trainer/distill_trainer_videogen.py.
++#
++# The Raven render server must be running (fast_roborender/run_raven_server.sh);
++# use fast_roborender/train_student_videogen.sbatch to launch both together.
++
++defaults:
++  - loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay
++  - _self_
++
++exp_var: videogen_offline_bc
++
++# Swap in the videogen trainer (keeps everything else from the homie API trainer).
++trainer:
++  _target_: gr00t.rl.trl.trainer.distill_trainer_videogen.TRLDistillTrainerVideoGen
++
++# Each env chunk costs one video generation (~4-8 s on the render GPU), so run
++# few envs. Override on the CLI with num_envs=N as needed.
++num_envs: 16
++
++simulator:
++  config:
++    cameras:
++      enable_cameras: true
++      # Depth is required: it is the control signal sent to the video model.
++      # RGB stays enabled because the obs pipeline still reads it (the frames
++      # are overwritten with generated RGB before every BC update).
++      camera_types:
++        - rgb: true
++        - depth: true
++      camera_resolutions: [108, 192]
++      stack_depth_image: false
++      depth_hi_resolution: [240, 416]
++      depth_hi_robot_rgb: true
++
++algo:
++  config:
++    num_mini_batches: 1
++    value_loss_coef: 0.0
++    entropy_coef: 0.0
++
++    # One DAgger/BC update per 81-step chunk (= the video model's clip length)
++    # instead of every step.
++    num_steps_per_env: 81
++
++    videogen:
++      enable: true
++      mode: offline
++      dataset_dir: /svl/u/ravenh/fast_roborender/videogen_dataset
++      host: 127.0.0.1
++      port: 18913
++      prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
++      seed: 42
++      # Metric depth -> uint8 control-video normalization.
++      depth_mode: disparity   # brightness ~ 1/z, matches training depth renders
++      depth_near: 0.25
++      depth_far: 6.0
++      invert_depth: true
++      # teacher: teacher's actions drive the env during the rollout (student is
++      #          trained purely from the relabeled BC loss).
++      # student: student drives, seeing the last generated frame of the
++      #          previous chunk as (stale) vision input.
++      rollout_action_source: teacher
++      # The TRT engine contract is exactly two 416x240 views; the single ego
++      # view is duplicated into both slots and primary_view is used for obs.
++      dump_first_n_chunks: 0
++      dump_dir: /svl/u/ravenh/fast_roborender/videogen_frames
++      view_names: [ext1, wrist]
++      primary_view: ext1
+diff --git a/gr00t/rl/config/trainer/trl_distill_videogen.yaml b/gr00t/rl/config/trainer/trl_distill_videogen.yaml
+new file mode 100644
+index 0000000..1ee671e
+--- /dev/null
++++ b/gr00t/rl/config/trainer/trl_distill_videogen.yaml
+@@ -0,0 +1 @@
++_target_: gr00t.rl.trl.trainer.distill_trainer_videogen.TRLDistillTrainerVideoGen
+diff --git a/gr00t/rl/simulator/isaacsim/isaacsim.py b/gr00t/rl/simulator/isaacsim/isaacsim.py
+index 98b2236..3bab186 100644
+--- a/gr00t/rl/simulator/isaacsim/isaacsim.py
++++ b/gr00t/rl/simulator/isaacsim/isaacsim.py
+@@ -1407,8 +1407,121 @@ class IsaacSim(BaseSimulator):
+ 
+             self.ego_camera = TiledCamera(ego_camera_config)
+             self.scene.sensors["ego_camera"] = self.ego_camera
++
++            # Conditioning cameras for the video-generation model. Either a
++            # list of views (cameras.conditioning_views: [{name, link, pos,
++            # rot}, ...]) or the legacy single hi-res camera on the ego mount
++            # (cameras.depth_hi_resolution). Each renders depth (+ rgb and
++            # semantic segmentation when cameras.depth_hi_robot_rgb is true).
++            depth_hi_res = getattr(self.simulator_config.cameras, "depth_hi_resolution", None)
++            cond_views = getattr(self.simulator_config.cameras, "conditioning_views", None)
++            self.conditioning_cameras = {}
++            self.depth_hi_camera = None
++            if depth_hi_res:
++                hi_types = ["depth"]
++                if getattr(self.simulator_config.cameras, "depth_hi_robot_rgb", False):
++                    hi_types = ["rgb", "depth", "semantic_segmentation"]
++                    try:
++                        try:
++                            from isaacsim.core.utils.semantics import add_update_semantics
++                        except ImportError:
++                            from omni.isaac.core.utils.semantics import add_update_semantics
++                        import omni.usd
++                        stage = omni.usd.get_context().get_stage()
++                        tagged = 0
++                        for env_i in range(self.scene.cfg.num_envs):
++                            prim = stage.GetPrimAtPath(f"/World/envs/env_{env_i}/Robot")
++                            if prim and prim.IsValid():
++                                add_update_semantics(prim, "robot")
++                                tagged += 1
++                        logger.info(f"semantic tag robot applied to {tagged} robot prims")
++                    except Exception as exc:
++                        logger.warning(f"failed to apply robot semantics: {exc}")
++
++                if not cond_views:
++                    cond_views = [{
++                        "name": "head_color",
++                        "link": self.simulator_config.cameras.camera_attached_link,
++                        "pos": list(self.config.simulator.config.cameras.camera_pos_offset),
++                        "rot": list(self.config.simulator.config.cameras.camera_rot_offset),
++                    }]
++
++                for view in cond_views:
++                    vname = view["name"]
++                    cam_config = TiledCameraCfg(
++                        prim_path=f"/World/envs/env_.*/Robot/{view['link']}/cond_cam_{vname}",
++                        offset=TiledCameraCfg.OffsetCfg(
++                            pos=torch.tensor(list(view["pos"]), device=self.sim_device),
++                            rot=torch.tensor(list(view["rot"]), device=self.sim_device),
++                            convention="world",
++                        ),
++                        data_types=hi_types,
++                        colorize_semantic_segmentation=False,
++                        spawn=sim_utils.PinholeCameraCfg(
++                            focal_length=self.simulator_config.cameras.camera_focal_length,
++                            focus_distance=self.simulator_config.cameras.camera_focus_distance,
++                            horizontal_aperture=self.simulator_config.cameras.camera_horizontal_aperture,
++                            vertical_aperture=self.simulator_config.cameras.camera_vertical_aperture,
++                            clipping_range=eval(self.simulator_config.cameras.camera_clipping_range),
++                        ),
++                        width=depth_hi_res[1],
++                        height=depth_hi_res[0],
++                        debug_vis=False,
++                    )
++                    cam = TiledCamera(cam_config)
++                    self.scene.sensors[f"cond_cam_{vname}"] = cam
++                    self.conditioning_cameras[vname] = cam
++                    logger.info(f"conditioning camera {vname} on link {view['link']}")
++                # legacy alias: first view acts as the old depth_hi camera
++                first = cond_views[0]["name"]
++                self.depth_hi_camera = self.conditioning_cameras[first]
++                self._depth_hi_alias = first
+         else:
+             self.ego_camera = None
++            self.depth_hi_camera = None
++
++        # Optional static walls so the head/ego camera sees real background
++        # geometry instead of the video model hallucinating it. Placed as a
++        # 3-sided enclosure around each env at cameras.wall_distance metres.
++        if getattr(self.simulator_config.cameras, "add_scene_walls", False):
++            try:
++                import isaaclab.sim as _wall_sim
++            except ImportError:
++                import omni.isaac.lab.sim as _wall_sim
++            wd = float(getattr(self.simulator_config.cameras, "wall_distance", 2.5))
++            wh = float(getattr(self.simulator_config.cameras, "wall_height", 2.5))
++            wt = 0.1  # thickness
++            # Walls are a camera backdrop, not obstacles: collidable walls sit
++            # inside the robot's walking path and cost ~40 pts of success rate
++            # (measured 2026-08-13: 16.7% collidable vs 56.0% none).
++            wall_collisions = bool(
++                getattr(self.simulator_config.cameras, "wall_collisions", False)
++            )
++            wcfg = _wall_sim.CuboidCfg(
++                size=(6.0, wt, wh),
++                visual_material=_wall_sim.PreviewSurfaceCfg(diffuse_color=(0.75, 0.75, 0.78)),
++                collision_props=_wall_sim.CollisionPropertiesCfg(
++                    collision_enabled=wall_collisions
++                ),
++                rigid_props=(
++                    _wall_sim.RigidBodyPropertiesCfg(kinematic_enabled=True)
++                    if wall_collisions else None
++                ),
++            )
++            # back wall (behind the table, +Y), left (-X) and right (+X) side walls
++            placements = {
++                "wall_back":  ((0.0, wd, wh / 2), (0.70711, 0.0, 0.0, 0.70711)),
++                "wall_left":  ((-wd, 0.0, wh / 2), (1.0, 0.0, 0.0, 0.0)),
++                "wall_right": ((wd, 0.0, wh / 2), (1.0, 0.0, 0.0, 0.0)),
++            }
++            for wname, (wpos, wrot) in placements.items():
++                cfg = wcfg.replace() if hasattr(wcfg, "replace") else wcfg
++                _wall_sim.spawn_from_usd if False else None
++                cfg.func(
++                    f"/World/envs/env_.*/{wname}", cfg,
++                    translation=wpos, orientation=wrot,
++                )
++            logger.info(f"spawned scene walls at {wd}m (collisions={wall_collisions})")
+ 
+         if self.scene_creation_callback is not None:
+             self.scene_creation_callback(self)
+@@ -1795,6 +1908,95 @@ class IsaacSim(BaseSimulator):
+                 dtype=torch.float,
+             )
+ 
++    def _cond_cam_depth(self, vname):
++        data = self.scene.sensors[f"cond_cam_{vname}"].data
++        depth = data.output["depth"]
++        if depth.dtype != torch.float:
++            depth = depth.float()
++        return torch.where(depth == float("inf"), torch.zeros_like(depth), depth)
++
++    def _cond_cam_robot_rgb(self, vname):
++        data = self.scene.sensors[f"cond_cam_{vname}"].data
++        rgb = data.output.get("rgb")
++        seg = data.output.get("semantic_segmentation")
++        if rgb is None or seg is None:
++            return None
++        cache = getattr(self, "_robot_semantic_ids", None)
++        if cache is None:
++            cache = {}
++            self._robot_semantic_ids = cache
++        if vname not in cache:
++            ids = []
++            try:
++                info = data.info["semantic_segmentation"]["idToLabels"]
++                for sid, label in info.items():
++                    text = str(label.get("class", label) if isinstance(label, dict) else label)
++                    if "robot" in text.lower():
++                        ids.append(int(sid))
++            except Exception as exc:
++                logger.warning(f"semantic idToLabels unavailable for {vname}: {exc}")
++            cache[vname] = ids
++            logger.info(f"robot semantic ids for {vname}: {ids}")
++        ids = cache[vname]
++        if not ids:
++            return None
++        if seg.shape[-1] == 1:
++            seg = seg[..., 0]
++        mask = torch.zeros_like(seg, dtype=torch.bool)
++        for sid in ids:
++            mask |= seg == sid
++        rgb = rgb[..., :3]
++        if rgb.dtype != torch.uint8:
++            rgb = rgb.to(torch.uint8)
++        return rgb * mask.unsqueeze(-1)
++
++    def refresh_conditioning_render(self):
++        """Force the RTX pipeline to render from the CURRENT camera poses.
++        TiledCamera output otherwise lags the current pose by a render cycle,
++        which is invisible for the near-stationary head camera but severe for
++        the fast-moving wrist cameras (the rendered scene lags reality, so a
++        placed object still appears held). Two renders flush the pose: the
++        first commits the current transforms, the second renders from them."""
++        cams = getattr(self, "conditioning_cameras", None)
++        if not cams:
++            return
++        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
++        if not is_rendering:
++            return
++        self.sim.render()
++        self.sim.render()
++        self.scene.update(dt=1.0 / self.simulator_config.sim.fps)
++
++    def get_conditioning_views(self):
++        """dict view_name -> {"depth": [B,H,W,1], "robot_rgb": [B,H,W,3]|None}"""
++        cams = getattr(self, "conditioning_cameras", None)
++        if not cams:
++            return None
++        self.refresh_conditioning_render()
++        out = {}
++        for vname in cams:
++            rgb = self.scene.sensors[f"cond_cam_{vname}"].data.output.get("rgb")
++            if rgb is not None:
++                rgb = rgb[..., :3]
++                if rgb.dtype != torch.uint8:
++                    rgb = rgb.to(torch.uint8)
++            out[vname] = {
++                "depth": self._cond_cam_depth(vname),
++                "robot_rgb": self._cond_cam_robot_rgb(vname),
++                "rgb": rgb,
++            }
++        return out
++
++    def get_depth_hi_image(self):
++        if getattr(self, "depth_hi_camera", None) is None:
++            return None
++        return self._cond_cam_depth(self._depth_hi_alias)
++
++    def get_robot_rgb_image(self):
++        if getattr(self, "depth_hi_camera", None) is None:
++            return None
++        return self._cond_cam_robot_rgb(self._depth_hi_alias)
++
+     def get_depth_image(self):
+         if self.ego_camera is not None:
+             # Get depth image from the ego camera
+diff --git a/gr00t/rl/trl/trainer/distill_trainer_videogen.py b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
+new file mode 100644
+index 0000000..7a3c443
+--- /dev/null
++++ b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
+@@ -0,0 +1,763 @@
++# Copyright (c) 2026. Video-generation-based DAgger/BC distillation trainer.
++"""Student distillation with generated (video-model) RGB instead of ray-traced RGB.
++
++Modes (algo.config.videogen.mode):
++
++  online  — teacher-driven 81-step rollouts; after each rollout the captured
++            depth chunks are rendered to RGB by the Raven server and overwrite
++            storage.vision_obs before the DAgger BC update. One update per
++            81-step chunk (the video model's clip length) instead of per step.
++
++  collect — teacher-driven rollouts only; per env-chunk saves an .npz with the
++            disparity control video, actor_obs, gt_actions and dones to
++            videogen.collect_dir. No generation, no meaningful learning —
++            run with many envs for fast data collection, then render offline
++            with fast_roborender/offline_render_dataset.py.
++
++  offline — no env stepping: each "rollout" loads num_envs pre-rendered chunks
++            (rgb_gen key added by the offline renderer) from
++            videogen.dataset_dir into storage and runs the BC update.
++            Set value_loss_coef: 0 and entropy_coef: 0 — advantages/returns
++            are zeros, so with num_learning_epochs 1 only the BC loss trains.
++
++Depth is captured from the high-res depth camera when configured
++(simulator.config.cameras.depth_hi_resolution: [240, 416]) so the control
++video needs no upscaling; falls back to the ego camera's depth otherwise.
++"""
++from __future__ import annotations
++
++import glob
++import logging as _logging
++import os
++import time
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++from gr00t.rl.trl.trainer.distill_trainer_obj_pred_homie_api import (
++    TRLDistillTrainerObjPredHomieAPI,
++)
++
++logger = _logging.getLogger(__name__)
++
++VIDEO_MODEL_CHUNK = 81
++
++
++class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
++    _tag_names = ["trl", "humanoid_distill_videogen"]
++
++    def _init_trl(self, *args, **kwargs):
++        super()._init_trl(*args, **kwargs)
++
++        vg = self.config.get("videogen", {})
++        self.vg_mode = vg.get("mode", "online")
++        assert self.vg_mode in ("online", "collect", "offline", "image_dagger")
++        self.vg_enabled = bool(vg.get("enable", True))
++        self.vg_prompt = vg.get("prompt", "A humanoid robot manipulating objects on a table.")
++        self.vg_seed = int(vg.get("seed", 42))
++        self.vg_depth_near = float(vg.get("depth_near", 0.25))
++        self.vg_depth_far = float(vg.get("depth_far", 6.0))
++        self.vg_invert_depth = bool(vg.get("invert_depth", True))
++        # "disparity": brightness ~ 1/z (near=white, bg falls to black) — matches
++        # the sim2realgen training depth videos. "linear": legacy linear ramp.
++        self.vg_depth_mode = vg.get("depth_mode", "disparity")
++        assert self.vg_depth_mode in ("disparity", "linear", "h5_v4")
++        self.vg_depth_near_per_view = dict(vg.get("depth_near_per_view", {}))
++        self.vg_depth_far_per_view = dict(vg.get("depth_far_per_view", {}))
++        # h5_v4 (the exact recipe that produced the video model's training
++        # depth, scripts/depth_methods.py in Sim2RealGen_Video_Model):
++        # raw clip -> per-video minmax [0,1] -> 1/(d+1e-3) -> inv clip ->
++        # log -> stretch to uint8. Params per view name.
++        self.vg_invalid_fill = vg.get("invalid_fill", "far")  # far|black
++        self.vg_h5v4_per_view = dict(vg.get("depth_h5v4_per_view", {}))
++        self.vg_h5v4_default = dict(vg.get("depth_h5v4_default",
++                                           {"raw_clip": [0.0, 10.0],
++                                            "inv_clip": [1.0, 20.0]}))
++        # Supersampling: cameras render at depth_hi_resolution (e.g. 2x the
++        # model input), control/mask sequences are area-downsized to this
++        # resolution at save time for antialiased edges. [H, W] or [] = off.
++        self.vg_control_res = [int(v) for v in vg.get("control_resolution", [])]
++        self.vg_rollout_action_source = vg.get("rollout_action_source", "teacher")
++        self.vg_view_names = list(vg.get("view_names", ["ext1", "wrist"]))
++        self.vg_primary_view = vg.get("primary_view", self.vg_view_names[0])
++        assert self.vg_rollout_action_source in ("teacher", "student")
++
++        self.vg_save_sim_rgb = bool(vg.get("save_sim_rgb", False))
++        # Save raw metric depth (float16, downsized to control_resolution) so
++        # normalization params can be re-tuned WITHOUT recollecting. Heavy
++        # (~45MB/chunk for 3 views) — preview batches only.
++        self.vg_save_raw_depth = bool(vg.get("save_raw_depth", False))
++        # Save raw depth at NATIVE camera resolution, 14-bit log-quantized
++        # uint16 (obs_utils.quantize_depth scheme: log(d+3.5) over [0,10]m).
++        # Enables ANY future reprocessing (resolution + normalization) without
++        # re-rolling policies. Heavier than the downsized f16 raw.
++        self.vg_save_raw_depth_native = bool(vg.get("save_raw_depth_native", False))
++        self.vg_collect_dir = vg.get("collect_dir", None)
++        self.vg_dataset_dir = vg.get("dataset_dir", None)
++        self.vg_dump_first_n_chunks = int(vg.get("dump_first_n_chunks", 0))
++        self.vg_dump_dir = vg.get("dump_dir", None)
++
++        self._vg_client = None
++        if self.vg_enabled and self.vg_mode == "online":
++            from gr00t.rl.utils.videogen_client import VideoGenRenderClient
++
++            self._vg_client = VideoGenRenderClient(
++                host=vg.get("host", "127.0.0.1"), port=int(vg.get("port", 18913))
++            )
++            cfg_steps = int(self.config.get("num_steps_per_env", 0))
++            if cfg_steps != VIDEO_MODEL_CHUNK:
++                logger.warning(
++                    "videogen: num_steps_per_env=%d but the video model chunk is %d.",
++                    cfg_steps, VIDEO_MODEL_CHUNK,
++                )
++
++        if self.vg_enabled and self.vg_mode == "image_dagger":
++            from gr00t.rl.utils.image3f_frame_client import Image3FFrameClient
++
++            self._id_endpoint_files = vg.get(
++                "image3f_endpoint_files",
++                ["/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt"])
++            self._id_env_clients = None  # one client per env, built lazily
++            self.vg_anchor_pool_dir = vg.get(
++                "anchor_pool_dir", "/svl/u/ravenh/fast_roborender/teacher_fullres")
++            self.vg_anchor_index = int(vg.get("anchor_index", 0))
++            # fraction of episodes (per env) trained on RAW ray-traced obs
++            # instead of generated obs — anti-forgetting mix
++            self.vg_raytraced_mix_prob = float(vg.get("raytraced_mix_prob", 0.0))
++            self._id_use_raytraced = None
++            self._id_anchor_files = sorted(
++                glob.glob(os.path.join(self.vg_anchor_pool_dir, "*.npz")))
++            assert self._id_anchor_files, f"no anchors in {self.vg_anchor_pool_dir}"
++            self._id_anchors = None      # per-env dict view->HxWx3
++            self._id_prompts = None      # per-env str
++            self._id_rng = np.random.RandomState(self.vg_seed)
++            self._id_gen_ms = []
++
++        if self.vg_mode == "collect":
++            assert self.vg_collect_dir, "videogen.collect_dir required in collect mode"
++            os.makedirs(self.vg_collect_dir, exist_ok=True)
++        if self.vg_mode == "offline":
++            assert self.vg_dataset_dir, "videogen.dataset_dir required in offline mode"
++            all_files = sorted(glob.glob(os.path.join(self.vg_dataset_dir, "chunk_*.npz")))
++            # Keep only chunks the offline renderer has finished (cheap check —
++            # np.load only reads the zip directory here).
++            self._offline_files = []
++            for f in all_files:
++                try:
++                    with np.load(f) as z:
++                        if "rgb_gen" in z.files and any(k.startswith("obs_") for k in z.files):
++                            self._offline_files.append(f)
++                except Exception:
++                    continue
++            assert self._offline_files, f"no rendered chunks (rgb_gen) in {self.vg_dataset_dir}"
++            self._offline_cursor = 0
++            logger.info("videogen offline: %d rendered / %d total chunks in %s",
++                        len(self._offline_files), len(all_files), self.vg_dataset_dir)
++
++        self._depth_chunk: list[torch.Tensor] = []
++        self._robot_rgb_chunk: list[torch.Tensor] = []
++        self._views_chunk: list[dict] = []
++        self._latest_gen_vision: torch.Tensor | None = None
++        self._in_train_rollout = False
++        self._vg_total_gen_time = 0.0
++        self._vg_total_chunks = 0
++        self._vg_saved_chunks = 0
++        self._vg_rollout_counter = 0
++        # Episode-aligned chunking: per-env frame buffers that reset on
++        # episode boundaries; a chunk is emitted only from 81 consecutive
++        # within-episode steps (training clips never contain resets).
++        self._ep_buf: list[dict] | None = None
++        self._ep_seq_base: list[int] | None = None
++        # Unique prefix so requeued/preempted collect jobs never overwrite
++        # earlier chunks, and so the renderer can group same-env sequences.
++        self._vg_run_tag = os.environ.get("SLURM_JOB_ID", "local")
++
++    # ------------------------------------------------------------------ rollout
++    def _get_depth_frame(self) -> torch.Tensor:
++        hi = None
++        if hasattr(self.env.simulator, "get_depth_hi_image"):
++            hi = self.env.simulator.get_depth_hi_image()
++        depth = hi if hi is not None else self.env.simulator.get_depth_image()
++        return depth[..., :1].detach().to("cpu", torch.float32)
++
++    def policy_step(self, policy_model, obs_dict, cur_dones=None):
++        if (not self._in_train_rollout and self.vg_enabled
++                and self.vg_mode == "image_dagger"
++                and os.environ.get("IMAGE_DAGGER_EVAL_RELABEL") == "1"):
++            # diagnostic: evaluate with generated observations in the loop
++            obs_dict = self._image_dagger_relabel(obs_dict, cur_dones)
++
++        if self._in_train_rollout and self.vg_enabled:
++            if (
++                self.vg_mode == "online"
++                and self.vg_rollout_action_source == "student"
++                and self._latest_gen_vision is not None
++                and "vision_obs" in obs_dict
++            ):
++                cur = obs_dict["vision_obs"]
++                stale = self._latest_gen_vision.to(device=cur.device, dtype=cur.dtype)
++                obs_dict = dict(obs_dict)
++                obs_dict["vision_obs"] = stale.reshape(cur.shape)
++
++            if self.vg_mode == "image_dagger":
++                obs_dict = self._image_dagger_relabel(obs_dict, cur_dones)
++
++            self._depth_chunk.append(self._get_depth_frame())
++            rr = None
++            if hasattr(self.env.simulator, "get_robot_rgb_image"):
++                rr = self.env.simulator.get_robot_rgb_image()
++            if rr is not None:
++                self._robot_rgb_chunk.append(rr.detach().to("cpu"))
++            # Multi-view conditioning (e.g. head + both wrists for the
++            # native3view student): capture every configured view.
++            if self.vg_mode == "collect" and hasattr(self.env.simulator, "get_conditioning_views"):
++                views = self.env.simulator.get_conditioning_views()
++                if views:
++                    step_views = {}
++                    for vname, v in views.items():
++                        step_views[vname] = {
++                            "depth": v["depth"][..., :1].detach().to("cpu", torch.float32),
++                            "robot_rgb": None if v["robot_rgb"] is None
++                            else v["robot_rgb"].detach().to("cpu"),
++                            # raw sim RGB only when explicitly enabled
++                            # (debugging aid; too heavy for routine chunks)
++                            "rgb": v["rgb"].detach().to("cpu")
++                            if self.vg_save_sim_rgb and v.get("rgb") is not None else None,
++                        }
++                    self._views_chunk.append(step_views)
++
++        policy_state_dict = super().policy_step(policy_model, obs_dict, cur_dones=cur_dones)
++
++        if (
++            self._in_train_rollout
++            and self.vg_enabled
++            and self.vg_rollout_action_source == "teacher"
++            and "gt_actions" in policy_state_dict
++        ):
++            policy_state_dict = dict(policy_state_dict)
++            policy_state_dict["actions"] = policy_state_dict["gt_actions"].clone()
++
++        return policy_state_dict
++
++    def _id_sample_anchor(self, env_i: int):
++        f = self._id_anchor_files[self._id_rng.randint(len(self._id_anchor_files))]
++        with np.load(f, allow_pickle=True) as z:
++            frames = list(z["frames"]) if "frames" in z.files else None
++            gi = frames.index(self.vg_anchor_index) if frames else self.vg_anchor_index
++            anchor = {v: z[f"gen__{v}"][gi].copy() for v in self.vg_view_names}
++            prompt = str(z["prompt"]) if "prompt" in z.files else self.vg_prompt
++        self._id_anchors[env_i] = anchor
++        self._id_prompts[env_i] = prompt
++        if self._id_use_raytraced is None:
++            self._id_use_raytraced = {}
++        self._id_use_raytraced[env_i] = (
++            self._id_rng.random_sample() < self.vg_raytraced_mix_prob)
++
++    def _image_dagger_relabel(self, obs_dict, cur_dones):
++        """Per-frame 3-view generated obs via the warm Image3F server.
++
++        Swaps vision_obs for every env BEFORE the policy acts, so both action
++        selection and storage see generated RGB (true per-step DAgger).
++        Anchor (fixed video-model reference triplet, frame vg_anchor_index)
++        is sampled per episode from the teacher pool, resampled on done.
++        """
++        if not hasattr(self.env.simulator, "get_conditioning_views"):
++            return obs_dict
++        views = self.env.simulator.get_conditioning_views()
++        if not views:
++            return obs_dict
++        any_v = next(iter(views.values()))
++        B = int(any_v["depth"].shape[0])
++        if self._id_anchors is None:
++            self._id_anchors = [None] * B
++            self._id_prompts = [None] * B
++            for b in range(B):
++                self._id_sample_anchor(b)
++        if cur_dones is not None:
++            done_idx = torch.nonzero(cur_dones.reshape(-1)).reshape(-1).tolist()
++            for b in done_idx:
++                if b < B:
++                    self._id_sample_anchor(b)
++
++        cam_h, cam_w = int(self.camera_resolution[0]), int(self.camera_resolution[1])
++        t0 = time.perf_counter()
++        vision = obs_dict["vision_obs"]
++        new_vision = vision.clone().reshape(B, cam_h, cam_w, 3)
++        if self._id_env_clients is None or len(self._id_env_clients) != B:
++            from gr00t.rl.utils.image3f_frame_client import Image3FFrameClient
++            nf = len(self._id_endpoint_files)
++            self._id_env_clients = [
++                Image3FFrameClient.from_endpoint_file(self._id_endpoint_files[b % nf])
++                for b in range(B)
++            ]
++        gen_envs = [b for b in range(B)
++                    if not (self._id_use_raytraced or {}).get(b, False)]
++        reqs = {}
++        for b in gen_envs:
++            depth_d, mask_d, prev_d = {}, {}, {}
++            for vname in self.vg_view_names:
++                d = views[vname]["depth"][b, ..., :1].detach().to("cpu", torch.float32)
++                ctrl = self._h5v4_control(d.numpy()[None, None, ..., 0], vname)  # [1,1,H,W]
++                if self.vg_control_res:
++                    ctrl = self._resize_seq(ctrl, self.vg_control_res)
++                depth_d[vname] = ctrl[0, 0].astype(np.uint8)
++                rr = views[vname]["robot_rgb"]
++                m = rr[b].detach().to("cpu").numpy() if rr is not None else \
++                    np.zeros((*depth_d[vname].shape, 3), np.uint8)
++                if self.vg_control_res and m.shape[:2] != tuple(self.vg_control_res):
++                    m = self._resize_seq(m[None, None], self.vg_control_res)[0, 0]
++                mask_d[vname] = m.astype(np.uint8)
++                prev_d[vname] = self._id_anchors[b][vname]
++            reqs[b] = (depth_d, mask_d, prev_d)
++
++        from concurrent.futures import ThreadPoolExecutor
++
++        def _render(b):
++            depth_d, mask_d, prev_d = reqs[b]
++            return self._id_env_clients[b].render_frame(
++                depth_d, mask_d, prev_d, prompt=self._id_prompts[b], seed=self.vg_seed)
++
++        gens = {}
++        if gen_envs:
++            with ThreadPoolExecutor(max_workers=len(gen_envs)) as pool:
++                for b, g in zip(gen_envs, pool.map(_render, gen_envs)):
++                    gens[b] = g
++
++        dump_dir = os.environ.get("IMAGE_DAGGER_DUMP_DIR")
++        for b in gen_envs:
++            gen = gens[b]
++            rgb = gen[self.vg_primary_view]  # 240x416x3 u8
++            if dump_dir and len(self._id_gen_ms) < 15:
++                from PIL import Image as _PILImage
++                os.makedirs(dump_dir, exist_ok=True)
++                step_i = len(self._id_gen_ms)
++                panel = np.concatenate(
++                    [np.stack([reqs[b][0][v]] * 3, -1) for v in self.vg_view_names]
++                    + [gen[v] for v in self.vg_view_names], axis=1)
++                _PILImage.fromarray(panel).save(
++                    os.path.join(dump_dir, f"step{step_i:03d}_env{b}.png"))
++            rgb_t = torch.from_numpy(rgb.copy()).float() / 255.0
++            rgb_t = rgb_t.permute(2, 0, 1)[None]
++            rgb_t = F.interpolate(rgb_t, size=(cam_h, cam_w),
++                                  mode="bilinear", align_corners=False)
++            rgb_t = rgb_t[0].permute(1, 2, 0)
++            new_vision[b] = self._normalize_like_env(rgb_t[None])[0].to(
++                device=new_vision.device, dtype=new_vision.dtype)
++        self._id_gen_ms.append((time.perf_counter() - t0) * 1000)
++        if len(self._id_gen_ms) % 50 == 1:
++            logger.info("image_dagger: %d envs relabeled in %.0fms (avg over %d steps: %.0fms)",
++                        B, self._id_gen_ms[-1], len(self._id_gen_ms),
++                        float(np.mean(self._id_gen_ms)))
++        out = dict(obs_dict)
++        out["vision_obs"] = new_vision.reshape(vision.shape)
++        return out
++
++    def _rollout_step(self, model, obs_dict):
++        if self.vg_mode == "offline":
++            return self._offline_fill_storage(model, obs_dict)
++
++        self._depth_chunk = []
++        self._robot_rgb_chunk = []
++        self._views_chunk = []
++        self._in_train_rollout = True
++        try:
++            out_obs = super()._rollout_step(model, obs_dict)
++        finally:
++            self._in_train_rollout = False
++
++        if self.vg_enabled and self._depth_chunk:
++            if self.vg_mode == "online":
++                self._videogen_relabel()
++            elif self.vg_mode == "collect":
++                self._save_collected_chunks()
++        return out_obs
++
++    # --------------------------------------------------------------- conversion
++    def _depth_to_control_video(self, depth: torch.Tensor,
++                                view: str | None = None) -> np.ndarray:
++        """[T, B, H, W, 1] metric depth -> uint8 [T, B, H, W] control video.
++
++        Per-view near/far via videogen.depth_near_per_view /
++        depth_far_per_view (wrist cams need a much smaller near than the head
++        cam, matching the training data where only the closest few cm of
++        gripper saturate white)."""
++        d = depth.squeeze(-1).numpy()
++        if self.vg_depth_mode == "h5_v4":
++            return self._h5v4_control(d, view)
++        near, far = self.vg_depth_near, self.vg_depth_far
++        if view is not None:
++            near = float(self.vg_depth_near_per_view.get(view, near))
++            far = float(self.vg_depth_far_per_view.get(view, far))
++        # Treat invalid/zero depth (inf was zeroed by the simulator) as far.
++        d = np.where(d <= 1e-6, far, d)
++        d = np.clip(d, near, far)
++        if self.vg_depth_mode == "disparity":
++            d01 = (1.0 / d - 1.0 / far) / (1.0 / near - 1.0 / far)
++        else:
++            d01 = (d - near) / (far - near)
++            if self.vg_invert_depth:
++                d01 = 1.0 - d01
++        return (d01 * 255.0).round().astype(np.uint8)
++
++    def _h5v4_control(self, d: np.ndarray, view: str | None) -> np.ndarray:
++        """Exact h5_v4 recipe from Sim2RealGen depth_methods.py, applied per
++        env-chunk (the per-video unit here). d: [T, B, H, W] metric depth."""
++        params = self.vg_h5v4_per_view.get(view, self.vg_h5v4_default)
++        rlo, rhi = (float(v) for v in params.get("raw_clip", self.vg_h5v4_default["raw_clip"]))
++        ilo, ihi = (float(v) for v in params.get("inv_clip", self.vg_h5v4_default["inv_clip"]))
++        raw_pct = params.get("raw_pct", self.vg_h5v4_default.get("raw_pct"))
++        norm_range = params.get("norm_range")  # fixed [lo,hi] instead of per-video minmax
++
++        out = np.zeros(d.shape, dtype=np.uint8)
++        for b in range(d.shape[1]):
++            db = d[:, b]
++            finite = np.isfinite(db) & (db > 0)
++            if not finite.any():
++                continue
++            blo, bhi = rlo, rhi
++            if raw_pct is not None:
++                # depth_methods.py h5_v4 raw_pct: clip bounds from per-video
++                # percentiles (raw_clip acts as a hard pre-filter), so a few
++                # ultra-near own-robot pixels cannot anchor the range floor.
++                valid_raw = db[finite]
++                mask = (valid_raw >= rlo) & (valid_raw <= rhi)
++                if mask.any():
++                    valid_raw = valid_raw[mask]
++                blo = float(np.percentile(valid_raw, float(raw_pct[0])))
++                bhi = float(np.percentile(valid_raw, float(raw_pct[1])))
++                if bhi <= blo:
++                    bhi = blo + 1e-3
++            dc = np.where(finite, np.clip(db, blo, bhi), bhi)
++            valid = dc[finite]
++            if norm_range is not None:
++                # fixed normalization bounds: a close object no longer anchors
++                # the range to white (keeps object shape) — used for head/ego.
++                lo, hi = float(norm_range[0]), float(norm_range[1])
++            else:
++                lo, hi = float(valid.min()), float(valid.max())
++            if hi <= lo:
++                ob = np.full(db.shape, 128, dtype=np.uint8)
++                ob[~finite] = 0
++                out[:, b] = ob
++                continue
++            dn = np.clip((dc - lo) / (hi - lo), 0.0, 1.0)
++            inv = np.clip(1.0 / (dn + 1e-3), ilo, ihi)
++            x = np.log(inv)
++            p_lo, p_hi = np.log(ilo), np.log(ihi)
++            norm = np.clip((x - p_lo) / (p_hi - p_lo), 0.0, 1.0)
++            ob = (norm * 255.0).astype(np.uint8)
++            if self.vg_invalid_fill == "black":
++                ob[~finite] = 0
++            # "far" (default): invalid pixels keep their far-clip value (dark
++            # gray) instead of pure black — matches the approved far-gray fill.
++            out[:, b] = ob
++        return out
++
++    def _resize_seq(self, arr: np.ndarray, hw: list[int]) -> np.ndarray:
++        """Area-downsize [T,B,H,W] or [T,B,H,W,3] uint8 to (h,w)."""
++        import cv2
++        h, w = int(hw[0]), int(hw[1])
++        if arr.shape[2] == h and arr.shape[3] == w:
++            return arr
++        t, b = arr.shape[0], arr.shape[1]
++        out_shape = (t, b, h, w) + arr.shape[4:]
++        out = np.empty(out_shape, dtype=arr.dtype)
++        for ti in range(t):
++            for bi in range(b):
++                out[ti, bi] = cv2.resize(arr[ti, bi], (w, h),
++                                         interpolation=cv2.INTER_AREA)
++        return out
++
++    def _normalize_like_env(self, rgb01: torch.Tensor) -> torch.Tensor:
++        cam_cfg = self.env.config.simulator.config.cameras
++        if hasattr(cam_cfg, "image_mean") and hasattr(cam_cfg, "image_std"):
++            mean = torch.tensor(list(cam_cfg.image_mean), dtype=rgb01.dtype)
++            std = torch.tensor(list(cam_cfg.image_std), dtype=rgb01.dtype)
++            rgb01 = (rgb01 - mean) / std
++        return rgb01
++
++    # ------------------------------------------------------------------ collect
++    def _save_collected_chunks(self):
++        depth = torch.stack(self._depth_chunk, dim=0)  # [T, B, H, W, 1]
++        self._depth_chunk = []
++        control = self._depth_to_control_video(depth)  # [T, B, H, W]
++        num_envs = control.shape[1]
++
++        # Robot-only RGB (textured robot on black) — the video model's
++        # control_video_2 / rgb_robot conditioning.
++        robot_rgb = None
++        if self._robot_rgb_chunk and len(self._robot_rgb_chunk) == control.shape[0]:
++            robot_rgb = torch.stack(self._robot_rgb_chunk, dim=0).numpy()  # [T,B,H,W,3] u8
++        self._robot_rgb_chunk = []
++
++        # Multi-view conditioning: per-view depth control + robot RGB
++        # (keys depth_ctrl__{view} / rgb_robot__{view}).
++        view_arrays = {}
++        if self._views_chunk and len(self._views_chunk) == control.shape[0]:
++            for vname in self._views_chunk[0]:
++                vdepth = torch.stack([sv[vname]["depth"] for sv in self._views_chunk], dim=0)
++                if self.vg_save_raw_depth_native:
++                    dn_ = vdepth.squeeze(-1).numpy().astype(np.float32)
++                    shift, dmin, dmax = 3.5, 0.0, 10.0
++                    ln, lx = np.log(dmin + shift), np.log(dmax + shift)
++                    q = np.clip(((np.log(np.clip(dn_, 0, dmax) + shift) - ln)
++                                 / (lx - ln) * 16383).round(), 0, 16383).astype(np.uint16)
++                    view_arrays[f"depth_rawq__{vname}"] = q
++                if self.vg_save_raw_depth:
++                    raw = vdepth.squeeze(-1).numpy().astype(np.float16)
++                    if self.vg_control_res:
++                        import cv2
++                        h, w = self.vg_control_res
++                        raw = np.stack([np.stack([
++                            cv2.resize(raw[t, b], (w, h), interpolation=cv2.INTER_NEAREST)
++                            for b in range(raw.shape[1])]) for t in range(raw.shape[0])])
++                    view_arrays[f"depth_raw__{vname}"] = raw
++                ctrl = self._depth_to_control_video(vdepth, view=vname)
++                if self.vg_control_res:
++                    ctrl = self._resize_seq(ctrl, self.vg_control_res)
++                view_arrays[f"depth_ctrl__{vname}"] = ctrl
++                if all(sv[vname]["robot_rgb"] is not None for sv in self._views_chunk):
++                    rr = torch.stack(
++                        [sv[vname]["robot_rgb"] for sv in self._views_chunk], dim=0).numpy()
++                    if self.vg_control_res:
++                        rr = self._resize_seq(rr, self.vg_control_res)
++                    view_arrays[f"rgb_robot__{vname}"] = rr
++                if all(sv[vname].get("rgb") is not None for sv in self._views_chunk):
++                    rs = torch.stack(
++                        [sv[vname]["rgb"] for sv in self._views_chunk], dim=0).numpy()
++                    if self.vg_control_res:
++                        rs = self._resize_seq(rs, self.vg_control_res)
++                    view_arrays[f"rgb_sim__{vname}"] = rs
++        self._views_chunk = []
++
++        # Save every registered obs key except vision (vision is what the
++        # offline renderer synthesizes) so offline policy forwards see the
++        # same obs dict as online ones (actor_obs, homie_obs, ...).
++        obs_arrays = {}
++        for key in self.algo_obs_dim_dict:
++            if key == "vision_obs":
++                continue
++            obs_arrays[f"obs_{key}"] = getattr(self.storage, key).cpu().numpy()
++        gt_actions = self.storage.gt_actions.cpu().numpy()    # [T, B, A]
++        dones = self.storage.dones.cpu().numpy()               # [T, B, 1]
++
++        num_steps = control.shape[0]
++        if self._ep_buf is None:
++            self._ep_buf = [{} for _ in range(num_envs)]
++            self._ep_seq_base = [0] * num_envs
++
++        def _flush(b):
++            self._ep_buf[b] = {}
++
++        def _append(b, t):
++            buf = self._ep_buf[b]
++            if not buf:
++                buf["frames"] = {k: [] for k in view_arrays} if view_arrays else {"depth_ctrl": []}
++                buf["gt"] = []
++                buf["obs"] = {k: [] for k in obs_arrays}
++                if not view_arrays and robot_rgb is not None:
++                    buf["frames"]["rgb_robot"] = []
++            if view_arrays:
++                for k, v in view_arrays.items():
++                    buf["frames"][k].append(v[t, b])
++            else:
++                buf["frames"]["depth_ctrl"].append(control[t, b])
++                if robot_rgb is not None:
++                    buf["frames"]["rgb_robot"].append(robot_rgb[t, b])
++            buf["gt"].append(gt_actions[t, b])
++            for k, v in obs_arrays.items():
++                buf["obs"][k].append(v[t, b])
++
++        def _emit(b):
++            buf = self._ep_buf[b]
++            idx = self._vg_saved_chunks
++            path = os.path.join(
++                self.vg_collect_dir, f"chunk_{self._vg_run_tag}_{idx:07d}.npz")
++            np.savez_compressed(
++                path,
++                gt_actions=np.stack(buf["gt"]).astype(np.float32),
++                dones=np.zeros(VIDEO_MODEL_CHUNK, dtype=bool),
++                prompt=np.array(self.vg_prompt),
++                env_id=np.array(b),
++                seq=np.array(self._ep_seq_base[b]),
++                **{k: np.stack(v) for k, v in buf["frames"].items()},
++                **{k: np.stack(v).astype(np.float32) for k, v in buf["obs"].items()},
++            )
++            self._vg_saved_chunks += 1
++            self._ep_seq_base[b] += 1
++            buf["frames"] = {k: [] for k in buf["frames"]}
++            buf["gt"] = []
++            buf["obs"] = {k: [] for k in buf["obs"]}
++
++        for b in range(num_envs):
++            for t in range(num_steps):
++                _append(b, t)
++                if len(self._ep_buf[b]["gt"]) == VIDEO_MODEL_CHUNK:
++                    _emit(b)
++                if bool(dones[t, b, 0]):
++                    # discard the partial tail of the ended episode and break
++                    # chaining: bump seq so the renderer never chains across
++                    # episode boundaries.
++                    _flush(b)
++                    self._ep_seq_base[b] += 2
++        if self._vg_saved_chunks % (10 * num_envs) < num_envs:
++            logger.info("videogen collect: %d chunks saved to %s",
++                        self._vg_saved_chunks, self.vg_collect_dir)
++
++    # ------------------------------------------------------------------ offline
++    def _next_offline_batch(self, batch: int) -> list[dict]:
++        out = []
++        for _ in range(batch):
++            path = self._offline_files[self._offline_cursor % len(self._offline_files)]
++            self._offline_cursor += 1
++            with np.load(path) as z:
++                if "rgb_gen" not in z:
++                    raise RuntimeError(
++                        f"{path} has no rgb_gen — run offline_render_dataset.py first")
++                out.append({k: z[k].copy() for k in z.files})
++        return out
++
++    def _offline_fill_storage(self, model, obs_dict):
++        """Fill storage from pre-rendered dataset chunks instead of env rollout."""
++        device = self.accelerator.device
++        policy_model = model.policy
++        policy_model.init_rollout()
++        self.storage.clear()
++
++        num_envs = self.env.num_envs
++        chunks = self._next_offline_batch(num_envs)
++        num_steps = self.num_steps_per_env
++
++        cam_h, cam_w = int(self.camera_resolution[0]), int(self.camera_resolution[1])
++
++        rgb = np.stack([c["rgb_gen"][:num_steps] for c in chunks], axis=1)  # [T,B,h,w,3]
++        rgb_t = torch.from_numpy(rgb).float() / 255.0
++        rgb_t = self._normalize_like_env(rgb_t)
++        # Restore every saved obs key (obs_actor_obs, obs_homie_obs,
++        # obs_teacher_obs, ...). teacher_obs IS fed to policy_step: the parent
++        # trainers (gt-label branch, enforce_teacher_rollout) expect gt_actions
++        # to exist, and the loaded ref_model recomputes them deterministically
++        # from the saved teacher_obs — identical to the dataset's gt_actions.
++        obs_seq = {}
++        for c_key in chunks[0]:
++            if c_key.startswith("obs_"):
++                obs_seq[c_key[4:]] = torch.from_numpy(
++                    np.stack([c[c_key][:num_steps] for c in chunks], axis=1)).float()
++        gt_actions = torch.from_numpy(
++            np.stack([c["gt_actions"][:num_steps] for c in chunks], axis=1)).float()
++        dones_np = np.stack([c["dones"][:num_steps] for c in chunks], axis=1)  # [T,B]
++
++        with torch.no_grad():
++            last_obs = None
++            for t in range(num_steps):
++                step_obs = {key: seq[t].to(device) for key, seq in obs_seq.items()}
++                step_obs["vision_obs"] = rgb_t[t].reshape(num_envs, cam_h, cam_w, 3).to(device)
++                last_obs = step_obs
++                policy_state_dict = super().policy_step(policy_model, step_obs)
++
++                for key, value in step_obs.items():
++                    self.storage.update_key(key, value)
++                for key, value in policy_state_dict.items():
++                    if key != "hidden_states":
++                        self.storage.update_key(key, value)
++
++                self.storage.update_key("gt_actions", gt_actions[t].to(device))
++                if self.learn_normalized_actions and "normalized_gt_actions" not in policy_state_dict:
++                    self.storage.update_key(
++                        "normalized_gt_actions", gt_actions[t].to(device))
++
++                zeros1 = torch.zeros(num_envs, 1, device=device)
++                d = torch.from_numpy(dones_np[t].astype(np.float32)).to(device)
++                self.storage.update_key("rewards", zeros1)
++                self.storage.update_key("dones", d.unsqueeze(1).bool())
++                self.storage.update_key("time_outs", torch.zeros(num_envs, 1, device=device).bool())
++                self.storage.update_key("values", zeros1)
++                self.storage.update_key("returns", zeros1)
++                self.storage.update_key("advantages", zeros1)
++                self.storage.increment_step()
++
++        # No env stepping happened, so the logging path needs a well-formed
++        # (empty) episode-info entry to iterate over.
++        self.ep_infos.append({})
++
++        policy_model.clear_rollout() if hasattr(policy_model, "clear_rollout") else None
++        return last_obs
++
++    # --------------------------------------------------------------- generation
++    def _dump_chunk(self, chunk_idx: int, env_i: int,
++                    control: np.ndarray, rgb: np.ndarray) -> None:
++        """Save depth-control + generated RGB side by side as an mp4."""
++        import cv2
++
++        dump_dir = self.vg_dump_dir or os.path.join(
++            getattr(self, "log_dir", None) or "videogen_debug", "videogen_frames")
++        os.makedirs(dump_dir, exist_ok=True)
++        path = os.path.join(dump_dir, f"chunk{chunk_idx:04d}_env{env_i}.mp4")
++
++        t = min(len(control), len(rgb))
++        gen_h, gen_w = rgb.shape[1], rgb.shape[2]
++        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"),
++                                 15, (gen_w * 2, gen_h))
++        for i in range(t):
++            ctrl = cv2.resize(control[i], (gen_w, gen_h), interpolation=cv2.INTER_NEAREST)
++            ctrl3 = np.repeat(ctrl[..., None], 3, axis=-1)
++            side = np.concatenate([ctrl3, rgb[i]], axis=1)
++            writer.write(cv2.cvtColor(side, cv2.COLOR_RGB2BGR))
++        writer.release()
++        logger.info("videogen: dumped %s", path)
++
++    def _videogen_relabel(self):
++        depth = torch.stack(self._depth_chunk, dim=0)  # [T, B, H, W, 1]
++        self._depth_chunk = []
++        num_steps, num_envs = depth.shape[0], depth.shape[1]
++
++        vs = self.storage.vision_obs  # registered shape [T, B, H, W, C]
++        cam_h, cam_w = int(self.camera_resolution[0]), int(self.camera_resolution[1])
++        expected = num_steps * num_envs * cam_h * cam_w * 3
++        if vs.numel() != expected:
++            raise RuntimeError(
++                "videogen requires a single-frame 3-channel vision_obs "
++                f"(storage {tuple(vs.shape)} vs expected T={num_steps} B={num_envs} "
++                f"H={cam_h} W={cam_w} C=3)."
++            )
++
++        control = self._depth_to_control_video(depth)  # [T, B, H, W]
++        robot_rgb = None
++        if self._robot_rgb_chunk and len(self._robot_rgb_chunk) == num_steps:
++            robot_rgb = torch.stack(self._robot_rgb_chunk, dim=0).numpy()  # [T,B,H,W,3]
++        self._robot_rgb_chunk = []
++
++        gen_all = torch.empty((num_steps, num_envs, cam_h, cam_w, 3), dtype=torch.float32)
++        t_start = time.perf_counter()
++        for env_i in range(num_envs):
++            frames = control[:, env_i]  # [T, H, W]
++            depth_views = {name: frames for name in self.vg_view_names}
++            mask_views = None
++            if robot_rgb is not None:
++                mask_views = {name: robot_rgb[:, env_i] for name in self.vg_view_names}
++            rgb = self._vg_client.render_chunk(
++                depth_views, mask_per_view=mask_views, prompt=self.vg_prompt,
++                seed=self.vg_seed,
++            )[self.vg_primary_view]  # uint8 [T, 240, 416, 3]
++
++            if self._vg_total_chunks < self.vg_dump_first_n_chunks:
++                self._dump_chunk(self._vg_total_chunks, env_i, frames, rgb)
++
++            rgb_t = torch.from_numpy(rgb[:num_steps].copy()).float() / 255.0
++            rgb_t = rgb_t.permute(0, 3, 1, 2)
++            rgb_t = F.interpolate(rgb_t, size=(cam_h, cam_w),
++                                  mode="bilinear", align_corners=False)
++            rgb_t = rgb_t.permute(0, 2, 3, 1)
++            gen_all[:, env_i] = self._normalize_like_env(rgb_t)
++
++        elapsed = time.perf_counter() - t_start
++        self._vg_total_gen_time += elapsed
++        self._vg_total_chunks += 1
++        logger.info(
++            "videogen: relabeled %d envs x %d steps in %.1fs (%.1fs/env, chunk #%d)",
++            num_envs, num_steps, elapsed, elapsed / max(num_envs, 1), self._vg_total_chunks,
++        )
++
++        vs.copy_(gen_all.reshape(vs.shape).to(device=vs.device, dtype=vs.dtype))
++        self._latest_gen_vision = gen_all[-1].clone()
+diff --git a/gr00t/rl/utils/image3f_frame_client.py b/gr00t/rl/utils/image3f_frame_client.py
+new file mode 100644
+index 0000000..91960ad
+--- /dev/null
++++ b/gr00t/rl/utils/image3f_frame_client.py
+@@ -0,0 +1,111 @@
++# Copyright (c) 2026. Client for the warm Image3F per-frame render server.
++"""Per-frame 3-view image render client (fixed-lag DAgger conditioning).
++
++Server: fast_roborender/image3f_server.py (TCP mode). Protocol identical to
++videogen_client: length-prefixed pickles, arrays as raw-bytes dicts.
++"""
++from __future__ import annotations
++
++import pickle
++import socket
++import struct
++import time
++from typing import Dict, Optional
++
++import numpy as np
++
++from gr00t.rl.utils.videogen_client import encode_array, decode_array
++
++
++class Image3FFrameClient:
++    def __init__(self, host: str, port: int, timeout_s: float = 120.0,
++                 connect_retries: int = 30, connect_retry_interval_s: float = 5.0):
++        self.host, self.port = host, port
++        self.timeout_s = timeout_s
++        self.connect_retries = connect_retries
++        self.connect_retry_interval_s = connect_retry_interval_s
++        self._sock: Optional[socket.socket] = None
++
++    @classmethod
++    def from_endpoint_file(cls, path: str, **kw):
++        with open(path) as f:
++            host, port = f.read().split()
++        c = cls(host, int(port), **kw)
++        c._endpoint_path = path
++        return c
++
++    def _connect(self):
++        last = None
++        for _ in range(self.connect_retries):
++            try:
++                ep = getattr(self, "_endpoint_path", None)
++                if ep:
++                    # server may have been restarted on a new host/port:
++                    # re-read the endpoint file before every attempt
++                    try:
++                        with open(ep) as f:
++                            h, p = f.read().split()
++                        self.host, self.port = h, int(p)
++                    except (OSError, ValueError):
++                        pass
++                s = socket.create_connection((self.host, self.port), timeout=self.timeout_s)
++                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++                return s
++            except OSError as exc:
++                last = exc
++                time.sleep(self.connect_retry_interval_s)
++        raise ConnectionError(f"image3f server unreachable {self.host}:{self.port}: {last}")
++
++    def _sockget(self):
++        if self._sock is None:
++            self._sock = self._connect()
++        return self._sock
++
++    def close(self):
++        if self._sock is not None:
++            try:
++                self._sock.close()
++            finally:
++                self._sock = None
++
++    @staticmethod
++    def _recv_exact(sock, n):
++        buf = b""
++        while len(buf) < n:
++            c = sock.recv(n - len(buf))
++            if not c:
++                raise ConnectionError("server closed connection")
++            buf += c
++        return buf
++
++    def _roundtrip(self, req: dict) -> dict:
++        payload = pickle.dumps(req, protocol=pickle.HIGHEST_PROTOCOL)
++        for attempt in range(2):
++            try:
++                sock = self._sockget()
++                sock.sendall(struct.pack("!Q", len(payload)) + payload)
++                n = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
++                return pickle.loads(self._recv_exact(sock, n))
++            except (ConnectionError, OSError):
++                self.close()
++                if attempt == 1:
++                    raise
++        raise ConnectionError("unreachable")
++
++    def ping(self) -> bool:
++        return bool(self._roundtrip({"cmd": "ping"}).get("ok"))
++
++    def render_frame(self, depth: Dict[str, np.ndarray], mask: Dict[str, np.ndarray],
++                     prev: Dict[str, np.ndarray], prompt: str, seed: int = 42
++                     ) -> Dict[str, np.ndarray]:
++        """depth: view->HxW u8 (or HxWx3); mask/prev: view->HxWx3 u8.
++        Returns view -> 240x416x3 u8 generated RGB."""
++        resp = self._roundtrip({
++            "cmd": "render_frame", "prompt": prompt, "seed": seed,
++            "depth": {v: encode_array(a) for v, a in depth.items()},
++            "mask": {v: encode_array(a) for v, a in mask.items()},
++            "prev": {v: encode_array(a) for v, a in prev.items()},
++        })
++        if not resp.get("ok"):
++            raise RuntimeError(f"image3f render failed: {resp.get('error')}")
++        return {v: decode_array(a) for v, a in resp["views"].items()}
+diff --git a/gr00t/rl/utils/videogen_client.py b/gr00t/rl/utils/videogen_client.py
+new file mode 100644
+index 0000000..bba7360
+--- /dev/null
++++ b/gr00t/rl/utils/videogen_client.py
+@@ -0,0 +1,109 @@
++# Copyright (c) 2026. Client for the Raven video-gen render server.
++"""TCP client used by the videogen distillation trainer.
++
++The server (fast_roborender/roborender-acceleration/runtime/raven_render_server.py)
++holds the Wan/LADD student + TensorRT engines resident and converts 81-frame
++depth(+mask) chunks into realistic RGB chunks. Protocol: length-prefixed pickles.
++"""
++from __future__ import annotations
++
++import pickle
++import socket
++import struct
++import time
++from typing import Optional
++
++import numpy as np
++
++
++def encode_array(arr: np.ndarray) -> dict:
++    """numpy-version-agnostic wire format (raw bytes + dtype/shape)."""
++    arr = np.ascontiguousarray(arr)
++    return {"__nd__": True, "dtype": str(arr.dtype), "shape": tuple(arr.shape),
++            "data": arr.tobytes()}
++
++
++def decode_array(obj) -> np.ndarray:
++    if isinstance(obj, dict) and obj.get("__nd__"):
++        return np.frombuffer(obj["data"], dtype=np.dtype(obj["dtype"])).reshape(obj["shape"])
++    return obj
++
++
++class VideoGenRenderClient:
++    def __init__(self, host: str = "127.0.0.1", port: int = 18913,
++                 timeout_s: float = 900.0, connect_retries: int = 60,
++                 connect_retry_interval_s: float = 5.0):
++        self.host = host
++        self.port = port
++        self.timeout_s = timeout_s
++        self.connect_retries = connect_retries
++        self.connect_retry_interval_s = connect_retry_interval_s
++        self._sock: Optional[socket.socket] = None
++
++    def _connect(self) -> socket.socket:
++        last_err = None
++        for _ in range(self.connect_retries):
++            try:
++                sock = socket.create_connection((self.host, self.port), timeout=self.timeout_s)
++                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++                return sock
++            except OSError as exc:
++                last_err = exc
++                time.sleep(self.connect_retry_interval_s)
++        raise ConnectionError(
++            f"could not reach raven render server at {self.host}:{self.port}: {last_err}")
++
++    def _ensure_sock(self) -> socket.socket:
++        if self._sock is None:
++            self._sock = self._connect()
++        return self._sock
++
++    def close(self) -> None:
++        if self._sock is not None:
++            try:
++                self._sock.close()
++            finally:
++                self._sock = None
++
++    @staticmethod
++    def _recv_exact(sock: socket.socket, n: int) -> bytes:
++        buf = b""
++        while len(buf) < n:
++            chunk = sock.recv(n - len(buf))
++            if not chunk:
++                raise ConnectionError("server closed connection mid-message")
++            buf += chunk
++        return buf
++
++    def _roundtrip(self, req: dict) -> dict:
++        payload = pickle.dumps(req, protocol=pickle.HIGHEST_PROTOCOL)
++        for attempt in range(2):
++            sock = self._ensure_sock()
++            try:
++                sock.sendall(struct.pack("!Q", len(payload)) + payload)
++                (length,) = struct.unpack("!Q", self._recv_exact(sock, 8))
++                return pickle.loads(self._recv_exact(sock, length))
++            except (ConnectionError, OSError):
++                self.close()
++                if attempt == 1:
++                    raise
++        raise RuntimeError("unreachable")
++
++    def render_chunk(self, depth_per_view: dict[str, np.ndarray],
++                     mask_per_view: Optional[dict[str, np.ndarray]] = None,
++                     prompt: str = "", seed: int = 42) -> dict[str, np.ndarray]:
++        """Render one 81-frame chunk.
++
++        depth_per_view: {view_name: uint8 [81,H,W] or [81,H,W,3]} control depth video.
++        mask_per_view: optional {view_name: uint8 like depth} robot masks.
++        Returns {view_name: uint8 [81,240,416,3]} generated RGB.
++        """
++        views = []
++        for name, depth in depth_per_view.items():
++            mask = None if mask_per_view is None else mask_per_view.get(name)
++            views.append({"name": name, "depth": encode_array(depth),
++                          "mask": None if mask is None else encode_array(mask)})
++        resp = self._roundtrip({"views": views, "prompt": prompt, "seed": seed})
++        if "error" in resp:
++            raise RuntimeError(f"raven render server error: {resp['error']}")
++        return {name: decode_array(arr) for name, arr in resp["rgb"].items()}
+diff --git a/gr00t/rl/utils/videogen_prompts.py b/gr00t/rl/utils/videogen_prompts.py
+new file mode 100644
+index 0000000..89d7779
+--- /dev/null
++++ b/gr00t/rl/utils/videogen_prompts.py
+@@ -0,0 +1,74 @@
++# Per-episode prompt generation for the videogen pipeline.
++# Template mirrors renderscale prompt_builder.py: background sentence,
++# foreground objects on the surface, robot instruction. Deterministic per seed.
++import random
++
++WALLS = [
++    "light gray walls",
++    "warm white walls with subtle texture",
++    "pale blue-gray walls",
++    "beige plaster walls",
++    "soft sage-green walls",
++    "off-white walls with a large window casting soft light",
++    "light taupe walls with white trim",
++]
++
++FLOORS = [
++    "a light yellow wood floor",
++    "a dark walnut plank floor",
++    "a polished gray concrete floor",
++    "a white large-tile floor",
++    "a honey-colored oak parquet floor",
++    "a light bamboo floor",
++    "a terracotta tile floor",
++    "a pale gray laminate floor",
++]
++
++TABLES = [
++    "the white table",
++    "a warm walnut butcher-block table",
++    "a speckled gray stone table",
++    "a matte black table",
++    "a sun-bleached pine table",
++    "a polished white marble table with subtle gray veins",
++    "a brushed stainless steel table",
++    "a varnished oak farmhouse table",
++]
++
++OBJECTS = [
++    ("a can of potato chips with a glossy red label and silver rim", "potato chips can"),
++    ("a tall emerald-green anodized aluminum soda can with a printed paper label", "green soda can"),
++    ("a bright blue aluminum energy drink can with a matte finish", "blue can"),
++    ("an orange cylindrical snack container with a white plastic lid", "orange container"),
++    ("a silver coffee tin with a black embossed logo", "coffee tin"),
++    ("a yellow lemonade can with condensation droplets on its surface", "yellow can"),
++    ("a white ceramic-look canister with thin blue stripes", "striped canister"),
++]
++
++CONTAINERS = [
++    ("a black storage basket with a matte woven-plastic texture and visible weave pattern", "black woven basket"),
++    ("a natural wicker basket with a warm honey tone", "wicker basket"),
++    ("a navy-blue fabric storage bin with white stitched edges", "blue fabric bin"),
++    ("a light gray felt basket with rounded corners", "gray felt basket"),
++    ("a rustic wooden crate with visible grain and slats", "wooden crate"),
++    ("a white perforated metal basket", "white metal basket"),
++]
++
++
++def build_prompt(seed: int) -> str:
++    rng = random.Random(int(seed))
++    wall = rng.choice(WALLS)
++    floor = rng.choice(FLOORS)
++    table = rng.choice(TABLES)
++    obj_long, obj_short = rng.choice(OBJECTS)
++    cont_long, cont_short = rng.choice(CONTAINERS)
++    return (
++        f"This video shows in the background, a bright room with {wall} and {floor}. "
++        f"In the foreground, on {table}, there is {obj_long} and {cont_long}. "
++        f"The robot is instructed to pick up the {obj_short} and place it into the {cont_short}."
++    )
++
++
++if __name__ == "__main__":
++    for s in range(4):
++        print(f"[{s}] {build_prompt(s)}\n")
+-- 
+2.43.0
+

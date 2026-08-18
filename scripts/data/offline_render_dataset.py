@@ -105,7 +105,12 @@ def main():
           for path in sorted(glob.glob(os.path.join(args.dataset_dir, "chunk_*.npz"))):
               try:
                   with np.load(path, allow_pickle=False) as z:
-                      if "rgb_gen" in z.files:
+                      # Resume: a chunk is done only when it has the primary rgb_gen AND
+                      # a per-view rgb_gen__<view> for every requested view. Chunks
+                      # rendered before per-view support are therefore re-rendered.
+                      have = ("rgb_gen" in z.files) and all(
+                          f"rgb_gen__{v}" in z.files for v in view_names)
+                      if have:
                           continue
                       meta = {
                           "path": path,
@@ -173,13 +178,23 @@ def main():
               resp = render_with_retry(depths, masks, prompt, 42)
               rgb = resp[primary_view]
 
-              for i, (m, data) in enumerate(zip(group, datas)):
-                  seg = rgb[i * CHUNK_T:(i + 1) * CHUNK_T]
-                  small = np.stack([
+              def _downsample(seg):
+                  return np.stack([
                       np.asarray(Image.fromarray(f).resize((st_w, st_h), Image.BILINEAR))
                       for f in seg
-                  ])
-                  data["rgb_gen"] = small.astype(np.uint8)
+                  ]).astype(np.uint8)
+
+              for i, (m, data) in enumerate(zip(group, datas)):
+                  seg = rgb[i * CHUNK_T:(i + 1) * CHUNK_T]
+                  # rgb_gen stays the primary view so single-view runs are unaffected;
+                  # rgb_gen__<view> is added for every view so a 3-view policy can tile.
+                  data["rgb_gen"] = _downsample(seg)
+                  for vname in view_names:
+                      vrgb = resp.get(vname)
+                      if vrgb is None:
+                          continue
+                      data[f"rgb_gen__{vname}"] = _downsample(
+                          vrgb[i * CHUNK_T:(i + 1) * CHUNK_T])
                   tmp = m["path"] + ".tmp.npz"
                   np.savez_compressed(tmp, **data)
                   os.replace(tmp, m["path"])
