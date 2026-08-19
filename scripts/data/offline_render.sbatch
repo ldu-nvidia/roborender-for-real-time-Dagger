@@ -4,7 +4,7 @@
 #SBATCH --job-name=videogen_render
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=08:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/offline_render_%j.log
 # CPU-only: streams chunks to the standing raven_server job
 set -Eeuo pipefail

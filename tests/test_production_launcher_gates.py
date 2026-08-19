@@ -269,6 +269,18 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                     else:
                         expected_partition = "cpu_short"
                     self.assertEqual({expected_partition}, set(partitions))
+                    time_match = re.search(
+                        r"^#SBATCH --time=(\d+):(\d+):(\d+)$", text, re.MULTILINE
+                    )
+                    self.assertIsNotNone(time_match, "missing HH:MM:SS time limit")
+                    hours, minutes, seconds = map(int, time_match.groups())
+                    total_seconds = hours * 3600 + minutes * 60 + seconds
+                    max_seconds = {
+                        "cpu_short": 4 * 3600,
+                        "grizzly": 4 * 3600,
+                        "backfill_block1": 16 * 3600,
+                    }[expected_partition]
+                    self.assertLessEqual(total_seconds, max_seconds)
 
 
 class NoRetiredSiteReferencesTest(unittest.TestCase):
@@ -290,6 +302,7 @@ class NoRetiredSiteReferencesTest(unittest.TestCase):
             # look like a deployable reference when the repository is audited.
             "retired user mount": re.compile(r"\b" + "sv" + r"l\b", re.IGNORECASE),
             "retired shared mount": re.compile("/" + "vis" + "ion/", re.IGNORECASE),
+            "retired external mount": re.compile("/mnt/" + "aml" + "fs", re.IGNORECASE),
             "retired home mount": re.compile(r"\b" + "sail" + r"home\b", re.IGNORECASE),
             "retired scheduler": re.compile(r"\b" + "vis" + r"cam\b", re.IGNORECASE),
             "retired username": re.compile(r"\b" + "raven" + r"h\b", re.IGNORECASE),
