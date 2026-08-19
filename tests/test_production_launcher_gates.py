@@ -288,12 +288,12 @@ class NoRetiredSiteReferencesTest(unittest.TestCase):
         forbidden = {
             # Split the retired tokens so this regression test does not itself
             # look like a deployable reference when the repository is audited.
-            "retired user mount": re.compile("/" + "sv" + "l/", re.IGNORECASE),
+            "retired user mount": re.compile(r"\b" + "sv" + r"l\b", re.IGNORECASE),
             "retired shared mount": re.compile("/" + "vis" + "ion/", re.IGNORECASE),
-            "retired home mount": re.compile("/" + "sail" + "home/", re.IGNORECASE),
-            "retired scheduler": re.compile("vis" + "cam", re.IGNORECASE),
-            "retired username": re.compile("raven" + "h", re.IGNORECASE),
-            "retired site name": re.compile("stan" + "ford", re.IGNORECASE),
+            "retired home mount": re.compile(r"\b" + "sail" + r"home\b", re.IGNORECASE),
+            "retired scheduler": re.compile(r"\b" + "vis" + r"cam\b", re.IGNORECASE),
+            "retired username": re.compile(r"\b" + "raven" + r"h\b", re.IGNORECASE),
+            "retired site name": re.compile(r"\b" + "stan" + r"ford\b", re.IGNORECASE),
         }
         failures = []
         for path in sorted(set(paths)):

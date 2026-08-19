@@ -27,7 +27,7 @@ until grep -q RAVEN_SERVER_READY "$SERVER_LOG" 2>/dev/null; do
 done
 echo "raven server ready"
 
-# Keep Isaac Sim / pip caches off the small /sailhome quota.
+# Keep Isaac Sim / pip caches on the shared OCI Lustre stage.
 export XDG_CACHE_HOME=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/cache/xdg
 export XDG_DATA_HOME=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/cache/share
 mkdir -p "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
