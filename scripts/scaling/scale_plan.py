@@ -22,6 +22,7 @@ class ScalePlan:
     required_renderers: int
     transitions_per_rollout_iteration: int
     generated_requests_per_rollout_iteration_capacity: int
+    reference_policy: str
     reference_lag: int
     num_mini_batches: int
     local_mini_batch: int
@@ -37,6 +38,7 @@ class ScalePlan:
     beta_schedule: str
     beta_start: float
     beta_end: float
+    beta_decay_iters: int
     rollout_with_teacher_num_steps: int
     enforce_teacher_rollout: bool
     teacher_rollout_ratio: float
@@ -51,12 +53,16 @@ def build_plan(
     trainer_nodes: int = 8,
     raytraced_mix: float = 0.0,
     envs_per_renderer: int = 5,
-    reference_lag: int = 256,
-    num_mini_batches: int = 4,
+    reference_lag: int = 0,
+    num_mini_batches: int = 1,
     per_device_train_batch_size: int = 1,
     num_learning_epochs: int = 1,
-    behavior_source: str = "student",
+    behavior_source: str = "annealed",
     teacher_rollout_ratio: float = 0.0,
+    beta_schedule: str = "linear",
+    beta_start: float = 1.0,
+    beta_end: float = 0.0,
+    beta_decay_iters: int = 500,
     primary_view: str = "head_color",
 ) -> ScalePlan:
     values = {
@@ -65,14 +71,18 @@ def build_plan(
         "num_rollout_iterations": num_rollout_iterations,
         "trainer_nodes": trainer_nodes,
         "envs_per_renderer": envs_per_renderer,
-        "reference_lag": reference_lag,
         "num_mini_batches": num_mini_batches,
         "per_device_train_batch_size": per_device_train_batch_size,
         "num_learning_epochs": num_learning_epochs,
+        "beta_decay_iters": beta_decay_iters,
     }
     for name, value in values.items():
         if int(value) != value or value < 1:
             raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if int(reference_lag) != reference_lag or reference_lag < 0:
+        raise ValueError(
+            f"reference_lag must be a non-negative integer, got {reference_lag!r}"
+        )
     if not 0.0 <= raytraced_mix <= 1.0:
         raise ValueError(f"raytraced_mix must be in [0, 1], got {raytraced_mix}")
     if not 0.0 <= teacher_rollout_ratio <= 1.0:
@@ -80,9 +90,9 @@ def build_plan(
             "teacher_rollout_ratio must be in [0, 1], got "
             f"{teacher_rollout_ratio}"
         )
-    if behavior_source not in {"student", "mixed", "teacher"}:
+    if behavior_source not in {"student", "mixed", "teacher", "annealed"}:
         raise ValueError(
-            "behavior_source must be one of student, mixed, teacher, got "
+            "behavior_source must be one of student, mixed, teacher, annealed, got "
             f"{behavior_source!r}"
         )
     if behavior_source == "student" and teacher_rollout_ratio != 0.0:
@@ -91,6 +101,21 @@ def build_plan(
         raise ValueError("mixed behavior requires 0 < teacher_rollout_ratio < 1")
     if behavior_source == "teacher" and teacher_rollout_ratio != 1.0:
         raise ValueError("teacher behavior requires teacher_rollout_ratio=1")
+    if behavior_source == "annealed" and teacher_rollout_ratio != 0.0:
+        raise ValueError("annealed behavior requires teacher_rollout_ratio=0")
+    if beta_schedule not in {"constant", "linear", "exponential"}:
+        raise ValueError(
+            "beta_schedule must be one of constant, linear, exponential, got "
+            f"{beta_schedule!r}"
+        )
+    for name, value in (("beta_start", beta_start), ("beta_end", beta_end)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {value}")
+    if behavior_source == "annealed":
+        if beta_schedule == "constant":
+            raise ValueError("annealed behavior requires a non-constant beta schedule")
+        if beta_start <= beta_end:
+            raise ValueError("annealed behavior requires beta_start > beta_end")
     supported_primary_views = {"hand_left", "hand_right", "head_color"}
     if primary_view not in supported_primary_views:
         raise ValueError(
@@ -131,6 +156,7 @@ def build_plan(
         required_renderers=required_renderers,
         transitions_per_rollout_iteration=transitions,
         generated_requests_per_rollout_iteration_capacity=generated_envs * rollout_steps,
+        reference_policy="fixed_anchor" if reference_lag == 0 else "generated_lag",
         reference_lag=reference_lag,
         num_mini_batches=num_mini_batches,
         local_mini_batch=local_mini_batch,
@@ -150,10 +176,14 @@ def build_plan(
             "student": "student",
             "mixed": "beta",
             "teacher": "teacher",
+            "annealed": "beta",
         }[behavior_source],
-        beta_schedule="constant",
-        beta_start=teacher_rollout_ratio,
-        beta_end=teacher_rollout_ratio,
+        beta_schedule=(
+            beta_schedule if behavior_source == "annealed" else "constant"
+        ),
+        beta_start=(beta_start if behavior_source == "annealed" else teacher_rollout_ratio),
+        beta_end=(beta_end if behavior_source == "annealed" else teacher_rollout_ratio),
+        beta_decay_iters=beta_decay_iters,
         rollout_with_teacher_num_steps=0,
         # Raven's videogen rollout_action_source is authoritative. Keep the
         # legacy parent-trainer mixer disabled to avoid applying two mixtures.
@@ -171,14 +201,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trainer-nodes", type=int, default=8)
     parser.add_argument("--raytraced-mix", type=float, default=0.0)
     parser.add_argument("--envs-per-renderer", type=int, default=5)
-    parser.add_argument("--reference-lag", type=int, default=256)
-    parser.add_argument("--num-mini-batches", type=int, default=4)
+    parser.add_argument("--reference-lag", type=int, default=0)
+    parser.add_argument("--num-mini-batches", type=int, default=1)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--num-learning-epochs", type=int, default=1)
     parser.add_argument(
-        "--behavior-source", choices=("student", "mixed", "teacher"), default="student"
+        "--behavior-source",
+        choices=("student", "mixed", "teacher", "annealed"),
+        default="annealed",
     )
     parser.add_argument("--teacher-rollout-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--beta-schedule", choices=("constant", "linear", "exponential"), default="linear"
+    )
+    parser.add_argument("--beta-start", type=float, default=1.0)
+    parser.add_argument("--beta-end", type=float, default=0.0)
+    parser.add_argument("--beta-decay-iters", type=int, default=500)
     parser.add_argument(
         "--primary-view",
         choices=("hand_left", "hand_right", "head_color"),
@@ -205,6 +243,10 @@ def main() -> int:
             num_learning_epochs=args.num_learning_epochs,
             behavior_source=args.behavior_source,
             teacher_rollout_ratio=args.teacher_rollout_ratio,
+            beta_schedule=args.beta_schedule,
+            beta_start=args.beta_start,
+            beta_end=args.beta_end,
+            beta_decay_iters=args.beta_decay_iters,
             primary_view=args.primary_view,
         )
     except ValueError as exc:
@@ -246,8 +288,13 @@ def main() -> int:
             f"iteration, {plan.transitions_per_optimizer_step:,} transitions/optimizer "
             f"step; behavior={plan.behavior_source} "
             f"(videogen rollout source {plan.rollout_action_source}, "
-            f"teacher ratio {plan.teacher_rollout_ratio:.3f}), "
+            f"beta {plan.beta_schedule} {plan.beta_start:.3f}->{plan.beta_end:.3f} "
+            f"over {plan.beta_decay_iters} iterations), "
             f"primary view={plan.primary_view}"
+        )
+        print(
+            f"Reference policy: {plan.reference_policy}; lag={plan.reference_lag} "
+            "(lag 0 keeps the episode's fixed teacher anchor)"
         )
         print(
             f"Run length: {plan.num_rollout_iterations} rollout iteration(s), "

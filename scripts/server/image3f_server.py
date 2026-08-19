@@ -379,7 +379,15 @@ def main():
         daemon=True,
     ).start()
     import subprocess
-    host = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
+    host = os.environ.get("IMAGE3F_ADVERTISE_HOST", "").strip()
+    if not host:
+        host = subprocess.run(
+            ["hostname", "-f"], capture_output=True, text=True
+        ).stdout.strip()
+    if not host:
+        host = subprocess.run(
+            ["hostname"], capture_output=True, text=True
+        ).stdout.strip()
     endpoint = Path(os.environ.get(
         "ENDPOINT_FILE", "/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt"
     ))

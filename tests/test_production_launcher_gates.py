@@ -23,6 +23,88 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         cls.cleanup_watchdog = (
             ROOT / "scripts/scaling/renderer_cleanup_watchdog.sbatch"
         ).read_text(encoding="utf-8")
+        cls.oci_submitter = (
+            ROOT / "scripts/scaling/submit_oci_packed.sh"
+        ).read_text(encoding="utf-8")
+        cls.oci_packed = (
+            ROOT / "scripts/scaling/oci_packed_256x300.sbatch"
+        ).read_text(encoding="utf-8")
+        cls.image3f_server = (
+            ROOT / "scripts/server/image3f_server.py"
+        ).read_text(encoding="utf-8")
+        cls.image3f_server_task = (
+            ROOT / "scripts/server/image3f_server_array.sbatch"
+        ).read_text(encoding="utf-8")
+
+    def test_oci_packed_topology_and_base_initialization_are_explicit(self):
+        for contract in (
+            "#SBATCH --nodes=8",
+            "#SBATCH --gpus-per-node=8",
+            "GLOBAL_NUM_ENVS=${GLOBAL_NUM_ENVS:-256}",
+            "ROLLOUT_STEPS=${ROLLOUT_STEPS:-300}",
+            "CKPT=${CKPT:-none}",
+            "EXPECTED_TRAIN_CHECKPOINT_SHA256=${EXPECTED_TRAIN_CHECKPOINT_SHA256:-NONE}",
+            'REQUIRED_RENDERERS" -eq 52',
+            "renderer_tasks=$REQUIRED_RENDERERS",
+            "trainer_tasks=$TRAINER_NODES",
+            "spare_gpus=4",
+            "reference_policy=FT-FIXED",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, self.oci_packed)
+        self.assertNotIn("last.pt", self.oci_packed)
+        self.assertNotIn("last.pt", self.oci_submitter)
+
+    def test_oci_renderers_and_trainers_share_one_allocation_safely(self):
+        for renderer_contract in (
+            '--ntasks="$REQUIRED_RENDERERS"',
+            "--ntasks-per-node=7",
+            "--distribution=cyclic",
+            "--gpus-per-task=1",
+            "--exact --exclusive --gpu-bind=closest",
+            "SLURM_ARRAY_TASK_ID=$SLURM_PROCID",
+            "IMAGE3F_ADVERTISE_HOST=${SLURMD_NODENAME:-$(hostname -f)}",
+        ):
+            with self.subTest(renderer_contract=renderer_contract):
+                self.assertIn(renderer_contract, self.oci_packed)
+        for trainer_contract in (
+            '--ntasks="$TRAINER_NODES" --ntasks-per-node=1',
+            '--cpus-per-task="$TRAINER_CPUS_PER_TASK"',
+            '--mem="$TRAINER_MEM_PER_NODE" --exact --exclusive',
+            "--gpu-bind=closest",
+        ):
+            with self.subTest(trainer_contract=trainer_contract):
+                self.assertIn(trainer_contract, self.launcher)
+        self.assertNotIn("scancel", self.oci_packed)
+        self.assertEqual(self.oci_submitter.count("sbatch --parsable"), 1)
+
+    def test_oci_packed_launch_has_asset_identity_and_observability_gates(self):
+        for gate in (
+            "ANCHOR_MIN_FILES=${ANCHOR_MIN_FILES:-2048}",
+            "gen__head_color",
+            "gen__hand_left",
+            "gen__hand_right",
+            "d14dd7bda9292a6f148c7d0a68d60f75",
+            "engine_build_manifest.json",
+            "fast_roborender source is dirty",
+            "GR00T source is dirty",
+            "WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}",
+        ):
+            with self.subTest(gate=gate):
+                self.assertIn(gate, self.oci_packed)
+        self.assertIn("STARTUP_STAGGER_SCOPE", self.image3f_server_task)
+        self.assertIn('os.environ.get("IMAGE3F_ADVERTISE_HOST"', self.image3f_server)
+
+    def test_oci_wrapper_owns_step_cleanup_and_signal_forwarding(self):
+        for lifecycle in (
+            "trap cleanup EXIT TERM INT",
+            "trap forward_pre_timeout USR1",
+            'kill -USR1 "$TRAIN_PID"',
+            'kill -TERM "$RENDER_STEP_PID"',
+            "packed renderer step exited while trainer was live",
+        ):
+            with self.subTest(lifecycle=lifecycle):
+                self.assertIn(lifecycle, self.oci_packed)
 
     def test_runtime_behavior_is_pinned(self):
         required_overrides = (
@@ -33,6 +115,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             'algo.config.videogen.beta_schedule="$VG_BETA_SCHEDULE"',
             'algo.config.videogen.beta_start="$VG_BETA_START"',
             'algo.config.videogen.beta_end="$VG_BETA_END"',
+            'algo.config.videogen.beta_decay_iters="$VG_BETA_DECAY_ITERS"',
             'algo.config.num_learning_epochs="$NUM_LEARNING_EPOCHS"',
             '++algo.config.videogen.primary_view="$VG_PRIMARY_VIEW"',
         )
@@ -56,10 +139,14 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             with self.subTest(runtime_assertion=runtime_assertion):
                 self.assertIn(runtime_assertion, self.launcher)
 
-    def test_production_defaults_are_student_only(self):
+    def test_production_defaults_are_fresh_policy_safe(self):
         for setting in (
-            "BEHAVIOR_SOURCE=${BEHAVIOR_SOURCE:-student}",
+            "BEHAVIOR_SOURCE=${BEHAVIOR_SOURCE:-annealed}",
             "TEACHER_ROLLOUT_RATIO=${TEACHER_ROLLOUT_RATIO:-0.0}",
+            "BETA_SCHEDULE=${BETA_SCHEDULE:-linear}",
+            "BETA_START=${BETA_START:-1.0}",
+            "BETA_END=${BETA_END:-0.0}",
+            "BETA_DECAY_ITERS=${BETA_DECAY_ITERS:-500}",
             "NUM_LEARNING_EPOCHS=${NUM_LEARNING_EPOCHS:-1}",
             "VG_PRIMARY_VIEW=${VG_PRIMARY_VIEW:-head_color}",
         ):
@@ -129,7 +216,11 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             "ROLLOUT_STEPS=300",
             "TRAINER_NODES=8",
             "NUM_LEARNING_EPOCHS=1",
-            "BEHAVIOR_SOURCE=student",
+            "BEHAVIOR_SOURCE=annealed",
+            "BETA_SCHEDULE=linear",
+            "BETA_START=1.0",
+            "BETA_END=0.0",
+            "BETA_DECAY_ITERS=500",
             "TEACHER_ROLLOUT_RATIO=0.0",
             "VG_PRIMARY_VIEW=head_color",
             "RUN_WALLTIME=08:00:00",
@@ -138,7 +229,8 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             "FIXED_EVAL_NUM_ENVS=32",
             "FIXED_EVAL_MAX_PARALLEL=4",
             "FIXED_EVAL_MIN_SUCCESS_DELTA=0.02",
-            "ENABLE_FIXED_EVAL_GATE=1",
+            "ENABLE_FIXED_EVAL_GATE=0",
+            "CKPT=none",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, self.eight_hour_submitter)
@@ -273,14 +365,15 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             "export NUM_ROLLOUT_ITERATIONS=1000",
             "export BASE_RENDER_SEED=42",
             "export SAVE_FREQUENCY=5",
-            "export PROJ=roborender_dagger_scale_8h",
-            "export RUN_ID=dagger_256x300_8h_$(date +%Y%m%d_%H%M%S)",
+            "export PROJ=roborender_dagger_base_scale_8h",
+            "export RUN_ID=dagger_base_256x300_8h_$(date +%Y%m%d_%H%M%S)",
             "unset ALLOW_DIRTY_FAST_ROBORENDER ALLOW_DIRTY_GR00T",
             "unset NUM_TOTAL_BATCHES FLEET_DIR TRAIN_RUN_DIR RUN_DIR",
             "unset WANDB_RUN_ID WANDB_RESUME WANDB_NAME WANDB_GROUP",
             "unset FIXED_EVAL_SEEDS FIXED_EVAL_NUM_ENVS FIXED_EVAL_MAX_PARALLEL",
             "export FIXED_EVAL_SEEDS=1729,3253,4519,5987,7411,8863,10193,12203",
-            "export ENABLE_FIXED_EVAL_GATE=1",
+            "export ENABLE_FIXED_EVAL_GATE=0",
+            "export CKPT=none",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, self.eight_hour_submitter)
@@ -296,6 +389,16 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             '"$ACTUAL_TRAIN_CHECKPOINT_SHA256" = "$EXPECTED_TRAIN_CHECKPOINT_SHA256"',
             self.launcher,
         )
+
+    def test_fresh_initialization_omits_round4_and_is_manifested(self):
+        self.assertIn("CKPT=${CKPT:-none}", self.submitter)
+        self.assertIn("CKPT=${CKPT:-none}", self.launcher)
+        self.assertIn("INITIALIZATION_MODE=base", self.submitter)
+        self.assertIn("ACTUAL_TRAIN_CHECKPOINT_SHA256=NONE", self.launcher)
+        self.assertIn("CKPT_ARG=checkpoint=null", self.launcher)
+        self.assertIn('headless=true "$CKPT_ARG"', self.launcher)
+        self.assertIn('"initialization_mode": "$INITIALIZATION_MODE"', self.submitter)
+        self.assertNotIn("image_dagger_r4", self.eight_hour_submitter)
 
 
 if __name__ == "__main__":

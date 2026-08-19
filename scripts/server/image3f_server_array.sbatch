@@ -34,8 +34,12 @@ rm -f "$ENDPOINT_FILE" "$IMAGE3F_QUEUE/READY"
 
 # Avoid 26+ cold model loads hitting shared storage in the same second.
 STARTUP_STAGGER_S=${STARTUP_STAGGER_S:-5}
+STAGGER_INDEX=$TASK_ID
+if [ "${STARTUP_STAGGER_SCOPE:-global}" = "local" ]; then
+    STAGGER_INDEX=${SLURM_LOCALID:-$TASK_ID}
+fi
 if [ "$STARTUP_STAGGER_S" -gt 0 ]; then
-    sleep $((TASK_ID * STARTUP_STAGGER_S))
+    sleep $((STAGGER_INDEX * STARTUP_STAGGER_S))
 fi
 
 cleanup() {
