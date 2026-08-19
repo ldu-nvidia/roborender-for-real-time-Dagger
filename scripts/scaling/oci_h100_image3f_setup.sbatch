@@ -9,6 +9,7 @@
 #SBATCH --time=06:00:00
 #SBATCH --job-name=rr_i3f_sm90_build
 #SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
