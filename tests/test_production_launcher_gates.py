@@ -123,6 +123,8 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         ):
             self.assertIn(contract, image_setup)
         self.assertIn("codeload.github.com/isaac-sim/IsaacLab/tar.gz", trainer_setup)
+        self.assertIn("#SBATCH --mem=224G", image_setup)
+        self.assertIn("#SBATCH --mem=224G", trainer_setup)
         self.assertIn(".oci_source_revision", trainer_setup)
         self.assertNotIn("git clone", trainer_setup)
         self.assertNotIn("git -C", trainer_setup)
