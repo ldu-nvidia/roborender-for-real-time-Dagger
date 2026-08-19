@@ -2,7 +2,7 @@
 # Distributed production DAgger: 256 global Isaac environments, 300 rollout steps.
 # This remains the validated pure-BC DAgger objective (teacher action supervision),
 # not PPO reward optimization. Submit via scripts/scaling/submit_production.sh.
-#SBATCH --partition=backfill_block1
+#SBATCH --partition=grizzly
 #SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_dagger_256x300
 #SBATCH --nodes=8
@@ -10,7 +10,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=08:15:00
+#SBATCH --time=04:00:00
 #SBATCH --signal=B:USR1@300
 set -Eeuo pipefail
 

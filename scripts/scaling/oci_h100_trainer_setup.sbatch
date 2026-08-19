@@ -4,7 +4,7 @@
 #SBATCH --partition=backfill_block1
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=30
 #SBATCH --mem=256G
 #SBATCH --time=04:00:00
 #SBATCH --job-name=rr_viral_setup

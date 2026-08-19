@@ -50,7 +50,7 @@ def _nonempty(value: object) -> str | None:
 
 
 def validate_mode(environment: Mapping[str, str] | None = None) -> str:
-    """Reject modes that would make an eight-hour run look monitored when it is not."""
+    """Reject modes that would make a production run look monitored when it is not."""
 
     environment = os.environ if environment is None else environment
     mode = environment.get("WANDB_MODE", "online").strip().lower() or "online"

@@ -3,12 +3,12 @@
 # share one 8-node/64-GPU allocation. Four GPUs remain as placement slack.
 # Submit only through submit_oci_packed.sh so paths and provenance are pinned.
 #SBATCH --account=general_cs_infra
-#SBATCH --partition=backfill_block1
+#SBATCH --partition=grizzly
 #SBATCH --nodes=8
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-gpu=10
 #SBATCH --mem=768G
-#SBATCH --time=08:15:00
+#SBATCH --time=04:00:00
 #SBATCH --signal=B:USR1@300
 #SBATCH --job-name=rr_base_256x300
 set -Eeuo pipefail
@@ -162,7 +162,7 @@ export IMAGE3F_MAX_STREAMS=16
 export STARTUP_STAGGER_SCOPE=local
 export STARTUP_STAGGER_S=${STARTUP_STAGGER_S:-2}
 export PYTHONDONTWRITEBYTECODE=1
-export PROJ=${PROJ:-roborender_dagger_base_scale_8h}
+export PROJ=${PROJ:-roborender_dagger_base_scale_4h}
 export EXP=${EXP:-dagger_base_256env_300step_${SLURM_JOB_ID}}
 export NUM_MINI_BATCHES=${NUM_MINI_BATCHES:-1}
 export NUM_ROLLOUT_ITERATIONS=${NUM_ROLLOUT_ITERATIONS:-500}

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Submit the pinned eight-hour, 256-environment RoboRender DAgger experiment.
+# Compatibility name: submit one cluster-max four-hour stage of the 256-env campaign.
+# A continuous eight-hour allocation requires long-run QoS not currently granted.
 set -Eeuo pipefail
 
 SCRIPT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -42,7 +43,7 @@ export BETA_START=1.0
 export BETA_END=0.0
 export BETA_DECAY_ITERS=500
 export VG_PRIMARY_VIEW=head_color
-export RUN_WALLTIME=08:00:00
+export RUN_WALLTIME=04:00:00
 export RENDER_WALLTIME=24:00:00
 export SAVE_FREQUENCY=5
 export FIXED_EVAL_SEEDS=1729,3253,4519,5987,7411,8863,10193,12203
@@ -67,8 +68,8 @@ export EXPECTED_IMAGE3F_INFERENCE_STEPS=5
 export EXPECTED_IMAGE3F_TEACACHE_THRESHOLD=0.3
 export EXPECTED_IMAGE3F_CFG_SCALE=1.0
 export EXPECTED_IMAGE3F_CUDA_GRAPH=disabled
-export PROJ=roborender_dagger_base_scale_8h
-export RUN_ID=dagger_base_256x300_8h_$(date +%Y%m%d_%H%M%S)
+export PROJ=roborender_dagger_base_scale_4h
+export RUN_ID=dagger_base_256x300_4h_$(date +%Y%m%d_%H%M%S)
 export EXP=$RUN_ID
 export CKPT=none
 

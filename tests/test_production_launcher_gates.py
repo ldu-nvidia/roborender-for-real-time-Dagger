@@ -39,12 +39,14 @@ class ProductionLauncherGatesTest(unittest.TestCase):
     def test_oci_scheduler_contract_is_explicit(self):
         for text in (self.packed, self.trainer, self.renderer):
             self.assertIn("#SBATCH --account=general_cs_infra", text)
-            self.assertIn("#SBATCH --partition=backfill_block1", text)
+        for text in (self.packed, self.trainer):
+            self.assertIn("#SBATCH --partition=grizzly", text)
+        self.assertIn("#SBATCH --partition=backfill_block1", self.renderer)
         for setting in (
             "#SBATCH --nodes=8",
             "#SBATCH --gpus-per-node=8",
             "#SBATCH --mem=768G",
-            "#SBATCH --time=08:15:00",
+            "#SBATCH --time=04:00:00",
             "OCI_CONTAINER_IMAGE=${OCI_CONTAINER_IMAGE:-nvcr.io#nvidia/isaac-sim:5.1.0}",
         ):
             self.assertIn(setting, self.packed)
@@ -255,11 +257,15 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                     self.assertTrue(accounts, "missing explicit OCI account")
                     self.assertTrue(partitions, "missing explicit OCI partition")
                     self.assertEqual({"general_cs_infra"}, set(accounts))
-                    expected_partition = (
-                        "backfill_block1"
-                        if re.search(r"^#SBATCH --gpus", text, re.MULTILINE)
-                        else "cpu_short"
-                    )
+                    if path.name in {
+                        "oci_packed_256x300.sbatch",
+                        "dagger_scale_256x300.sbatch",
+                    }:
+                        expected_partition = "grizzly"
+                    elif re.search(r"^#SBATCH --gpus", text, re.MULTILINE):
+                        expected_partition = "backfill_block1"
+                    else:
+                        expected_partition = "cpu_short"
                     self.assertEqual({expected_partition}, set(partitions))
 
 
