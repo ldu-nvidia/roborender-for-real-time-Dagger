@@ -5,6 +5,7 @@
 #SBATCH --account=general_cs_infra
 #SBATCH --partition=backfill_block1
 #SBATCH --nodes=1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=00:30:00

@@ -127,6 +127,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         self.assertIn("runtime/envs/wandb-host", wandb_setup)
         self.assertIn("HOST_PYTHON=${HOST_PYTHON:-/usr/bin/python3}", wandb_setup)
         self.assertIn("NUMPY_VERSION=${NUMPY_VERSION:-1.24.4}", wandb_setup)
+        self.assertIn("#SBATCH --gpus-per-node=1", wandb_setup)
         self.assertNotIn("#SBATCH --container-image=", wandb_setup)
 
     def test_host_coordinator_never_executes_container_python(self):
