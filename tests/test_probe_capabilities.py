@@ -13,6 +13,10 @@ class ProbeCapabilityTest(unittest.TestCase):
             "capabilities": {
                 "lagged_reference_history": True,
                 "reference_lag_max": 512,
+                "output_views": ["head_color", "hand_left", "hand_right"],
+                "output_layout": "vertical",
+                "output_tile_shape_hwc": [240, 416, 3],
+                "output_stacked_shape_hwc": [720, 416, 3],
             },
             "runtime_identity": {
                 "schema_version": 1,
@@ -64,6 +68,10 @@ class ProbeCapabilityTest(unittest.TestCase):
             expected_cfg_scale=1.0,
             expected_cuda_graph=False,
             require_tensorrt_engine=True,
+            expected_output_views=("head_color", "hand_left", "hand_right"),
+            expected_output_layout="vertical",
+            expected_output_tile_shape=(240, 416, 3),
+            expected_output_stacked_shape=(720, 416, 3),
         )
 
     def test_accepts_protocol_two_and_sufficient_lag(self):
@@ -143,6 +151,23 @@ class ProbeCapabilityTest(unittest.TestCase):
         response = self.production_response()
         response["runtime_identity"]["engine"]["compute_capability"] = "8.9"
         self.assertIn("compute_capability", self.production_error(response))
+
+    def test_rejects_output_view_order_layout_and_shape_mismatches(self):
+        mutations = (
+            ("output_views", ["hand_left", "head_color", "hand_right"], "output views"),
+            ("output_layout", "horizontal", "output layout"),
+            ("output_tile_shape_hwc", [240, 415, 3], "output_tile_shape_hwc"),
+            (
+                "output_stacked_shape_hwc",
+                [240, 1248, 3],
+                "output_stacked_shape_hwc",
+            ),
+        )
+        for field, value, expected_error in mutations:
+            with self.subTest(field=field):
+                response = self.production_response()
+                response["capabilities"][field] = value
+                self.assertIn(expected_error, self.production_error(response))
 
 
 if __name__ == "__main__":

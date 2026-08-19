@@ -88,6 +88,12 @@ class TrainerPatchTest(unittest.TestCase):
         self.assertIn("episode_id=int(self._id_episode_ids[b])", patched)
         self.assertIn("self._id_episode_steps += 1", patched)
         self.assertIn("IMAGE_DAGGER_EXPECT_PRIMARY_VIEW", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_POLICY_VIEWS", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_POLICY_VIEW_LAYOUT", patched)
+        self.assertIn("IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE", patched)
+        self.assertIn("production gate failed: policy views mismatch", patched)
+        self.assertIn("production gate failed: policy image shape mismatch", patched)
         self.assertIn("IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE", patched)
         self.assertIn("production gate failed: rollout action source mismatch", patched)
         self.assertIn("IMAGE_DAGGER_EXPECT_BETA_SCHEDULE", patched)
@@ -160,6 +166,27 @@ class TrainerPatchTest(unittest.TestCase):
         self.assertIn("FAST_ROBORENDER_PRODUCTION_GATES_V2", upgraded)
         self.assertNotIn("FAST_ROBORENDER_PRODUCTION_GATES_V1", upgraded)
         self.assertIn("IMAGE_DAGGER_EXPECT_BETA_SCHEDULE", upgraded)
+
+    def test_upgrades_pre_three_view_v2_runtime_gates(self):
+        current = patch_source(REPRESENTATIVE)
+        lines = current.splitlines(keepends=True)
+        three_view_start = next(
+            i for i, line in enumerate(lines) if "_gate_policy_views =" in line
+        )
+        rollout_start = next(
+            i
+            for i, line in enumerate(lines[three_view_start:], start=three_view_start)
+            if "_gate_rollout_source =" in line
+        )
+        old_v2 = "".join(lines[:three_view_start] + lines[rollout_start:])
+        self.assertIn(RUNTIME_GATES_MARKER, old_v2)
+        self.assertNotIn("IMAGE_DAGGER_EXPECT_POLICY_VIEWS", old_v2)
+
+        upgraded = patch_source(old_v2)
+        ast.parse(upgraded)
+        self.assertIn("IMAGE_DAGGER_EXPECT_POLICY_VIEWS", upgraded)
+        self.assertIn("IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE", upgraded)
+        self.assertEqual(patch_source(upgraded), upgraded)
 
     def test_refuses_unknown_source(self):
         with self.assertRaises(PatchError):

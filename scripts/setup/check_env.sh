@@ -14,6 +14,7 @@ set -uo pipefail
 #   VIRAL_PY=$CONDA_PREFIX/bin/python  bash scripts/setup/check_env.sh
 ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
 ACCEL=${ACCEL:-$STAGE_ROOT/assets/roborender-acceleration}
 IMAGE3F=${IMAGE3F:-$STAGE_ROOT/assets/roborender_image_model_accelerated}
 IMAGE3F_PY=${IMAGE3F_PY:-$STAGE_ROOT/runtime/envs/image3f-cu128/bin/python}
@@ -40,9 +41,50 @@ fi
 sec "container trainer environment"
 TRAINER_MANIFEST=$STAGE_ROOT/runtime/envs/trainer_environment_manifest.txt
 if [ -s "$TRAINER_MANIFEST" ]; then
-    pass "pinned Isaac/GR00T environment manifest at $TRAINER_MANIFEST"
+    CURRENT_GR00T_REV=$(git -C "$GR00T_ROOT" rev-parse HEAD 2>/dev/null || true)
+    MANIFEST_GR00T_REV=$(awk -F= '$1 == "gr00t_revision" {print $2}' "$TRAINER_MANIFEST")
+    if [ -n "$CURRENT_GR00T_REV" ] && [ "$MANIFEST_GR00T_REV" = "$CURRENT_GR00T_REV" ]; then
+        pass "pinned Isaac/GR00T environment manifest matches $CURRENT_GR00T_REV"
+    else
+        fail "trainer manifest GR00T revision ${MANIFEST_GR00T_REV:-missing} does not match source ${CURRENT_GR00T_REV:-unknown}"
+    fi
+    HYDRA_CONTRACT_REPORT=$(awk -F= '$1 == "production_hydra_contract" {print substr($0, index($0, "=") + 1)}' "$TRAINER_MANIFEST")
+    HYDRA_CONTRACT_SHA256=$(awk -F= '$1 == "production_hydra_contract_sha256" {print $2}' "$TRAINER_MANIFEST")
+    if [ -n "$CURRENT_GR00T_REV" ] && [ -s "$HYDRA_CONTRACT_REPORT" ] && \
+            [ "$(sha256sum "$HYDRA_CONTRACT_REPORT" | awk '{print $1}')" = "$HYDRA_CONTRACT_SHA256" ] && \
+            python3 - "$HYDRA_CONTRACT_REPORT" "$CURRENT_GR00T_REV" <<'PY' >/dev/null 2>&1
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert payload["schema"] == "fast_roborender.production_hydra_contract.v1"
+assert payload["status"] == "validated"
+assert payload["gr00t_revision"] == sys.argv[2]
+assert payload["policy_views"] == ["head_color", "hand_left", "hand_right"]
+assert payload["renderer_views"] == ["head_color", "hand_left", "hand_right"]
+assert payload["policy_image_shape"] == [324, 192, 3]
+assert payload["checks"] and all(payload["checks"].values())
+PY
+    then
+        pass "exact production Hydra composition report"
+    else
+        fail "production Hydra composition report is missing, stale, or invalid"
+    fi
 else
     fail "no trainer manifest — run scripts/scaling/oci_h100_trainer_setup.sbatch"
+fi
+if command -v python3 >/dev/null 2>&1 && [ -d "$GR00T_ROOT" ]; then
+    CURRENT_GR00T_REV=${CURRENT_GR00T_REV:-$(git -C "$GR00T_ROOT" rev-parse HEAD 2>/dev/null || true)}
+    if [ -n "$CURRENT_GR00T_REV" ] && python3 "$ROOT/scripts/scaling/install_gr00t_integration.py" \
+            --gr00t-root "$GR00T_ROOT" --expected-revision "$CURRENT_GR00T_REV" \
+            --json >/dev/null 2>&1; then
+        pass "exact three-view trainer/config/runtime-gate integration"
+    else
+        fail "three-view GR00T integration check failed"
+    fi
+else
+    fail "cannot validate the three-view GR00T integration"
 fi
 
 sec "render bundles"
@@ -55,6 +97,13 @@ if [ -s "$STAGE_ROOT/runtime/envs/image3f-cu128/.oci_environment_ready" ]; then
     pass "Image3F OCI environment marker at $STAGE_ROOT/runtime/envs/image3f-cu128"
 else
     fail "no Image3F OCI environment — run scripts/scaling/oci_h100_image3f_setup.sbatch"
+fi
+ENGINE_MANIFEST=$IMAGE3F/assets/generated/engines/current/engine_build_manifest.json
+I3F_CURRENT_ENGINES=("$IMAGE3F"/assets/generated/engines/current/*.engine)
+if [ -s "$ENGINE_MANIFEST" ] && [ -e "${I3F_CURRENT_ENGINES[0]}" ]; then
+    pass "target-local Image3F TensorRT engine and build manifest"
+else
+    fail "no validated target-local Image3F TensorRT engine — run scripts/scaling/oci_h100_image3f_setup.sbatch"
 fi
 if [ -f "$IMAGE3F/adapter/rgb030-depth030-step-5000.safetensors" ]; then
     pass "Image3F adapter (rgb030-depth030-step-5000)"
@@ -131,7 +180,7 @@ fi
 
 sec "slurm"
 if command -v sacctmgr >/dev/null 2>&1; then
-    sacctmgr -n show assoc user="$USER" format=account 2>/dev/null | tr -d ' ' | sort -u \
+    sacctmgr -nP show assoc where user="$USER" format=Account 2>/dev/null | sed 's/|$//' | sort -u \
       | grep -q '^general_cs_infra$' && pass "general_cs_infra account available" \
       || warn "general_cs_infra account not found"
 else

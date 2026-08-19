@@ -19,13 +19,14 @@ if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
         "$ROOT/scripts/scaling/oci_h100_trainer_setup.sbatch"
 fi
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
-EXPECTED_GR00T_REVISION=${EXPECTED_GR00T_REVISION:-81e79d71e2d4dc22d249efd5efc18e83e60a02c1}
+EXPECTED_GR00T_REVISION=${EXPECTED_GR00T_REVISION:-b4d17449d70eb3fb7caa7ea9366ca59bb0589cdd}
 ISAACLAB_ROOT=${ISAACLAB_ROOT:-$STAGE_ROOT/src/IsaacLab}
 ISAACLAB_REVISION=${ISAACLAB_REVISION:-37ddf626871758333d6ed89cf64ad702aef127d0}
 VIRAL_ENV=${VIRAL_ENV:-$STAGE_ROOT/runtime/envs/viral}
 BASE_PYTHON=${BASE_PYTHON:-/isaac-sim/python.sh}
 PY=${PY:-$VIRAL_ENV/bin/python}
 ACTIVATE_WRAPPER=${ACTIVATE_WRAPPER:-$STAGE_ROOT/runtime/envs/activate_viral_isaac.sh}
+HYDRA_CONTRACT_REPORT=${HYDRA_CONTRACT_REPORT:-$STAGE_ROOT/runtime/envs/production_hydra_contract.json}
 export HOME=${HOME_OVERRIDE:-$STAGE_ROOT/runtime/home}
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$STAGE_ROOT/runtime/cache/xdg}
 export PIP_CACHE_DIR=${PIP_CACHE_DIR:-$STAGE_ROOT/runtime/cache/pip}
@@ -136,6 +137,10 @@ fi
     -e "$ISAACLAB_ROOT/source/isaaclab_rl[all]"
 "$PY" -m pip install numpy==1.26.0
 "$PY" -m pip install -e "$GR00T_ROOT"
+"$PY" "$ROOT/scripts/scaling/validate_production_hydra.py" \
+    --gr00t-root "$GR00T_ROOT" \
+    --expected-revision "$GR00T_REVISION" \
+    --output "$HYDRA_CONTRACT_REPORT"
 # Fresh policy initialization uses ImageNet ResNet-18 weights. Populate the
 # shared cache once so eight ranks never race on a launch-time download.
 "$PY" - <<'PY'
@@ -171,5 +176,7 @@ gr00t_revision=$GR00T_REVISION
 python=$PY
 activation=$ACTIVATE_WRAPPER
 torch_home=$TORCH_HOME
+production_hydra_contract=$HYDRA_CONTRACT_REPORT
+production_hydra_contract_sha256=$(sha256sum "$HYDRA_CONTRACT_REPORT" | awk '{print $1}')
 EOF
 echo "VIRAL_H100_SETUP_DONE"

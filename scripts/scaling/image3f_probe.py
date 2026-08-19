@@ -85,6 +85,10 @@ def capability_error(
     expected_cfg_scale: float | None = None,
     expected_cuda_graph: bool | None = None,
     require_tensorrt_engine: bool = False,
+    expected_output_views: tuple[str, ...] | None = None,
+    expected_output_layout: str | None = None,
+    expected_output_tile_shape: tuple[int, int, int] | None = None,
+    expected_output_stacked_shape: tuple[int, int, int] | None = None,
 ) -> str | None:
     """Return why a healthy endpoint is incompatible, or ``None``."""
     capabilities = response.get("capabilities", {})
@@ -102,6 +106,24 @@ def capability_error(
         return "lagged reference history is not supported"
     if history_required and max_lag < required_reference_lag:
         return f"maximum reference lag {max_lag} < required {required_reference_lag}"
+    if expected_output_views is not None:
+        output_views = capabilities.get("output_views")
+        if not isinstance(output_views, list) or tuple(output_views) != expected_output_views:
+            return f"output views {output_views!r} != required {list(expected_output_views)!r}"
+    if expected_output_layout is not None and capabilities.get("output_layout") != expected_output_layout:
+        return (
+            f"output layout {capabilities.get('output_layout')!r} != required "
+            f"{expected_output_layout!r}"
+        )
+    for field, expected in (
+        ("output_tile_shape_hwc", expected_output_tile_shape),
+        ("output_stacked_shape_hwc", expected_output_stacked_shape),
+    ):
+        if expected is None:
+            continue
+        actual = capabilities.get(field)
+        if not isinstance(actual, list) or tuple(actual) != expected:
+            return f"{field} {actual!r} != required {list(expected)!r}"
 
     identity_required = any(
         value is not None
@@ -228,11 +250,45 @@ def main() -> int:
         "--expected-cuda-graph", choices=("enabled", "disabled"), default=None
     )
     parser.add_argument("--require-tensorrt-engine", action="store_true")
+    parser.add_argument("--expected-output-views")
+    parser.add_argument("--expected-output-layout")
+    parser.add_argument("--expected-output-tile-shape")
+    parser.add_argument("--expected-output-stacked-shape")
     parser.add_argument("--write-manifest", type=Path, default=None)
     parser.add_argument("--write-report", type=Path, default=None)
     parser.add_argument("--hydra-list", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    def parse_csv(raw, *, cast, flag):
+        if raw is None:
+            return None
+        try:
+            values = tuple(cast(value.strip()) for value in raw.split(","))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"{flag} is malformed: {exc}") from exc
+        if not values or any(value == "" for value in values):
+            raise SystemExit(f"{flag} must be a non-empty comma-separated value")
+        return values
+
+    expected_output_views = parse_csv(
+        args.expected_output_views, cast=str, flag="--expected-output-views"
+    )
+    expected_output_tile_shape = parse_csv(
+        args.expected_output_tile_shape,
+        cast=int,
+        flag="--expected-output-tile-shape",
+    )
+    expected_output_stacked_shape = parse_csv(
+        args.expected_output_stacked_shape,
+        cast=int,
+        flag="--expected-output-stacked-shape",
+    )
+    for flag, shape in (
+        ("--expected-output-tile-shape", expected_output_tile_shape),
+        ("--expected-output-stacked-shape", expected_output_stacked_shape),
+    ):
+        if shape is not None and (len(shape) != 3 or any(value <= 0 for value in shape)):
+            raise SystemExit(f"{flag} must contain exactly three positive integers")
     if args.expected < 0:
         raise SystemExit("--expected must be non-negative")
     if args.required_reference_lag < 0:
@@ -281,6 +337,10 @@ def main() -> int:
                     else None
                 ),
                 require_tensorrt_engine=args.require_tensorrt_engine,
+                expected_output_views=expected_output_views,
+                expected_output_layout=args.expected_output_layout,
+                expected_output_tile_shape=expected_output_tile_shape,
+                expected_output_stacked_shape=expected_output_stacked_shape,
             )
             if incompatible is None:
                 capable.append(item)

@@ -174,6 +174,10 @@ def handle_conn(
                         "lagged_reference_history": True,
                         "reference_lag_max": int(os.environ.get("IMAGE3F_MAX_REFERENCE_LAG", "512")),
                         "serialized_inference": True,
+                        "output_views": [view for _, view in VIEW_MAP],
+                        "output_layout": "vertical",
+                        "output_tile_shape_hwc": [H, W, 3],
+                        "output_stacked_shape_hwc": [len(VIEW_MAP) * H, W, 3],
                     },
                     "runtime_identity": runtime_identity,
                     "history": references.stats(),
@@ -250,6 +254,12 @@ def handle_conn(
                     imgs, timing = session.generate(r, output_type="rgb")
                     inference_ms = (time.perf_counter() - infer_start) * 1000
                 stacked = np.asarray(imgs[0])
+                expected_shape = (len(order) * H, W, 3)
+                if stacked.shape != expected_shape or stacked.dtype != np.uint8:
+                    raise RuntimeError(
+                        "Image3F output contract mismatch: expected uint8 "
+                        f"{expected_shape}, got {stacked.dtype} {stacked.shape}"
+                    )
                 out_arrays = {
                     v: np.ascontiguousarray(stacked[i * H:(i + 1) * H])
                     for i, v in enumerate(order)

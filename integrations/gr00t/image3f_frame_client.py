@@ -65,6 +65,38 @@ def _decode_array(obj: object) -> np.ndarray:
     return np.frombuffer(obj["data"], dtype=np.dtype(obj["dtype"])).reshape(obj["shape"]).copy()
 
 
+def _validate_output_views(views: dict[str, np.ndarray]) -> None:
+    """Enforce the opt-in production output order and per-view tensor contract."""
+    expected_raw = os.environ.get("IMAGE3F_EXPECT_OUTPUT_VIEWS")
+    shape_raw = os.environ.get("IMAGE3F_EXPECT_OUTPUT_SHAPE")
+    if expected_raw is None and shape_raw is None:
+        return
+    if not expected_raw or not shape_raw:
+        raise RuntimeError(
+            "IMAGE3F_EXPECT_OUTPUT_VIEWS and IMAGE3F_EXPECT_OUTPUT_SHAPE must be set together"
+        )
+    expected_views = tuple(value.strip() for value in expected_raw.split(","))
+    try:
+        expected_shape = tuple(int(value.strip()) for value in shape_raw.split(","))
+    except ValueError as exc:
+        raise RuntimeError("invalid IMAGE3F_EXPECT_OUTPUT_SHAPE") from exc
+    if any(not value for value in expected_views) or len(expected_shape) != 3 or any(
+        value <= 0 for value in expected_shape
+    ):
+        raise RuntimeError("invalid Image3F output contract")
+    if tuple(views) != expected_views:
+        raise RuntimeError(
+            "Image3F response view order mismatch: "
+            f"expected {expected_views}, got {tuple(views)}"
+        )
+    for view, image in views.items():
+        if image.dtype != np.uint8 or tuple(image.shape) != expected_shape:
+            raise RuntimeError(
+                f"Image3F response shape/dtype mismatch for {view}: expected "
+                f"uint8 {expected_shape}, got {image.dtype} {image.shape}"
+            )
+
+
 def _read_endpoint(path: str | os.PathLike[str]) -> tuple[str, int]:
     fields = Path(path).read_text(encoding="utf-8").split()
     if len(fields) != 2:
@@ -286,7 +318,9 @@ class Image3FFrameClient:
         views = response.get("views")
         if not isinstance(views, dict):
             raise RuntimeError("Image3F response has no views")
-        return {view: _decode_array(image) for view, image in views.items()}
+        decoded = {view: _decode_array(image) for view, image in views.items()}
+        _validate_output_views(decoded)
+        return decoded
 
     def reset_stream(self) -> bool:
         response = self._request({"cmd": "reset_stream", "stream_id": self._stream_id})

@@ -1,5 +1,7 @@
+import math
 import re
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -21,16 +23,25 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         cls.renderer = read("scripts/server/image3f_server_array.sbatch")
         cls.compat = read("scripts/scaling/submit_production.sh")
         cls.eight_hour = read("scripts/scaling/submit_8h_256env.sh")
+        cls.smoke = read("scripts/scaling/submit_oci_smoke_32x300.sh")
+        cls.calibration = read("scripts/scaling/submit_oci_calibration_3view.sh")
+        cls.distributed_smoke = read("scripts/scaling/submit_oci_smoke_256x300.sh")
         cls.config = (
             GR00T
-            / "gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml"
+            / "gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml"
         ).read_text(encoding="utf-8")
         cls.integrated_trainer = (
             GR00T / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
         ).read_text(encoding="utf-8")
 
     def test_only_packed_oci_entrypoint_is_reachable(self):
-        for wrapper in (self.compat, self.eight_hour):
+        for wrapper in (
+            self.compat,
+            self.eight_hour,
+            self.smoke,
+            self.calibration,
+            self.distributed_smoke,
+        ):
             self.assertIn("submit_oci_packed.sh", wrapper)
             self.assertNotIn("submit_production.sh\"", wrapper)
         self.assertNotIn("image3f_server_array.sbatch\")", self.submit)
@@ -51,18 +62,202 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         ):
             self.assertIn(setting, self.packed)
 
+    def test_profile_scheduler_and_step_resources_are_immutable(self):
+        tuples = (
+            "grizzly:10:768G:8:512G:16:128G",
+            "backfill_block1:10:768G:8:512G:16:128G",
+            "backfill_block1:16:256G:64G:128G",
+        )
+        for contract in tuples:
+            self.assertIn(contract, self.submit)
+        for wrapper, expected in (
+            (
+                self.smoke,
+                (
+                    "PACKED_PARTITION=backfill_block1",
+                    "PACKED_CPUS_PER_GPU=10",
+                    "PACKED_MEM=768G",
+                    "RENDERER_MEM_PER_NODE=512G",
+                    "TRAINER_MEM_PER_NODE=128G",
+                ),
+            ),
+            (
+                self.calibration,
+                (
+                    "PACKED_PARTITION=backfill_block1",
+                    "PACKED_CPUS_PER_GPU=16",
+                    "PACKED_MEM=256G",
+                    "RENDERER_MEM_PER_NODE=64G",
+                    "TRAINER_MEM_PER_NODE=128G",
+                ),
+            ),
+            (
+                self.distributed_smoke,
+                (
+                    "PACKED_PARTITION=grizzly",
+                    "PACKED_CPUS_PER_GPU=10",
+                    "PACKED_MEM=768G",
+                    "RENDERER_MEM_PER_NODE=512G",
+                    "TRAINER_MEM_PER_NODE=128G",
+                ),
+            ),
+        ):
+            for contract in expected:
+                self.assertIn(contract, wrapper)
+
     def test_packed_gpu_topology_matches_256_environment_plan(self):
         for contract in (
             "GLOBAL_NUM_ENVS=${GLOBAL_NUM_ENVS:-256}",
             "ROLLOUT_STEPS=${ROLLOUT_STEPS:-300}",
             "TRAINER_NODES=${TRAINER_NODES:-8}",
             "ENVS_PER_RENDERER=${ENVS_PER_RENDERER:-5}",
-            "[ \"$REQUIRED_RENDERERS\" -eq 52 ]",
-            "[ $((REQUIRED_RENDERERS + TRAINER_NODES)) -le 64 ]",
+            '"8:8:256:300:8:5:52"',
+            '[ "$REQUIRED_RENDERERS" -eq "$EXPECTED_RENDERERS" ]',
             "--ntasks-per-node=7",
             "trainer_tasks=$TRAINER_NODES",
         ):
             self.assertIn(contract, self.packed)
+
+    def test_one_node_smoke_uses_the_same_packed_runtime(self):
+        for contract in (
+            "RUN_PROFILE=smoke_32x300",
+            "PACKED_NODES=1",
+            "PACKED_GPUS_PER_NODE=8",
+            "GLOBAL_NUM_ENVS=32",
+            "ROLLOUT_STEPS=300",
+            "TRAINER_NODES=1",
+            "EXPECTED_RENDERERS=7",
+            "NUM_ROLLOUT_ITERATIONS=1",
+            "SAVE_FREQUENCY=1",
+            "submit_oci_packed.sh",
+        ):
+            self.assertIn(contract, self.smoke)
+        self.assertIn("smoke_32x300", self.submit)
+        self.assertIn("smoke_32x300", self.packed)
+        self.assertIn('"1:8:32:300:1:5:7:1:1"', self.submit)
+        self.assertIn('"1:8:32:300:1:5:7:1:1"', self.packed)
+        self.assertIn('--nodes="$PACKED_NODES"', self.submit)
+        self.assertIn('--nodes="$PACKED_NODES"', self.packed)
+        for contract in (
+            "PACKED_PARTITION=backfill_block1",
+            "PACKED_CPUS_PER_GPU=10",
+            "PACKED_MEM=768G",
+            "RENDERER_CPUS_PER_TASK=8",
+            "RENDERER_MEM_PER_NODE=512G",
+            "TRAINER_CPUS_PER_TASK=16",
+            "TRAINER_MEM_PER_NODE=128G",
+        ):
+            self.assertIn(f"export {contract}", self.smoke)
+        self.assertIn(
+            '"backfill_block1:10:768G:8:512G:16:128G"', self.submit
+        )
+
+    def test_camera_calibration_profile_is_small_and_dump_bounded(self):
+        for contract in (
+            "RUN_PROFILE=calibration_3view",
+            "PACKED_NODES=1",
+            "PACKED_GPUS_PER_NODE=2",
+            "PACKED_PARTITION=backfill_block1",
+            "PACKED_CPUS_PER_GPU=16",
+            "PACKED_MEM=256G",
+            "GLOBAL_NUM_ENVS=1",
+            "ROLLOUT_STEPS=2",
+            "TRAINER_NODES=1",
+            "EXPECTED_RENDERERS=1",
+            "NUM_ROLLOUT_ITERATIONS=1",
+            "RENDERER_MEM_PER_NODE=64G",
+            "TRAINER_MEM_PER_NODE=128G",
+            "IMAGE_DAGGER_DUMP_SIM_RGB=1",
+            "IMAGE_DAGGER_DUMP_MAX_STEPS=2",
+            "IMAGE_DAGGER_DUMP_MAX_ENVS=1",
+            "IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS=1",
+        ):
+            self.assertIn(contract, self.calibration)
+        self.assertIn("calibration_3view", self.submit)
+        self.assertIn("calibration_3view", self.packed)
+        self.assertIn("PROFILE_TECHNICALLY_VALIDATED", self.trainer)
+        self.assertIn("awaiting_camera_visual_acceptance", self.trainer)
+        self.assertIn('"columns": ["head_color", "hand_left", "hand_right"]', self.trainer)
+        self.assertIn(
+            '"rows": ["depth_control", "simulator_rgb", "generated_rgb"]',
+            self.trainer,
+        )
+        self.assertIn('"panel_shape_hwc": [720, 1248, 3]', self.trainer)
+        self.assertIn("calibration panel contract mismatch", self.trainer)
+
+    def test_human_accepted_camera_calibration_is_a_release_prerequisite(self):
+        for text in (self.submit, self.packed):
+            self.assertIn("CAMERA_CALIBRATION_ACCEPTANCE", text)
+            self.assertIn("EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256", text)
+            self.assertIn("camera_calibration_gate.py", text)
+            self.assertIn("camera calibration acceptance validation failed", text)
+        self.assertIn(
+            "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json",
+            self.submit,
+        )
+        self.assertIn("camera_calibration_acceptance=", self.submit)
+        self.assertIn("camera_calibration_acceptance=", self.packed)
+        self.assertIn("camera_calibration_acceptance=", self.trainer)
+        self.assertIn(
+            '"status": "awaiting_visual_acceptance"', self.trainer
+        )
+
+    def test_distributed_smoke_enables_sync_gate_and_one_update(self):
+        for contract in (
+            "RUN_PROFILE=smoke_256x300",
+            "PACKED_NODES=8",
+            "PACKED_GPUS_PER_NODE=8",
+            "GLOBAL_NUM_ENVS=256",
+            "ROLLOUT_STEPS=300",
+            "TRAINER_NODES=8",
+            "EXPECTED_RENDERERS=52",
+            "NUM_ROLLOUT_ITERATIONS=1",
+            "SAVE_FREQUENCY=1",
+            "IMAGE_DAGGER_VERIFY_DDP_SYNC=1",
+            "IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS=1",
+            "PROJ=roborender_dagger_3view_validation",
+        ):
+            self.assertIn(contract, self.distributed_smoke)
+        self.assertIn("smoke_256x300", self.submit)
+        self.assertIn("smoke_256x300", self.packed)
+
+    def test_production_rechecks_ddp_sync_on_its_own_first_update(self):
+        self.assertIn("IMAGE_DAGGER_VERIFY_DDP_SYNC=1", self.compat)
+        self.assertIn("IMAGE_DAGGER_VERIFY_DDP_SYNC=1", self.eight_hour)
+        self.assertIn('"0:0:0:1:1"', self.submit)
+        self.assertIn('"0:0:0:1:1"', self.packed)
+
+    def test_smoke_profiles_are_machine_enforced_release_predecessors(self):
+        for text in (self.submit, self.packed):
+            self.assertIn("PREREQUISITE_PROFILE_VALIDATION", text)
+            self.assertIn("EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256", text)
+            self.assertIn("PREREQUISITE_PROFILE_EXPECTED", text)
+            self.assertIn("profile_validation_gate.py", text)
+            self.assertIn("predecessor profile validation failed", text)
+        self.assertIn(
+            "$STAGE_ROOT/runtime/validation/smoke_32x300_profile_validation_manifest.txt",
+            self.submit,
+        )
+        self.assertIn(
+            "$STAGE_ROOT/runtime/validation/smoke_256x300_profile_validation_manifest.txt",
+            self.submit,
+        )
+        self.assertIn("smoke_256x300:smoke_32x300", self.packed)
+        self.assertIn("production_256x300:smoke_256x300", self.packed)
+        self.assertIn("prerequisite_profile_validation=", self.submit)
+        self.assertIn("prerequisite_profile_validation=", self.packed)
+        self.assertIn("prerequisite_profile_validation=", self.trainer)
+
+    def test_single_rank_profile_omits_distributed_accelerate_flags(self):
+        self.assertIn('if [ "$TRAINER_NODES" -eq 1 ]; then', self.trainer)
+        self.assertIn("ACCELERATE_ARGS=(", self.trainer)
+        self.assertIn('exec accelerate launch "${ACCELERATE_ARGS[@]}"', self.trainer)
+        single_rank_branch = self.trainer.split(
+            'if [ "$TRAINER_NODES" -eq 1 ]; then', 1
+        )[1].split("else", 1)[0]
+        self.assertNotIn("--multi_gpu", single_rank_branch)
+        self.assertNotIn("--num_machines", single_rank_branch)
+        self.assertNotIn("--machine_rank", single_rank_branch)
 
     def test_student_initialization_is_fresh_and_checkpoint_free(self):
         for contract in (
@@ -75,6 +270,203 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         self.assertIn("CKPT=none", self.submit)
         self.assertIn("EXPECTED_TRAIN_CHECKPOINT_SHA256=NONE", self.submit)
         self.assertIn("CKPT_ARG=checkpoint=null", self.trainer)
+
+    def test_three_view_policy_contract_is_fail_closed(self):
+        ordered = "head_color:hand_left:hand_right"
+        for text in (self.submit, self.packed, self.trainer, self.eight_hour):
+            self.assertIn(ordered, text)
+            self.assertIn("VG_POLICY_VIEW_COUNT", text)
+            self.assertIn("VG_POLICY_VIEW_LAYOUT", text)
+            self.assertIn("VG_POLICY_IMAGE_SHAPE", text)
+            self.assertIn("324x192x3", text)
+        self.assertIn("+exp=loco_manip/wsdpt_image_dagger_3view", self.trainer)
+        self.assertNotRegex(
+            self.trainer,
+            r"\+exp=loco_manip/wsdpt_image_dagger(?:\s|\\)",
+        )
+        for gate in (
+            "IMAGE_DAGGER_EXPECT_POLICY_VIEWS",
+            "IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT",
+            "IMAGE_DAGGER_EXPECT_POLICY_VIEW_LAYOUT",
+            "IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE",
+        ):
+            self.assertIn(gate, self.trainer)
+        self.assertIn(
+            'IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE="${VG_POLICY_IMAGE_SHAPE//x/,}"',
+            self.trainer,
+        )
+        self.assertIn(
+            "IMAGE_DAGGER_DUMP_SIM_RGB=${IMAGE_DAGGER_DUMP_SIM_RGB:-0}",
+            self.trainer,
+        )
+        self.assertIn("IMAGE_DAGGER_DUMP_SIM_RGB=1", self.calibration)
+        self.assertIn("IMAGE_DAGGER_DUMP_MAX_STEPS=2", self.calibration)
+        self.assertIn("IMAGE_DAGGER_DUMP_MAX_ENVS=1", self.calibration)
+        for manifest in (
+            "policy_views=",
+            "policy_view_count=",
+            "policy_view_layout=",
+            "policy_image_shape=",
+        ):
+            self.assertIn(manifest, self.submit)
+            self.assertIn(manifest, self.packed)
+            self.assertIn(manifest, self.trainer)
+        self.assertRegex(
+            self.config,
+            r"policy_views:\s*\[head_color, hand_left, hand_right\]",
+        )
+        self.assertRegex(self.config, r"policy_view_count:\s*3")
+
+    def test_absent_beta_fields_use_hydra_append_override(self):
+        for field in ("beta_schedule", "beta_start", "beta_end", "beta_decay_iters"):
+            self.assertIn(f"++algo.config.videogen.{field}=", self.trainer)
+            self.assertNotRegex(
+                self.trainer,
+                rf"(?<!\+)algo\.config\.videogen\.{field}=",
+            )
+
+    def test_full_production_hydra_overrides_compose(self):
+        try:
+            from hydra import compose, initialize_config_dir
+            from omegaconf import OmegaConf
+        except ImportError:
+            self.skipTest("hydra-core/omegaconf unavailable in this test environment")
+
+        sys.path.insert(0, str(GR00T))
+        try:
+            # Mirror register_rl_resolvers() without importing the training
+            # stack: config composition itself should not require torch,
+            # Isaac, or even the optional loguru package.
+            resolvers = {
+                "eval": eval,
+                "if": lambda pred, a, b: a if pred else b,
+                "eq": lambda x, y: x.lower() == y.lower(),
+                "sqrt": lambda x: math.sqrt(float(x)),
+                "sum": lambda x: sum(x),
+                "ceil": lambda x: math.ceil(x),
+                "int": lambda x: int(x),
+                "len": lambda x: len(x),
+                "sum_list": lambda values: sum(values),
+            }
+            for name, resolver in resolvers.items():
+                if not OmegaConf.has_resolver(name):
+                    OmegaConf.register_new_resolver(name, resolver)
+            overrides = [
+                "+exp=loco_manip/wsdpt_image_dagger_3view",
+                "num_envs=32",
+                "algo.config.num_steps_per_env=300",
+                "algo.config.num_mini_batches=1",
+                "algo.config.num_learning_epochs=1",
+                "algo.config.rollout_with_teacher_num_steps=0",
+                "algo.config.enforce_teacher_rollout=true",
+                "algo.config.ratio_teacher_rollout=0.0",
+                "algo.config.value_loss_coef=0.0",
+                "algo.config.entropy_coef=0.0",
+                "algo.config.videogen.rollout_action_source=beta",
+                "++algo.config.videogen.beta_schedule=linear",
+                "++algo.config.videogen.beta_start=1.0",
+                "++algo.config.videogen.beta_end=0.0",
+                "++algo.config.videogen.beta_decay_iters=500",
+                "algo.trl.per_device_train_batch_size=1",
+                "algo.trl.gradient_accumulation_steps=32",
+                "algo.trl.num_total_batches=1",
+                "algo.trl.total_episodes=null",
+                "callbacks.model_save.save_frequency=5",
+                "callbacks.model_save.save_initial_checkpoint=true",
+                "headless=true",
+                "checkpoint=null",
+                "teacher_actor_path=/tmp/expert.pt",
+                "algo.config.videogen.raytraced_mix_prob=0.0",
+                "++algo.config.videogen.seed=42",
+                "++algo.config.videogen.reference_lag=0",
+                "++algo.config.videogen.primary_view=head_color",
+                "simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]",
+                "policy_view_count=3",
+                "algo.config.videogen.image3f_endpoint_files=[/tmp/endpoint.json]",
+                "algo.config.videogen.anchor_pool_dir=/tmp/anchors",
+                "algo.config.videogen.anchor_index=0",
+                "simulator.config.render_results=false",
+                "use_wandb=true",
+                "wandb.wandb_entity=ldu",
+                "wandb.wandb_group=null",
+                "project_name=roborender_dagger_base_scale_4h",
+                "experiment_name=composition_regression",
+                "experiment_dir=/tmp/roborender-composition",
+                "hydra.run.dir=/tmp/roborender-composition/.hydra/rank_0",
+                "output_dir=/tmp/roborender-composition/output/rank_0",
+            ]
+            with initialize_config_dir(
+                config_dir=str(GR00T / "gr00t/rl/config"),
+                version_base="1.1",
+            ):
+                cfg = compose(config_name="base", overrides=overrides)
+        finally:
+            sys.path.remove(str(GR00T))
+
+        self.assertEqual(
+            list(cfg.simulator.config.cameras.policy_views),
+            ["head_color", "hand_left", "hand_right"],
+        )
+        self.assertEqual(cfg.policy_view_count, 3)
+        self.assertTrue(cfg.callbacks.model_save.save_initial_checkpoint)
+        self.assertEqual(cfg.algo.config.videogen.rollout_action_source, "beta")
+        self.assertEqual(cfg.algo.config.videogen.beta_schedule, "linear")
+        self.assertEqual(cfg.algo.config.videogen.beta_decay_iters, 500)
+
+    def test_initial_and_post_update_checkpoints_are_release_gates(self):
+        self.assertIn("callbacks.model_save.save_initial_checkpoint=true", self.trainer)
+        for text in (self.submit, self.packed, self.trainer):
+            self.assertIn("initial_policy_checkpoint=", text)
+        self.assertIn('model_step_000001.pt', self.trainer)
+        self.assertIn("profile_validation_manifest.txt", self.trainer)
+        self.assertIn("PROFILE_VALIDATED", self.trainer)
+        self.assertIn("ddp_policy_sync_step_000000001.json", self.trainer)
+        self.assertIn('"world_size": 8', self.trainer)
+        self.assertIn("initial_policy_sha256=", self.trainer)
+        self.assertIn("final_checkpoint_sha256=", self.trainer)
+        self.assertIn("EXPECTED_FINAL_CHECKPOINT", self.trainer)
+        self.assertIn("NUM_ROLLOUT_ITERATIONS % SAVE_FREQUENCY", self.trainer)
+        self.assertIn("successful trainer did not create exact final checkpoint", self.trainer)
+
+    def test_all_profiles_require_finite_nonnegative_bc_loss(self):
+        for wrapper in (
+            self.compat,
+            self.eight_hour,
+            self.smoke,
+            self.calibration,
+            self.distributed_smoke,
+        ):
+            self.assertIn("IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS=1", wrapper)
+        for contract in (
+            "dagger_bc_loss_step_",
+            '"schema": "fast_roborender.dagger_bc_loss.v1"',
+            '"finite_verified": True',
+            '"nonnegative_verified": True',
+            "finite_bc_loss_marker_sha256=",
+        ):
+            self.assertIn(contract, self.trainer)
+
+    def test_non_calibration_profiles_forbid_camera_dumps(self):
+        for wrapper in (
+            self.compat,
+            self.eight_hour,
+            self.smoke,
+            self.distributed_smoke,
+        ):
+            self.assertIn("IMAGE_DAGGER_DUMP_SIM_RGB=0", wrapper)
+            self.assertIn("IMAGE_DAGGER_DUMP_MAX_STEPS=0", wrapper)
+            self.assertIn("IMAGE_DAGGER_DUMP_MAX_ENVS=0", wrapper)
+
+    def test_hydra_contract_is_built_and_checked_before_submission(self):
+        setup = read("scripts/scaling/oci_h100_trainer_setup.sbatch")
+        preflight = read("scripts/setup/check_env.sh")
+        validator = read("scripts/scaling/validate_production_hydra.py")
+        self.assertIn("validate_production_hydra.py", setup)
+        self.assertIn("production_hydra_contract_sha256=", setup)
+        self.assertIn("production_hydra_contract", preflight)
+        self.assertIn("fast_roborender.production_hydra_contract.v1", preflight)
+        self.assertIn("+exp=loco_manip/wsdpt_image_dagger_3view", validator)
+        self.assertIn('"fresh_student": cfg.checkpoint is None', validator)
 
     def test_expert_labeler_is_a_pinned_cluster_asset(self):
         expected_hash = "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38"
@@ -94,6 +486,10 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             "EXPECTED_IMAGE3F_CUDA_GRAPH",
             "--require-tensorrt-engine",
             "engine_build_manifest.json",
+            "--expected-output-views",
+            "--expected-output-layout",
+            "--expected-output-tile-shape",
+            "--expected-output-stacked-shape",
         ):
             self.assertIn(contract, self.submit + self.packed + self.trainer)
 

@@ -382,9 +382,10 @@ rollout.
 
 The core trainer is a separate, pinned GR00T checkout. Public NVlabs GR00T does not have
 `distill_trainer_videogen.py`, `image3f_frame_client.py`, or `wsdpt_image_dagger.yaml`. The
-installer patches the known parallel trainer to pass explicit episode/step IDs and installs
-the versioned client. Run it only after checking out that exact fork, review both changes, then
-commit them in the GR00T repository so production sees a clean, pinned revision:
+trainer integration lives in the pinned nested GR00T repository. The installer verifies that
+exact trainer contract and installs only the versioned client/telemetry utilities; it deliberately
+refuses to source-patch an arbitrary GR00T checkout. Run it after checking out the pinned nested
+revision so production sees one clean, reproducible source tree:
 
 ```bash
 python scripts/scaling/install_gr00t_integration.py \
@@ -422,17 +423,57 @@ Production behavior is explicit and recorded in both manifests. It uses per-deci
 annealed linearly from 1.0 to 0.0 over 500 rollout iterations: the expert dominates while the
 fresh student is random, and the student increasingly drives the visited-state distribution.
 The legacy parent-trainer mixer remains disabled. `NUM_LEARNING_EPOCHS=1`, one minibatch,
-`VG_PRIMARY_VIEW=head_color`, `value_loss_coef=0.0`, and `entropy_coef=0.0` are pinned. Image3F
-generates all three synchronized views, while the current actor consumes the selected head view.
-Runtime assertions reject any composed Hydra configuration that disagrees with this contract.
+`value_loss_coef=0.0`, and `entropy_coef=0.0` are pinned. Image3F generates all three synchronized
+views and the actor consumes the ordered vertical tile `[head_color, hand_left, hand_right]` at
+`324x192x3`. Runtime assertions reject any composed Hydra configuration that disagrees with this
+contract.
 
 ### Explicit production gates
+
+Release validation is deliberately sequential. First run
+`scripts/scaling/submit_oci_calibration_3view.sh`; its two diagnostic panels are
+technical artifacts only and remain `awaiting_visual_acceptance`. After checking that the three
+columns are the head, left-wrist, and right-wrist cameras with correct orientation, create the
+content-addressed acceptance record (the confirmation text is intentionally exact):
+
+```bash
+python scripts/scaling/camera_calibration_gate.py accept \
+  --manifest /absolute/run/path/validation/camera_calibration_manifest.json \
+  --output "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json" \
+  --reviewer ldu@nvidia.com \
+  --confirm 'I reviewed both three-view calibration panels and accept the camera mapping.' \
+  --expected-fast-roborender-revision "$(git rev-parse HEAD)" \
+  --expected-gr00t-revision "$(git -C GR00T-VisualSim2Real rev-parse HEAD)"
+```
+
+The acceptance binds both panel hashes, their PNG dimensions, ordered camera semantics, and both
+repository revisions. Any source, panel, or revision change invalidates it. The bounded validation
+sequence then runs `submit_oci_smoke_32x300.sh` followed by
+`submit_oci_smoke_256x300.sh`; the latter proves one synchronized optimizer update across all eight
+trainer ranks. Publish each successful run without copying or editing its manifest, then advance
+to the next gate:
+
+```bash
+ln -s /absolute/smoke32/run/profile_validation_manifest.txt \
+  "$STAGE_ROOT/runtime/validation/smoke_32x300_profile_validation_manifest.txt"
+bash scripts/scaling/submit_oci_smoke_256x300.sh
+
+ln -s /absolute/smoke256/run/profile_validation_manifest.txt \
+  "$STAGE_ROOT/runtime/validation/smoke_256x300_profile_validation_manifest.txt"
+bash scripts/scaling/submit_production.sh
+```
+
+The submitter and packed allocation independently rehash the predecessor manifest, checkpoints,
+finite-loss marker, and (for the full smoke) eight-rank DDP policy digest. Production submission
+remains blocked until every predecessor artifact validates against the same source revisions.
 
 | Gate | Must pass before/while running |
 |---|---|
 | Source and assets | Clean, run-pinned `fast_roborender` and integrated GR00T revisions; exact expert-labeler SHA; base student initialization; versioned Image3F client and telemetry integration |
 | Scale and behavior | 8 nodes × 8 H100s; 8 ranks × 32 environments = 256; 300-step rollout; 52 renderers + 4 slack; `MIX=0`; FT-FIXED lag 0; β 1→0 over 500 iterations; pure DAgger BC |
-| Renderer provenance | All 52 live endpoints report the exact fine-tuned release/adapter SHA, five-step sampler, TeaCache 0.3, CFG 1.0, CUDA graph setting, and a load-verified TensorRT engine compatible with the serving GPU/software stack |
+| Camera semantics | Human-accepted, content-addressed calibration for exact head/left-wrist/right-wrist order, orientations, tile shapes, panels, and source revisions |
+| Renderer provenance | All 52 live endpoints report exact three-view order/layout/shape, fine-tuned release/adapter SHA, five-step sampler, TeaCache 0.3, CFG 1.0, CUDA graph setting, and a load-verified TensorRT engine compatible with the serving GPU/software stack |
+| Training integrity | One-node predecessor smoke passes; full 8-rank predecessor smoke proves synchronized post-update policy SHA; every update has finite/nonnegative cross-rank BC loss; initial and exact terminal checkpoints exist |
 | W&B observability | Online personal workspace authenticated as `ldu@nvidia.com`; stable resumable sidecar run; scalar, condition/generated image, and MP4 producers ready; repeated upload/encoding errors terminate training |
 | Runtime semantics | The composed trainer agrees with every behavior, primary-view, epoch, and loss-coefficient assertion before its first rollout |
 | Scientific result | Baseline/early/mid/final fixed-seed evaluation is complete; the final policy improves success by at least 2 absolute points and the paired 95% bootstrap interval has a lower bound above zero |

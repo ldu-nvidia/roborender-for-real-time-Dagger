@@ -42,6 +42,10 @@ BETA_START=${BETA_START:-1.0}
 BETA_END=${BETA_END:-0.0}
 BETA_DECAY_ITERS=${BETA_DECAY_ITERS:-500}
 VG_PRIMARY_VIEW=${VG_PRIMARY_VIEW:-head_color}
+VG_POLICY_VIEWS=${VG_POLICY_VIEWS:-head_color:hand_left:hand_right}
+VG_POLICY_VIEW_COUNT=${VG_POLICY_VIEW_COUNT:-3}
+VG_POLICY_VIEW_LAYOUT=${VG_POLICY_VIEW_LAYOUT:-vertical}
+VG_POLICY_IMAGE_SHAPE=${VG_POLICY_IMAGE_SHAPE:-324x192x3}
 SAVE_FREQUENCY=${SAVE_FREQUENCY:-5}
 TRAINER_CPUS_PER_TASK=${TRAINER_CPUS_PER_TASK:-16}
 TRAINER_MEM_PER_NODE=${TRAINER_MEM_PER_NODE:-128G}
@@ -61,6 +65,7 @@ WANDB_WATCHER_POLL_S=${WANDB_WATCHER_POLL_S:-15}
 WANDB_WATCHER_READY_TIMEOUT_S=${WANDB_WATCHER_READY_TIMEOUT_S:-120}
 WANDB_WATCHER_DRAIN_TIMEOUT_S=${WANDB_WATCHER_DRAIN_TIMEOUT_S:-240}
 TRAINER_NODES=${SLURM_NNODES:?must run under Slurm}
+RUN_PROFILE=${RUN_PROFILE:-production_256x300}
 RENDER_READY_TIMEOUT_S=${RENDER_READY_TIMEOUT_S:-3600}
 RENDER_JOB_ID=${RENDER_JOB_ID:-}
 [[ -z "$RENDER_JOB_ID" || "$RENDER_JOB_ID" =~ ^[0-9]+$ ]] || {
@@ -213,6 +218,34 @@ VG_BETA_DECAY_ITERS=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}"
     echo "FATAL: NUM_ROLLOUT_ITERATIONS must be a positive integer, got $NUM_ROLLOUT_ITERATIONS"
     exit 2
 }
+[[ "$SAVE_FREQUENCY" =~ ^[1-9][0-9]*$ ]] || {
+    echo "FATAL: SAVE_FREQUENCY must be a positive integer, got $SAVE_FREQUENCY"
+    exit 2
+}
+[ $((NUM_ROLLOUT_ITERATIONS % SAVE_FREQUENCY)) -eq 0 ] || {
+    echo "FATAL: NUM_ROLLOUT_ITERATIONS must be divisible by SAVE_FREQUENCY so the exact final checkpoint is persisted"
+    exit 2
+}
+[ "$VG_PRIMARY_VIEW" = head_color ] || {
+    echo "FATAL: three-view production requires primary_view=head_color"
+    exit 2
+}
+[ "$VG_POLICY_VIEWS" = head_color:hand_left:hand_right ] || {
+    echo "FATAL: three-view production requires ordered policy views head_color:hand_left:hand_right"
+    exit 2
+}
+[ "$VG_POLICY_VIEW_COUNT" = 3 ] || {
+    echo "FATAL: three-view production requires policy_view_count=3"
+    exit 2
+}
+[ "$VG_POLICY_VIEW_LAYOUT" = vertical ] || {
+    echo "FATAL: three-view production requires a vertical tile layout"
+    exit 2
+}
+[ "$VG_POLICY_IMAGE_SHAPE" = 324x192x3 ] || {
+    echo "FATAL: three-view production requires policy image shape 324x192x3"
+    exit 2
+}
 
 # Until Raven's private trainer proves an episode-sticky mixed cohort, lagged
 # streams are production-safe only when every env renders every tick (MIX=0)
@@ -287,6 +320,10 @@ if [ "$REQUIRED_RENDERERS" -gt 0 ]; then
         --expected-teacache-threshold "$EXPECTED_IMAGE3F_TEACACHE_THRESHOLD" \
         --expected-cfg-scale "$EXPECTED_IMAGE3F_CFG_SCALE" \
         --expected-cuda-graph "$EXPECTED_IMAGE3F_CUDA_GRAPH" \
+        --expected-output-views "${VG_POLICY_VIEWS//:/,}" \
+        --expected-output-layout "$VG_POLICY_VIEW_LAYOUT" \
+        --expected-output-tile-shape 240,416,3 \
+        --expected-output-stacked-shape 720,416,3 \
         --require-tensorrt-engine \
         --write-manifest "$SELECTED_ENDPOINT_MANIFEST" \
         --write-report "$FLEET_DIR/renderer_capabilities.json" --hydra-list)
@@ -299,6 +336,8 @@ PROJ=${PROJ:-roborender_dagger_scale}
 EXP=${EXP:-dagger_${GLOBAL_NUM_ENVS}env_${ROLLOUT_STEPS}step_mix${MIX}}
 TRAIN_RUN_DIR=${TRAIN_RUN_DIR:-$GR00T_ROOT/logs_rl/$PROJ/${EXP}-${SLURM_JOB_ID}}
 mkdir -p "$TRAIN_RUN_DIR/slurm" "$TRAIN_RUN_DIR/output"
+printf -v EXPECTED_FINAL_CHECKPOINT '%s/model_step_%06d.pt' \
+    "$TRAIN_RUN_DIR" "$NUM_ROLLOUT_ITERATIONS"
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 MASTER_PORT=$((15000 + SLURM_JOB_ID % 20000))
@@ -314,10 +353,53 @@ export IMAGE3F_ENDPOINT_DIR="$FLEET_DIR/endpoints"
 export IMAGE3F_ENDPOINT_MANIFEST="$SELECTED_ENDPOINT_MANIFEST"
 export IMAGE3F_LOCAL_ENVS="$LOCAL_NUM_ENVS"
 export IMAGE3F_REFERENCE_LAG="$REFERENCE_LAG"
+export IMAGE3F_EXPECT_OUTPUT_VIEWS="${VG_POLICY_VIEWS//:/,}"
+export IMAGE3F_EXPECT_OUTPUT_SHAPE=240,416,3
 export IMAGE3F_RUN_ID=${IMAGE3F_RUN_ID:-$SLURM_JOB_ID}
 export IMAGE3F_REQUEST_TIMEOUT_S=${IMAGE3F_REQUEST_TIMEOUT_S:-120}
 export BASE_RENDER_SEED=${BASE_RENDER_SEED:-42}
 export IMAGE_DAGGER_EXPECT_PRIMARY_VIEW="$VG_PRIMARY_VIEW"
+export IMAGE_DAGGER_EXPECT_POLICY_VIEWS="${VG_POLICY_VIEWS//:/,}"
+export IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT="$VG_POLICY_VIEW_COUNT"
+export IMAGE_DAGGER_EXPECT_POLICY_VIEW_LAYOUT="$VG_POLICY_VIEW_LAYOUT"
+export IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE="${VG_POLICY_IMAGE_SHAPE//x/,}"
+export IMAGE_DAGGER_DUMP_SIM_RGB=${IMAGE_DAGGER_DUMP_SIM_RGB:-0}
+case "$IMAGE_DAGGER_DUMP_SIM_RGB" in 0|1) ;; *)
+    echo "FATAL: IMAGE_DAGGER_DUMP_SIM_RGB must be 0 or 1"
+    exit 2
+esac
+if [ -n "${IMAGE_DAGGER_DUMP_MAX_STEPS:-}" ]; then
+    [[ "$IMAGE_DAGGER_DUMP_MAX_STEPS" =~ ^[0-9]+$ ]] || {
+        echo "FATAL: IMAGE_DAGGER_DUMP_MAX_STEPS must be a non-negative integer"
+        exit 2
+    }
+    export IMAGE_DAGGER_DUMP_MAX_STEPS
+fi
+if [ -n "${IMAGE_DAGGER_DUMP_MAX_ENVS:-}" ]; then
+    [[ "$IMAGE_DAGGER_DUMP_MAX_ENVS" =~ ^[0-9]+$ ]] || {
+        echo "FATAL: IMAGE_DAGGER_DUMP_MAX_ENVS must be a non-negative integer"
+        exit 2
+    }
+    export IMAGE_DAGGER_DUMP_MAX_ENVS
+fi
+case "${IMAGE_DAGGER_VERIFY_DDP_SYNC:-0}" in
+    0) unset IMAGE_DAGGER_VERIFY_DDP_SYNC ;;
+    1)
+        [ "$TRAINER_NODES" -gt 1 ] || {
+            echo "FATAL: DDP synchronization verification requires multiple trainer ranks"
+            exit 2
+        }
+        export IMAGE_DAGGER_VERIFY_DDP_SYNC=1
+        ;;
+    *) echo "FATAL: IMAGE_DAGGER_VERIFY_DDP_SYNC must be 0 or 1"; exit 2 ;;
+esac
+case "${IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS:-}" in
+    1) export IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS=1 ;;
+    *)
+        echo "FATAL: packed production profiles require IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS=1"
+        exit 2
+        ;;
+esac
 export IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE="$VG_ROLLOUT_ACTION_SOURCE"
 export IMAGE_DAGGER_EXPECT_BETA_SCHEDULE="$VG_BETA_SCHEDULE"
 export IMAGE_DAGGER_EXPECT_BETA_START="$VG_BETA_START"
@@ -331,6 +413,7 @@ export IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF=0.0
 export IMAGE_DAGGER_EXPECT_ENTROPY_COEF=0.0
 export WANDB_EXPECTED_EMAIL WANDB_MODE WANDB_ENTITY WANDB_PYTHON
 export ROOT GR00T_ROOT FLEET_DIR GLOBAL_NUM_ENVS ROLLOUT_STEPS MIX REFERENCE_LAG
+export RUN_PROFILE
 export STAGE_ROOT ANCHORS TEACHER_CKPT EXPECTED_TEACHER_CKPT_SHA256
 export LOCAL_NUM_ENVS REQUIRED_RENDERERS GRADIENT_ACCUMULATION_STEPS EP_LIST CKPT
 export PROJ EXP TRAIN_RUN_DIR MASTER_ADDR MASTER_PORT TRAINER_NODES
@@ -339,6 +422,7 @@ export NUM_MINI_BATCHES PER_DEVICE_TRAIN_BATCH_SIZE
 export NUM_ROLLOUT_ITERATIONS NUM_LEARNING_EPOCHS
 export BEHAVIOR_SOURCE VG_ROLLOUT_ACTION_SOURCE VG_BETA_SCHEDULE VG_BETA_START VG_BETA_END VG_BETA_DECAY_ITERS
 export TEACHER_ROLLOUT_RATIO ENFORCE_TEACHER_ROLLOUT VG_PRIMARY_VIEW
+export VG_POLICY_VIEWS VG_POLICY_VIEW_COUNT VG_POLICY_VIEW_LAYOUT VG_POLICY_IMAGE_SHAPE
 export INITIALIZATION_MODE CKPT_ARG
 export SAVE_FREQUENCY TRAINER_CPUS_PER_TASK TRAINER_MEM_PER_NODE
 
@@ -443,6 +527,18 @@ rollout_with_teacher_num_steps=0
 enforce_teacher_rollout=$ENFORCE_TEACHER_ROLLOUT
 teacher_rollout_ratio=$TEACHER_ROLLOUT_RATIO
 primary_view=$VG_PRIMARY_VIEW
+policy_views=${VG_POLICY_VIEWS//:/,}
+policy_view_count=$VG_POLICY_VIEW_COUNT
+policy_view_layout=$VG_POLICY_VIEW_LAYOUT
+policy_image_shape=$VG_POLICY_IMAGE_SHAPE
+initial_policy_checkpoint=$TRAIN_RUN_DIR/initial_policy.pt
+expected_final_checkpoint=$EXPECTED_FINAL_CHECKPOINT
+camera_calibration_acceptance=${CAMERA_CALIBRATION_ACCEPTANCE:-NONE}
+camera_calibration_acceptance_sha256=${EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256:-NONE}
+prerequisite_profile=${PREREQUISITE_PROFILE_EXPECTED:-NONE}
+prerequisite_profile_validation=${PREREQUISITE_PROFILE_VALIDATION:-NONE}
+prerequisite_profile_validation_sha256=${EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256:-NONE}
+finite_bc_loss_gate=$IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS
 checkpoint_frequency_rollout_iterations=$SAVE_FREQUENCY
 value_loss_coef=0.0
 entropy_coef=0.0
@@ -461,7 +557,7 @@ echo " optimizer step: ${TRANSITIONS_PER_OPTIMIZER_STEP} global transitions"
 echo " rollout iterations: ${NUM_ROLLOUT_ITERATIONS} (trainer num_total_batches)"
 echo " behavior: ${BEHAVIOR_SOURCE}, videogen rollout source=${VG_ROLLOUT_ACTION_SOURCE}, beta=${VG_BETA_SCHEDULE}:${VG_BETA_START}->${VG_BETA_END}/${VG_BETA_DECAY_ITERS}, legacy teacher mixer=false, warmup teacher steps=0"
 echo " objective: pure DAgger BC (value_loss_coef=0.0, entropy_coef=0.0)"
-echo " actor RGB input: generated primary view=${VG_PRIMARY_VIEW}"
+echo " actor RGB input: generated policy views=${VG_POLICY_VIEWS} (${VG_POLICY_VIEW_COUNT} views, ${VG_POLICY_VIEW_LAYOUT}, ${VG_POLICY_IMAGE_SHAPE})"
 echo " renderers: ${REQUIRED_RENDERERS}, ray-traced mix=${MIX}, reference policy=$([ "$REFERENCE_LAG" -eq 0 ] && echo fixed-anchor || echo generated-lag), RGB lag=${REFERENCE_LAG}"
 echo " initialization: $INITIALIZATION_MODE ($CKPT)"
 echo " output: $TRAIN_RUN_DIR"
@@ -500,17 +596,26 @@ srun --nodes="$TRAINER_NODES" --ntasks="$TRAINER_NODES" --ntasks-per-node=1 \
         fi
         cd "$GR00T_ROOT"
         RANK_RENDER_SEED=$((BASE_RENDER_SEED + SLURM_PROCID))
-        exec accelerate launch \
-            --multi_gpu \
-            --num_machines "$TRAINER_NODES" \
-            --num_processes "$TRAINER_NODES" \
-            --machine_rank "$SLURM_PROCID" \
-            --main_process_ip "$MASTER_ADDR" \
-            --main_process_port "$MASTER_PORT" \
-            --same_network --rdzv_backend static --max_restarts 0 \
-            --num_cpu_threads_per_process "$TRAINER_CPUS_PER_TASK" \
+        if [ "$TRAINER_NODES" -eq 1 ]; then
+            ACCELERATE_ARGS=(
+                --num_processes 1
+                --num_cpu_threads_per_process "$TRAINER_CPUS_PER_TASK"
+            )
+        else
+            ACCELERATE_ARGS=(
+                --multi_gpu
+                --num_machines "$TRAINER_NODES"
+                --num_processes "$TRAINER_NODES"
+                --machine_rank "$SLURM_PROCID"
+                --main_process_ip "$MASTER_ADDR"
+                --main_process_port "$MASTER_PORT"
+                --same_network --rdzv_backend static --max_restarts 0
+                --num_cpu_threads_per_process "$TRAINER_CPUS_PER_TASK"
+            )
+        fi
+        exec accelerate launch "${ACCELERATE_ARGS[@]}" \
             gr00t/rl/train_agent_trl.py \
-                +exp=loco_manip/wsdpt_image_dagger \
+                +exp=loco_manip/wsdpt_image_dagger_3view \
                 num_envs="$LOCAL_NUM_ENVS" \
                 algo.config.num_steps_per_env="$ROLLOUT_STEPS" \
                 algo.config.num_mini_batches="$NUM_MINI_BATCHES" \
@@ -521,21 +626,24 @@ srun --nodes="$TRAINER_NODES" --ntasks="$TRAINER_NODES" --ntasks-per-node=1 \
                 algo.config.value_loss_coef=0.0 \
                 algo.config.entropy_coef=0.0 \
                 algo.config.videogen.rollout_action_source="$VG_ROLLOUT_ACTION_SOURCE" \
-                algo.config.videogen.beta_schedule="$VG_BETA_SCHEDULE" \
-                algo.config.videogen.beta_start="$VG_BETA_START" \
-                algo.config.videogen.beta_end="$VG_BETA_END" \
-                algo.config.videogen.beta_decay_iters="$VG_BETA_DECAY_ITERS" \
+                ++algo.config.videogen.beta_schedule="$VG_BETA_SCHEDULE" \
+                ++algo.config.videogen.beta_start="$VG_BETA_START" \
+                ++algo.config.videogen.beta_end="$VG_BETA_END" \
+                ++algo.config.videogen.beta_decay_iters="$VG_BETA_DECAY_ITERS" \
                 algo.trl.per_device_train_batch_size="$PER_DEVICE_TRAIN_BATCH_SIZE" \
                 algo.trl.gradient_accumulation_steps="$GRADIENT_ACCUMULATION_STEPS" \
                 algo.trl.num_total_batches="$NUM_ROLLOUT_ITERATIONS" \
                 algo.trl.total_episodes=null \
                 callbacks.model_save.save_frequency="$SAVE_FREQUENCY" \
+                callbacks.model_save.save_initial_checkpoint=true \
                 headless=true "$CKPT_ARG" \
                 teacher_actor_path="$TEACHER_CKPT" \
                 algo.config.videogen.raytraced_mix_prob="$MIX" \
                 ++algo.config.videogen.seed="$RANK_RENDER_SEED" \
                 ++algo.config.videogen.reference_lag="$REFERENCE_LAG" \
                 ++algo.config.videogen.primary_view="$VG_PRIMARY_VIEW" \
+                simulator.config.cameras.policy_views="[head_color,hand_left,hand_right]" \
+                policy_view_count="$VG_POLICY_VIEW_COUNT" \
                 algo.config.videogen.image3f_endpoint_files="$EP_LIST" \
                 algo.config.videogen.anchor_pool_dir="$ANCHORS" \
                 algo.config.videogen.anchor_index="${ANCHOR_IDX:-0}" \
@@ -597,6 +705,203 @@ if ! kill -0 "$WANDB_WATCHER_PID" 2>/dev/null; then
     if [ "$TRAIN_RC" -eq 0 ]; then
         exit 70
     fi
+fi
+
+if [ "$TRAIN_RC" -eq 0 ]; then
+    if [ ! -s "$TRAIN_RUN_DIR/initial_policy.pt" ]; then
+        echo "FATAL: successful trainer did not create initial_policy.pt" >&2
+        TRAIN_RC=71
+    fi
+    if [ ! -s "$EXPECTED_FINAL_CHECKPOINT" ]; then
+        echo "FATAL: successful trainer did not create exact final checkpoint $EXPECTED_FINAL_CHECKPOINT" >&2
+        TRAIN_RC=71
+    fi
+fi
+
+# If a pre-timeout run produced any trained checkpoint, training necessarily
+# began and the iteration-zero baseline must also exist. Do not misclassify a
+# job killed before trainer initialization as an artifact-integrity failure.
+if [ "$TRAIN_RC" -eq 124 ] && compgen -G "$TRAIN_RUN_DIR/model_step_*.pt" >/dev/null; then
+    if [ ! -s "$TRAIN_RUN_DIR/initial_policy.pt" ]; then
+        echo "FATAL: checkpointed pre-timeout run is missing initial_policy.pt" >&2
+        TRAIN_RC=71
+    fi
+fi
+
+if [ "$TRAIN_RC" -eq 0 ]; then
+    case "$RUN_PROFILE" in
+        calibration_3view|smoke_32x300|smoke_256x300)
+            FINAL_CHECKPOINT="$EXPECTED_FINAL_CHECKPOINT"
+            if [ ! -s "$FINAL_CHECKPOINT" ]; then
+                echo "FATAL: validation profile did not create model_step_000001.pt" >&2
+                TRAIN_RC=71
+            else
+                INITIAL_SHA256=$(sha256sum "$TRAIN_RUN_DIR/initial_policy.pt" | awk '{print $1}')
+                FINAL_SHA256=$(sha256sum "$FINAL_CHECKPOINT" | awk '{print $1}')
+                BC_LOSS_MARKER="$TRAIN_RUN_DIR/validation/dagger_bc_loss_step_000000001.json"
+                if [ ! -s "$BC_LOSS_MARKER" ]; then
+                    echo "FATAL: validation profile is missing its finite BC-loss marker" >&2
+                    exit 71
+                fi
+                if ! python3 - "$BC_LOSS_MARKER" "$TRAINER_NODES" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "schema": "fast_roborender.dagger_bc_loss.v1",
+    "update": 1,
+    "world_size": int(sys.argv[2]),
+    "finite_verified": True,
+    "nonnegative_verified": True,
+}
+for key, value in expected.items():
+    if payload.get(key) != value:
+        raise SystemExit(f"FATAL: invalid BC-loss marker {key}={payload.get(key)!r}")
+loss = payload.get("loss")
+if isinstance(loss, bool) or not isinstance(loss, (int, float)):
+    raise SystemExit("FATAL: BC-loss marker has no numeric loss")
+if not math.isfinite(float(loss)) or float(loss) < 0.0:
+    raise SystemExit(f"FATAL: BC-loss marker has invalid loss {loss!r}")
+PY
+                then
+                    echo "FATAL: finite BC-loss marker validation failed" >&2
+                    exit 71
+                fi
+                BC_LOSS_MARKER_SHA256=$(sha256sum "$BC_LOSS_MARKER" | awk '{print $1}')
+                DDP_MARKER=""
+                DDP_MARKER_SHA256=""
+                if [ "$RUN_PROFILE" = smoke_256x300 ]; then
+                    DDP_MARKER="$TRAIN_RUN_DIR/validation/ddp_policy_sync_step_000000001.json"
+                    if [ ! -s "$DDP_MARKER" ]; then
+                        echo "FATAL: distributed smoke is missing its DDP synchronization marker" >&2
+                        exit 71
+                    fi
+                    if ! python3 - "$DDP_MARKER" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "schema": "fast_roborender.ddp_policy_sync.v1",
+    "verified": True,
+    "optimizer_update": 1,
+    "world_size": 8,
+}
+for key, value in expected.items():
+    if payload.get(key) != value:
+        raise SystemExit(
+            f"FATAL: invalid DDP synchronization marker {key}={payload.get(key)!r}"
+        )
+PY
+                    then
+                        echo "FATAL: distributed smoke DDP marker validation failed" >&2
+                        exit 71
+                    fi
+                    DDP_MARKER_SHA256=$(sha256sum "$DDP_MARKER" | awk '{print $1}')
+                fi
+                CAMERA_CALIBRATION_MANIFEST=""
+                CAMERA_CALIBRATION_MANIFEST_SHA256=""
+                VALIDATION_STATUS=validated
+                if [ "$RUN_PROFILE" = calibration_3view ]; then
+                    CAMERA_PANEL_0="$TRAIN_RUN_DIR/render_dumps/step000_env0.png"
+                    CAMERA_PANEL_1="$TRAIN_RUN_DIR/render_dumps/step001_env0.png"
+                    for dump in "$CAMERA_PANEL_0" "$CAMERA_PANEL_1"; do
+                        if [ ! -s "$dump" ]; then
+                            echo "FATAL: calibration profile is missing camera panel $dump" >&2
+                            exit 71
+                        fi
+                        if ! python3 - "$dump" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+with path.open("rb") as handle:
+    signature = handle.read(8)
+    length = struct.unpack(">I", handle.read(4))[0]
+    chunk_type = handle.read(4)
+    ihdr = handle.read(length)
+if signature != b"\x89PNG\r\n\x1a\n" or chunk_type != b"IHDR" or length != 13:
+    raise SystemExit(f"FATAL: malformed calibration PNG {path}")
+width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
+    ">IIBBBBB", ihdr
+)
+expected = (1248, 720, 8, 2, 0, 0, 0)
+actual = (width, height, bit_depth, color_type, compression, filtering, interlace)
+if actual != expected:
+    raise SystemExit(
+        f"FATAL: calibration panel contract mismatch for {path}: "
+        f"expected {expected}, got {actual}"
+    )
+PY
+                        then
+                            echo "FATAL: calibration panel validation failed" >&2
+                            exit 71
+                        fi
+                    done
+                    CAMERA_PANEL_0_SHA256=$(sha256sum "$CAMERA_PANEL_0" | awk '{print $1}')
+                    CAMERA_PANEL_1_SHA256=$(sha256sum "$CAMERA_PANEL_1" | awk '{print $1}')
+                    CAMERA_CALIBRATION_MANIFEST="$TRAIN_RUN_DIR/validation/camera_calibration_manifest.json"
+                    CAMERA_TMP="$CAMERA_CALIBRATION_MANIFEST.tmp.$$"
+                    cat > "$CAMERA_TMP" <<EOF
+{
+  "schema": "fast_roborender.camera_calibration.v1",
+  "status": "awaiting_visual_acceptance",
+  "fast_roborender_revision": "$FAST_REVISION",
+  "gr00t_revision": "$EXPECTED_GR00T_REVISION",
+  "policy_views": ["head_color", "hand_left", "hand_right"],
+  "columns": ["head_color", "hand_left", "hand_right"],
+  "rows": ["depth_control", "simulator_rgb", "generated_rgb"],
+  "tile_shape_hwc": [240, 416, 3],
+  "panel_shape_hwc": [720, 1248, 3],
+  "panels": [
+    {"path": "$CAMERA_PANEL_0", "sha256": "$CAMERA_PANEL_0_SHA256"},
+    {"path": "$CAMERA_PANEL_1", "sha256": "$CAMERA_PANEL_1_SHA256"}
+  ]
+}
+EOF
+                    mv "$CAMERA_TMP" "$CAMERA_CALIBRATION_MANIFEST"
+                    CAMERA_CALIBRATION_MANIFEST_SHA256=$(sha256sum "$CAMERA_CALIBRATION_MANIFEST" | awk '{print $1}')
+                    VALIDATION_STATUS=awaiting_camera_visual_acceptance
+                fi
+                VALIDATION_TMP="$TRAIN_RUN_DIR/profile_validation_manifest.txt.tmp.$$"
+                cat > "$VALIDATION_TMP" <<EOF
+run_profile=$RUN_PROFILE
+fast_roborender_revision=$FAST_REVISION
+gr00t_revision=$EXPECTED_GR00T_REVISION
+global_envs=$GLOBAL_NUM_ENVS
+rollout_steps=$ROLLOUT_STEPS
+trainer_nodes=$TRAINER_NODES
+policy_views=${VG_POLICY_VIEWS//:/,}
+policy_view_count=$VG_POLICY_VIEW_COUNT
+policy_view_layout=$VG_POLICY_VIEW_LAYOUT
+policy_image_shape=$VG_POLICY_IMAGE_SHAPE
+initial_policy_checkpoint=$TRAIN_RUN_DIR/initial_policy.pt
+initial_policy_sha256=$INITIAL_SHA256
+final_checkpoint=$FINAL_CHECKPOINT
+final_checkpoint_sha256=$FINAL_SHA256
+finite_bc_loss_marker=$BC_LOSS_MARKER
+finite_bc_loss_marker_sha256=$BC_LOSS_MARKER_SHA256
+ddp_sync_marker=$DDP_MARKER
+ddp_sync_marker_sha256=$DDP_MARKER_SHA256
+camera_calibration_manifest=$CAMERA_CALIBRATION_MANIFEST
+camera_calibration_manifest_sha256=$CAMERA_CALIBRATION_MANIFEST_SHA256
+rollout_iterations=1
+status=$VALIDATION_STATUS
+EOF
+                mv "$VALIDATION_TMP" "$TRAIN_RUN_DIR/profile_validation_manifest.txt"
+                if [ "$RUN_PROFILE" = calibration_3view ]; then
+                    : > "$TRAIN_RUN_DIR/PROFILE_TECHNICALLY_VALIDATED"
+                else
+                    : > "$TRAIN_RUN_DIR/PROFILE_VALIDATED"
+                fi
+            fi
+            ;;
+    esac
 fi
 
 if [ "$TRAIN_RC" -eq 0 ]; then

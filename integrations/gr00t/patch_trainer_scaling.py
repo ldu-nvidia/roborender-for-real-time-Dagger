@@ -96,12 +96,37 @@ def _remove_legacy_runtime_gates(source: str) -> str:
     return "".join(lines[: starts[0]] + lines[ends[0] + 1 :])
 
 
+def _remove_v2_runtime_gates_for_upgrade(source: str) -> str:
+    """Remove a complete pre-three-view V2 block so it can be extended."""
+    if source.count(RUNTIME_GATES_MARKER) != 1:
+        raise PatchError("invalid production runtime gates marker count")
+    lines = source.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if RUNTIME_GATES_MARKER in line]
+    ends = [
+        i
+        for i, line in enumerate(lines)
+        if i >= starts[0]
+        and "production gate failed: entropy coefficient mismatch" in line
+    ]
+    if len(ends) != 1 or ends[0] < starts[0]:
+        raise PatchError("invalid production runtime gates: incomplete V2 block")
+    return "".join(lines[: starts[0]] + lines[ends[0] + 1 :])
+
+
 def _patch_runtime_gates(source: str) -> str:
     """Add fail-fast checks for the controls pinned by the production launcher."""
     required_literals = (
         RUNTIME_GATES_MARKER,
         "IMAGE_DAGGER_EXPECT_PRIMARY_VIEW",
         "production gate failed: primary view mismatch",
+        "IMAGE_DAGGER_EXPECT_POLICY_VIEWS",
+        "production gate failed: policy views mismatch",
+        "IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT",
+        "production gate failed: policy view count mismatch",
+        "IMAGE_DAGGER_EXPECT_POLICY_VIEW_LAYOUT",
+        "production gate failed: policy view layout mismatch",
+        "IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE",
+        "production gate failed: policy image shape mismatch",
         "IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE",
         "production gate failed: rollout action source mismatch",
         "IMAGE_DAGGER_EXPECT_BETA_SCHEDULE",
@@ -124,8 +149,40 @@ def _patch_runtime_gates(source: str) -> str:
         "production gate failed: entropy coefficient mismatch",
     )
     if RUNTIME_GATES_MARKER in source:
-        _require_literals_once(source, required_literals, "production runtime gates")
-        return source
+        new_literals = required_literals[3:11]
+        if all(source.count(literal) == 1 for literal in required_literals):
+            return source
+        # A complete old V2 block can be upgraded.  A partial three-view block
+        # is corruption and must never be silently repaired.
+        if any(literal in source for literal in new_literals):
+            _require_literals_once(source, required_literals, "production runtime gates")
+        old_v2_literals = (
+            RUNTIME_GATES_MARKER,
+            "IMAGE_DAGGER_EXPECT_PRIMARY_VIEW",
+            "production gate failed: primary view mismatch",
+            "IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE",
+            "production gate failed: rollout action source mismatch",
+            "IMAGE_DAGGER_EXPECT_BETA_SCHEDULE",
+            "production gate failed: beta schedule mismatch",
+            "IMAGE_DAGGER_EXPECT_BETA_START",
+            "production gate failed: beta start mismatch",
+            "IMAGE_DAGGER_EXPECT_BETA_END",
+            "production gate failed: beta end mismatch",
+            "IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS",
+            "production gate failed: teacher warmup mismatch",
+            "IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER",
+            "production gate failed: behavior source mismatch",
+            "IMAGE_DAGGER_EXPECT_TEACHER_RATIO",
+            "production gate failed: teacher ratio mismatch",
+            "IMAGE_DAGGER_EXPECT_LEARNING_EPOCHS",
+            "production gate failed: learning epochs mismatch",
+            "IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF",
+            "production gate failed: value loss coefficient mismatch",
+            "IMAGE_DAGGER_EXPECT_ENTROPY_COEF",
+            "production gate failed: entropy coefficient mismatch",
+        )
+        _require_literals_once(source, old_v2_literals, "production runtime gates")
+        source = _remove_v2_runtime_gates_for_upgrade(source)
     source = _remove_legacy_runtime_gates(source)
     source = _sub_once(
         r"^(?P<i>\s*)self\._id_episode_steps\s*=\s*None\s*$",
@@ -135,6 +192,36 @@ def _patch_runtime_gates(source: str) -> str:
             r"\g<i>_gate_primary = os.environ.get('IMAGE_DAGGER_EXPECT_PRIMARY_VIEW')\n"
             r"\g<i>if _gate_primary and str(self.vg_primary_view) != _gate_primary:\n"
             r"\g<i>    raise RuntimeError('production gate failed: primary view mismatch')\n"
+            r"\g<i>_gate_policy_views = os.environ.get('IMAGE_DAGGER_EXPECT_POLICY_VIEWS')\n"
+            r"\g<i>if _gate_policy_views is not None:\n"
+            r"\g<i>    _expected_policy_views = tuple(v.strip() for v in _gate_policy_views.split(','))\n"
+            r"\g<i>    if (not _expected_policy_views or any(not v for v in _expected_policy_views)\n"
+            r"\g<i>            or tuple(str(v) for v in self._policy_views) != _expected_policy_views):\n"
+            r"\g<i>        raise RuntimeError('production gate failed: policy views mismatch')\n"
+            r"\g<i>_gate_policy_count = os.environ.get('IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT')\n"
+            r"\g<i>if _gate_policy_count is not None:\n"
+            r"\g<i>    try:\n"
+            r"\g<i>        _expected_policy_count = int(_gate_policy_count)\n"
+            r"\g<i>        _configured_policy_count = int(self.env.config.get('policy_view_count', -1))\n"
+            r"\g<i>    except (TypeError, ValueError) as exc:\n"
+            r"\g<i>        raise RuntimeError('production gate failed: invalid policy view count') from exc\n"
+            r"\g<i>    if (_expected_policy_count <= 0 or _configured_policy_count != _expected_policy_count\n"
+            r"\g<i>            or len(self._policy_views) != _expected_policy_count):\n"
+            r"\g<i>        raise RuntimeError('production gate failed: policy view count mismatch')\n"
+            r"\g<i>_gate_policy_layout = os.environ.get('IMAGE_DAGGER_EXPECT_POLICY_VIEW_LAYOUT')\n"
+            r"\g<i>if (_gate_policy_layout is not None\n"
+            r"\g<i>        and str(getattr(_cams, 'policy_view_layout', '')) != _gate_policy_layout):\n"
+            r"\g<i>    raise RuntimeError('production gate failed: policy view layout mismatch')\n"
+            r"\g<i>_gate_policy_shape = os.environ.get('IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE')\n"
+            r"\g<i>if _gate_policy_shape is not None:\n"
+            r"\g<i>    try:\n"
+            r"\g<i>        _expected_policy_shape = tuple(int(v.strip()) for v in _gate_policy_shape.split(','))\n"
+            r"\g<i>        _actual_policy_shape = tuple(int(v) for v in self.camera_resolution)\n"
+            r"\g<i>    except (TypeError, ValueError) as exc:\n"
+            r"\g<i>        raise RuntimeError('production gate failed: invalid policy image shape') from exc\n"
+            r"\g<i>    if (len(_expected_policy_shape) != 3 or any(v <= 0 for v in _expected_policy_shape)\n"
+            r"\g<i>            or _actual_policy_shape != _expected_policy_shape):\n"
+            r"\g<i>        raise RuntimeError('production gate failed: policy image shape mismatch')\n"
             r"\g<i>_gate_rollout_source = os.environ.get('IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE')\n"
             r"\g<i>if _gate_rollout_source is not None and str(getattr(self, 'vg_rollout_action_source', None)) != _gate_rollout_source:\n"
             r"\g<i>    raise RuntimeError('production gate failed: rollout action source mismatch')\n"
