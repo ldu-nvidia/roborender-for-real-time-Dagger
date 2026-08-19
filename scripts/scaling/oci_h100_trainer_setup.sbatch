@@ -23,8 +23,9 @@ ACTIVATE_WRAPPER=${ACTIVATE_WRAPPER:-$STAGE_ROOT/runtime/envs/activate_viral_isa
 export HOME=${HOME_OVERRIDE:-$STAGE_ROOT/runtime/home}
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$STAGE_ROOT/runtime/cache/xdg}
 export PIP_CACHE_DIR=${PIP_CACHE_DIR:-$STAGE_ROOT/runtime/cache/pip}
+export TORCH_HOME=${TORCH_HOME:-$STAGE_ROOT/runtime/cache/torch}
 export TMPDIR=${TMPDIR:-$STAGE_ROOT/runtime/tmp}
-mkdir -p "$HOME" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$TMPDIR" "$(dirname "$VIRAL_ENV")"
+mkdir -p "$HOME" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$TORCH_HOME" "$TMPDIR" "$(dirname "$VIRAL_ENV")"
 
 [ -d "$GR00T_ROOT" ] || { echo "FATAL: integrated GR00T source missing: $GR00T_ROOT" >&2; exit 2; }
 [ -x "$BASE_PYTHON" ] || { echo "FATAL: Isaac Python missing: $BASE_PYTHON" >&2; exit 2; }
@@ -51,6 +52,13 @@ fi
     -e "$ISAACLAB_ROOT/source/isaaclab_rl[all]"
 "$PY" -m pip install numpy==1.26.0
 "$PY" -m pip install -e "$GR00T_ROOT"
+# Fresh policy initialization uses ImageNet ResNet-18 weights. Populate the
+# shared cache once so eight ranks never race on a launch-time download.
+"$PY" - <<'PY'
+from torchvision.models import ResNet18_Weights, resnet18
+resnet18(weights=ResNet18_Weights.DEFAULT)
+print("resnet18_imagenet_cache=ready")
+PY
 
 cat > "$ACTIVATE_WRAPPER" <<EOF
 #!/bin/bash
@@ -78,5 +86,6 @@ isaaclab_revision=$(git -C "$ISAACLAB_ROOT" rev-parse HEAD)
 gr00t_revision=$(git -C "$GR00T_ROOT" rev-parse HEAD)
 python=$PY
 activation=$ACTIVATE_WRAPPER
+torch_home=$TORCH_HOME
 EOF
 echo "VIRAL_H100_SETUP_DONE"

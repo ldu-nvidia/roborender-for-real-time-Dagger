@@ -139,6 +139,7 @@ export TRAINER_CONTAINER_MOUNTS="$STAGE_ROOT:$STAGE_ROOT"
 export HOME_OVERRIDE="$STAGE_ROOT/runtime/home"
 export XDG_CACHE_HOME="$STAGE_ROOT/runtime/cache/xdg"
 export XDG_DATA_HOME="$STAGE_ROOT/runtime/cache/share"
+export TORCH_HOME="$STAGE_ROOT/runtime/cache/torch"
 export TMPDIR="$STAGE_ROOT/runtime/tmp"
 export IMAGE3F_RUN_ID="$RUN_ID"
 export IMAGE3F_MAX_STREAMS=16
