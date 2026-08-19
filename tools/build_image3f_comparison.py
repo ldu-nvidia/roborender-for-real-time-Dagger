@@ -6,7 +6,7 @@ head row also appends the video-model rgb_gen (upscaled). Also computes
 PSNR/SSIM (head, vs video-model rgb_gen at 108x192) and temporal
 consistency (mean abs frame diff).
 """
-import argparse, json
+import argparse, json, os
 from pathlib import Path
 
 import cv2
@@ -54,7 +54,8 @@ def write_mp4(path, frames, fps=15):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gen_npz", nargs="+", required=True, help="*_gen_<variant>.npz from image3f_eval.py")
-    ap.add_argument("--pool", default="/svl/u/ravenh/fast_roborender/videogen_dataset")
+    root = Path(os.environ.get("ROBORENDER_ROOT", Path(__file__).resolve().parents[1]))
+    ap.add_argument("--pool", default=str(root / "videogen_dataset"))
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     out = Path(args.out)

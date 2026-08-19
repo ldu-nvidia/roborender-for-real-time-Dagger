@@ -1,28 +1,27 @@
 #!/bin/bash
 #SBATCH --job-name=i3f_ft_setup_hi
-#SBATCH --partition=viscam-hi
-#SBATCH --account=viscam
-#SBATCH --nodelist=viscam14,viscam15
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --gres=gpu:rtxpro6000:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=4:00:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/i3f_ft_setup_hi_%j.log
+#SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/i3f_ft_setup_hi_%j.log
 set -x
-export HOME=/sailhome/ravenh
+export HOME=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/home
 export PYTHONDONTWRITEBYTECODE=1
-export PIP_CACHE_DIR=/vision/u/ravenh/pip_cache
-export TMPDIR=/vision/u/ravenh/tmp
+export PIP_CACHE_DIR=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/cache/pip
+export TMPDIR=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/tmp
 mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
-ROOT=/vision/u/ravenh/roborender_image_model_accelerated
-export ROBORENDER_MODEL_BASE=/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models
+ROOT=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets/roborender_image_model_accelerated
+export ROBORENDER_MODEL_BASE=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets/models
 cd "$ROOT"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
 if [ ! -x "$ROOT/.venv/bin/python" ]; then
   sed -i 's|--index-url "${TORCH_INDEX_URL}" \\|--index-url "${TORCH_INDEX_URL}" --extra-index-url https://pypi.org/simple \\|' bin/create_baremetal_env.sh
-  PYTHON=/vision/u/ravenh/py313/bin/python ./bin/create_baremetal_env.sh; RC=$?
-  cd /vision/u/ravenh && unzip -o -q roborender_image_fine_tune.zip roborender_image_model_accelerated/bin/create_baremetal_env.sh && cd "$ROOT"
+  PYTHON=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets/roborender_image_model_accelerated/.venv/bin/python ./bin/create_baremetal_env.sh; RC=$?
+  cd /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets && unzip -o -q roborender_image_fine_tune.zip roborender_image_model_accelerated/bin/create_baremetal_env.sh && cd "$ROOT"
   [ $RC -ne 0 ] && { echo ENV_FAIL; exit 1; }
 fi
 export PYTHON="$ROOT/.venv/bin/python"

@@ -1,7 +1,9 @@
 import numpy as np, glob, random, os, cv2, imageio
+from pathlib import Path
 
-POOL = "/svl/u/ravenh/fast_roborender/videogen_dataset"
-OUT  = "/svl/u/ravenh/fast_roborender/training_samples_b"
+ROOT = Path(os.environ.get("ROBORENDER_ROOT", Path(__file__).resolve().parents[1]))
+POOL = str(ROOT / "videogen_dataset")
+OUT = str(ROOT / "training_samples_b")
 os.makedirs(OUT, exist_ok=True)
 VIEWS = ["hand_left", "head_color", "hand_right"]
 H, W = 240, 416

@@ -25,8 +25,9 @@ DROID_PARAMS = {
 }
 VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]
 
-POOL = Path("/svl/u/ravenh/fast_roborender/videogen_dataset")
-OUT = Path("/svl/u/ravenh/fast_roborender/image3f_reproduction")
+ROOT = Path(os.environ.get("ROBORENDER_ROOT", Path(__file__).resolve().parents[1]))
+POOL = ROOT / "videogen_dataset"
+OUT = ROOT / "image3f_reproduction"
 CHUNKS = ["chunk_16222830_0001309", "chunk_16222830_0000051", "chunk_16222830_0000501"]
 W, H = 416, 240
 

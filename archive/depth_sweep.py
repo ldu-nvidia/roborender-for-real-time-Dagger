@@ -1,8 +1,8 @@
 import numpy as np, sys, glob
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender")
 from renormalize_depth import h5v4_frame_seq
 
-files = sorted(glob.glob("/svl/u/ravenh/fast_roborender/videogen_dataset/chunk_*.npz"))[:40]
+files = sorted(glob.glob("/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/videogen_dataset/chunk_*.npz"))[:40]
 raws = []
 for f in files:
     r = np.load(f)["depth_raw__head_color"].astype(np.float32)

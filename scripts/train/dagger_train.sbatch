@@ -25,24 +25,27 @@
 #   ANCHORS     anchor pool dir, default anchor_pool_2048
 #   ANCHOR_IDX  which stored anchor frame, default 0
 #
-#SBATCH --partition=viscam-hi
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=dagger_train
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=48:00:00
-#SBATCH --exclude=viscam10,viscam12
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/dagger_train_%j.log
+#SBATCH --time=08:00:00
+#SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/dagger_train_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -euo pipefail
 
-ROOT=/svl/u/ravenh/fast_roborender
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
+source "$ROOT/scripts/setup/oci_env.sh"
 MIX=${MIX:-0.5}
 NUM_ENVS=${NUM_ENVS:-16}
-ANCHORS=${ANCHORS:-/vision/u/ravenh/anchor_pool_2048}
+ANCHORS=${ANCHORS:-$ROBORENDER_STAGE_ROOT/assets/anchor_pool_2048}
 ANCHOR_IDX=${ANCHOR_IDX:-0}
-CKPT=${CKPT:-$ROOT/GR00T-VisualSim2Real/logs_rl/image_dagger_r4/image_dagger_run4-20260814_131202/last.pt}
+CKPT=${CKPT:-none}
 MIXTAG=$(python3 -c "print({'0.0':'fullgen','1.0':'fullrt'}.get('$MIX','mix$MIX'))")
 PROJ=${PROJ:-image_dagger_$MIXTAG}
 EXP=${EXP:-dagger_$MIXTAG}
@@ -51,9 +54,7 @@ python3 -c "
 mix = float('$MIX')
 assert 0.0 <= mix <= 1.0, 'MIX must be in [0,1], got %r' % mix" || exit 1
 
-export HOME=/sailhome/ravenh
-export XDG_CACHE_HOME=/svl/u/ravenh/.cache_xdg XDG_DATA_HOME=/svl/u/ravenh/.share_xdg
-export TMPDIR=/svl/u/ravenh/tmp OMNI_KIT_ACCEPT_EULA=YES
+export HOME=$HOME_OVERRIDE OMNI_KIT_ACCEPT_EULA=YES
 
 # CKPT=none trains without a warm start. Required for the 3-view policy: its vision_obs
 # is 3x taller, so single-view checkpoints (offline BC, image DAgger rounds 1-4) carry
@@ -98,8 +99,7 @@ echo " anchors    : $ANCHORS (index $ANCHOR_IDX)"
 echo " run        : $PROJ / $EXP"
 echo "=================================================================="
 
-source /svl/u/ravenh/miniconda3/etc/profile.d/conda.sh
-conda activate viral
+source "$VIRAL_VENV_ACTIVATE"
 cd "$ROOT/GR00T-VisualSim2Real"
 HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
     gr00t/rl/train_agent_trl.py \

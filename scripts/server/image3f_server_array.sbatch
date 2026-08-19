@@ -2,25 +2,29 @@
 # Production Image3F fleet element. Submit through scripts/scaling/submit_production.sh
 # so every array task receives a unique endpoint and queue directory.
 #SBATCH --job-name=i3f_scale
-#SBATCH --partition=viscam-hi
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:rtxpro6000:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/i3f_scale_%A_%a.log
+#SBATCH --time=08:15:00
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
-ROOT=${ROOT:-/svl/u/ravenh/fast_roborender}
+STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 RUN_DIR=${RUN_DIR:-${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_production.sh}}
 TASK_ID=${SLURM_ARRAY_TASK_ID:?this script must run as a Slurm array}
 INDEX=$(printf '%03d' "$TASK_ID")
 
-export HOME=${HOME_OVERRIDE:-/sailhome/ravenh}
+export HOME=${HOME_OVERRIDE:-$STAGE_ROOT/runtime/home}
 export PYTHONDONTWRITEBYTECODE=1
-export IMAGE3F_ROOT=${IMAGE3F_ROOT:-/vision/u/ravenh/roborender_image_model_accelerated}
-export ROBORENDER_MODEL_BASE=${ROBORENDER_MODEL_BASE:-/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models}
+export IMAGE3F_ROOT=${IMAGE3F_ROOT:-$STAGE_ROOT/assets/roborender_image_model_accelerated}
+export IMAGE3F_ENV=${IMAGE3F_ENV:-$STAGE_ROOT/runtime/envs/image3f-cu128}
+export IMAGE3F_PYTHON=${IMAGE3F_PYTHON:-$IMAGE3F_ENV/bin/python}
+export ROBORENDER_MODEL_BASE=${ROBORENDER_MODEL_BASE:-$STAGE_ROOT/assets/models}
 export ENDPOINT_FILE="$RUN_DIR/endpoints/renderer_${INDEX}.txt"
 export IMAGE3F_QUEUE="$RUN_DIR/queues/renderer_${INDEX}"
 export IMAGE3F_SERVER_ID="${IMAGE3F_RUN_ID:-${SLURM_ARRAY_JOB_ID}}:${INDEX}"
@@ -47,4 +51,4 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$IMAGE3F_ROOT/.venv/bin/python" "$ROOT/scripts/server/image3f_server.py"
+"$IMAGE3F_PYTHON" "$ROOT/scripts/server/image3f_server.py"

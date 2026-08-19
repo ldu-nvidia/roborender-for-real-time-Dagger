@@ -2,22 +2,24 @@
 # Distributed production DAgger: 256 global Isaac environments, 300 rollout steps.
 # This remains the validated pure-BC DAgger objective (teacher action supervision),
 # not PPO reward optimization. Submit via scripts/scaling/submit_production.sh.
-#SBATCH --partition=viscam-hi
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_dagger_256x300
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=48:00:00
+#SBATCH --time=08:15:00
 #SBATCH --signal=B:USR1@300
-#SBATCH --exclude=viscam10,viscam12
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/rr_dagger_256x300_%j.log
 set -Eeuo pipefail
 
-ROOT=${ROOT:-/svl/u/ravenh/fast_roborender}
+STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
+ANCHORS=${ANCHORS:-$STAGE_ROOT/assets/anchor_pool_2048}
+TEACHER_CKPT=${TEACHER_CKPT:-$STAGE_ROOT/assets/policies/expert_labeler/model_step_044500.pt}
+EXPECTED_TEACHER_CKPT_SHA256=${EXPECTED_TEACHER_CKPT_SHA256:-943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38}
 FLEET_DIR=${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_production.sh}
 GLOBAL_NUM_ENVS=${GLOBAL_NUM_ENVS:-256}
 ROLLOUT_STEPS=${ROLLOUT_STEPS:-300}
@@ -43,16 +45,18 @@ VG_PRIMARY_VIEW=${VG_PRIMARY_VIEW:-head_color}
 SAVE_FREQUENCY=${SAVE_FREQUENCY:-5}
 TRAINER_CPUS_PER_TASK=${TRAINER_CPUS_PER_TASK:-16}
 TRAINER_MEM_PER_NODE=${TRAINER_MEM_PER_NODE:-128G}
-TRAINER_CONTAINER_IMAGE=${TRAINER_CONTAINER_IMAGE:-}
-TRAINER_CONTAINER_MOUNTS=${TRAINER_CONTAINER_MOUNTS:-}
+TRAINER_CONTAINER_IMAGE=${TRAINER_CONTAINER_IMAGE:-nvcr.io#nvidia/isaac-sim:5.1.0}
+TRAINER_CONTAINER_MOUNTS=${TRAINER_CONTAINER_MOUNTS:-$STAGE_ROOT:$STAGE_ROOT}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_ENTITY=${WANDB_ENTITY:-}
-VIRAL_PYTHON=${VIRAL_PYTHON:-/svl/u/ravenh/miniconda3/envs/viral/bin/python}
-VIRAL_CONDA_SH=${VIRAL_CONDA_SH:-/svl/u/ravenh/miniconda3/etc/profile.d/conda.sh}
+VIRAL_ENV=${VIRAL_ENV:-$STAGE_ROOT/runtime/envs/viral}
+VIRAL_PYTHON=${VIRAL_PYTHON:-$VIRAL_ENV/bin/python}
+VIRAL_CONDA_SH=${VIRAL_CONDA_SH:-}
 VIRAL_ENV_NAME=${VIRAL_ENV_NAME:-viral}
-VIRAL_VENV_ACTIVATE=${VIRAL_VENV_ACTIVATE:-}
-WANDB_PYTHON=${WANDB_PYTHON:-$VIRAL_PYTHON}
+VIRAL_VENV_ACTIVATE=${VIRAL_VENV_ACTIVATE:-$STAGE_ROOT/runtime/envs/activate_viral_isaac.sh}
+WANDB_ENV=${WANDB_ENV:-$STAGE_ROOT/runtime/envs/wandb-host}
+WANDB_PYTHON=${WANDB_PYTHON:-$WANDB_ENV/bin/python}
 WANDB_WATCHER_POLL_S=${WANDB_WATCHER_POLL_S:-15}
 WANDB_WATCHER_READY_TIMEOUT_S=${WANDB_WATCHER_READY_TIMEOUT_S:-120}
 WANDB_WATCHER_DRAIN_TIMEOUT_S=${WANDB_WATCHER_DRAIN_TIMEOUT_S:-240}
@@ -172,7 +176,7 @@ if [ -n "${EXPECTED_FAST_ROBORENDER_REVISION:-}" ] && \
     echo "FATAL: fast_roborender revision $FAST_REVISION != $EXPECTED_FAST_ROBORENDER_REVISION"
     exit 2
 fi
-: "${EXPECTED_GR00T_REVISION:?EXPECTED_GR00T_REVISION must pin the Raven private trainer}"
+: "${EXPECTED_GR00T_REVISION:?EXPECTED_GR00T_REVISION must pin the integrated trainer}"
 
 PLAN=(
     --global-envs "$GLOBAL_NUM_ENVS"
@@ -250,6 +254,15 @@ fi
     echo "FATAL: training initialization changed after production submission"
     exit 2
 }
+[ -s "$TEACHER_CKPT" ] || {
+    echo "FATAL: expert labeler checkpoint not found: $TEACHER_CKPT"
+    exit 2
+}
+ACTUAL_TEACHER_CKPT_SHA256=$(sha256sum "$TEACHER_CKPT" | awk '{print $1}')
+[ "$ACTUAL_TEACHER_CKPT_SHA256" = "$EXPECTED_TEACHER_CKPT_SHA256" ] || {
+    echo "FATAL: expert labeler checkpoint hash mismatch"
+    exit 2
+}
 
 SELECTED_ENDPOINT_MANIFEST="$FLEET_DIR/selected_endpoints.txt"
 if [ "$REQUIRED_RENDERERS" -gt 0 ]; then
@@ -290,10 +303,10 @@ mkdir -p "$TRAIN_RUN_DIR/slurm" "$TRAIN_RUN_DIR/output"
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 MASTER_PORT=$((15000 + SLURM_JOB_ID % 20000))
 
-export HOME=${HOME_OVERRIDE:-/sailhome/ravenh}
-export XDG_CACHE_HOME=${XDG_CACHE_HOME:-/svl/u/ravenh/.cache_xdg}
-export XDG_DATA_HOME=${XDG_DATA_HOME:-/svl/u/ravenh/.share_xdg}
-export TMPDIR=${TMPDIR:-/svl/u/ravenh/tmp}
+export HOME=${HOME_OVERRIDE:-$STAGE_ROOT/runtime/home}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$STAGE_ROOT/runtime/cache/xdg}
+export XDG_DATA_HOME=${XDG_DATA_HOME:-$STAGE_ROOT/runtime/cache/share}
+export TMPDIR=${TMPDIR:-$STAGE_ROOT/runtime/tmp}
 export OMNI_KIT_ACCEPT_EULA=YES
 export NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -318,6 +331,7 @@ export IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF=0.0
 export IMAGE_DAGGER_EXPECT_ENTROPY_COEF=0.0
 export WANDB_EXPECTED_EMAIL WANDB_MODE WANDB_ENTITY WANDB_PYTHON
 export ROOT GR00T_ROOT FLEET_DIR GLOBAL_NUM_ENVS ROLLOUT_STEPS MIX REFERENCE_LAG
+export STAGE_ROOT ANCHORS TEACHER_CKPT EXPECTED_TEACHER_CKPT_SHA256
 export LOCAL_NUM_ENVS REQUIRED_RENDERERS GRADIENT_ACCUMULATION_STEPS EP_LIST CKPT
 export PROJ EXP TRAIN_RUN_DIR MASTER_ADDR MASTER_PORT TRAINER_NODES
 export VIRAL_PYTHON VIRAL_CONDA_SH VIRAL_ENV_NAME VIRAL_VENV_ACTIVATE
@@ -404,6 +418,8 @@ gr00t_dirty_status_sha256=$(git -C "$GR00T_ROOT" status --porcelain | sha256sum 
 initialization_mode=$INITIALIZATION_MODE
 checkpoint=$CKPT
 checkpoint_sha256=$ACTUAL_TRAIN_CHECKPOINT_SHA256
+expert_labeler_checkpoint=$TEACHER_CKPT
+expert_labeler_checkpoint_sha256=$ACTUAL_TEACHER_CKPT_SHA256
 fleet_dir=$FLEET_DIR
 trainer_nodes=$TRAINER_NODES
 local_envs=$LOCAL_NUM_ENVS
@@ -515,12 +531,13 @@ srun --nodes="$TRAINER_NODES" --ntasks="$TRAINER_NODES" --ntasks-per-node=1 \
                 algo.trl.total_episodes=null \
                 callbacks.model_save.save_frequency="$SAVE_FREQUENCY" \
                 headless=true "$CKPT_ARG" \
+                teacher_actor_path="$TEACHER_CKPT" \
                 algo.config.videogen.raytraced_mix_prob="$MIX" \
                 ++algo.config.videogen.seed="$RANK_RENDER_SEED" \
                 ++algo.config.videogen.reference_lag="$REFERENCE_LAG" \
                 ++algo.config.videogen.primary_view="$VG_PRIMARY_VIEW" \
                 algo.config.videogen.image3f_endpoint_files="$EP_LIST" \
-                algo.config.videogen.anchor_pool_dir="${ANCHORS:-/vision/u/ravenh/anchor_pool_2048}" \
+                algo.config.videogen.anchor_pool_dir="$ANCHORS" \
                 algo.config.videogen.anchor_index="${ANCHOR_IDX:-0}" \
                 simulator.config.render_results=false \
                 use_wandb=true \

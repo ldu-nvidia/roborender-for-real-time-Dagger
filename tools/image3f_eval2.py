@@ -16,7 +16,16 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-BUNDLE = Path(os.environ.get("IMAGE3F_ROOT", "/vision/u/ravenh/roborender_image_model_accelerated"))
+STAGE_ROOT = Path(os.environ.get(
+    "ROBORENDER_STAGE_ROOT",
+    "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale",
+))
+ROBORENDER_ROOT = Path(
+    os.environ.get("ROBORENDER_ROOT", Path(__file__).resolve().parents[1])
+)
+BUNDLE = Path(os.environ.get(
+    "IMAGE3F_ROOT", STAGE_ROOT / "assets/roborender_image_model_accelerated"
+))
 sys.path.insert(0, str(BUNDLE))
 
 from runtime import Image3FRequest, Image3FSession  # noqa: E402
@@ -79,7 +88,7 @@ def main():
     ap.add_argument("--prev_modes", default="fixed,chain,zero")
     ap.add_argument("--tag_prefix", default="ft_")
     ap.add_argument("--depth_variant", choices=["droid", "bctrl"], default="droid")
-    ap.add_argument("--init_prev_dir", default="/svl/u/ravenh/fast_roborender/teacher_fullres")
+    ap.add_argument("--init_prev_dir", default=str(ROBORENDER_ROOT / "teacher_fullres"))
     ap.add_argument("--model_root", default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max_frames", type=int, default=81)

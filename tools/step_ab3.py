@@ -3,9 +3,14 @@ import time, json
 from pathlib import Path
 import numpy as _np
 
+import os as _os
 import sys as _sys
-if "/svl/u/ravenh/fast_roborender/tools" not in _sys.path:
-    _sys.path.insert(0, "/svl/u/ravenh/fast_roborender/tools")
+_ROOT = Path(_os.environ.get(
+    "ROBORENDER_ROOT",
+    "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender",
+))
+if str(_ROOT / "tools") not in _sys.path:
+    _sys.path.insert(0, str(_ROOT / "tools"))
 from depth_recipe import load_view_params as _load_view_params, h5v4_control as _h5v4_ctrl
 
 # Per-view params come from the production config, so these renders match training.
@@ -26,9 +31,9 @@ def h5v4_view(d, view):
 
 W, H = 416, 240
 VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]
-DATA = Path("/svl/u/ravenh/fast_roborender/videogen_dataset")
-TEACH = Path("/svl/u/ravenh/fast_roborender/teacher_fullres")
-OUT = Path("/svl/u/ravenh/fast_roborender/step_ab_out")
+DATA = _ROOT / "videogen_dataset"
+TEACH = _ROOT / "teacher_fullres"
+OUT = _ROOT / "step_ab_out"
 CHUNKS = ["chunk_16222830_0000051", "chunk_16222830_0000501"]
 FRAMES = [10, 40, 70]
 PROD_SCHED = [1.0, 0.7539682388305664, 0.6122448446350098,

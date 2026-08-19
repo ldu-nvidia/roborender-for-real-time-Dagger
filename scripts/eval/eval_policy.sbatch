@@ -17,25 +17,28 @@
 #   ENDPOINT   OBS=generated only: renderer endpoint file
 #   NUM_ENVS   parallel envs, default 4
 #
-#SBATCH --partition=viscam-hi
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=eval_policy
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=100G
 #SBATCH --time=6:00:00
-#SBATCH --exclude=viscam10,viscam12
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/eval_policy_%j.log
+#SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/eval_policy_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -euo pipefail
 
-ROOT=/svl/u/ravenh/fast_roborender
-REPO=$ROOT/GR00T-VisualSim2Real
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
+source "$ROOT/scripts/setup/oci_env.sh"
+REPO=$GR00T_ROOT
 # Reference configs. RAYTRACED = the offline-BC baseline's own config, i.e. the environment
 # every headline number in README.md was measured in. GENERATED additionally needs the
 # videogen/image_dagger block, so it comes from a DAgger run.
-BASELINE_CFG=$REPO/logs_rl/videogen_offline_bc/videogen_offline_bc-20260721_204447/config.yaml
-RELABEL_CFG=$REPO/logs_rl/image_dagger_r4/image_dagger_run4-20260814_131202/config.yaml
+BASELINE_CFG=${BASELINE_CFG:-}
+RELABEL_CFG=${RELABEL_CFG:-}
 
 : "${CKPT:?set CKPT=<path to .pt>}"
 EPISODES=${EPISODES:-300}
@@ -43,16 +46,16 @@ OBS=${OBS:-raytraced}
 NUM_ENVS=${NUM_ENVS:-4}
 ENDPOINT=${ENDPOINT:-$ROOT/image3f_server_endpoint.txt}
 
-export HOME=/sailhome/ravenh
-export XDG_CACHE_HOME=/svl/u/ravenh/.cache_xdg XDG_DATA_HOME=/svl/u/ravenh/.share_xdg
-export TMPDIR=/svl/u/ravenh/tmp OMNI_KIT_ACCEPT_EULA=YES
+export HOME=$HOME_OVERRIDE OMNI_KIT_ACCEPT_EULA=YES
 
 [ -f "$CKPT" ] || { echo "FATAL: no such checkpoint: $CKPT"; exit 1; }
 
 case "$OBS" in
-  raytraced) CONFIG=${CONFIG:-$BASELINE_CFG} ;;
+  raytraced)
+    : "${CONFIG:=${BASELINE_CFG:?set CONFIG or BASELINE_CFG to a staged config}}"
+    ;;
   generated)
-    CONFIG=${CONFIG:-$RELABEL_CFG}
+    : "${CONFIG:=${RELABEL_CFG:?set CONFIG or RELABEL_CFG to a staged config}}"
     export IMAGE_DAGGER_EVAL_RELABEL=1
     # A stale endpoint file outlives its server and points the client at a dead host,
     # so require one whose node still has a running i3f_warm_server job.
@@ -79,8 +82,7 @@ echo " config     : $CONFIG"
 echo " obs        : $OBS      episodes: $EPISODES      envs: $NUM_ENVS"
 echo "=================================================================="
 
-source /svl/u/ravenh/miniconda3/etc/profile.d/conda.sh
-conda activate viral
+source "$VIRAL_VENV_ACTIVATE"
 cd "$REPO"
 python gr00t/rl/eval_agent_trl.py \
     +checkpoint="$STAGE/last.pt" \
@@ -88,7 +90,7 @@ python gr00t/rl/eval_agent_trl.py \
     algo.config.eval.num_eval_episodes="$EPISODES" \
     +simulator.config.render_results=true
 
-LOG=$ROOT/logs_archive/eval_policy_${SLURM_JOB_ID:-manual}.log
+LOG=$ROBORENDER_STAGE_ROOT/logs/eval_policy_${SLURM_JOB_ID:-manual}.log
 echo "RESULT $(basename "$CKPT") obs=$OBS eps=$EPISODES :: $(grep -hoE 'success rate.*' "$LOG" | tail -1)"
 rm -rf "$STAGE"
 echo EVAL_DONE

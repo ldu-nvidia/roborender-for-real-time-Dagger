@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 """Render teacher anchor pool with rich prompts. Shardable."""
 import argparse, os, sys, time
+from pathlib import Path
 import numpy as np
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+ROOT = Path(os.environ.get("ROBORENDER_ROOT", Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(ROOT / "GR00T-VisualSim2Real"))
+sys.path.insert(0, str(ROOT))
 from gr00t.rl.utils.videogen_client import VideoGenRenderClient
 from rich_prompts import build_rich_prompt
 
 VIEWS = ["hand_left", "hand_right", "head_color"]
-POOL = "/svl/u/ravenh/fast_roborender/videogen_dataset"
+POOL = os.environ.get("ROBORENDER_DATASET", str(ROOT / "videogen_dataset"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--start", type=int, required=True)

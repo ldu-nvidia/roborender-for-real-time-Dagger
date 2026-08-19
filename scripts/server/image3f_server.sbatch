@@ -1,19 +1,22 @@
 #!/bin/bash
 #SBATCH --job-name=i3f_warm_server
-#SBATCH --partition=viscam-hi
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:rtxpro6000:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/i3f_warm_server_%j.log
-export HOME=/sailhome/ravenh
+#SBATCH --time=08:00:00
+#SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/i3f_warm_server_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
+set -Eeuo pipefail
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+FR_ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
+source "$FR_ROOT/scripts/setup/oci_env.sh"
+export HOME=$HOME_OVERRIDE
 export PYTHONDONTWRITEBYTECODE=1
-ROOT=/vision/u/ravenh/roborender_image_model_accelerated
-export IMAGE3F_ROOT="$ROOT"
-export ROBORENDER_MODEL_BASE=/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models
-export ENDPOINT_FILE=${ENDPOINT_FILE:-/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt}
-export IMAGE3F_QUEUE=${IMAGE3F_QUEUE:-/svl/u/ravenh/fast_roborender/image3f_queue}
+export ENDPOINT_FILE=${ENDPOINT_FILE:-$FR_ROOT/image3f_server_endpoint.txt}
+export IMAGE3F_QUEUE=${IMAGE3F_QUEUE:-$FR_ROOT/image3f_queue}
 rm -f $IMAGE3F_QUEUE/READY
-exec "$ROOT/.venv/bin/python" /svl/u/ravenh/fast_roborender/scripts/server/image3f_server.py
+exec "$IMAGE3F_PYTHON" "$FR_ROOT/scripts/server/image3f_server.py"

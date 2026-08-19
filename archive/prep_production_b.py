@@ -4,12 +4,12 @@
 - rest: renormalize head to B from stored raw, assign varied prompt, strip rgb_gen"""
 import glob, os, shutil, sys
 import numpy as np
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender")
 from renormalize_depth import h5v4_frame_seq
 from videogen_prompts import build_prompt
 
-PROD = "/svl/u/ravenh/fast_roborender/videogen_dataset"
-AB = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
+PROD = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/videogen_dataset"
+AB = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
 files = sorted(glob.glob(f"{PROD}/chunk_*.npz"))
 adopted = renormed = 0
 for i, f in enumerate(files):

@@ -1,17 +1,19 @@
 #!/bin/bash
 # Aggregate all fixed-seed blocks, upload comparable metrics to the same personal
 # W&B project, and make the Slurm job red unless the policy-improvement gate passes.
-#SBATCH --partition=viscam
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_eval_report
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=00:30:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/rr_eval_report_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
-ROOT=${ROOT:-/svl/u/ravenh/fast_roborender}
+STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 EVAL_MANIFEST=${EVAL_MANIFEST:?EVAL_MANIFEST is required}
 EVAL_DIR=${EVAL_DIR:?EVAL_DIR is required}
 PROJ=${PROJ:-roborender_dagger_scale}
@@ -20,7 +22,7 @@ MIN_SUCCESS_DELTA=${MIN_SUCCESS_DELTA:-0.02}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_ENTITY=${WANDB_ENTITY:-}
-WANDB_PYTHON=${WANDB_PYTHON:-/svl/u/ravenh/miniconda3/envs/viral/bin/python}
+WANDB_PYTHON=${WANDB_PYTHON:-$STAGE_ROOT/runtime/envs/viral/bin/python}
 SUMMARY="$EVAL_DIR/fixed_seed_improvement_report.json"
 
 set +e

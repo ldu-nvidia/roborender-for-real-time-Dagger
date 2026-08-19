@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """Render full-res 3-view teacher (50-step) generations for given chunks."""
 import argparse, os, sys, time
+from pathlib import Path
 import numpy as np
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
+ROOT = Path(os.environ.get("ROBORENDER_ROOT", Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(ROOT / "GR00T-VisualSim2Real"))
 from gr00t.rl.utils.videogen_client import VideoGenRenderClient
 
 VIEWS = ["hand_left", "hand_right", "head_color"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Adds image_dagger mode to distill_trainer_videogen.py (idempotent)."""
-p = "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real/gr00t/rl/trl/trainer/distill_trainer_videogen.py"
+p = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/GR00T-VisualSim2Real/gr00t/rl/trl/trainer/distill_trainer_videogen.py"
 s = open(p).read()
 if "_image_dagger_relabel" in s:
     print("already patched")
@@ -15,10 +15,10 @@ s = s.replace('''        if self.vg_mode == "collect":
             from gr00t.rl.utils.image3f_frame_client import Image3FFrameClient
 
             ep_files = vg.get("image3f_endpoint_files",
-                              ["/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt"])
+                              ["/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/image3f_server_endpoint.txt"])
             self._id_clients = [Image3FFrameClient.from_endpoint_file(f) for f in ep_files]
             self.vg_anchor_pool_dir = vg.get(
-                "anchor_pool_dir", "/svl/u/ravenh/fast_roborender/teacher_fullres")
+                "anchor_pool_dir", "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/teacher_fullres")
             self.vg_anchor_index = int(vg.get("anchor_index", 0))
             self._id_anchor_files = sorted(
                 glob.glob(os.path.join(self.vg_anchor_pool_dir, "*_teacher3v.npz")))

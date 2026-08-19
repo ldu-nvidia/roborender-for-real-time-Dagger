@@ -5,7 +5,7 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/GR00T-VisualSim2Real")
 from gr00t.rl.utils.videogen_client import VideoGenRenderClient  # noqa: E402
 
 T, H, W = 81, 108, 192

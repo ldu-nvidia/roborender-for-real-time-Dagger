@@ -31,7 +31,9 @@ for dp, dns, fns in os.walk('.'):
             continue
         path = os.path.normpath(os.path.join(dp, f))
         text = open(path, errors='ignore').read()
-        for m in re.finditer(r'(/svl/u/ravenh/fast_roborender/)([\w./-]+\.(?:py|sh|sbatch))', text):
+        for m in re.finditer(
+            r'(/[^\s"\']+/fast_roborender/)([\w./-]+\.(?:py|sh|sbatch))', text
+        ):
             ref = m.group(2)
             if os.path.exists(ref):
                 continue
@@ -54,7 +56,7 @@ fixes = {}
 for path, ref, actual in problems:
     tgt = f'{ROOT}/{actual[0]}' if actual else '??? (file not found anywhere)'
     print(f'  {path}\n      {ref}\n   -> {tgt}\n')
-    if actual and ref.startswith('/svl'):
+    if actual and ref.startswith('/'):
         fixes.setdefault(path, []).append((ref, f'{ROOT}/{actual[0]}'))
     elif actual:
         fixes.setdefault(path, []).append(

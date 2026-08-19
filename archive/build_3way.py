@@ -3,9 +3,9 @@
 all with identical varied prompts. Videos + closest-frame stills."""
 import glob, os, numpy as np, cv2
 import imageio.v3 as iio
-B  = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
-K  = "/svl/u/ravenh/fast_roborender/ab_knee_dataset"
-O  = "/svl/u/ravenh/fast_roborender/ab_oldd_dataset"
+B  = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
+K  = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_knee_dataset"
+O  = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_oldd_dataset"
 OUT = "/tmp/threeway"; os.makedirs(OUT, exist_ok=True)
 H, W = 216, 384
 stills = []

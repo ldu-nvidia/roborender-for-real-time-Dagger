@@ -1,5 +1,5 @@
 import numpy as np, glob, os, cv2
-A="/svl/u/ravenh/fast_roborender/videogen_dataset"; B="/svl/u/ravenh/fast_roborender/ab_test_dataset"
+A="/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/videogen_dataset"; B="/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
 rows=[]
 for bf in sorted(glob.glob(f"{B}/chunk_*.npz"))[:60]:
     name=os.path.basename(bf); af=os.path.join(A,name)

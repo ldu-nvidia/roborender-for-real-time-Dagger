@@ -1,8 +1,8 @@
 import glob, os, numpy as np, sys
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender")
 from renormalize_depth import h5v4_frame_seq
-B = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
-DST = "/svl/u/ravenh/fast_roborender/ab_adaptive_dataset"
+B = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
+DST = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_adaptive_dataset"
 os.makedirs(DST, exist_ok=True)
 files = sorted(glob.glob(f"{B}/chunk_*.npz"))
 # pick 8: aim for 4 close-heavy + 4 far-only so both branches are exercised

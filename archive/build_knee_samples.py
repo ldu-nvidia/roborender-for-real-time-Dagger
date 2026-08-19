@@ -1,6 +1,6 @@
 import glob, os, numpy as np, cv2
-B = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
-K = "/svl/u/ravenh/fast_roborender/ab_knee_dataset"
+B = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
+K = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_knee_dataset"
 OUT = "/tmp/knee_samples"; os.makedirs(OUT, exist_ok=True)
 H, W = 216, 384
 made = 0

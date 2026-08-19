@@ -1,8 +1,8 @@
 import glob, os, numpy as np, sys
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender")
 from renormalize_depth import h5v4_frame_seq
-B = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
-DST = "/svl/u/ravenh/fast_roborender/ab_knee_dataset"
+B = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
+DST = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_knee_dataset"
 files = sorted(glob.glob(f"{B}/chunk_*.npz"))
 picks = [files[i] for i in range(5, 200, 16)][:12]
 n = 0

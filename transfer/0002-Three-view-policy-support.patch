@@ -154,10 +154,10 @@ index 0000000..1557865
 +      enable: true
 +      mode: image_dagger
 +      image3f_endpoint_files:
-+        - /svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt
-+        - /svl/u/ravenh/fast_roborender/image3f_server_endpoint_2.txt
-+        - /svl/u/ravenh/fast_roborender/image3f_server_endpoint_3.txt
-+      anchor_pool_dir: /vision/u/ravenh/anchor_pool_2048
++        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint.txt
++        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint_2.txt
++        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint_3.txt
++      anchor_pool_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets/anchor_pool_2048
 +      anchor_index: 0
 +      raytraced_mix_prob: 0.5
 +      save_raw_depth: false
@@ -188,7 +188,7 @@ index 0000000..1557865
 +      # The TRT engine contract is exactly two 416x240 views; the single ego
 +      # view is duplicated into both slots and primary_view is used for obs.
 +      dump_first_n_chunks: 0
-+      dump_dir: /svl/u/ravenh/fast_roborender/videogen_frames
++      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
 +      view_names: [head_color, hand_left, hand_right]
 +      primary_view: head_color
 +
@@ -258,7 +258,7 @@ index 0000000..f3d3a1c
 +    videogen:
 +      enable: true
 +      mode: offline
-+      dataset_dir: /svl/u/ravenh/fast_roborender/videogen_dataset
++      dataset_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/data/videogen_dataset
 +      host: 127.0.0.1
 +      port: 18913
 +      prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
@@ -276,7 +276,7 @@ index 0000000..f3d3a1c
 +      # The TRT engine contract is exactly two 416x240 views; the single ego
 +      # view is duplicated into both slots and primary_view is used for obs.
 +      dump_first_n_chunks: 0
-+      dump_dir: /svl/u/ravenh/fast_roborender/videogen_frames
++      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
 +      view_names: [ext1, wrist]
 +      primary_view: ext1
 +
@@ -561,4 +561,3 @@ index 53f995c..99c7dc8 100644
  
 -- 
 2.43.0
-

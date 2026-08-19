@@ -7,7 +7,7 @@ and strips rgb_gen so the renderer regenerates. Requires chunks collected with
 videogen.save_raw_depth: true.
 
 Usage:
-  python /svl/u/ravenh/fast_roborender/scripts/data/renormalize_depth.py --dataset_dir DIR \
+  python scripts/data/renormalize_depth.py --dataset_dir DIR \
       --view_params '{"head_color":{"raw_clip":[0,10],"inv_clip":[1,100],"raw_pct":[1,99]},
                       "hand_left":{"raw_clip":[0,1.5],"inv_clip":[0.7,100],"raw_pct":[1,99]},
                       "hand_right":{"raw_clip":[0,1.5],"inv_clip":[0.7,100],"raw_pct":[1,99]}}' \

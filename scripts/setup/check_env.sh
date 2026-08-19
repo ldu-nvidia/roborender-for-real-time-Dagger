@@ -8,16 +8,21 @@
 # WARN means "fine unless you need that stage" (e.g. no dataset if you only run DAgger).
 set -uo pipefail
 
-# Paths default to the sc layout; override any of them for another machine, e.g.
+# Paths default to the OCI/Lustre layout; override any of them for another machine, e.g.
 #   ROOT=/mnt/data1/ldu/research/fast_roborender \
 #   IMAGE3F=/opt/roborender_image_model_accelerated \
 #   VIRAL_PY=$CONDA_PREFIX/bin/python  bash scripts/setup/check_env.sh
 ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
-ACCEL=${ACCEL:-$ROOT/roborender-acceleration}
-IMAGE3F=${IMAGE3F:-/vision/u/ravenh/roborender_image_model_accelerated}
-MODEL_BASE=${MODEL_BASE:-/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models}
-ANCHORS=${ANCHORS:-/vision/u/ravenh/anchor_pool_2048}
-VIRAL_PY=${VIRAL_PY:-/svl/u/ravenh/miniconda3/envs/viral/bin/python}
+STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ACCEL=${ACCEL:-$STAGE_ROOT/assets/roborender-acceleration}
+IMAGE3F=${IMAGE3F:-$STAGE_ROOT/assets/roborender_image_model_accelerated}
+IMAGE3F_PY=${IMAGE3F_PY:-$STAGE_ROOT/runtime/envs/image3f-cu128/bin/python}
+MODEL_BASE=${MODEL_BASE:-$STAGE_ROOT/assets/models}
+ANCHORS=${ANCHORS:-$STAGE_ROOT/assets/anchor_pool_2048}
+VIRAL_PY=${VIRAL_PY:-$STAGE_ROOT/runtime/envs/viral/bin/python}
+WANDB_PY=${WANDB_PY:-$STAGE_ROOT/runtime/envs/wandb-host/bin/python}
+TEACHER_CKPT=${TEACHER_CKPT:-$STAGE_ROOT/assets/policies/expert_labeler/model_step_044500.pt}
+EXPECTED_TEACHER_SHA256=${EXPECTED_TEACHER_SHA256:-943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38}
 FAIL=0
 
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
@@ -25,18 +30,19 @@ warn() { printf '  \033[33mWARN\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); }
 sec()  { printf '\n== %s ==\n' "$1"; }
 
-sec "trainer environment (conda: viral)"
-if [ -x "$VIRAL_PY" ]; then
-    pass "python $($VIRAL_PY -V 2>&1 | cut -d' ' -f2) at $VIRAL_PY"
-    for mod in torch isaaclab gr00t; do
-        if v=$("$VIRAL_PY" -c "import $mod,sys; print(getattr($mod,'__version__',''))" 2>/dev/null); then
-            pass "import $mod ${v:+($v)}"
-        else
-            fail "import $mod — rerun scripts/setup/setup_viral_env.sh"
-        fi
-    done
+sec "host telemetry environment"
+if [ -x "$WANDB_PY" ] && "$WANDB_PY" -c 'import wandb' 2>/dev/null; then
+    pass "host W&B Python at $WANDB_PY"
 else
-    fail "no trainer env at $VIRAL_PY — run scripts/setup/setup_viral_env.sh"
+    fail "no host W&B env — run scripts/scaling/oci_host_wandb_setup.sbatch"
+fi
+
+sec "container trainer environment"
+TRAINER_MANIFEST=$STAGE_ROOT/runtime/envs/trainer_environment_manifest.txt
+if [ -s "$TRAINER_MANIFEST" ]; then
+    pass "pinned Isaac/GR00T environment manifest at $TRAINER_MANIFEST"
+else
+    fail "no trainer manifest — run scripts/scaling/oci_h100_trainer_setup.sbatch"
 fi
 
 sec "render bundles"
@@ -45,10 +51,10 @@ if [ -x "$ACCEL/.venv/bin/python" ]; then
 else
     warn "no venv at $ACCEL/.venv — needed for offline rendering and the teacher anchor server"
 fi
-if [ -x "$IMAGE3F/.venv/bin/python" ]; then
-    pass "Image3F bundle venv"
+if [ -s "$STAGE_ROOT/runtime/envs/image3f-cu128/.oci_environment_ready" ]; then
+    pass "Image3F OCI environment marker at $STAGE_ROOT/runtime/envs/image3f-cu128"
 else
-    fail "no venv at $IMAGE3F/.venv — needed for DAgger; see scripts/server/image3f_ft_setup.sbatch"
+    fail "no Image3F OCI environment — run scripts/scaling/oci_h100_image3f_setup.sbatch"
 fi
 if [ -f "$IMAGE3F/adapter/rgb030-depth030-step-5000.safetensors" ]; then
     pass "Image3F adapter (rgb030-depth030-step-5000)"
@@ -98,9 +104,14 @@ else
 fi
 
 sec "baseline checkpoints"
+if [ -s "$TEACHER_CKPT" ] && [ "$(sha256sum "$TEACHER_CKPT" | awk '{print $1}')" = "$EXPECTED_TEACHER_SHA256" ]; then
+    pass "expert labeler checkpoint and SHA-256"
+else
+    fail "expert labeler checkpoint missing or hash mismatch: $TEACHER_CKPT"
+fi
 BC=${BASELINE_RUN:-$ROOT/GR00T-VisualSim2Real/logs_rl/videogen_offline_bc/videogen_offline_bc-20260721_204447}
 [ -f "$BC/config.yaml" ] && pass "baseline eval config (eval_policy.sbatch stages against it)" \
-                         || fail "baseline config missing: $BC/config.yaml"
+                         || warn "historical baseline config missing: $BC/config.yaml"
 [ -f "$BC/model_step_011000.pt" ] && pass "offline-BC baseline checkpoint (57.3%)" \
                                   || warn "offline-BC baseline checkpoint missing"
 
@@ -121,11 +132,13 @@ fi
 sec "slurm"
 if command -v sacctmgr >/dev/null 2>&1; then
     sacctmgr -n show assoc user="$USER" format=account 2>/dev/null | tr -d ' ' | sort -u \
-      | grep -q viscam && pass "viscam account available" || warn "viscam account not found"
+      | grep -q '^general_cs_infra$' && pass "general_cs_infra account available" \
+      || warn "general_cs_infra account not found"
 else
     warn "no Slurm on this machine - launch training directly (see README, Running on another machine)"
 fi
-df -h /svl/u/ravenh 2>/dev/null | tail -1 | awk '{print "  INFO  /svl/u/ravenh " $4 " free (" $5 " used)"}'
+df -h "$STAGE_ROOT" 2>/dev/null | tail -1 \
+  | awk -v root="$STAGE_ROOT" '{print "  INFO  " root " " $4 " free (" $5 " used)"}'
 
 printf '\n'
 [ "$FAIL" -eq 0 ] && printf '\033[32mREADY\033[0m — %d hard failures\n' "$FAIL" \

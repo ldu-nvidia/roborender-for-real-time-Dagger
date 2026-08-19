@@ -1,0 +1,25 @@
+#!/bin/bash
+# Shared OCI/Lustre defaults for RoboRender tooling. Callers may override any
+# value before sourcing this file, but no fallback points at another site.
+
+export ROBORENDER_STAGE_ROOT="${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}"
+export ROOT="${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}"
+export ROBORENDER_ROOT="${ROBORENDER_ROOT:-$ROOT}"
+export GR00T_ROOT="${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}"
+export IMAGE3F_ROOT="${IMAGE3F_ROOT:-$ROBORENDER_STAGE_ROOT/assets/roborender_image_model_accelerated}"
+export IMAGE3F_ENV="${IMAGE3F_ENV:-$ROBORENDER_STAGE_ROOT/runtime/envs/image3f-cu128}"
+export IMAGE3F_PYTHON="${IMAGE3F_PYTHON:-$IMAGE3F_ENV/bin/python}"
+export ROBORENDER_ACCEL_ROOT="${ROBORENDER_ACCEL_ROOT:-$ROBORENDER_STAGE_ROOT/assets/roborender-acceleration}"
+export ROBORENDER_ACCEL_PYTHON="${ROBORENDER_ACCEL_PYTHON:-$ROBORENDER_ACCEL_ROOT/.venv/bin/python}"
+export ROBORENDER_MODEL_BASE="${ROBORENDER_MODEL_BASE:-$ROBORENDER_STAGE_ROOT/assets/models}"
+export ANCHORS="${ANCHORS:-$ROBORENDER_STAGE_ROOT/assets/anchor_pool_2048}"
+export VIRAL_ENV="${VIRAL_ENV:-$ROBORENDER_STAGE_ROOT/runtime/envs/viral}"
+export VIRAL_PYTHON="${VIRAL_PYTHON:-$VIRAL_ENV/bin/python}"
+export VIRAL_VENV_ACTIVATE="${VIRAL_VENV_ACTIVATE:-$ROBORENDER_STAGE_ROOT/runtime/envs/activate_viral_isaac.sh}"
+export WANDB_ENV="${WANDB_ENV:-$ROBORENDER_STAGE_ROOT/runtime/envs/wandb-host}"
+export WANDB_PYTHON="${WANDB_PYTHON:-$WANDB_ENV/bin/python}"
+export HOME_OVERRIDE="${HOME_OVERRIDE:-$ROBORENDER_STAGE_ROOT/runtime/home}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$ROBORENDER_STAGE_ROOT/runtime/cache/xdg}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$ROBORENDER_STAGE_ROOT/runtime/cache/share}"
+export TORCH_HOME="${TORCH_HOME:-$ROBORENDER_STAGE_ROOT/runtime/cache/torch}"
+export TMPDIR="${TMPDIR:-$ROBORENDER_STAGE_ROOT/runtime/tmp}"

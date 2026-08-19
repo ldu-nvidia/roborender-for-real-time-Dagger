@@ -1,19 +1,21 @@
 #!/bin/bash
-#SBATCH --partition=viscam
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=eval_student_b
-#SBATCH --gres=gpu:a5000:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=04:00:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/eval_student_b_%j.log
-set -e
-export HOME=/sailhome/ravenh
-export XDG_CACHE_HOME=/svl/u/ravenh/.cache_xdg XDG_DATA_HOME=/svl/u/ravenh/.share_xdg
-export TMPDIR=/svl/u/ravenh/tmp OMNI_KIT_ACCEPT_EULA=YES
-source /svl/u/ravenh/miniconda3/etc/profile.d/conda.sh
-conda activate viral
-cd /svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real
+#SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/eval_student_b_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
+set -Eeuo pipefail
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
+source "$ROOT/scripts/setup/oci_env.sh"
+export HOME=$HOME_OVERRIDE OMNI_KIT_ACCEPT_EULA=YES
+source "$VIRAL_VENV_ACTIVATE"
+cd "$GR00T_ROOT"
 RUN=$(ls -td logs_rl/videogen_offline_bc/*/ | head -1)
 CKPT=$(ls "$RUN"model_step_*.pt | sort -t_ -k3 -n | tail -1)
 echo "evaluating $CKPT"

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Parallelize image_dagger render calls: one client per env, threaded requests."""
-p = "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real/gr00t/rl/trl/trainer/distill_trainer_videogen.py"
+p = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/GR00T-VisualSim2Real/gr00t/rl/trl/trainer/distill_trainer_videogen.py"
 s = open(p).read()
 if "_id_env_clients" in s:
     print("already patched")
     raise SystemExit
 
 s = s.replace('''            ep_files = vg.get("image3f_endpoint_files",
-                              ["/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt"])
+                              ["/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/image3f_server_endpoint.txt"])
             self._id_clients = [Image3FFrameClient.from_endpoint_file(f) for f in ep_files]''',
 '''            self._id_endpoint_files = vg.get(
                 "image3f_endpoint_files",
-                ["/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt"])
+                ["/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/image3f_server_endpoint.txt"])
             self._id_env_clients = None  # one client per env, built lazily''')
 
 s = s.replace('''        cam_h, cam_w = int(self.camera_resolution[0]), int(self.camera_resolution[1])

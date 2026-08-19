@@ -17,10 +17,16 @@ STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_
 ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
 IMAGE3F_ROOT=${IMAGE3F_ROOT:-$STAGE_ROOT/assets/roborender_image_model_accelerated}
-ROBORENDER_MODEL_BASE=${ROBORENDER_MODEL_BASE:-$STAGE_ROOT/assets/models/PAI/Wan2.1-Fun-V1.1-1.3B-Control}
+IMAGE3F_ENV=${IMAGE3F_ENV:-$STAGE_ROOT/runtime/envs/image3f-cu128}
+IMAGE3F_PYTHON=${IMAGE3F_PYTHON:-$IMAGE3F_ENV/bin/python}
+ROBORENDER_MODEL_BASE=${ROBORENDER_MODEL_BASE:-$STAGE_ROOT/assets/models}
 ANCHORS=${ANCHORS:-$STAGE_ROOT/assets/anchor_pool_2048}
+TEACHER_CKPT=${TEACHER_CKPT:-$STAGE_ROOT/assets/policies/expert_labeler/model_step_044500.pt}
+EXPECTED_TEACHER_CKPT_SHA256=${EXPECTED_TEACHER_CKPT_SHA256:-943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38}
 VIRAL_ENV=${VIRAL_ENV:-$STAGE_ROOT/runtime/envs/viral}
 VIRAL_PYTHON=${VIRAL_PYTHON:-$VIRAL_ENV/bin/python}
+HOST_PYTHON=${HOST_PYTHON:-/usr/bin/python3}
+WANDB_ENV=${WANDB_ENV:-$STAGE_ROOT/runtime/envs/wandb-host}
 VIRAL_VENV_ACTIVATE=${VIRAL_VENV_ACTIVATE:-$STAGE_ROOT/runtime/envs/activate_viral_isaac.sh}
 OCI_CONTAINER_IMAGE=${OCI_CONTAINER_IMAGE:-nvcr.io#nvidia/isaac-sim:5.1.0}
 RUN_ID=${RUN_ID:-oci_base_256x300_${SLURM_JOB_ID}}
@@ -42,7 +48,7 @@ TRAINER_MEM_PER_NODE=${TRAINER_MEM_PER_NODE:-128G}
 RENDER_READY_TIMEOUT_S=${RENDER_READY_TIMEOUT_S:-1800}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 WANDB_MODE=${WANDB_MODE:-online}
-WANDB_PYTHON=${WANDB_PYTHON:-$VIRAL_PYTHON}
+WANDB_PYTHON=${WANDB_PYTHON:-$WANDB_ENV/bin/python}
 
 fatal() {
     echo "FATAL: $*" >&2
@@ -61,10 +67,12 @@ case "$CKPT" in none|null) ;; *) fatal "Round-4 and all other student checkpoint
 for path in "$ROOT" "$GR00T_ROOT" "$IMAGE3F_ROOT" "$ROBORENDER_MODEL_BASE" "$ANCHORS"; do
     [ -d "$path" ] || fatal "required directory missing: $path"
 done
-[ -x "$IMAGE3F_ROOT/.venv/bin/python" ] || fatal "H100 Image3F environment has not been built"
+[ -x "$IMAGE3F_PYTHON" ] || fatal "H100 Image3F environment has not been built: $IMAGE3F_PYTHON"
 [ -s "$IMAGE3F_ROOT/assets/generated/engines/current/engine_build_manifest.json" ] || \
     fatal "target-local H100 TensorRT engine has not passed its build gate"
 [ -x "$VIRAL_PYTHON" ] || fatal "trainer environment has not been built: $VIRAL_PYTHON"
+[ -x "$HOST_PYTHON" ] || fatal "OCI host Python is missing: $HOST_PYTHON"
+[ -x "$WANDB_PYTHON" ] || fatal "OCI host W&B environment has not been built: $WANDB_PYTHON"
 [ -f "$VIRAL_VENV_ACTIVATE" ] || fatal "trainer activation script missing: $VIRAL_VENV_ACTIVATE"
 
 FAST_REVISION=$(git -C "$ROOT" rev-parse HEAD)
@@ -76,9 +84,8 @@ GR00T_REVISION=$(git -C "$GR00T_ROOT" rev-parse HEAD)
 [ -z "${EXPECTED_GR00T_REVISION:-}" ] || \
     [ "$GR00T_REVISION" = "$EXPECTED_GR00T_REVISION" ] || fatal "GR00T revision changed"
 
-TEACHER_CKPT=${TEACHER_CKPT:-$GR00T_ROOT/logs_rl/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q9_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--3500.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251105_004910/model_step_044500.pt}
 [ -s "$TEACHER_CKPT" ] || fatal "expert labeler checkpoint missing"
-[ "$(md5sum "$TEACHER_CKPT" | awk '{print $1}')" = d14dd7bda9292a6f148c7d0a68d60f75 ] || \
+[ "$(sha256sum "$TEACHER_CKPT" | awk '{print $1}')" = "$EXPECTED_TEACHER_CKPT_SHA256" ] || \
     fatal "expert labeler checkpoint hash mismatch"
 [ -s "$GR00T_ROOT/models/model_walk.pt" ] || fatal "Homie walk model missing"
 [ -s "$GR00T_ROOT/models/model_stand.pt" ] || fatal "Homie stand model missing"
@@ -86,20 +93,21 @@ TEACHER_CKPT=${TEACHER_CKPT:-$GR00T_ROOT/logs_rl/walk_stand_place_grasp_turn_hom
 ANCHOR_COUNT=$(find "$ANCHORS" -maxdepth 1 -type f -name '*.npz' -printf '.' | wc -c)
 [ "$ANCHOR_COUNT" -ge "$ANCHOR_MIN_FILES" ] || \
     fatal "FT-FIXED anchor pool has $ANCHOR_COUNT files; expected at least $ANCHOR_MIN_FILES"
-"$VIRAL_PYTHON" - "$ANCHORS" <<'PY'
-import glob
+"$HOST_PYTHON" - "$ANCHORS" <<'PY'
 import sys
-import numpy as np
+import zipfile
+from pathlib import Path
 
-path = sorted(glob.glob(sys.argv[1] + "/*.npz"))[0]
-with np.load(path, allow_pickle=True) as data:
+path = sorted(Path(sys.argv[1]).glob("*.npz"))[0]
+with zipfile.ZipFile(path) as archive:
+    keys = {Path(name).stem for name in archive.namelist() if name.endswith(".npy")}
     required = {"gen__head_color", "gen__hand_left", "gen__hand_right"}
-    missing = sorted(required.difference(data.files))
+    missing = sorted(required.difference(keys))
     if missing:
         raise SystemExit(f"FATAL: anchor schema missing {missing} in {path}")
 PY
 
-REQUIRED_RENDERERS=$("$VIRAL_PYTHON" "$ROOT/scripts/scaling/scale_plan.py" \
+REQUIRED_RENDERERS=$("$HOST_PYTHON" "$ROOT/scripts/scaling/scale_plan.py" \
     --global-envs "$GLOBAL_NUM_ENVS" --rollout-steps "$ROLLOUT_STEPS" \
     --trainer-nodes "$TRAINER_NODES" --raytraced-mix "$MIX" \
     --envs-per-renderer "$ENVS_PER_RENDERER" --reference-lag "$REFERENCE_LAG" \
@@ -121,6 +129,8 @@ global_envs=$GLOBAL_NUM_ENVS
 rollout_steps=$ROLLOUT_STEPS
 initialization=fresh_student
 checkpoint=none
+expert_labeler_checkpoint=$TEACHER_CKPT
+expert_labeler_checkpoint_sha256=$EXPECTED_TEACHER_CKPT_SHA256
 reference_policy=FT-FIXED
 reference_lag=0
 anchor_files=$ANCHOR_COUNT
@@ -129,10 +139,12 @@ gr00t_revision=$GR00T_REVISION
 container=$OCI_CONTAINER_IMAGE
 EOF
 
-export ROOT GR00T_ROOT IMAGE3F_ROOT ROBORENDER_MODEL_BASE ANCHORS
+export STAGE_ROOT ROOT GR00T_ROOT IMAGE3F_ROOT IMAGE3F_ENV IMAGE3F_PYTHON
+export ROBORENDER_MODEL_BASE ANCHORS
+export TEACHER_CKPT EXPECTED_TEACHER_CKPT_SHA256
 export FLEET_DIR TRAIN_RUN_DIR GLOBAL_NUM_ENVS ROLLOUT_STEPS TRAINER_NODES
 export ENVS_PER_RENDERER REFERENCE_LAG MIX CKPT EXPECTED_TRAIN_CHECKPOINT_SHA256
-export VIRAL_PYTHON VIRAL_VENV_ACTIVATE WANDB_PYTHON WANDB_EXPECTED_EMAIL WANDB_MODE
+export VIRAL_PYTHON VIRAL_VENV_ACTIVATE WANDB_ENV WANDB_PYTHON WANDB_EXPECTED_EMAIL WANDB_MODE
 export TRAINER_CPUS_PER_TASK TRAINER_MEM_PER_NODE RENDER_READY_TIMEOUT_S
 export TRAINER_CONTAINER_IMAGE="$OCI_CONTAINER_IMAGE"
 export TRAINER_CONTAINER_MOUNTS="$STAGE_ROOT:$STAGE_ROOT"
@@ -141,6 +153,10 @@ export XDG_CACHE_HOME="$STAGE_ROOT/runtime/cache/xdg"
 export XDG_DATA_HOME="$STAGE_ROOT/runtime/cache/share"
 export TORCH_HOME="$STAGE_ROOT/runtime/cache/torch"
 export TMPDIR="$STAGE_ROOT/runtime/tmp"
+export IMAGE_DAGGER_DUMP_DIR="$TRAIN_RUN_DIR/render_dumps"
+# The batch job receives an explicit allowlist from sbatch. Export that already
+# sanitized environment, plus the values established above, to nested srun steps.
+export SLURM_EXPORT_ENV=ALL
 export IMAGE3F_RUN_ID="$RUN_ID"
 export IMAGE3F_MAX_STREAMS=16
 export STARTUP_STAGGER_SCOPE=local

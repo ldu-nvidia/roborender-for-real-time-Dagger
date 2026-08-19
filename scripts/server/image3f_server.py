@@ -5,7 +5,7 @@ Watches QUEUE/inbox/*.json; each request:
   {"chunks": [npz paths], "prev_mode": "fixed|chain|black|zero",
    "tag_prefix": "x_", "anchor_index": 0, "depth_variant": "droid",
    "out": "/path", "seed": 42, "max_frames": 81,
-   "init_prev_dir": "/svl/u/ravenh/fast_roborender/teacher_fullres"}
+   "init_prev_dir": "/path/to/teacher_fullres"}
 
 Writes generations to <out>/<chunk>_gen_<tag>.npz, then moves the request to
 QUEUE/done/<name>.json with a .result.json beside it (timing + status).
@@ -21,11 +21,11 @@ from PIL import Image
 from reference_history import LaggedReferenceStore
 from runtime_identity import describe_runtime_identity
 
-BUNDLE = Path(os.environ.get("IMAGE3F_ROOT", "/vision/u/ravenh/roborender_image_model_accelerated"))
+BUNDLE = Path(os.environ["IMAGE3F_ROOT"])
 sys.path.insert(0, str(BUNDLE))
 from runtime import Image3FRequest, Image3FSession  # noqa: E402
 
-QUEUE = Path(os.environ.get("IMAGE3F_QUEUE", "/svl/u/ravenh/fast_roborender/image3f_queue"))
+QUEUE = Path(os.environ["IMAGE3F_QUEUE"])
 VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]
 W, H = 416, 240
 PROTOCOL_VERSION = 2
@@ -65,7 +65,10 @@ def run_request(session, session_lock, req):
     tag = f'{req.get("tag_prefix", "q_")}{mode}'
     out = Path(req["out"]); out.mkdir(parents=True, exist_ok=True)
     anchor_idx = int(req.get("anchor_index", 0))
-    init_dir = Path(req.get("init_prev_dir", "/svl/u/ravenh/fast_roborender/teacher_fullres"))
+    init_prev_dir = req.get("init_prev_dir") or os.environ.get("IMAGE3F_INIT_PREV_DIR")
+    if mode in ("fixed", "chain") and not init_prev_dir:
+        raise ValueError("fixed/chain mode requires init_prev_dir")
+    init_dir = Path(init_prev_dir) if init_prev_dir else QUEUE
     seed = int(req.get("seed", 42))
     stats = {}
     for cpath in req["chunks"]:
@@ -388,9 +391,7 @@ def main():
         host = subprocess.run(
             ["hostname"], capture_output=True, text=True
         ).stdout.strip()
-    endpoint = Path(os.environ.get(
-        "ENDPOINT_FILE", "/svl/u/ravenh/fast_roborender/image3f_server_endpoint.txt"
-    ))
+    endpoint = Path(os.environ["ENDPOINT_FILE"])
     endpoint.parent.mkdir(parents=True, exist_ok=True)
     endpoint_tmp = endpoint.with_name(f".{endpoint.name}.{os.getpid()}.tmp")
     endpoint_tmp.write_text(f"{host} {port}\n")

@@ -1,31 +1,31 @@
 #!/bin/bash
 #SBATCH --job-name=i3f_ft_setup
-#SBATCH --partition=viscam
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:rtxpro6000:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=4:00:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/i3f_ft_setup_%j.log
-set -x
-export HOME=/sailhome/ravenh
+#SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/i3f_ft_setup_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
+set -Eeuo pipefail
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+FR_ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
+source "$FR_ROOT/scripts/setup/oci_env.sh"
+export HOME=$HOME_OVERRIDE
 export PYTHONDONTWRITEBYTECODE=1
-export PIP_CACHE_DIR=/vision/u/ravenh/pip_cache
-export TMPDIR=/vision/u/ravenh/tmp
+export PIP_CACHE_DIR=$ROBORENDER_STAGE_ROOT/runtime/cache/pip
 mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
-ROOT=/vision/u/ravenh/roborender_image_model_accelerated
-export ROBORENDER_MODEL_BASE=/vision/u/ravenh/roborender_image3f_portable_buildonly_v1/assets/models
-cd "$ROOT"
+cd "$IMAGE3F_ROOT"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-if [ ! -x "$ROOT/.venv/bin/python" ]; then
-  sed -i 's|--index-url "${TORCH_INDEX_URL}" \\|--index-url "${TORCH_INDEX_URL}" --extra-index-url https://pypi.org/simple \\|' bin/create_baremetal_env.sh
-  PYTHON=/vision/u/ravenh/py313/bin/python ./bin/create_baremetal_env.sh; RC=$?
-  cd /vision/u/ravenh && unzip -o -q roborender_image_fine_tune.zip roborender_image_model_accelerated/bin/create_baremetal_env.sh && cd "$ROOT"
-  [ $RC -ne 0 ] && { echo ENV_FAIL; exit 1; }
-fi
-export PYTHON="$ROOT/.venv/bin/python"
+[ -x "$IMAGE3F_PYTHON" ] || {
+  echo "FATAL: target-local environment missing; run scripts/scaling/oci_h100_image3f_setup.sbatch" >&2
+  exit 2
+}
+export PYTHON=$IMAGE3F_PYTHON
 echo ENV_OK
 
 "$PYTHON" bin/doctor.py --stage package || { echo PKG_DOCTOR_FAIL; exit 1; }

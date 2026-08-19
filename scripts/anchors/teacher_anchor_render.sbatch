@@ -1,21 +1,27 @@
 #!/bin/bash
-#SBATCH --partition=viscam
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=teacher_anchor
-#SBATCH --gres=gpu:rtxpro6000:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=3:00:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/teacher_anchor_%j.log
-set -x
-export HOME=/sailhome/ravenh
-cd /svl/u/ravenh/fast_roborender
-FR=/svl/u/ravenh/fast_roborender
+#SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/teacher_anchor_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
+set -Eeuo pipefail
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
+source "$ROOT/scripts/setup/oci_env.sh"
+export HOME=$HOME_OVERRIDE
+cd "$ROOT"
+FR=$ROOT
 PORT=$((18000 + SLURM_JOB_ID % 1000))
-/svl/u/ravenh/fast_roborender/run_raven_server.sh --host 127.0.0.1 --port $PORT --teacher_lora /svl/u/ravenh/renderscale/Sim2RealGen_Video_Model/lora_ckpts/Wan2.1-Fun-V1.1-1.3B-Mixed-DROID-AGIBOT-3View-DualControl-PrevFrame-droidnew_continue_lora/step-5294.safetensors &
+: "${TEACHER_LORA:?TEACHER_LORA must point to the staged teacher LoRA}"
+"$ROOT/run_raven_server.sh" --host 127.0.0.1 --port "$PORT" --teacher_lora "$TEACHER_LORA" &
 SERVER_PID=$!
-CHUNKS="${CHUNKS_OVERRIDE:- /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000123.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000404.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0000777.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001111.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001666.npz /svl/u/ravenh/fast_roborender/videogen_dataset/chunk_16222830_0001999.npz}"
-/svl/u/ravenh/miniconda3/envs/gr00t/bin/python /svl/u/ravenh/fast_roborender/scripts/anchors/render_teacher_fullres.py \
+CHUNKS="${CHUNKS_OVERRIDE:- $ROOT/videogen_dataset/chunk_16222830_0000123.npz $ROOT/videogen_dataset/chunk_16222830_0000404.npz $ROOT/videogen_dataset/chunk_16222830_0000777.npz $ROOT/videogen_dataset/chunk_16222830_0001111.npz $ROOT/videogen_dataset/chunk_16222830_0001666.npz $ROOT/videogen_dataset/chunk_16222830_0001999.npz}"
+"$VIRAL_PYTHON" "$ROOT/scripts/anchors/render_teacher_fullres.py" \
   --chunks $CHUNKS --out "$FR/teacher_fullres" --port $PORT
 RC=$?
 kill $SERVER_PID 2>/dev/null

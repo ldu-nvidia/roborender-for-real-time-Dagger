@@ -1,7 +1,7 @@
 import glob, os, numpy as np, sys
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender")
 from renormalize_depth import h5v4_frame_seq
-B = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
+B = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
 # near-object chunks found earlier
 NAMES = ["chunk_16222830_0000001.npz","chunk_16222830_0000002.npz",
          "chunk_16222830_0000006.npz","chunk_16222830_0000008.npz"]
@@ -10,7 +10,7 @@ CONDS = {
     "oldd": dict(norm_range=[0.05,3.0], inv=[1,100], knee=None),
 }
 for cond, p in CONDS.items():
-    dst = f"/svl/u/ravenh/fast_roborender/ab_{cond}_dataset"
+    dst = f"/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_{cond}_dataset"
     os.makedirs(dst, exist_ok=True)
     for nm in NAMES:
         src = os.path.join(B, nm)

@@ -27,7 +27,10 @@ from collections import defaultdict
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
+ROOT = os.environ.get(
+    "ROBORENDER_ROOT", os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+)
+sys.path.insert(0, os.path.join(ROOT, "GR00T-VisualSim2Real"))
 
 CHUNK_T = 81
 
@@ -45,8 +48,9 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset_dir", required=True)
-    ap.add_argument("--endpoint_file",
-                    default="/svl/u/ravenh/fast_roborender/raven_server_endpoint.txt")
+    ap.add_argument(
+        "--endpoint_file", default=os.path.join(ROOT, "raven_server_endpoint.txt")
+    )
     ap.add_argument("--host", default=None)
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--student_res", type=int, nargs=2, default=[108, 192],

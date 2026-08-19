@@ -3,12 +3,12 @@
 assign a varied per-chunk prompt, strip rgb_gen for re-render."""
 import glob, os, shutil, sys
 import numpy as np
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender")
 from renormalize_depth import h5v4_frame_seq
 from videogen_prompts import build_prompt
 
-SRC = "/svl/u/ravenh/fast_roborender/videogen_dataset"
-DST = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
+SRC = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/videogen_dataset"
+DST = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
 N = 200
 os.makedirs(DST, exist_ok=True)
 files = sorted(glob.glob(f"{SRC}/chunk_*.npz"))[:N]

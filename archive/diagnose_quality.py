@@ -5,14 +5,14 @@ import sys
 import imageio.v3 as iio
 import numpy as np
 
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
+sys.path.insert(0, "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/GR00T-VisualSim2Real")
 from gr00t.rl.utils.videogen_client import VideoGenRenderClient  # noqa: E402
 
-FIX = "/svl/u/ravenh/fast_roborender/roborender-acceleration/assets/fixtures/input/episode_00000000"
-OUT = "/svl/u/ravenh/fast_roborender/quality_diag"
+FIX = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/roborender-acceleration/assets/fixtures/input/episode_00000000"
+OUT = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/quality_diag"
 PROMPT = "A robot arm opens a drawer."
 
-with open("/svl/u/ravenh/fast_roborender/raven_server_endpoint.txt") as f:
+with open("/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/raven_server_endpoint.txt") as f:
     host, port = f.read().split()
 client = VideoGenRenderClient(host=host, port=int(port))
 
@@ -46,7 +46,7 @@ for name, (depths, masks) in conds.items():
           flush=True)
 
 # reference: the validated raw-sample output frame
-ref = load("/svl/u/ravenh/fast_roborender/roborender-acceleration/outputs/raw_drawer_sample/generated_ext1.mp4")
+ref = load("/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/roborender-acceleration/outputs/raw_drawer_sample/generated_ext1.mp4")
 iio.imwrite(f"{OUT}/ref_rawsample_f40.png", ref[40])
 print(f"ref_rawsample: mean={ref.mean():.1f} std={ref.std():.1f} "
       f"sat={np.abs(ref.astype(int) - ref.mean(axis=-1, keepdims=True)).mean():.2f}")

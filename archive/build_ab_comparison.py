@@ -5,8 +5,8 @@ Layout per frame: [A rgb_gen | B rgb_gen] upscaled, with labels."""
 import glob, os
 import numpy as np, cv2
 
-A_DIR = "/svl/u/ravenh/fast_roborender/videogen_dataset"
-B_DIR = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
+A_DIR = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/videogen_dataset"
+B_DIR = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
 OUT = "/tmp/ab_compare"
 os.makedirs(OUT, exist_ok=True)
 

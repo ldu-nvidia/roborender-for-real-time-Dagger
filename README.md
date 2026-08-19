@@ -12,39 +12,39 @@ Code lives in `GR00T-VisualSim2Real/`; launchers and assets live here in `fast_r
 
 ## Setup
 
-Three separate Python environments, because the trainer and the renderers cannot share one
-(the render bundles pin their own torch/TensorRT builds):
+OCI uses three separate environments because the host telemetry process, Image3F renderer,
+and Isaac/GR00T trainer have incompatible runtime requirements:
 
 | Environment | Built by | Used for |
 |---|---|---|
-| conda `viral` | `scripts/setup/setup_viral_env.sh` | Isaac Sim, IsaacLab, `gr00t` — all training and eval |
-| `roborender-acceleration/.venv` | the bundle's `bin/create_baremetal_env.sh` | teacher video model, LADD students, offline rendering |
-| `<image3f bundle>/.venv` | `scripts/server/image3f_ft_setup.sbatch` | Image3F per-frame renderer (DAgger) |
+| Host W&B venv | `scripts/scaling/oci_host_wandb_setup.sbatch` | Coordinator-side telemetry and media uploads |
+| Image3F CUDA 12.8 venv | `scripts/scaling/oci_h100_image3f_setup.sbatch` | H100 Image3F serving, ONNX export, TensorRT build, TeaCache calibration, and smoke gate |
+| Isaac/GR00T venv | `scripts/scaling/oci_h100_trainer_setup.sbatch` | Isaac Sim 5.1, IsaacLab, integrated GR00T trainer, and evaluation |
 
 ```bash
-# 1. trainer environment (~30 min; clones IsaacLab, installs Isaac Sim 5.1)
-bash scripts/setup/setup_viral_env.sh
+# Shared OCI/Lustre paths used by all three jobs.
+source scripts/setup/oci_env.sh
 
-# 2. Image3F bundle: venv, ONNX export, TensorRT engine, doctor + smoke test.
-#    Must run on the GPU you will deploy on — engines are arch- and TRT-version-specific.
-sbatch scripts/server/image3f_ft_setup.sbatch
+# These environments are independent and may be submitted together.
+sbatch scripts/scaling/oci_host_wandb_setup.sbatch
+sbatch scripts/scaling/oci_h100_image3f_setup.sbatch
+sbatch scripts/scaling/oci_h100_trainer_setup.sbatch
 
-# 3. verify everything before submitting real jobs
+# Read-only aggregate preflight after all three jobs finish.
 bash scripts/setup/check_env.sh
 ```
 
-`check_env.sh` is read-only and prints PASS/WARN/FAIL for the trainer env and its imports,
-all three render environments, the Image3F adapter and foundation weights, TensorRT engines
-present per GPU arch, the anchor pool and dataset, the baseline checkpoint and config that
-`eval_policy.sbatch` stages against, any running render servers (flagging **stale endpoint
-files**, whose host no longer has a server), and the viscam Slurm account. WARN means "fine
-unless you need that stage". Exit status is non-zero only on hard failures.
+`check_env.sh` is read-only and prints PASS/WARN/FAIL for the three OCI environments,
+Image3F adapter and foundation weights, the H100 TensorRT engine, anchor pool, expert
+labeler, and the `general_cs_infra` Slurm account. WARN means “fine unless you need that
+stage.” Exit status is non-zero only on hard failures.
 
 ### Setup gotchas
 
-- **Engines are per GPU arch and per TensorRT version.** `sm120` (RTX PRO 6000), `sm89`
-  (L40S), `sm86` (A40) each need their own build, and a LoRA change requires a fresh ONNX
-  export. Nothing is shipped prebuilt — `assets/generated/` starts empty by design.
+- **Engines are per GPU architecture and TensorRT version.** OCI production builds an
+  H100 `sm90` engine with TensorRT 10.13.3.9. A different GPU/software stack or LoRA
+  requires a fresh ONNX export and engine build. Nothing is shipped prebuilt —
+  `assets/generated/` starts empty by design.
 - **The bundles hash-verify their own source tree.** Never leave edits in a bundle: patch,
   run, restore. `PYTHONDONTWRITEBYTECODE=1` is required, since stray `.pyc` files fail the
   release-tree check, and the package-stage doctor demands an empty `assets/generated/`
@@ -53,7 +53,7 @@ unless you need that stage". Exit status is non-zero only on hard failures.
   unzips (a 22 GB extract died with exit 137).
 - The Image3F bundle ships only the LoRA delta; foundation weights are attached via
   `ROBORENDER_MODEL_BASE`, pointing at the older portable bundle's `assets/models`.
-- Model load is ~110 s with a warm page cache but up to ~40 min cold from NFS, which is why
+- Model load is ~110 s with a warm page cache but can be much longer cold from Lustre, which is why
   the render server is a persistent job rather than something each run starts.
 
 ## Repository layout
@@ -63,9 +63,11 @@ README.md                     this file
 run_raven_server.sh           render-server entrypoint (bundle-relative; stays at root)
 
 scripts/
-  setup/    setup_viral_env.sh  check_env.sh
+  setup/    oci_env.sh  check_env.sh
   scaling/  scale_plan.py  image3f_probe.py  install_gr00t_integration.py
-            submit_production.sh
+            oci_host_wandb_setup.sbatch  oci_h100_image3f_setup.sbatch
+            oci_h100_trainer_setup.sbatch  oci_packed_256x300.sbatch
+            submit_oci_packed.sh  submit_production.sh  submit_8h_256env.sh
   data/     collect_data.sbatch  offline_render.sbatch  render_shard.sbatch
             offline_render_dataset.py  renormalize_depth.py
   anchors/  anchor_pool.sbatch  render_anchor_pool.py  rich_prompts.py
@@ -82,8 +84,8 @@ integrations/gr00t/
 tests/      login-node unit tests for scale math and lag-reference semantics
 archive/    superseded one-off diagnostics and earlier experiments
 
-GR00T-VisualSim2Real/         trainer, configs, simulator (own git repo, branch
-                              videogen-image-dagger)
+GR00T-VisualSim2Real/         trainer, configs, simulator (own git repo, pinned
+                              OCI integration branch)
 roborender-acceleration/      LADD student bundle + TensorRT engines (own repo)
 ```
 
@@ -115,7 +117,7 @@ The renderer is not a bottleneck for this task.
 | **50-step teacher video model** | `renderscale/Sim2RealGen_Video_Model/lora_ckpts/Wan2.1-Fun-V1.1-1.3B-Mixed-DROID-AGIBOT-3View-DualControl-PrevFrame-droidnew_continue_lora/step-5294.safetensors` | 81-frame 3-view clip | ~32 s/clip (~400 ms/frame) | **A** dataset rendering; **B** anchor pool |
 | LADD 5-step student, 3-view | `roborender-acceleration/assets/student/raven_native3view_ladd_5step_iter5250.pth` | 81-frame 3-view clip | 6.9 s/clip (~85 ms/frame) | **A** when throughput matters more than texture |
 | LADD 5-step student, 2-view | `roborender-acceleration/assets/student/raven_ladd_5step_global_best_iter5250_bf16.safetensors` | 81-frame 2-view clip | TRT-accelerated (3.37× smoke) | 2-view tasks only — no wrist-pair support |
-| **Image3F finetune (image model)** | `/vision/u/ravenh/roborender_image_model_accelerated`, adapter `rgb030-depth030-step-5000.safetensors` | **single 3-view frame** | ~192 ms/frame warm | **B** — the only option for in-loop relabelling |
+| **Image3F finetune (image model)** | `$ROBORENDER_STAGE_ROOT/assets/roborender_image_model_accelerated`, adapter `rgb030-depth030-step-5000.safetensors` | **single 3-view frame** | ~192 ms/frame warm | **B** — the only option for in-loop relabelling |
 
 **A (offline BC) → 50-step teacher.** You are rendering whole clips ahead of time, so
 per-frame latency does not matter and clip-based video models give the best quality. The
@@ -227,7 +229,7 @@ The alternatives both lose: chaining on the model's own previous output collapse
 frame 20, and dropping the reference entirely is out of contract for this checkpoint (its
 view-dropout only ever dropped *one* view, never all three).
 
-**The pool.** `/vision/u/ravenh/anchor_pool_2048` — 2048 anchors, each an independent scene
+**The pool.** `$ROBORENDER_STAGE_ROOT/assets/anchor_pool_2048` — 2048 anchors, each an independent scene
 rendered by the 50-step teacher:
 
 ```
@@ -247,7 +249,7 @@ server (LoRA path is required — the server dies instantly without it) and rend
 # START/END/OUT are read from the environment; the render server's port is derived
 # from the job id inside the script, so parallel shards never collide.
 for SH in 0 1 2; do
-  sbatch --export=ALL,START=$((SH*683)),END=$(((SH+1)*683)),OUT=/vision/u/ravenh/anchor_pool_2048          scripts/anchors/anchor_pool.sbatch
+  sbatch --export=START=$((SH*683)),END=$(((SH+1)*683)),OUT="$ROBORENDER_STAGE_ROOT/assets/anchor_pool_2048",TEACHER_LORA="$TEACHER_LORA" scripts/anchors/anchor_pool.sbatch
 done
 ```
 
@@ -309,18 +311,10 @@ the student's undiluted state distribution, which is the point of DAgger. β aff
 training rollouts only; evaluation always runs the student.
 
 ```bash
-# 1. anchor pool (see Anchors above) — only needed once
-sbatch scripts/anchors/anchor_pool.sbatch
-
-# 2. warm renderers: ~1 per 5 relabelled envs, each with its own endpoint file and queue
-for i in '' _2 _3; do
-  sbatch --time=3-00:00:00 \
-    --export=ALL,ENDPOINT_FILE=$PWD/image3f_server_endpoint$i.txt,IMAGE3F_QUEUE=$PWD/image3f_queue$i \
-    scripts/server/image3f_server.sbatch
-done
-
-# 3. train
-sbatch --export=ALL,MIX=0.5 scripts/train/dagger_train.sbatch
+# The packed launcher starts both renderer and trainer steps inside one allocation.
+source scripts/setup/oci_env.sh
+DRY_RUN=1 bash scripts/scaling/submit_oci_packed.sh
+bash scripts/scaling/submit_oci_packed.sh
 ```
 
 ### Observation mixing
@@ -331,7 +325,7 @@ sbatch --export=ALL,MIX=0.5 scripts/train/dagger_train.sbatch
 | `MIX` | Regime | Renderers for 16 envs | Notes |
 |---|---|---|---|
 | `0.0` | **fully image-generated** | ~3 | every env relabelled; trains purely on the generated distribution |
-| `0.5` | **mixed** (default) | ~2 | what round 4 used → 69.3%; hedges against renderer artefacts |
+| `0.5` | mixed (historical) | ~2 | what round 4 used → 69.3%; hedges against renderer artefacts |
 | `1.0` | fully ray-traced | 0 | no relabelling; plain DAgger, useful as a control |
 
 `scripts/train/dagger_train.sbatch` validates `MIX ∈ [0,1]`, discovers endpoint files whose host still runs
@@ -340,9 +334,9 @@ relabelling is requested with no live renderer, and warns when there are fewer s
 `ceil(envs × (1 − MIX) / 5)`. Too few servers does not fail — it serialises the rollout, so
 watch `Iteration time` (expect ~145 s at 16 envs / 3 servers / `MIX=0.5`).
 
-Other variables: `CKPT` (warm start, defaults to the round-4 final), `NUM_ENVS` (16),
-`ANCHORS`, `ANCHOR_IDX`, `EXP`/`PROJ`. Run names default to the mix
-(`dagger_fullgen`, `dagger_mix0.5`, `dagger_fullrt`).
+That table describes the earlier small-run launcher. OCI production fixes `MIX=0`, starts
+the student from base initialization (`CKPT=none`), and validates all 52 renderer endpoints
+inside the packed job before training.
 
 ### Config that matters
 
@@ -355,42 +349,38 @@ Other variables: `CKPT` (warm start, defaults to the round-4 final), `NUM_ENVS` 
 | `videogen.raytraced_mix_prob` | via `MIX` | see above |
 | `videogen.image3f_endpoint_files` | one per renderer | envs are sharded round-robin across them |
 | `videogen.anchor_pool_dir` / `anchor_index` | `anchor_pool_2048` / `0` | fixed anchor per episode; chaining on own outputs collapses |
-| `videogen.rollout_action_source` | `teacher` | who drives the rollout: `teacher` (β=1), `student` (β=0), `beta` (annealed) |
+| `videogen.rollout_action_source` | `beta` in production | per-decision expert/student mixture |
 | `videogen.beta_schedule` | `linear` | `constant` / `linear` / `exponential`, used when the source is `beta` |
 | `videogen.beta_start` / `beta_end` | `1.0` / `0.0` | DAgger mixture endpoints |
 | `videogen.beta_decay_iters` / `beta_decay_rate` | `500` / `0.99` | linear horizon / exponential rate |
-| `num_steps_per_env` | `81` | one BC update per video-model clip length |
+| `num_steps_per_env` | `300` in production | rollout horizon per outer DAgger iteration |
 
-Warm-start from the previous round's `last.pt`: round 4 started from round 3 and reached
-`dagger_bc_loss` 0.146 within ~900 iterations (round 3 ended at 0.67, and finished at 0.134).
+Historically, round 4 warm-started from round 3 and reached `dagger_bc_loss` 0.146 within
+~900 iterations (round 3 ended at 0.67 and finished at 0.134). The OCI campaign does not
+reuse that policy: its ImageNet-pretrained ResNet-18 encoder and policy heads start from the
+base model path, while the expert checkpoint is used only to label actions.
 
 ### Production scale: 256 environments × 300 rollout steps
 
-The production launcher uses **eight synchronized trainer ranks with 32 Isaac environments
-per rank**. `num_envs` is rank-local in GR00T, so passing 256 to every rank would accidentally
-create 2,048 environments. Each outer rollout-and-learning iteration collects 76,800
-transitions; rank sharding also avoids the unsafe single-L40S rollout allocation.
-Accelerate/DDP synchronizes the
-student's supervised DAgger gradients after each rank collects its local trajectories.
-With the pinned production settings (`num_learning_epochs=1`, four minibatches), that outer
-iteration performs four optimizer steps, each covering 19,200 global transitions.
+Production is one packed Slurm allocation: **8 nodes × 8 H100 GPUs = 64 H100s**. Inside that
+allocation, one concurrent step runs 52 persistent Image3F renderer tasks (up to seven per
+node), and a second step runs eight synchronized trainer ranks (one per node). Four GPUs remain
+as placement slack. There are no independently scheduled renderer or trainer jobs.
 
-The production-safe default is `MIX=0.0`: all 256 environments render every simulator tick,
-requiring 52 independent RTX PRO 6000 Image3F servers at five environments per server. This
-guarantees contiguous lag histories. The previously validated `MIX=0.5` recipe needs only 26
-servers, but it is gated behind `ALLOW_EXPERIMENTAL_MIXED_LAG=1` until Raven's private trainer
-is verified to use an episode-sticky generated cohort; per-tick Bernoulli mixing would make
-`t-256` histories discontinuous. Endpoints live in a run-scoped selected manifest and are
-actively pinged. Training refuses to start until every required server advertises protocol 2
-and a maximum reference lag at least as large as the requested lag.
+Each trainer rank owns 32 Isaac environments, giving 256 globally. `num_envs` is rank-local in
+GR00T, so passing 256 to every rank would accidentally create 2,048 environments. Every outer
+iteration collects 256 × 300 = 76,800 transitions. With one minibatch, one learning epoch,
+microbatch 1, and gradient accumulation 32, it performs one synchronized optimizer update over
+all 76,800 transitions.
 
-The 300-step horizon crosses Image3F's training-time reference boundary. The production client
-and server therefore implement the exact policy: use the episode anchor at `t < 256`, then use
-the generated RGB from `t-256`. History is bounded and held server-side; environment streams
-remain sticky to endpoints. Legacy 81-step launchers keep their stateless behavior unless
-`IMAGE3F_REFERENCE_LAG` is set.
+Production fixes `MIX=0`, so all 256 environments receive Image3F observations at every tick.
+The reference policy is FT-FIXED (`REFERENCE_LAG=0`): one teacher-rendered RGB triplet is sampled
+for each episode and reused on every frame. Generated frames are never fed back as later
+references. The 52 endpoints are run-scoped and must all report protocol, release, adapter,
+sampler, TeaCache, TensorRT, and runtime identities matching the launch contract before the first
+rollout.
 
-The core trainer is a separate, gitignored Raven GR00T fork. Public NVlabs GR00T does not have
+The core trainer is a separate, pinned GR00T checkout. Public NVlabs GR00T does not have
 `distill_trainer_videogen.py`, `image3f_frame_client.py`, or `wsdpt_image_dagger.yaml`. The
 installer patches the known parallel trainer to pass explicit episode/step IDs and installs
 the versioned client. Run it only after checking out that exact fork, review both changes, then
@@ -403,79 +393,54 @@ python scripts/scaling/install_gr00t_integration.py \
 # inspect the exact 256x300 capacity calculation
 python scripts/scaling/scale_plan.py
 
-# validate commands without submitting jobs
-DRY_RUN=1 bash scripts/scaling/submit_production.sh
+# validate the single packed command without submitting
+DRY_RUN=1 bash scripts/scaling/submit_oci_packed.sh
 
-# submit 52 renderer array elements plus the 8-rank trainer (MIX=0 default)
+# submit the packed 8-node allocation
+bash scripts/scaling/submit_oci_packed.sh
+
+# Compatibility entry points resolve to the same packed launcher.
 bash scripts/scaling/submit_production.sh
-
-# pinned production campaign: 256 environments, 300-step rollouts, 8-hour wall time
 bash scripts/scaling/submit_8h_256env.sh
 ```
 
-The eight-hour value is the trainer allocation wall time, not a promise of eight full hours of
-optimizer execution: endpoint readiness and final cleanup happen inside that allocation. The
-trainer is submitted with an `after:<renderer-array>` dependency so Slurm does not allocate its
-eight trainer GPUs until every renderer-array task has at least started; it still verifies every
-endpoint before the first rollout. Renderer workers use a longer lease as scheduling/startup
-headroom, but that lease is a bounded safeguard rather than a gang-scheduling guarantee. The
-launcher records renderer and trainer job IDs incrementally in `slurm_jobs.json`; if trainer
-submission fails it cancels only the renderer array it just created. Once trainer submission
-succeeds, that renderer ID is passed to the trainer, which cancels the fleet on every success or
-failure exit. Slurm sends the batch shell `USR1` five minutes before the trainer limit; the shell
-stops the distributed step, retains the latest five-iteration periodic checkpoint, drains
-telemetry, and records a nonzero outcome instead of waiting for a hard time-limit kill. A separate
-`afterany:<trainer_job>` cleanup watchdog also owns the renderer job ID; this covers a trainer
-cancelled while still pending, which never enters its batch shell and therefore cannot run that
-EXIT trap.
+The wall time covers renderer startup, endpoint validation, training, telemetry drain, and
+cleanup inside the same allocation. The packed coordinator owns both `srun` steps: if a renderer
+dies while training is live, it signals the trainer and fails the job; on any exit it terminates
+both steps. Slurm sends `USR1` five minutes before the allocation limit, allowing the trainer to
+retain its latest periodic checkpoint and drain telemetry before the job ends. Submission and
+packed manifests record the single job ID, both repository revisions, asset identities, and the
+52+8+4 GPU layout.
 
-Useful overrides are `GLOBAL_NUM_ENVS`, `ROLLOUT_STEPS`, `TRAINER_NODES`, `MIX`,
-`REFERENCE_LAG`, `CKPT`, `NUM_ROLLOUT_ITERATIONS`, `PROJ`, and `EXP`. The trainer launcher logs a
-machine-readable scale plan, both repository revisions, the checkpoint, endpoint fleet, and
-rank-specific stdout/stderr under its run directory. It uses microbatch 1 with gradient
-accumulation 8 by default, preserving the effective local mini-batch while limiting 300-frame
-sequence memory. `ROLLOUT_STEPS=300` is the collection horizon of each outer rollout
-iteration; it is not an optimizer-batch size and is distinct from run length.
-`NUM_ROLLOUT_ITERATIONS` defaults to 1 for a bounded scale-validation run and maps to the
-trainer's legacy `algo.trl.num_total_batches` setting. `NUM_TOTAL_BATCHES` remains a deprecated
-environment alias; setting both names to different values is a fatal error.
+The production contract fixes 256 environments, 300 rollout steps, eight trainer ranks,
+52 renderers, `MIX=0`, fixed anchors, and fresh student initialization. Useful campaign-level
+overrides are `NUM_ROLLOUT_ITERATIONS`, `SAVE_FREQUENCY`, `PROJ`, `EXP`, `RUN_ID`, and
+`RUN_WALLTIME`; source and asset identities remain pinned. `ROLLOUT_STEPS=300` is the collection
+horizon of each outer iteration, not an optimizer-batch size or run length.
 
-Production behavior is explicit and recorded in both manifests. The default is
-`BEHAVIOR_SOURCE=student`, which pins the Image3F trainer's actual action selector
-`videogen.rollout_action_source=student` as well as `rollout_with_teacher_num_steps=0`,
-`enforce_teacher_rollout=false`, and `TEACHER_ROLLOUT_RATIO=0.0`. The launcher derives and
-runtime-gates that Image3F selector separately so the trainer's default `teacher` behavior
-cannot silently override a run labeled as student-driven. An intentional mixed run must
-set `BEHAVIOR_SOURCE=mixed` and a ratio strictly between zero and one; this maps to Raven's
-`rollout_action_source=beta` with a constant per-decision β equal to that ratio while keeping
-the legacy parent-trainer mixer disabled. A teacher-only run must
-set `BEHAVIOR_SOURCE=teacher` and ratio `1.0`. Inconsistent combinations fail before any Slurm
-submission. `NUM_LEARNING_EPOCHS=1` and `VG_PRIMARY_VIEW=head_color` are also pinned explicitly.
-The supported primary views are `hand_left`, `hand_right`, and `head_color`. Image3F still
-generates all three synchronized views, but this trainer supplies only the selected primary
-view to the actor. The GR00T integration patch installs matching runtime assertions inside the
-trainer, so a composed Hydra configuration that disagrees with the launch manifest fails before
-its first rollout. The production command also pins `value_loss_coef=0.0` and
-`entropy_coef=0.0`; both source-config inspection and the composed trainer assert exact numeric
-zero, so a prefix such as `0.1` cannot pass as pure behavior cloning.
+Production behavior is explicit and recorded in both manifests. It uses per-decision β mixing,
+annealed linearly from 1.0 to 0.0 over 500 rollout iterations: the expert dominates while the
+fresh student is random, and the student increasingly drives the visited-state distribution.
+The legacy parent-trainer mixer remains disabled. `NUM_LEARNING_EPOCHS=1`, one minibatch,
+`VG_PRIMARY_VIEW=head_color`, `value_loss_coef=0.0`, and `entropy_coef=0.0` are pinned. Image3F
+generates all three synchronized views, while the current actor consumes the selected head view.
+Runtime assertions reject any composed Hydra configuration that disagrees with this contract.
 
 ### Explicit production gates
 
 | Gate | Must pass before/while running |
 |---|---|
-| Source and assets | Clean, run-pinned `fast_roborender` and private GR00T revisions; versioned Image3F client/telemetry integration; launch-time checkpoint and reference-config SHA-256 values unchanged |
-| Scale and behavior | 8 ranks × 32 environments = 256; 300-step rollout; 52 renderers; `MIX=0`; lag 256; student behavior; one learning epoch; pure DAgger BC |
+| Source and assets | Clean, run-pinned `fast_roborender` and integrated GR00T revisions; exact expert-labeler SHA; base student initialization; versioned Image3F client and telemetry integration |
+| Scale and behavior | 8 nodes × 8 H100s; 8 ranks × 32 environments = 256; 300-step rollout; 52 renderers + 4 slack; `MIX=0`; FT-FIXED lag 0; β 1→0 over 500 iterations; pure DAgger BC |
 | Renderer provenance | All 52 live endpoints report the exact fine-tuned release/adapter SHA, five-step sampler, TeaCache 0.3, CFG 1.0, CUDA graph setting, and a load-verified TensorRT engine compatible with the serving GPU/software stack |
 | W&B observability | Online personal workspace authenticated as `ldu@nvidia.com`; stable resumable sidecar run; scalar, condition/generated image, and MP4 producers ready; repeated upload/encoding errors terminate training |
-| Runtime semantics | The composed private trainer agrees with every behavior, primary-view, epoch, and loss-coefficient assertion before its first rollout |
+| Runtime semantics | The composed trainer agrees with every behavior, primary-view, epoch, and loss-coefficient assertion before its first rollout |
 | Scientific result | Baseline/early/mid/final fixed-seed evaluation is complete; the final policy improves success by at least 2 absolute points and the paired 95% bootstrap interval has a lower bound above zero |
 
-The full `MIX=0` topology asks Slurm for 8 L40S trainer GPUs plus 52 RTX PRO 6000
-renderer GPUs. The orchestration repository, two-GPU workstation, or an otherwise idle cluster is
-not by itself sufficient: the Raven private GR00T trainer/config, actor checkpoint, Image3F model
-assets, compatible per-GPU TensorRT builds, and W&B authentication must also be present. A failed
-gate never becomes a nominal production run; transactional submission cancels only jobs created by
-that submission.
+The packed topology requires eight OCI H100 nodes at once. Source alone is not sufficient: the
+integrated GR00T checkout, expert labeler, Image3F adapter and foundation weights, anchor pool,
+target-built H100 TensorRT engine, three ready environments, and W&B authentication must all be
+present. A failed gate never becomes a nominal production run.
 
 ### W&B production telemetry
 
@@ -493,22 +458,18 @@ failures write `RUN_FAILED` with the preserved trainer exit status.
 
 ### Fixed-seed policy-improvement gate
 
-The pinned eight-hour launcher also schedules a ray-traced policy evaluation with
-`afterany:<trainer_job>`, so a useful checkpoint can still be measured when the eight-hour
-wall-time ends the trainer. It selects four distinct policies—warm-start baseline, first saved
-checkpoint, midpoint checkpoint, and latest checkpoint—and evaluates each on the same eight
-Isaac seed blocks with 32 environments per block. Each environment contributes exactly one
-episode, giving 256 matched episodes per checkpoint without letting fast-terminating policies
-advance the reset RNG to different scenarios. All checkpoints use the same offline-BC reference
-config. The baseline checkpoint and reference-config hashes are captured before training;
-both the trainer and delayed evaluator fail if those paths later resolve to different bytes.
+The packed production launcher intentionally submits only the training allocation; it does not
+silently create follow-on evaluation jobs. After training, the fixed-seed evaluation entrypoints
+can compare a declared baseline, early, midpoint, and final checkpoint on the same eight Isaac
+seed blocks with 32 environments per block. Each environment contributes exactly one episode,
+giving 256 matched episodes per checkpoint without letting fast-terminating policies advance the
+reset RNG to different scenarios. Because production starts a fresh student, the baseline must be
+declared explicitly (for example, a captured iteration-zero policy) rather than inferred from a
+warm-start checkpoint. Baseline and reference-config hashes are pinned before evaluation.
 Evaluation atomically rebuilds each staged checkpoint, removes only environment, optimizer,
 and scheduler state, and records the actual staged checkpoint/config hashes before reset. A strict
 in-tree adapter captures the mapping returned by `trainer.eval()` and writes it atomically; the
-gate does not rely on a particular private trainer variant happening to emit `metrics_eval.json`.
-Generic bounded smoke runs automatically disable this statistical gate when their configured
-run length cannot produce three distinct saved snapshots; the pinned campaign explicitly
-enables it.
+gate does not rely on a particular trainer variant happening to emit `metrics_eval.json`.
 
 The machine-readable report is
 `<training_run>/fixed_seed_eval/fixed_seed_improvement_report.json`. The gate passes only when
@@ -517,17 +478,14 @@ its paired seed-block bootstrap 95% interval is above zero. Reward and its paire
 reported as a diagnostic but are not silently mixed into the success criterion. Training loss
 is explicitly excluded as evidence of closed-loop improvement. Baseline/early/mid/final success,
 Wilson intervals, reward intervals, and the gate result are logged to a separate evaluation run
-in the same personal W&B project. `slurm_jobs.json` starts with the evaluation-orchestrator ID;
-the orchestrator atomically adds the four-task evaluation-array and report job IDs after Slurm
-accepts them. Failure to submit that dependent gate rolls back both the newly submitted trainer
-and renderer fleet, so an ungated production run is not left alive. The launcher transfers
-ownership only after Slurm accepts the trainer, renderer-cleanup watchdog, and evaluation
-orchestrator.
+in the same personal W&B project. This post-run scientific gate does not change the lifecycle or
+ownership of the completed packed production job.
 
-Before the full job, validate progressively: 4×4, 32×16, 64×75, 128×75, 256×75,
-256×260 (the lag transition), then 256×300. Acceptance requires exact global transition
-counts, finite BC loss, balanced endpoint request counts, zero render errors, correct anchor
-reset/t−256 telemetry, and synchronized policy checkpoints across ranks.
+Before the full job, validate environment imports, the H100 renderer smoke test, endpoint
+identity checks, and a bounded distributed rollout. Acceptance requires exact global transition
+counts, finite BC loss, balanced endpoint request counts, zero render errors, correct FT-FIXED
+anchor resets, and synchronized policy checkpoints across ranks.
+
 ## Multi-view policies
 
 By default the policy sees one camera (the ego/head view). Image3F renders three
@@ -599,8 +557,8 @@ sbatch --export=ALL,CKPT=<run>/last.pt,OBS=generated scripts/eval/eval_policy.sb
 
 The script also fails loudly on the traps that previously ate whole runs: a missing
 checkpoint or config, and — for `OBS=generated` — an endpoint file whose host has no
-`i3f_warm_server` running on it, which is what a stale endpoint looks like. It excludes
-viscam10/viscam12 (NFS hangs), logs to `logs_archive/eval_policy_<jobid>.log`, prints a
+`i3f_warm_server` running on it, which is what a stale endpoint looks like. It logs to the
+OCI/Lustre run log directory, prints a
 one-line `RESULT ...` summary, and cleans up its staging directory.
 
 Reference configs it stages against:
@@ -635,15 +593,15 @@ The patches carry code only. Also needed on the target machine, none of it in th
 
 | Asset | Where it comes from |
 |---|---|
-| Image3F bundle + adapter | `/vision/u/ravenh/roborender_image_model_accelerated` |
+| Image3F bundle + adapter | `$ROBORENDER_STAGE_ROOT/assets/roborender_image_model_accelerated` |
 | Foundation weights | `ROBORENDER_MODEL_BASE`, see [Setup](#setup) |
 | TensorRT engines | built locally per GPU arch — never shipped |
 | Anchor pool | `scripts/anchors/anchor_pool.sbatch` |
 | Rendered dataset | `scripts/data/` (offline BC only) |
 | Launchers and this README | `fast_roborender/` |
 
-Every launcher in `scripts/` is an sbatch script written for this cluster (viscam
-partitions, `/svl` and `/vision` paths). On a workstation with no Slurm, run the training
+Every launcher in `scripts/` now targets the OCI cluster (`general_cs_infra`,
+`backfill_block1`, and the shared Lustre stage root). On a workstation with no Slurm, run the training
 command directly — the launchers are thin wrappers around it:
 
 ```bash
@@ -664,7 +622,7 @@ Start the renderer first with `runtime/image3f_deploy.py` behind
 writes.
 
 `bash scripts/setup/check_env.sh` reports which assets are missing. Its paths default to
-the sc layout and are overridable:
+the OCI/Lustre layout and are overridable:
 
 ```bash
 ROOT=/your/checkout IMAGE3F=/your/image3f_bundle VIRAL_PY=$CONDA_PREFIX/bin/python \
@@ -729,10 +687,10 @@ every arm by 0.7-1.2 dB. Training was never affected -- it always went through t
 - **Stale endpoints.** `image3f_queue*/READY` and `image3f_server_endpoint*.txt` persist
   across jobs. A readiness check that only tests file existence will fire on a dead server
   from a previous run. Verify the endpoint's hostname matches the server job's node.
-- **NFS hangs.** viscam10 and viscam12 have wedged `cp` in `handle_async_copy` for an hour
-  with the destination already fully written. `--exclude=viscam10,viscam12` for eval jobs;
-  check `ps -o wchan` on the node when a job runs with an empty log.
-- **Slurm.** `--nodelist=A,B` requests *all* listed nodes — use `--gres=gpu:<type>:1 --nodes=1`.
-  `viscam-hi` preempts `viscam`/`sc-loprio`. Hydra needs a `+` prefix for keys absent from
+- **Shared storage stalls.** Check `ps -o wchan` and the Lustre client state when a job
+  runs with an empty log; never work around this by writing large artifacts to the root disk.
+- **Slurm.** `--nodelist=A,B` requests *all* listed nodes. OCI production uses
+  `--gpus-per-node=8` for the packed run and `--gpus-per-node=1` for single-GPU helpers.
+  Hydra needs a `+` prefix for keys absent from
   the base config. Training runs end in `TIMEOUT` at their limit; that is normal, and
   `--dependency=afterany` (not `afterok`) is what chains an eval behind them.

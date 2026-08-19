@@ -1,14 +1,13 @@
 #!/bin/bash
 # Redundant fleet cleanup for the case where a pending trainer is cancelled and
 # therefore never executes its own EXIT trap. Submit with afterany:<trainer_job>.
-#SBATCH --partition=viscam
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_fleet_cleanup
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=1G
 #SBATCH --time=00:10:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/rr_fleet_cleanup_%j.log
 set -Eeuo pipefail
 
 RENDER_JOB_ID=${RENDER_JOB_ID:?RENDER_JOB_ID is required}

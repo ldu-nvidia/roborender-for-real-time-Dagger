@@ -2,8 +2,9 @@
 # Submit the pinned eight-hour, 256-environment RoboRender DAgger experiment.
 set -Eeuo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-export ROOT
+SCRIPT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+export STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+export ROOT="$STAGE_ROOT/src/fast_roborender"
 export GR00T_ROOT="$ROOT/GR00T-VisualSim2Real"
 
 # This entry point is intentionally reproducible.  Do not let ambient shell
@@ -71,4 +72,4 @@ export RUN_ID=dagger_base_256x300_8h_$(date +%Y%m%d_%H%M%S)
 export EXP=$RUN_ID
 export CKPT=none
 
-exec bash "$ROOT/scripts/scaling/submit_production.sh"
+exec bash "$SCRIPT_ROOT/scripts/scaling/submit_oci_packed.sh"

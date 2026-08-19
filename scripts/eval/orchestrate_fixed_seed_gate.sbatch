@@ -2,21 +2,23 @@
 # Run after the trainer (normally dependency=afterany:<trainer job>).  It discovers
 # the snapshots that actually exist, then submits four checkpoint evaluations and
 # a fail-closed report job.
-#SBATCH --partition=viscam
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_eval_orchestrate
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=00:30:00
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/rr_eval_orchestrate_%j.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
-ROOT=${ROOT:-/svl/u/ravenh/fast_roborender}
+STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
 TRAIN_RUN_DIR=${TRAIN_RUN_DIR:?TRAIN_RUN_DIR is required}
 BASELINE_CKPT=${BASELINE_CKPT:?BASELINE_CKPT is required}
-REFERENCE_CONFIG=${REFERENCE_CONFIG:-$GR00T_ROOT/logs_rl/videogen_offline_bc/videogen_offline_bc-20260721_204447/config.yaml}
+REFERENCE_CONFIG=${REFERENCE_CONFIG:?REFERENCE_CONFIG must identify the staged OCI evaluation config}
 EXPECTED_BASELINE_CKPT_SHA256=${EXPECTED_BASELINE_CKPT_SHA256:?EXPECTED_BASELINE_CKPT_SHA256 is required}
 EXPECTED_REFERENCE_CONFIG_SHA256=${EXPECTED_REFERENCE_CONFIG_SHA256:?EXPECTED_REFERENCE_CONFIG_SHA256 is required}
 FIXED_EVAL_SEEDS=${FIXED_EVAL_SEEDS:-}
@@ -29,7 +31,7 @@ FIXED_EVAL_MAX_PARALLEL=${FIXED_EVAL_MAX_PARALLEL:-4}
 EVAL_DIR=${EVAL_DIR:-$TRAIN_RUN_DIR/fixed_seed_eval}
 EVAL_MANIFEST="$EVAL_DIR/manifest.json"
 JOB_MANIFEST=${JOB_MANIFEST:-}
-PYTHON=${PYTHON:-/svl/u/ravenh/miniconda3/envs/viral/bin/python}
+PYTHON=${PYTHON:-$STAGE_ROOT/runtime/envs/viral/bin/python}
 PROJ=${PROJ:-roborender_dagger_scale}
 EXP=${EXP:-dagger_fixed_seed_gate}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}

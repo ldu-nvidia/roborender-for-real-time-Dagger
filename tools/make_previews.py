@@ -2,12 +2,14 @@
 """Directly render N chunks (single-clip requests) and build 3-view grid
 previews. Bypasses the follow-mode renderer. Rows = each view (depth|gen)."""
 import sys, os, glob, numpy as np, cv2
-sys.path.insert(0, "/svl/u/ravenh/fast_roborender/GR00T-VisualSim2Real")
+from pathlib import Path
+ROOT = Path(os.environ.get("ROBORENDER_ROOT", Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(ROOT / "GR00T-VisualSim2Real"))
 from gr00t.rl.utils.videogen_client import VideoGenRenderClient
 
 VIEWS = ["hand_left", "hand_right", "head_color"]
-DS = "/svl/u/ravenh/fast_roborender/videogen_dataset"
-with open(os.environ.get("ENDPOINT_FILE","/svl/u/ravenh/fast_roborender/raven_server_endpoint.txt")) as f:
+DS = str(ROOT / "videogen_dataset")
+with open(os.environ.get("ENDPOINT_FILE", str(ROOT / "raven_server_endpoint.txt"))) as f:
     host, port = f.read().split()
 client = VideoGenRenderClient(host=host, port=int(port), timeout_s=1800)
 PROMPT_FILE = os.environ.get("PREVIEW_PROMPT_FILE")

@@ -1,6 +1,6 @@
 import glob, os, numpy as np, cv2
-B = "/svl/u/ravenh/fast_roborender/ab_test_dataset"
-A = "/svl/u/ravenh/fast_roborender/ab_adaptive_dataset"
+B = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_test_dataset"
+A = "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/src/fast_roborender/ab_adaptive_dataset"
 OUT = "/tmp/adaptive_cmp"; os.makedirs(OUT, exist_ok=True)
 H, W = 216, 384
 for af in sorted(glob.glob(f"{A}/chunk_*.npz")):

@@ -1,24 +1,27 @@
 #!/bin/bash
 # One array task evaluates one checkpoint over every fixed seed block.  Keeping
 # each seed to exactly one episode per environment preserves matched reset RNGs.
-#SBATCH --partition=viscam-hi
-#SBATCH --account=viscam
+#SBATCH --partition=backfill_block1
+#SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_fixed_eval
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=100G
 #SBATCH --time=08:00:00
-#SBATCH --exclude=viscam10,viscam12
-#SBATCH --output=/svl/u/ravenh/fast_roborender/logs_archive/rr_fixed_eval_%A_%a.log
+#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
+#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
-ROOT=${ROOT:-/svl/u/ravenh/fast_roborender}
+STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
 EVAL_MANIFEST=${EVAL_MANIFEST:?EVAL_MANIFEST is required}
 EVAL_DIR=${EVAL_DIR:?EVAL_DIR is required}
 TASK_INDEX=${SLURM_ARRAY_TASK_ID:?run this script as a Slurm array}
-PYTHON=${PYTHON:-/svl/u/ravenh/miniconda3/envs/viral/bin/python}
+VIRAL_ENV=${VIRAL_ENV:-$STAGE_ROOT/runtime/envs/viral}
+PYTHON=${PYTHON:-$VIRAL_ENV/bin/python}
+VIRAL_VENV_ACTIVATE=${VIRAL_VENV_ACTIVATE:-$STAGE_ROOT/runtime/envs/activate_viral_isaac.sh}
 
 [ -f "$EVAL_MANIFEST" ] || { echo "FATAL: missing manifest: $EVAL_MANIFEST"; exit 2; }
 [ -x "$PYTHON" ] || { echo "FATAL: evaluation Python is not executable: $PYTHON"; exit 2; }
@@ -61,10 +64,10 @@ ACTUAL_CONFIG_SHA=$(sha256sum "$REFERENCE_CONFIG" | awk '{print $1}')
     echo "FATAL: reference config changed after manifest creation"
     exit 2
 }
-export HOME=${HOME_OVERRIDE:-/sailhome/ravenh}
-export XDG_CACHE_HOME=${XDG_CACHE_HOME:-/svl/u/ravenh/.cache_xdg}
-export XDG_DATA_HOME=${XDG_DATA_HOME:-/svl/u/ravenh/.share_xdg}
-export TMPDIR=${TMPDIR:-/svl/u/ravenh/tmp}
+export HOME=${HOME_OVERRIDE:-$STAGE_ROOT/runtime/home}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$STAGE_ROOT/runtime/cache/xdg}
+export XDG_DATA_HOME=${XDG_DATA_HOME:-$STAGE_ROOT/runtime/cache/share}
+export TMPDIR=${TMPDIR:-$STAGE_ROOT/runtime/tmp}
 export OMNI_KIT_ACCEPT_EULA=YES
 export WANDB_MODE=disabled
 
@@ -87,8 +90,11 @@ STAGED_CONFIG_SHA=$(sha256sum "$STAGE/config.yaml" | awk '{print $1}')
     exit 2
 }
 
-source /svl/u/ravenh/miniconda3/etc/profile.d/conda.sh
-conda activate viral
+[ -f "$VIRAL_VENV_ACTIVATE" ] || {
+    echo "FATAL: trainer activation script missing: $VIRAL_VENV_ACTIVATE"
+    exit 2
+}
+source "$VIRAL_VENV_ACTIVATE"
 cd "$GR00T_ROOT"
 
 IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
