@@ -601,7 +601,8 @@ The patches carry code only. Also needed on the target machine, none of it in th
 | Launchers and this README | `fast_roborender/` |
 
 Every launcher in `scripts/` now targets the OCI cluster (`general_cs_infra`,
-`backfill_block1`, and the shared Lustre stage root). On a workstation with no Slurm, run the training
+`backfill_block1` for GPU work, `cpu_short` for host-only utilities, and the shared
+Lustre stage root). On a workstation with no Slurm, run the training
 command directly — the launchers are thin wrappers around it:
 
 ```bash

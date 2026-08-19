@@ -8,12 +8,16 @@
 #SBATCH --mem=256G
 #SBATCH --time=04:00:00
 #SBATCH --job-name=rr_viral_setup
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
 ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-$STAGE_ROOT}
+source "$ROOT/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" \
+        "$ROOT/scripts/scaling/oci_h100_trainer_setup.sbatch"
+fi
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
 EXPECTED_GR00T_REVISION=${EXPECTED_GR00T_REVISION:-e15aed42df44cc36941da9df7dd2e3d1002b244a}
 ISAACLAB_ROOT=${ISAACLAB_ROOT:-$STAGE_ROOT/src/IsaacLab}

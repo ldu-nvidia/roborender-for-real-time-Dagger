@@ -7,7 +7,7 @@
 #SBATCH --nodes=8
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-gpu=10
-#SBATCH --mem=0
+#SBATCH --mem=768G
 #SBATCH --time=08:15:00
 #SBATCH --signal=B:USR1@300
 #SBATCH --job-name=rr_base_256x300
@@ -222,6 +222,7 @@ srun --nodes=8 --ntasks="$REQUIRED_RENDERERS" --ntasks-per-node=7 \
     --error="$FLEET_DIR/logs/renderer_%t.err" \
     bash -lc '
         set -Eeuo pipefail
+        export ROBORENDER_CONTAINERIZED=1
         export SLURM_ARRAY_TASK_ID=$SLURM_PROCID
         export SLURM_ARRAY_JOB_ID=$SLURM_JOB_ID
         export IMAGE3F_ADVERTISE_HOST=${SLURMD_NODENAME:-$(hostname -f)}

@@ -3,9 +3,8 @@
 # The packed coordinator runs on the host, while Isaac/GR00T ranks run in a
 # container, so this environment must not inherit a container-only interpreter.
 #SBATCH --account=general_cs_infra
-#SBATCH --partition=backfill_block1
+#SBATCH --partition=cpu_short
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=00:30:00
@@ -18,6 +17,7 @@ WANDB_ENV=${WANDB_ENV:-$STAGE_ROOT/runtime/envs/wandb-host}
 HOST_PYTHON=${HOST_PYTHON:-/usr/bin/python3}
 WANDB_VERSION=${WANDB_VERSION:-0.21.1}
 NUMPY_VERSION=${NUMPY_VERSION:-1.24.4}
+OPENCV_VERSION=${OPENCV_VERSION:-4.10.0.84}
 READY_MARKER=$WANDB_ENV/.oci_environment_ready
 export PIP_CACHE_DIR=${PIP_CACHE_DIR:-$STAGE_ROOT/runtime/cache/pip}
 export TMPDIR=${TMPDIR:-$STAGE_ROOT/runtime/tmp}
@@ -29,23 +29,31 @@ if [ ! -x "$WANDB_ENV/bin/python" ]; then
 fi
 "$WANDB_ENV/bin/python" -m pip install --upgrade pip setuptools wheel
 "$WANDB_ENV/bin/python" -m pip install \
-    "wandb==$WANDB_VERSION" "numpy==$NUMPY_VERSION" pillow
-"$WANDB_ENV/bin/python" - "$WANDB_VERSION" "$NUMPY_VERSION" <<'PY'
+    "wandb==$WANDB_VERSION" "numpy==$NUMPY_VERSION" \
+    "opencv-python-headless==$OPENCV_VERSION" pillow
+"$WANDB_ENV/bin/python" - "$WANDB_VERSION" "$NUMPY_VERSION" "$OPENCV_VERSION" <<'PY'
 import sys
+import cv2
 import numpy
 import wandb
 
-expected_wandb, expected_numpy = sys.argv[1:]
+expected_wandb, expected_numpy, expected_opencv = sys.argv[1:]
 if wandb.__version__ != expected_wandb:
     raise SystemExit(f"expected wandb {expected_wandb}, found {wandb.__version__}")
 if numpy.__version__ != expected_numpy:
     raise SystemExit(f"expected numpy {expected_numpy}, found {numpy.__version__}")
-print(f"wandb={wandb.__version__} numpy={numpy.__version__} python={sys.executable}")
+if cv2.__version__ != ".".join(expected_opencv.split(".")[:3]):
+    raise SystemExit(f"expected opencv {expected_opencv}, found {cv2.__version__}")
+print(
+    f"wandb={wandb.__version__} numpy={numpy.__version__} "
+    f"opencv={cv2.__version__} python={sys.executable}"
+)
 PY
 {
     echo "python=$HOST_PYTHON"
     echo "wandb=$WANDB_VERSION"
     echo "numpy=$NUMPY_VERSION"
+    echo "opencv=$OPENCV_VERSION"
     echo "context=oci-host"
 } > "$READY_MARKER"
 echo "W&B host environment ready: $WANDB_ENV"

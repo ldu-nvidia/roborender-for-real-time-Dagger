@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=relocate_cache
 #SBATCH --account=general_cs_infra
-#SBATCH --partition=backfill_block1
+#SBATCH --partition=cpu_short
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=4:00:00

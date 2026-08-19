@@ -1,15 +1,13 @@
 #!/bin/bash
 # Aggregate all fixed-seed blocks, upload comparable metrics to the same personal
 # W&B project, and make the Slurm job red unless the policy-improvement gate passes.
-#SBATCH --partition=backfill_block1
+#SBATCH --partition=cpu_short
 #SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_eval_report
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=00:30:00
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
@@ -22,7 +20,8 @@ MIN_SUCCESS_DELTA=${MIN_SUCCESS_DELTA:-0.02}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_ENTITY=${WANDB_ENTITY:-}
-WANDB_PYTHON=${WANDB_PYTHON:-$STAGE_ROOT/runtime/envs/viral/bin/python}
+WANDB_PYTHON=${WANDB_PYTHON:-$STAGE_ROOT/runtime/envs/wandb-host/bin/python}
+export HOME=${HOME_OVERRIDE:-$STAGE_ROOT/runtime/home}
 SUMMARY="$EVAL_DIR/fixed_seed_improvement_report.json"
 
 set +e

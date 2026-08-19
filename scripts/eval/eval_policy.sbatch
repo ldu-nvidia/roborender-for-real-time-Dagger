@@ -26,13 +26,14 @@
 #SBATCH --mem=100G
 #SBATCH --time=6:00:00
 #SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/eval_policy_%j.log
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -euo pipefail
 
 ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
 ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
 source "$ROOT/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" "$ROOT/scripts/eval/eval_policy.sbatch"
+fi
 REPO=$GR00T_ROOT
 # Reference configs. RAYTRACED = the offline-BC baseline's own config, i.e. the environment
 # every headline number in README.md was measured in. GENERATED additionally needs the

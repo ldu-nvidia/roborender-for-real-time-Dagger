@@ -9,8 +9,16 @@
 #SBATCH --time=00:30:00
 #SBATCH --job-name=rr_isaac51_probe
 # Pyxis uses REGISTRY#IMAGE syntax; a slash here is interpreted as Docker Hub.
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
 set -Eeuo pipefail
+
+STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-$STAGE_ROOT}
+source "$ROOT/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" \
+        "$ROOT/scripts/scaling/oci_h100_container_probe.sbatch"
+fi
 
 ISAAC_PYTHON=${ISAAC_PYTHON:-/isaac-sim/python.sh}
 [ -x "$ISAAC_PYTHON" ] || {

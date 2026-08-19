@@ -43,6 +43,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         for setting in (
             "#SBATCH --nodes=8",
             "#SBATCH --gpus-per-node=8",
+            "#SBATCH --mem=768G",
             "#SBATCH --time=08:15:00",
             "OCI_CONTAINER_IMAGE=${OCI_CONTAINER_IMAGE:-nvcr.io#nvidia/isaac-sim:5.1.0}",
         ):
@@ -127,7 +128,8 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         self.assertIn("runtime/envs/wandb-host", wandb_setup)
         self.assertIn("HOST_PYTHON=${HOST_PYTHON:-/usr/bin/python3}", wandb_setup)
         self.assertIn("NUMPY_VERSION=${NUMPY_VERSION:-1.24.4}", wandb_setup)
-        self.assertIn("#SBATCH --gpus-per-node=1", wandb_setup)
+        self.assertIn("#SBATCH --partition=cpu_short", wandb_setup)
+        self.assertNotIn("#SBATCH --gpus-per-node=", wandb_setup)
         self.assertNotIn("#SBATCH --container-image=", wandb_setup)
 
     def test_host_coordinator_never_executes_container_python(self):
@@ -145,21 +147,22 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                 with self.subTest(path=path.relative_to(ROOT)):
                     self.assertNotIn("BASH_SOURCE", path.read_text(encoding="utf-8"))
 
-    def test_standalone_container_python_jobs_are_containerized(self):
+    def test_standalone_container_python_jobs_reexec_through_srun(self):
         jobs = (
             "scripts/anchors/anchor_pool.sbatch",
             "scripts/anchors/teacher_anchor_render.sbatch",
             "scripts/data/collect_data.sbatch",
-            "scripts/data/offline_render.sbatch",
-            "scripts/data/preview_render_3view.sbatch",
-            "scripts/data/render_shard.sbatch",
-            "scripts/data/rerender_3view.sbatch",
             "scripts/eval/eval_latest.sbatch",
             "scripts/eval/eval_policy.sbatch",
             "scripts/eval/eval_student.sbatch",
+            "scripts/eval/fixed_seed_policy_eval.sbatch",
+            "scripts/scaling/oci_h100_container_probe.sbatch",
+            "scripts/scaling/oci_h100_image3f_setup.sbatch",
+            "scripts/scaling/oci_h100_trainer_setup.sbatch",
             "scripts/server/image3f_ft_eval.sbatch",
             "scripts/server/image3f_ft_setup.sbatch",
             "scripts/server/image3f_server.sbatch",
+            "scripts/server/image3f_server_array.sbatch",
             "scripts/server/raven_server.sbatch",
             "scripts/train/dagger_train.sbatch",
             "scripts/train/dagger_train_3view.sbatch",
@@ -167,14 +170,26 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             "scripts/train/image_dagger_run.sbatch",
             "scripts/train/image_dagger_smoke.sbatch",
             "scripts/train/offline_bc_train.sbatch",
-            "tools/make_previews.sbatch",
             "tools/student3v_bench.sbatch",
         )
         for job in jobs:
             text = read(job)
             with self.subTest(job=job):
-                self.assertIn('#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"', text)
-                self.assertIn("#SBATCH --container-mounts=/lustre/fs11/", text)
+                self.assertIn("reexec_in_oci_container.sh", text)
+                self.assertNotIn("#SBATCH --container-image=", text)
+                self.assertNotIn("#SBATCH --container-mounts=", text)
+
+    def test_oci_container_interface_is_srun_only(self):
+        helper = read("scripts/setup/reexec_in_oci_container.sh")
+        self.assertIn('exec srun --nodes=1 --ntasks=1', helper)
+        self.assertIn('--container-image="$OCI_CONTAINER_IMAGE"', helper)
+        self.assertIn('--container-mounts="$ROBORENDER_STAGE_ROOT:$ROBORENDER_STAGE_ROOT"', helper)
+        for base in (ROOT / "scripts", ROOT / "tools"):
+            for path in base.rglob("*.sbatch"):
+                text = path.read_text(encoding="utf-8")
+                with self.subTest(path=path.relative_to(ROOT)):
+                    self.assertNotIn("#SBATCH --container-image=", text)
+                    self.assertNotIn("#SBATCH --container-mounts=", text)
 
     def test_optional_legacy_renderer_uses_staged_asset_contract(self):
         sources = read("scripts/setup/oci_env.sh") + read("run_raven_server.sh")
@@ -240,7 +255,12 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                     self.assertTrue(accounts, "missing explicit OCI account")
                     self.assertTrue(partitions, "missing explicit OCI partition")
                     self.assertEqual({"general_cs_infra"}, set(accounts))
-                    self.assertEqual({"backfill_block1"}, set(partitions))
+                    expected_partition = (
+                        "backfill_block1"
+                        if re.search(r"^#SBATCH --gpus", text, re.MULTILINE)
+                        else "cpu_short"
+                    )
+                    self.assertEqual({expected_partition}, set(partitions))
 
 
 class NoRetiredSiteReferencesTest(unittest.TestCase):

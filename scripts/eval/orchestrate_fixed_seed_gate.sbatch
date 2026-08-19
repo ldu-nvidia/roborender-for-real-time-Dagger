@@ -2,15 +2,13 @@
 # Run after the trainer (normally dependency=afterany:<trainer job>).  It discovers
 # the snapshots that actually exist, then submits four checkpoint evaluations and
 # a fail-closed report job.
-#SBATCH --partition=backfill_block1
+#SBATCH --partition=cpu_short
 #SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_eval_orchestrate
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=00:30:00
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
@@ -31,7 +29,7 @@ FIXED_EVAL_MAX_PARALLEL=${FIXED_EVAL_MAX_PARALLEL:-4}
 EVAL_DIR=${EVAL_DIR:-$TRAIN_RUN_DIR/fixed_seed_eval}
 EVAL_MANIFEST="$EVAL_DIR/manifest.json"
 JOB_MANIFEST=${JOB_MANIFEST:-}
-PYTHON=${PYTHON:-$STAGE_ROOT/runtime/envs/viral/bin/python}
+PYTHON=${PYTHON:-$STAGE_ROOT/runtime/envs/wandb-host/bin/python}
 PROJ=${PROJ:-roborender_dagger_scale}
 EXP=${EXP:-dagger_fixed_seed_gate}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}

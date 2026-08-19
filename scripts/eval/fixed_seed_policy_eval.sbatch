@@ -9,12 +9,16 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=100G
 #SBATCH --time=08:00:00
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
 ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-$STAGE_ROOT}
+source "$ROOT/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" \
+        "$ROOT/scripts/eval/fixed_seed_policy_eval.sbatch"
+fi
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
 EVAL_MANIFEST=${EVAL_MANIFEST:?EVAL_MANIFEST is required}
 EVAL_DIR=${EVAL_DIR:?EVAL_DIR is required}

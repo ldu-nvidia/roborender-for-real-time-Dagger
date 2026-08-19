@@ -8,11 +8,16 @@
 #SBATCH --mem=256G
 #SBATCH --time=06:00:00
 #SBATCH --job-name=rr_i3f_sm90_build
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
+ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-$STAGE_ROOT}
+source "$ROOT/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" \
+        "$ROOT/scripts/scaling/oci_h100_image3f_setup.sbatch"
+fi
 IMAGE3F_ROOT=${IMAGE3F_ROOT:-$STAGE_ROOT/assets/roborender_image_model_accelerated}
 IMAGE3F_ENV=${IMAGE3F_ENV:-$STAGE_ROOT/runtime/envs/image3f-cu128}
 ROBORENDER_MODEL_BASE=${ROBORENDER_MODEL_BASE:-$STAGE_ROOT/assets/models}

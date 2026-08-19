@@ -34,13 +34,14 @@
 #SBATCH --mem=128G
 #SBATCH --time=08:00:00
 #SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/dagger_train_%j.log
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -euo pipefail
 
 ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
 ROOT=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
 source "$ROOT/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" "$ROOT/scripts/train/dagger_train.sbatch"
+fi
 MIX=${MIX:-0.5}
 NUM_ENVS=${NUM_ENVS:-16}
 ANCHORS=${ANCHORS:-$ROBORENDER_STAGE_ROOT/assets/anchor_pool_2048}

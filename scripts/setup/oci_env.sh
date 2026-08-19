@@ -3,6 +3,7 @@
 # value before sourcing this file, but no fallback points at another site.
 
 export ROBORENDER_STAGE_ROOT="${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}"
+export OCI_CONTAINER_IMAGE="${OCI_CONTAINER_IMAGE:-nvcr.io#nvidia/isaac-sim:5.1.0}"
 export ROOT="${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}"
 export ROBORENDER_ROOT="${ROBORENDER_ROOT:-$ROOT}"
 export GR00T_ROOT="${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}"

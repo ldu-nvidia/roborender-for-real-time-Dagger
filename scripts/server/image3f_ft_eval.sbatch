@@ -8,12 +8,13 @@
 #SBATCH --mem=64G
 #SBATCH --time=2:00:00
 #SBATCH --output=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/logs/i3f_ft_eval_%j.log
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
 FR=${ROOT:-$ROBORENDER_STAGE_ROOT/src/fast_roborender}
 source "$FR/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" "$ROOT/scripts/server/image3f_ft_eval.sbatch"
+fi
 export HOME=$HOME_OVERRIDE
 export PYTHONDONTWRITEBYTECODE=1
 PYTHON=$IMAGE3F_PYTHON

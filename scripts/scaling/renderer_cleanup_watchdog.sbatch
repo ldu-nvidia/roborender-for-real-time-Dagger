@@ -1,7 +1,7 @@
 #!/bin/bash
 # Redundant fleet cleanup for the case where a pending trainer is cancelled and
 # therefore never executes its own EXIT trap. Submit with afterany:<trainer_job>.
-#SBATCH --partition=backfill_block1
+#SBATCH --partition=cpu_short
 #SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_fleet_cleanup
 #SBATCH --nodes=1

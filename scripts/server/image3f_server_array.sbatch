@@ -9,12 +9,16 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=08:15:00
-#SBATCH --container-image="nvcr.io#nvidia/isaac-sim:5.1.0"
-#SBATCH --container-mounts=/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale:/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale
 set -Eeuo pipefail
 
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
 ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
+ROBORENDER_STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-$STAGE_ROOT}
+source "$ROOT/scripts/setup/oci_env.sh"
+if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
+    exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" \
+        "$ROOT/scripts/server/image3f_server_array.sbatch"
+fi
 RUN_DIR=${RUN_DIR:-${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_production.sh}}
 TASK_ID=${SLURM_ARRAY_TASK_ID:?this script must run as a Slurm array}
 INDEX=$(printf '%03d' "$TASK_ID")
