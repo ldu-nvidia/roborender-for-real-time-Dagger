@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +13,19 @@ CAMERA_KITS = (
     APP_DIR / "isaaclab.python.headless.rendering.kit",
     APP_DIR / "phc.isaaclab.python.rendering.kit",
 )
+CONTRACT_PATH = (
+    ROOT
+    / "GR00T-VisualSim2Real/gr00t/rl/utils/camera_rendering_contract.py"
+)
+
+
+def _load_contract_module():
+    spec = importlib.util.spec_from_file_location("camera_rendering_contract", CONTRACT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load {CONTRACT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _settings(path: Path) -> dict[str, str]:
@@ -25,6 +40,10 @@ def _settings(path: Path) -> dict[str, str]:
 
 
 class IsaacCameraRenderingContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.contract = _load_contract_module()
+
     def test_all_camera_kits_disable_nrd_dependent_rendering_paths(self):
         required = {
             "rtx.reflections.enabled": "false",
@@ -64,6 +83,57 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
                 settings = _settings(path)
                 for key, expected in required.items():
                     self.assertEqual(settings.get(key), expected, key)
+
+    def test_headless_camera_launch_forces_performance_mode(self):
+        args = SimpleNamespace(enable_cameras=True, headless=True, rendering_mode="balanced")
+        self.assertTrue(self.contract.configure_headless_camera_rendering(args))
+        self.assertEqual(args.rendering_mode, "performance")
+
+    def test_non_headless_camera_launch_preserves_requested_mode(self):
+        args = SimpleNamespace(enable_cameras=True, headless=False, rendering_mode="quality")
+        self.assertFalse(self.contract.configure_headless_camera_rendering(args))
+        self.assertEqual(args.rendering_mode, "quality")
+
+    def test_resolved_settings_are_validated_fail_closed(self):
+        values = {
+            path: False for path in self.contract.REQUIRED_DISABLED_CARB_SETTINGS
+        }
+
+        class Settings:
+            def get(self, path):
+                return values.get(path)
+
+        self.assertEqual(
+            self.contract.validate_headless_camera_rendering(Settings()), values
+        )
+
+        values["/rtx/directLighting/sampledLighting/enabled"] = True
+        with self.assertRaisesRegex(RuntimeError, "NRD-dependent"):
+            self.contract.validate_headless_camera_rendering(Settings())
+
+        values.pop("/rtx/directLighting/sampledLighting/enabled")
+        with self.assertRaisesRegex(RuntimeError, "NRD-dependent"):
+            self.contract.validate_headless_camera_rendering(Settings())
+
+    def test_train_and_eval_enforce_post_launch_contract(self):
+        environment_creation = {
+            "train_agent_trl.py": "env = custom_instantiate(config.env",
+            "eval_agent_trl.py": "env = instantiate(config=config.env",
+        }
+        for name, creation_marker in environment_creation.items():
+            path = ROOT / "GR00T-VisualSim2Real/gr00t/rl" / name
+            source = path.read_text(encoding="utf-8")
+            with self.subTest(path=name):
+                self.assertIn("configure_headless_camera_rendering(args_cli)", source)
+                validation_marker = (
+                    "resolved_rendering_settings = validate_headless_camera_rendering("
+                )
+                self.assertIn(validation_marker, source)
+                self.assertLess(
+                    source.index(creation_marker),
+                    source.index(validation_marker),
+                    "resolved rendering must be checked after SimulationContext creation",
+                )
 
 
 if __name__ == "__main__":
