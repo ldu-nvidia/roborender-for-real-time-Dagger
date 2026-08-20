@@ -5,7 +5,9 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -34,6 +36,82 @@ def write(path: Path, payload: bytes) -> str:
 
 
 class HsgGb200SmokeGateTests(unittest.TestCase):
+    def run_ffmpeg_gate(self, value: str | None) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        if value is None:
+            environment.pop("IMAGE_DAGGER_FFMPEG", None)
+        else:
+            environment["IMAGE_DAGGER_FFMPEG"] = value
+        return subprocess.run(
+            [
+                "bash",
+                str(ROOT / "scripts/scaling/check_image_dagger_ffmpeg.sh"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+    def test_ffmpeg_runtime_gate_rejects_unset_missing_and_nonexecutable_paths(self):
+        unset = self.run_ffmpeg_gate(None)
+        self.assertEqual(unset.returncode, 2)
+        self.assertIn("IMAGE_DAGGER_FFMPEG is unset", unset.stderr)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            missing = self.run_ffmpeg_gate(str(base / "missing-ffmpeg"))
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("missing or not a regular file", missing.stderr)
+
+            nonexecutable = base / "ffmpeg"
+            nonexecutable.write_text("#!/bin/sh\necho fake\n", encoding="utf-8")
+            nonexecutable.chmod(0o644)
+            rejected = self.run_ffmpeg_gate(str(nonexecutable))
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("not executable", rejected.stderr)
+
+    def test_ffmpeg_runtime_gate_attests_the_exact_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            encoder = Path(temporary) / "ffmpeg"
+            encoder.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  '-version') printf '%s\\n' 'ffmpeg version fixture-7.0.2' ;;\n"
+                "  '-hide_banner -encoders') printf '%s\\n' ' V....D libx264 H.264 fixture encoder' ;;\n"
+                "  *) exit 64 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            encoder.chmod(0o755)
+            accepted = self.run_ffmpeg_gate(str(encoder))
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn(f"IMAGE_DAGGER_FFMPEG={encoder}\n", accepted.stdout)
+            self.assertIn(
+                "IMAGE_DAGGER_FFMPEG_VERSION=ffmpeg version fixture-7.0.2\n",
+                accepted.stdout,
+            )
+            self.assertIn(
+                "IMAGE_DAGGER_FFMPEG_ENCODER=libx264\n", accepted.stdout
+            )
+
+    def test_ffmpeg_runtime_gate_rejects_version_only_binary_without_libx264(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            encoder = Path(temporary) / "ffmpeg"
+            encoder.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  '-version') printf '%s\\n' 'ffmpeg version fixture-7.0.2' ;;\n"
+                "  '-hide_banner -encoders') printf '%s\\n' ' V....D h264 fixture encoder' ;;\n"
+                "  *) exit 64 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            encoder.chmod(0o755)
+            rejected = self.run_ffmpeg_gate(str(encoder))
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("does not advertise the required libx264 encoder", rejected.stderr)
+
     def test_preflight_authenticates_dual_images_engine_assets_and_sources(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -373,6 +451,32 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         self.assertIn('for slurm_command in scontrol srun; do', submit)
         self.assertIn('for slurm_command in scontrol srun; do', packed)
         self.assertIn("export SLURM_EXPORT_ENV=ALL", packed)
+
+    def test_hsg_ffmpeg_path_is_pinned_preflighted_and_propagated(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        encoder = (
+            "/opt/viral-sm100/lib/python3.11/site-packages/imageio_ffmpeg/"
+            "binaries/ffmpeg-linux-aarch64-v7.0.2"
+        )
+        self.assertIn(f"HSG_TRAINER_FFMPEG={encoder}", submit)
+        self.assertIn("IMAGE_DAGGER_FFMPEG=$IMAGE_DAGGER_FFMPEG", submit)
+        self.assertIn("image_dagger_ffmpeg=$IMAGE_DAGGER_FFMPEG", submit)
+        self.assertIn("IMAGE_DAGGER_FFMPEG", packed.split("required=(", 1)[1])
+        self.assertIn(
+            'env IMAGE_DAGGER_FFMPEG="$IMAGE_DAGGER_FFMPEG"', packed
+        )
+        self.assertIn("check_image_dagger_ffmpeg.sh", packed)
+        self.assertIn("export IMAGE_DAGGER_FFMPEG", packed)
+        preflight = packed.index('FFMPEG_PREFLIGHT="$RUN_ROOT/trainer_ffmpeg_preflight.txt"')
+        renderer_launch = packed.index('srun --nodes="$PACKED_NODES"')
+        trainer_launch = packed.index('srun --nodes="$TRAINER_RANKS"')
+        self.assertLess(preflight, renderer_launch)
+        self.assertLess(preflight, trainer_launch)
+        self.assertLess(
+            packed.index("export SLURM_EXPORT_ENV=ALL"),
+            preflight,
+        )
 
     def test_srun_steps_receive_variables_computed_after_sbatch_submission(self):
         packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()

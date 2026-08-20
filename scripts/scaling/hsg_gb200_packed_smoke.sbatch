@@ -19,6 +19,7 @@ required=(STAGE_ROOT ROOT GR00T_ROOT RUN_PROFILE RUN_ID RUN_ROOT FLEET_DIR TRAIN
           EXPECTED_RENDERERS RENDERER_CONTAINER TRAINER_CONTAINER IMAGE3F_ROOT
           ROBORENDER_MODEL_BASE IMAGE3F_GENERATED_ROOT ANCHORS TEACHER_CKPT
           TORCH_HOME RESNET18_WEIGHTS EXPECTED_RESNET18_SHA256
+          IMAGE_DAGGER_FFMPEG
           PACKED_QOS EXPECTED_GR00T_SOURCE_TREE_SHA256
           WANDB_ONLINE_VALIDATION EXPECTED_WANDB_ONLINE_VALIDATION_SHA256
           WANDB_WATCHER_POLL_S WANDB_WATCHER_READY_TIMEOUT_S
@@ -118,6 +119,22 @@ TRAINER_NODELIST=$(IFS=,; echo "${TRAINER_NODES[*]}")
 MASTER_ADDR=${TRAINER_NODES[0]}
 MASTER_PORT=$((15000 + SLURM_JOB_ID % 20000))
 LOCAL_NUM_ENVS=$((GLOBAL_NUM_ENVS / TRAINER_RANKS))
+
+# Validate the exact encoder in the sealed trainer before starting renderer
+# servers or importing Isaac/GR00T.  IMAGE_DAGGER_FFMPEG is carried through the
+# sanitized sbatch environment and is also passed explicitly at this boundary,
+# so a missing Slurm export cannot silently fall back to PATH.
+FFMPEG_PREFLIGHT="$RUN_ROOT/trainer_ffmpeg_preflight.txt"
+srun --nodes=1 --ntasks=1 --nodelist="$MASTER_ADDR" \
+    --cpus-per-task=2 --mem=4G --exact --exclusive \
+    --container-image="$TRAINER_CONTAINER" \
+    --container-mounts="$STAGE_ROOT:$STAGE_ROOT" \
+    env IMAGE_DAGGER_FFMPEG="$IMAGE_DAGGER_FFMPEG" \
+    /usr/local/bin/roborender-trainer-sm100 bash \
+    "$ROOT/scripts/scaling/check_image_dagger_ffmpeg.sh" \
+    | tee "$FFMPEG_PREFLIGHT"
+grep -Fx "IMAGE_DAGGER_FFMPEG=$IMAGE_DAGGER_FFMPEG" "$FFMPEG_PREFLIGHT" >/dev/null || \
+    fatal "trainer FFmpeg preflight did not attest the selected encoder"
 
 mkdir -p "$FLEET_DIR/endpoints" "$FLEET_DIR/queues" "$FLEET_DIR/logs" \
          "$TRAIN_RUN_DIR/slurm" "$TRAIN_RUN_DIR/output" "$TRAIN_RUN_DIR/telemetry" \
@@ -362,6 +379,7 @@ export IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES="$TELEMETRY_CLIP_FRAMES"
 export IMAGE_DAGGER_TELEMETRY_CLIP_FPS=10
 export IMAGE_DAGGER_TELEMETRY_REQUIRED=1
 export IMAGE_DAGGER_TELEMETRY_REQUIRE_VIDEO=1
+export IMAGE_DAGGER_FFMPEG
 export PROJ=roborender_dagger_hsg_gb200_smoke
 export EXP="${RUN_PROFILE}_${RUN_ID}"
 export TRAIN_ABSOLUTE_TARGET
@@ -438,6 +456,7 @@ run_train_phase() {
         --error="$TRAIN_RUN_DIR/slurm/${phase}_rank_%t.err" \
         /usr/local/bin/roborender-trainer-sm100 bash -lc '
             set -Eeuo pipefail
+            bash "$ROOT/scripts/scaling/check_image_dagger_ffmpeg.sh" >/dev/null
             [ "$(tr -d "\r\n" < /opt/GR00T-VisualSim2Real/.source_revision)" = "$EXPECTED_GR00T_REVISION" ] || {
                 echo "FATAL: sealed trainer GR00T revision mismatch" >&2; exit 2;
             }
