@@ -316,6 +316,11 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             r"policy_views:\s*\[head_color, hand_left, hand_right\]",
         )
         self.assertRegex(self.config, r"policy_view_count:\s*3")
+        self.assertIn("image_dagger_policy_view_count: ${policy_view_count}", self.config)
+        self.assertIn(
+            '++env.config.image_dagger_policy_view_count="$VG_POLICY_VIEW_COUNT"',
+            self.trainer,
+        )
 
     def test_absent_beta_fields_use_hydra_append_override(self):
         for field in ("beta_schedule", "beta_start", "beta_end", "beta_decay_iters"):
@@ -382,6 +387,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                 "++algo.config.videogen.primary_view=head_color",
                 "simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]",
                 "policy_view_count=3",
+                "++env.config.image_dagger_policy_view_count=3",
                 "algo.config.videogen.image3f_endpoint_files=[/tmp/endpoint.json]",
                 "algo.config.videogen.anchor_pool_dir=/tmp/anchors",
                 "algo.config.videogen.anchor_index=0",
@@ -408,6 +414,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             ["head_color", "hand_left", "hand_right"],
         )
         self.assertEqual(cfg.policy_view_count, 3)
+        self.assertEqual(cfg.env.config.image_dagger_policy_view_count, 3)
         self.assertTrue(cfg.callbacks.model_save.save_initial_checkpoint)
         self.assertEqual(cfg.algo.config.videogen.rollout_action_source, "beta")
         self.assertEqual(cfg.algo.config.videogen.beta_schedule, "linear")
@@ -645,7 +652,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         ):
             self.assertIn(message, self.integrated_trainer)
 
-    def test_all_active_batch_headers_target_oci(self):
+    def test_all_active_batch_headers_target_authorized_oci_profile(self):
         for base in (ROOT / "scripts", ROOT / "tools"):
             for path in base.rglob("*.sbatch"):
                 text = path.read_text(encoding="utf-8")
@@ -654,16 +661,22 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                 with self.subTest(path=path.relative_to(ROOT)):
                     self.assertTrue(accounts, "missing explicit OCI account")
                     self.assertTrue(partitions, "missing explicit OCI partition")
-                    self.assertEqual({"general_cs_infra"}, set(accounts))
-                    if path.name in {
+                    if path.name.startswith("hsg_gb200_"):
+                        expected_account = "llmservice_nemotron_ultra"
+                        expected_partition = "batch"
+                    elif path.name in {
                         "oci_packed_256x300.sbatch",
                         "dagger_scale_256x300.sbatch",
                     }:
+                        expected_account = "general_cs_infra"
                         expected_partition = "grizzly"
                     elif re.search(r"^#SBATCH --gpus", text, re.MULTILINE):
+                        expected_account = "general_cs_infra"
                         expected_partition = "backfill_block1"
                     else:
+                        expected_account = "general_cs_infra"
                         expected_partition = "cpu_short"
+                    self.assertEqual({expected_account}, set(accounts))
                     self.assertEqual({expected_partition}, set(partitions))
                     time_match = re.search(
                         r"^#SBATCH --time=(\d+):(\d+):(\d+)$", text, re.MULTILINE
@@ -675,6 +688,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                         "cpu_short": 4 * 3600,
                         "grizzly": 4 * 3600,
                         "backfill_block1": 16 * 3600,
+                        "batch": 4 * 3600,
                     }[expected_partition]
                     self.assertLessEqual(total_seconds, max_seconds)
 

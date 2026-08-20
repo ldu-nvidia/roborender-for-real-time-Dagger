@@ -14,6 +14,11 @@
 #SBATCH --signal=B:USR1@300
 set -Eeuo pipefail
 
+# This launcher may be submitted with a restricted sbatch --export contract.
+# Child srun steps still need variables derived after allocation (endpoint
+# manifests, per-rank environment counts, telemetry controls, and seeds).
+export SLURM_EXPORT_ENV=ALL
+
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
 ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
@@ -47,6 +52,7 @@ VG_POLICY_VIEW_COUNT=${VG_POLICY_VIEW_COUNT:-3}
 VG_POLICY_VIEW_LAYOUT=${VG_POLICY_VIEW_LAYOUT:-vertical}
 VG_POLICY_IMAGE_SHAPE=${VG_POLICY_IMAGE_SHAPE:-324x192x3}
 SAVE_FREQUENCY=${SAVE_FREQUENCY:-5}
+TEST_STOP_AFTER_CHECKPOINT_STEP=${TEST_STOP_AFTER_CHECKPOINT_STEP:-0}
 TRAINER_CPUS_PER_TASK=${TRAINER_CPUS_PER_TASK:-16}
 TRAINER_MEM_PER_NODE=${TRAINER_MEM_PER_NODE:-128G}
 TRAINER_CONTAINER_IMAGE=${TRAINER_CONTAINER_IMAGE:-nvcr.io#nvidia/isaac-sim:5.1.0}
@@ -54,6 +60,7 @@ TRAINER_CONTAINER_MOUNTS=${TRAINER_CONTAINER_MOUNTS:-$STAGE_ROOT:$STAGE_ROOT}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_ENTITY=${WANDB_ENTITY:-}
+USE_WANDB=${USE_WANDB:-1}
 VIRAL_ENV=${VIRAL_ENV:-$STAGE_ROOT/runtime/envs/viral}
 VIRAL_PYTHON=${VIRAL_PYTHON:-$VIRAL_ENV/bin/python}
 VIRAL_CONDA_SH=${VIRAL_CONDA_SH:-}
@@ -72,11 +79,27 @@ RENDER_JOB_ID=${RENDER_JOB_ID:-}
     echo "FATAL: RENDER_JOB_ID must be the numeric array parent job id"
     exit 2
 }
-[[ "$WANDB_WATCHER_DRAIN_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]] && \
-    [ "$WANDB_WATCHER_DRAIN_TIMEOUT_S" -le 270 ] || {
-    echo "FATAL: WANDB_WATCHER_DRAIN_TIMEOUT_S must be an integer in [1,270]"
-    exit 2
-}
+case "$USE_WANDB" in
+    1) ;;
+    0)
+        [ "${CHECKPOINT_MECHANICS_SMOKE:-0}" = 1 ] || {
+            echo "FATAL: USE_WANDB=0 is restricted to CHECKPOINT_MECHANICS_SMOKE=1"
+            exit 2
+        }
+        [ "$RUN_PROFILE" != production_256x300 ] || {
+            echo "FATAL: production_256x300 requires online W&B telemetry"
+            exit 2
+        }
+        ;;
+    *) echo "FATAL: USE_WANDB must be 0 or 1"; exit 2 ;;
+esac
+if [ "$USE_WANDB" = 1 ]; then
+    [[ "$WANDB_WATCHER_DRAIN_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]] && \
+        [ "$WANDB_WATCHER_DRAIN_TIMEOUT_S" -le 270 ] || {
+        echo "FATAL: WANDB_WATCHER_DRAIN_TIMEOUT_S must be an integer in [1,270]"
+        exit 2
+    }
+fi
 
 SRUN_PID=""
 WANDB_WATCHER_PID=""
@@ -226,6 +249,32 @@ VG_BETA_DECAY_ITERS=$(python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}"
     echo "FATAL: NUM_ROLLOUT_ITERATIONS must be divisible by SAVE_FREQUENCY so the exact final checkpoint is persisted"
     exit 2
 }
+[[ "$TEST_STOP_AFTER_CHECKPOINT_STEP" =~ ^[0-9]+$ ]] || {
+    echo "FATAL: TEST_STOP_AFTER_CHECKPOINT_STEP must be a non-negative integer"
+    exit 2
+}
+if [ "$TEST_STOP_AFTER_CHECKPOINT_STEP" -gt 0 ]; then
+    [ "${CHECKPOINT_MECHANICS_SMOKE:-0}" = 1 ] || {
+        echo "FATAL: test checkpoint stop is restricted to CHECKPOINT_MECHANICS_SMOKE=1"
+        exit 2
+    }
+    [ "$USE_WANDB" = 0 ] || {
+        echo "FATAL: test checkpoint stop requires USE_WANDB=0"
+        exit 2
+    }
+    [ "$RUN_PROFILE" != production_256x300 ] || {
+        echo "FATAL: production may not use the test checkpoint stop"
+        exit 2
+    }
+    [ "$TEST_STOP_AFTER_CHECKPOINT_STEP" -lt "$NUM_ROLLOUT_ITERATIONS" ] || {
+        echo "FATAL: test checkpoint stop must be earlier than the absolute target"
+        exit 2
+    }
+    [ $((TEST_STOP_AFTER_CHECKPOINT_STEP % SAVE_FREQUENCY)) -eq 0 ] || {
+        echo "FATAL: test checkpoint stop must be divisible by SAVE_FREQUENCY"
+        exit 2
+    }
+fi
 [ "$VG_PRIMARY_VIEW" = head_color ] || {
     echo "FATAL: three-view production requires primary_view=head_color"
     exit 2
@@ -272,13 +321,23 @@ python3 "$ROOT/scripts/scaling/install_gr00t_integration.py" \
 
 [ -d "$GR00T_ROOT" ] || { echo "FATAL: GR00T tree not found: $GR00T_ROOT"; exit 2; }
 CKPT=${CKPT:-none}
+RESUME_TRAINING=${RESUME_TRAINING:-0}
 : "${EXPECTED_TRAIN_CHECKPOINT_SHA256:?launcher must pin EXPECTED_TRAIN_CHECKPOINT_SHA256}"
 if [ "$CKPT" = "none" ] || [ "$CKPT" = "null" ]; then
+    [ "$RESUME_TRAINING" = 0 ] || {
+        echo "FATAL: RESUME_TRAINING=1 requires CKPT"
+        exit 2
+    }
     INITIALIZATION_MODE=base
     ACTUAL_TRAIN_CHECKPOINT_SHA256=NONE
     CKPT_ARG=checkpoint=null
+    RESUME_ARG=resume=false
 else
-    INITIALIZATION_MODE=checkpoint
+    case "$RESUME_TRAINING" in
+        0) INITIALIZATION_MODE=weight_warm_start; RESUME_ARG=resume=false ;;
+        1) INITIALIZATION_MODE=resume_checkpoint; RESUME_ARG=resume=true ;;
+        *) echo "FATAL: RESUME_TRAINING must be 0 or 1"; exit 2 ;;
+    esac
     [ -f "$CKPT" ] || { echo "FATAL: checkpoint not found: $CKPT"; exit 2; }
     ACTUAL_TRAIN_CHECKPOINT_SHA256=$(sha256sum "$CKPT" | awk '{print $1}')
     CKPT_ARG="checkpoint=$CKPT"
@@ -336,8 +395,27 @@ PROJ=${PROJ:-roborender_dagger_scale}
 EXP=${EXP:-dagger_${GLOBAL_NUM_ENVS}env_${ROLLOUT_STEPS}step_mix${MIX}}
 TRAIN_RUN_DIR=${TRAIN_RUN_DIR:-$GR00T_ROOT/logs_rl/$PROJ/${EXP}-${SLURM_JOB_ID}}
 mkdir -p "$TRAIN_RUN_DIR/slurm" "$TRAIN_RUN_DIR/output"
+if [ "$RESUME_TRAINING" = 1 ]; then
+    CHECKPOINT_DIR=$(dirname "$(realpath "$CKPT")")
+    [ "$(realpath "$TRAIN_RUN_DIR")" = "$CHECKPOINT_DIR" ] || {
+        echo "FATAL: strict resume must reuse the checkpoint experiment directory"
+        exit 2
+    }
+    if [ "$USE_WANDB" = 1 ]; then
+        [ -s "$TRAIN_RUN_DIR/meta.yaml" ] || {
+            echo "FATAL: strict resume is missing the original trainer W&B metadata"
+            exit 2
+        }
+        [ -s "$TRAIN_RUN_DIR/telemetry/WANDB_SIDECAR_RUN_ID" ] || {
+            echo "FATAL: strict resume is missing the original media W&B run ID"
+            exit 2
+        }
+    fi
+fi
 printf -v EXPECTED_FINAL_CHECKPOINT '%s/model_step_%06d.pt' \
     "$TRAIN_RUN_DIR" "$NUM_ROLLOUT_ITERATIONS"
+printf -v EXPECTED_TEST_STOP_CHECKPOINT '%s/model_step_%06d.pt' \
+    "$TRAIN_RUN_DIR" "$TEST_STOP_AFTER_CHECKPOINT_STEP"
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 MASTER_PORT=$((15000 + SLURM_JOB_ID % 20000))
@@ -411,7 +489,7 @@ export IMAGE_DAGGER_EXPECT_TEACHER_RATIO="$TEACHER_ROLLOUT_RATIO"
 export IMAGE_DAGGER_EXPECT_LEARNING_EPOCHS="$NUM_LEARNING_EPOCHS"
 export IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF=0.0
 export IMAGE_DAGGER_EXPECT_ENTROPY_COEF=0.0
-export WANDB_EXPECTED_EMAIL WANDB_MODE WANDB_ENTITY WANDB_PYTHON
+export WANDB_EXPECTED_EMAIL WANDB_MODE WANDB_ENTITY WANDB_PYTHON USE_WANDB
 export ROOT GR00T_ROOT FLEET_DIR GLOBAL_NUM_ENVS ROLLOUT_STEPS MIX REFERENCE_LAG
 export RUN_PROFILE
 export STAGE_ROOT ANCHORS TEACHER_CKPT EXPECTED_TEACHER_CKPT_SHA256
@@ -423,24 +501,9 @@ export NUM_ROLLOUT_ITERATIONS NUM_LEARNING_EPOCHS
 export BEHAVIOR_SOURCE VG_ROLLOUT_ACTION_SOURCE VG_BETA_SCHEDULE VG_BETA_START VG_BETA_END VG_BETA_DECAY_ITERS
 export TEACHER_ROLLOUT_RATIO ENFORCE_TEACHER_ROLLOUT VG_PRIMARY_VIEW
 export VG_POLICY_VIEWS VG_POLICY_VIEW_COUNT VG_POLICY_VIEW_LAYOUT VG_POLICY_IMAGE_SHAPE
-export INITIALIZATION_MODE CKPT_ARG
-export SAVE_FREQUENCY TRAINER_CPUS_PER_TASK TRAINER_MEM_PER_NODE
-
-[ -x "$WANDB_PYTHON" ] || {
-    echo "FATAL: trainer W&B Python is not executable: $WANDB_PYTHON"
-    exit 2
-}
-WANDB_PREFLIGHT=("$WANDB_PYTHON" "$ROOT/scripts/scaling/wandb_preflight.py"
-    --expected-email "$WANDB_EXPECTED_EMAIL" --format shell)
-if [ -n "$WANDB_ENTITY" ]; then
-    WANDB_PREFLIGHT+=(--entity "$WANDB_ENTITY")
-fi
-WANDB_IDENTITY=$(WANDB_MODE="$WANDB_MODE" "${WANDB_PREFLIGHT[@]}")
-case "$WANDB_IDENTITY" in
-    WANDB_ENTITY=?*) WANDB_ENTITY=${WANDB_IDENTITY#WANDB_ENTITY=} ;;
-    *) echo "FATAL: rank-zero W&B identity preflight failed"; exit 2 ;;
-esac
-export WANDB_ENTITY
+export INITIALIZATION_MODE CKPT_ARG RESUME_ARG RESUME_TRAINING
+export SAVE_FREQUENCY TEST_STOP_AFTER_CHECKPOINT_STEP
+export TRAINER_CPUS_PER_TASK TRAINER_MEM_PER_NODE
 
 export ROBORENDER_TELEMETRY_DIR="$TRAIN_RUN_DIR/telemetry"
 export IMAGE_DAGGER_TELEMETRY_SCALAR_EVERY=${IMAGE_DAGGER_TELEMETRY_SCALAR_EVERY:-10}
@@ -455,42 +518,67 @@ mkdir -p "$ROBORENDER_TELEMETRY_DIR/scalars" \
     "$ROBORENDER_TELEMETRY_DIR/videos"
 WANDB_WATCHER_LOG="$TRAIN_RUN_DIR/wandb_media_watcher.log"
 WANDB_WATCHER_READY="$TRAIN_RUN_DIR/telemetry/WANDB_WATCHER_READY.json"
-rm -f "$WANDB_WATCHER_READY"
-"$WANDB_PYTHON" "$ROOT/scripts/scaling/wandb_run_watcher.py" \
-    --run-dir "$TRAIN_RUN_DIR" \
-    --project "$PROJ" \
-    --name "${EXP}-media-${SLURM_JOB_ID}" \
-    --expected-email "$WANDB_EXPECTED_EMAIL" \
-    --entity "$WANDB_ENTITY" \
-    --poll-interval-s "$WANDB_WATCHER_POLL_S" \
-    --ready-marker "$WANDB_WATCHER_READY" \
-    --max-consecutive-error-scans 4 \
-    --finish-marker WANDB_UPLOAD_STOP \
-    >"$WANDB_WATCHER_LOG" 2>&1 &
-WANDB_WATCHER_PID=$!
+# These markers belong to the previous watcher process.  The stable run ID
+# and upload-state files remain; removing only lifecycle markers lets the new
+# process resume that same media run instead of immediately final-draining.
+rm -f "$WANDB_WATCHER_READY" "$TRAIN_RUN_DIR/WANDB_UPLOAD_STOP"
+if [ "$USE_WANDB" = 1 ]; then
+    [ -x "$WANDB_PYTHON" ] || {
+        echo "FATAL: trainer W&B Python is not executable: $WANDB_PYTHON"
+        exit 2
+    }
+    WANDB_PREFLIGHT=("$WANDB_PYTHON" "$ROOT/scripts/scaling/wandb_preflight.py"
+        --expected-email "$WANDB_EXPECTED_EMAIL" --format shell)
+    if [ -n "$WANDB_ENTITY" ]; then
+        WANDB_PREFLIGHT+=(--entity "$WANDB_ENTITY")
+    fi
+    WANDB_IDENTITY=$(WANDB_MODE="$WANDB_MODE" "${WANDB_PREFLIGHT[@]}")
+    case "$WANDB_IDENTITY" in
+        WANDB_ENTITY=?*) WANDB_ENTITY=${WANDB_IDENTITY#WANDB_ENTITY=} ;;
+        *) echo "FATAL: rank-zero W&B identity preflight failed"; exit 2 ;;
+    esac
+    export WANDB_ENTITY
+    TRAINER_USE_WANDB=true
+    "$WANDB_PYTHON" "$ROOT/scripts/scaling/wandb_run_watcher.py" \
+        --run-dir "$TRAIN_RUN_DIR" \
+        --project "$PROJ" \
+        --name "${EXP}-media-${SLURM_JOB_ID}" \
+        --expected-email "$WANDB_EXPECTED_EMAIL" \
+        --entity "$WANDB_ENTITY" \
+        --poll-interval-s "$WANDB_WATCHER_POLL_S" \
+        --ready-marker "$WANDB_WATCHER_READY" \
+        --max-consecutive-error-scans 4 \
+        --finish-marker WANDB_UPLOAD_STOP \
+        >>"$WANDB_WATCHER_LOG" 2>&1 &
+    WANDB_WATCHER_PID=$!
 
-WATCHER_READY_DEADLINE=$((SECONDS + WANDB_WATCHER_READY_TIMEOUT_S))
-while [ ! -s "$WANDB_WATCHER_READY" ] && \
-      kill -0 "$WANDB_WATCHER_PID" 2>/dev/null && \
-      [ "$SECONDS" -lt "$WATCHER_READY_DEADLINE" ]; do
-    sleep 1
-done
-if [ ! -s "$WANDB_WATCHER_READY" ]; then
-    if kill -0 "$WANDB_WATCHER_PID" 2>/dev/null; then
-        kill -TERM "$WANDB_WATCHER_PID" 2>/dev/null || true
+    WATCHER_READY_DEADLINE=$((SECONDS + WANDB_WATCHER_READY_TIMEOUT_S))
+    while [ ! -s "$WANDB_WATCHER_READY" ] && \
+          kill -0 "$WANDB_WATCHER_PID" 2>/dev/null && \
+          [ "$SECONDS" -lt "$WATCHER_READY_DEADLINE" ]; do
+        sleep 1
+    done
+    if [ ! -s "$WANDB_WATCHER_READY" ]; then
+        if kill -0 "$WANDB_WATCHER_PID" 2>/dev/null; then
+            kill -TERM "$WANDB_WATCHER_PID" 2>/dev/null || true
+        fi
+        if wait "$WANDB_WATCHER_PID"; then
+            WATCHER_START_RC=0
+        else
+            WATCHER_START_RC=$?
+        fi
+        WANDB_WATCHER_PID=""
+        if [ "$WATCHER_START_RC" -eq 0 ]; then
+            WATCHER_START_RC=70
+        fi
+        echo "FATAL: W&B media watcher did not become ready; see $WANDB_WATCHER_LOG"
+        exit "$WATCHER_START_RC"
     fi
-    if wait "$WANDB_WATCHER_PID"; then
-        WATCHER_START_RC=0
-    else
-        WATCHER_START_RC=$?
-    fi
-    WANDB_WATCHER_PID=""
-    if [ "$WATCHER_START_RC" -eq 0 ]; then
-        WATCHER_START_RC=70
-    fi
-    echo "FATAL: W&B media watcher did not become ready; see $WANDB_WATCHER_LOG"
-    exit "$WATCHER_START_RC"
+else
+    WANDB_ENTITY=DISABLED
+    TRAINER_USE_WANDB=false
 fi
+export WANDB_ENTITY TRAINER_USE_WANDB
 
 python3 "$ROOT/scripts/scaling/scale_plan.py" "${PLAN[@]}" --format json \
     | tee "$TRAIN_RUN_DIR/scale_plan.json"
@@ -500,6 +588,7 @@ fast_roborender_dirty_status_sha256=$(git -C "$ROOT" status --porcelain | sha256
 gr00t_revision=$(git -C "$GR00T_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 gr00t_dirty_status_sha256=$(git -C "$GR00T_ROOT" status --porcelain | sha256sum | awk '{print $1}')
 initialization_mode=$INITIALIZATION_MODE
+strict_resume=$RESUME_TRAINING
 checkpoint=$CKPT
 checkpoint_sha256=$ACTUAL_TRAIN_CHECKPOINT_SHA256
 expert_labeler_checkpoint=$TEACHER_CKPT
@@ -540,9 +629,11 @@ prerequisite_profile_validation=${PREREQUISITE_PROFILE_VALIDATION:-NONE}
 prerequisite_profile_validation_sha256=${EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256:-NONE}
 finite_bc_loss_gate=$IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS
 checkpoint_frequency_rollout_iterations=$SAVE_FREQUENCY
+test_stop_after_checkpoint_step=$TEST_STOP_AFTER_CHECKPOINT_STEP
 value_loss_coef=0.0
 entropy_coef=0.0
 wandb_expected_email=$WANDB_EXPECTED_EMAIL
+wandb_enabled=$USE_WANDB
 wandb_entity=$WANDB_ENTITY
 wandb_project=$PROJ
 wandb_media_run=${EXP}-media-${SLURM_JOB_ID}
@@ -561,7 +652,7 @@ echo " actor RGB input: generated policy views=${VG_POLICY_VIEWS} (${VG_POLICY_V
 echo " renderers: ${REQUIRED_RENDERERS}, ray-traced mix=${MIX}, reference policy=$([ "$REFERENCE_LAG" -eq 0 ] && echo fixed-anchor || echo generated-lag), RGB lag=${REFERENCE_LAG}"
 echo " initialization: $INITIALIZATION_MODE ($CKPT)"
 echo " output: $TRAIN_RUN_DIR"
-echo " W&B: $WANDB_ENTITY/$PROJ (scalars=$EXP, media=${EXP}-media-${SLURM_JOB_ID})"
+echo " W&B enabled: $USE_WANDB ($WANDB_ENTITY/$PROJ)"
 echo "=================================================================="
 
 TRAINER_CONTAINER_ARGS=()
@@ -636,7 +727,8 @@ srun --nodes="$TRAINER_NODES" --ntasks="$TRAINER_NODES" --ntasks-per-node=1 \
                 algo.trl.total_episodes=null \
                 callbacks.model_save.save_frequency="$SAVE_FREQUENCY" \
                 callbacks.model_save.save_initial_checkpoint=true \
-                headless=true "$CKPT_ARG" \
+                callbacks.model_save.test_stop_after_checkpoint_step="$TEST_STOP_AFTER_CHECKPOINT_STEP" \
+                headless=true "$CKPT_ARG" "$RESUME_ARG" \
                 teacher_actor_path="$TEACHER_CKPT" \
                 algo.config.videogen.raytraced_mix_prob="$MIX" \
                 ++algo.config.videogen.seed="$RANK_RENDER_SEED" \
@@ -644,11 +736,12 @@ srun --nodes="$TRAINER_NODES" --ntasks="$TRAINER_NODES" --ntasks-per-node=1 \
                 ++algo.config.videogen.primary_view="$VG_PRIMARY_VIEW" \
                 simulator.config.cameras.policy_views="[head_color,hand_left,hand_right]" \
                 policy_view_count="$VG_POLICY_VIEW_COUNT" \
+                ++env.config.image_dagger_policy_view_count="$VG_POLICY_VIEW_COUNT" \
                 algo.config.videogen.image3f_endpoint_files="$EP_LIST" \
                 algo.config.videogen.anchor_pool_dir="$ANCHORS" \
                 algo.config.videogen.anchor_index="${ANCHOR_IDX:-0}" \
                 simulator.config.render_results=false \
-                use_wandb=true \
+                use_wandb="$TRAINER_USE_WANDB" \
                 wandb.wandb_entity="$WANDB_ENTITY" \
                 wandb.wandb_group=null \
                 project_name="$PROJ" experiment_name="$EXP" \
@@ -661,7 +754,7 @@ SRUN_PID=$!
 # W&B media is a production gate, not a best-effort sidecar.  Check it while
 # the trainer step is live and stop the distributed step if observability dies.
 while kill -0 "$SRUN_PID" 2>/dev/null; do
-    if ! kill -0 "$WANDB_WATCHER_PID" 2>/dev/null; then
+    if [ "$USE_WANDB" = 1 ] && ! kill -0 "$WANDB_WATCHER_PID" 2>/dev/null; then
         if wait "$WANDB_WATCHER_PID"; then
             WATCHER_RUN_RC=0
         else
@@ -694,7 +787,7 @@ if [ "$PRE_TIMEOUT_SIGNALLED" -eq 1 ]; then
 fi
 
 # Close the race where the watcher and trainer exit between the final poll.
-if ! kill -0 "$WANDB_WATCHER_PID" 2>/dev/null; then
+if [ "$USE_WANDB" = 1 ] && ! kill -0 "$WANDB_WATCHER_PID" 2>/dev/null; then
     if wait "$WANDB_WATCHER_PID"; then
         WATCHER_RUN_RC=0
     else
@@ -712,7 +805,16 @@ if [ "$TRAIN_RC" -eq 0 ]; then
         echo "FATAL: successful trainer did not create initial_policy.pt" >&2
         TRAIN_RC=71
     fi
-    if [ ! -s "$EXPECTED_FINAL_CHECKPOINT" ]; then
+    if [ "$TEST_STOP_AFTER_CHECKPOINT_STEP" -gt 0 ]; then
+        if [ ! -s "$EXPECTED_TEST_STOP_CHECKPOINT" ]; then
+            echo "FATAL: checkpoint mechanics phase A did not create $EXPECTED_TEST_STOP_CHECKPOINT" >&2
+            TRAIN_RC=71
+        fi
+        if [ -e "$EXPECTED_FINAL_CHECKPOINT" ]; then
+            echo "FATAL: checkpoint mechanics phase A unexpectedly reached the absolute target" >&2
+            TRAIN_RC=71
+        fi
+    elif [ ! -s "$EXPECTED_FINAL_CHECKPOINT" ]; then
         echo "FATAL: successful trainer did not create exact final checkpoint $EXPECTED_FINAL_CHECKPOINT" >&2
         TRAIN_RC=71
     fi

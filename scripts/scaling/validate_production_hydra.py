@@ -19,6 +19,14 @@ def resolve_git_head(repo: Path) -> str:
     """Resolve HEAD without requiring a git executable in the Isaac image."""
 
     git_dir = repo / ".git"
+    if not git_dir.exists():
+        marker = repo / ".source_revision"
+        if marker.is_file():
+            revision = marker.read_text(encoding="utf-8").strip()
+            if len(revision) == 40 and all(char in "0123456789abcdef" for char in revision):
+                return revision
+            raise RuntimeError(f"malformed GR00T source revision marker: {marker}")
+        raise RuntimeError(f"GR00T checkout has neither .git nor .source_revision: {repo}")
     if git_dir.is_file():
         value = git_dir.read_text(encoding="utf-8").strip()
         if not value.startswith("gitdir: "):
@@ -75,6 +83,7 @@ def production_overrides() -> list[str]:
         "++algo.config.videogen.primary_view=head_color",
         "simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]",
         "policy_view_count=3",
+        "++env.config.image_dagger_policy_view_count=3",
         "algo.config.videogen.image3f_endpoint_files=[/validation/endpoint.txt]",
         "algo.config.videogen.anchor_pool_dir=/validation/anchors",
         "algo.config.videogen.anchor_index=0",
@@ -128,6 +137,8 @@ def compose_and_validate(gr00t_root: Path, expected_revision: str | None) -> dic
         "policy_views": views == EXPECTED_VIEWS,
         "renderer_views": renderer_views == EXPECTED_VIEWS,
         "policy_view_count": count == 3,
+        "trainer_policy_view_count": int(cfg.env.config.image_dagger_policy_view_count)
+        == count,
         "policy_view_layout": cfg.simulator.config.cameras.policy_view_layout == "vertical",
         "policy_image_shape": shape == EXPECTED_POLICY_SHAPE,
         "rollout_horizon": int(cfg.algo.config.num_steps_per_env) == 300,

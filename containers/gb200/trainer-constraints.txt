@@ -1,0 +1,21 @@
+# Keep Isaac Sim 5.1's embedded ML ABI.  Unconstrained future pip resolution
+# otherwise upgrades to CUDA 13 torch while satisfying IsaacLab's `torch>=2.7`.
+torch==2.7.0+cu128
+torchvision==0.22.0
+numpy==1.26.0
+triton==3.3.0
+# IsaacLab's RL packages require packaging<24.  Keep a wheel release whose
+# own metadata remains compatible with that requirement.
+packaging==23.2
+wheel==0.45.1
+flatdict==4.0.1
+# OpenCV 5 requires NumPy 2, while Isaac Sim 5.1 is pinned to NumPy 1.26.
+opencv-python==4.11.0.86
+# ARM64 quadprog is published as a Cython source distribution.
+Cython==3.2.9
+quadprog==0.1.13
+# rl-games permits newer Ray releases whose packaging>=24.2 requirement would
+# conflict with IsaacLab RL's packaging<24 contract.
+ray==2.52.1
+docstring-parser==0.16
+PyJWT==2.10.1
