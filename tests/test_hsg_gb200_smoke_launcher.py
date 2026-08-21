@@ -1133,6 +1133,72 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             packed.index("RANK_RENDER_SEED=$((BASE_RENDER_SEED + SLURM_PROCID))"),
         )
 
+    def test_hsg_nested_renderer_and_trainer_shells_have_all_variables(self):
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+
+        # Variables in sbatch's sanitized --export list enter the batch as
+        # environment variables.  Variables derived later must be explicitly
+        # exported before a nested srun shell can consume them.
+        export_lines = "\n".join(
+            line for line in submit.splitlines() if line.startswith("EXPORTS=")
+        )
+        submitted = set(
+            re.findall(
+                r"(?:^|,)([A-Z][A-Z0-9_]*)=",
+                export_lines.replace('EXPORTS="', "").replace('"', ""),
+            )
+        )
+
+        def audit_nested_shell(marker: str, terminator: str) -> set[str]:
+            launch = packed.index(marker)
+            body_start = launch + len(marker)
+            body = packed[body_start : packed.index(terminator, body_start)]
+            references = set(
+                re.findall(r"\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)", body)
+            )
+            # Arithmetic expansion permits bare variable names.
+            for expression in re.findall(r"\$\(\((.*?)\)\)", body, re.DOTALL):
+                references.update(
+                    re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", expression)
+                )
+
+            exported_before_launch: set[str] = set()
+            for statement in re.findall(
+                r"(?m)^\s*export\s+([^\n#]+)$", packed[:launch]
+            ):
+                for token in statement.split():
+                    match = re.match(
+                        r"([A-Za-z_][A-Za-z0-9_]*)(?:=|$)", token
+                    )
+                    if match:
+                        exported_before_launch.add(match.group(1))
+
+            locally_defined = set(
+                re.findall(
+                    r"(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=", body
+                )
+            )
+            slurm_injected = {"SLURM_PROCID", "SLURM_JOB_ID", "SLURMD_NODENAME"}
+            available = (
+                submitted | exported_before_launch | locally_defined | slurm_injected
+            )
+            return references - available
+
+        blocks = {
+            "renderer": (
+                "    bash -lc '\n",
+                "\n    ' &",
+            ),
+            "trainer": (
+                "        /usr/local/bin/roborender-trainer-sm100 bash -lc '\n",
+                "\n        ' &",
+            ),
+        }
+        for name, (marker, terminator) in blocks.items():
+            with self.subTest(shell=name):
+                self.assertEqual(set(), audit_nested_shell(marker, terminator))
+
 
 if __name__ == "__main__":
     unittest.main()

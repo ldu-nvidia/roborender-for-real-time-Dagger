@@ -1077,6 +1077,10 @@ DDP_GATE=0
 export EP_LIST LOCAL_NUM_ENVS GRADIENT_ACCUMULATION_STEPS MASTER_ADDR MASTER_PORT
 export TRAINER_RANKS GLOBAL_NUM_ENVS ROLLOUT_STEPS TRAIN_RUN_DIR FLEET_DIR ANCHORS TEACHER_CKPT
 export EXPECTED_GR00T_REVISION USE_WANDB_HYDRA WANDB_ENTITY WANDB_MODE
+# These paths are selected inside this batch process, after sbatch's sanitized
+# environment is created.  The trainer command runs in a nested `srun` shell,
+# so they must be environment variables rather than shell-only assignments.
+export TRAIN_HYDRA_DIR TRAIN_OUTPUT_DIR
 export ROBORENDER_TELEMETRY_DIR="$TRAIN_RUN_DIR/telemetry"
 export IMAGE3F_ENDPOINT_DIR="$FLEET_DIR/endpoints"
 export IMAGE3F_ENDPOINT_MANIFEST="$FLEET_DIR/selected_endpoints.txt"
