@@ -136,6 +136,34 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "NRD-dependent"):
             self.contract.validate_headless_camera_rendering(Settings())
 
+    def test_simulation_render_cfg_preserves_direct_lighting(self):
+        kwargs = self.contract.headless_camera_render_cfg_kwargs()
+        self.assertEqual(kwargs["rendering_mode"], "performance")
+        self.assertIs(kwargs["enable_direct_lighting"], True)
+        carb_settings = kwargs["carb_settings"]
+        self.assertEqual(
+            set(carb_settings), set(self.contract.REQUIRED_DISABLED_CARB_SETTINGS)
+        )
+        self.assertTrue(all(value is False for value in carb_settings.values()))
+        self.assertNotIn("/rtx/directLighting/enabled", carb_settings)
+
+    def test_simulation_render_cfg_is_applied_before_context_and_cameras(self):
+        path = (
+            ROOT
+            / "GR00T-VisualSim2Real/gr00t/rl/simulator/isaacsim/isaacsim.py"
+        )
+        source = path.read_text(encoding="utf-8")
+        render_cfg_marker = 'simulation_render_kwargs["render"] = RenderCfg('
+        context_marker = "SimulationContext(sim_config)"
+        camera_marker = "TiledCamera(ego_camera_config)"
+        self.assertIn(
+            "from isaaclab.sim import PhysxCfg, RenderCfg, SimulationCfg, SimulationContext",
+            source,
+        )
+        self.assertIn(render_cfg_marker, source)
+        self.assertLess(source.index(render_cfg_marker), source.index(context_marker))
+        self.assertLess(source.index(context_marker), source.index(camera_marker))
+
     def test_train_and_eval_enforce_post_launch_contract(self):
         environment_creation = {
             "train_agent_trl.py": "env = custom_instantiate(config.env",
