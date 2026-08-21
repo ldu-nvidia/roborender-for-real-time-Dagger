@@ -388,6 +388,11 @@ export IMAGE_DAGGER_TELEMETRY_CLIP_FPS=10
 export IMAGE_DAGGER_TELEMETRY_REQUIRED=1
 export IMAGE_DAGGER_TELEMETRY_REQUIRE_VIDEO=1
 export IMAGE_DAGGER_FFMPEG
+# These finite batch-smoke phases exit only after their checkpoint is durable.
+# Isaac Sim 5.1's graceful close can then block indefinitely in headless HSG
+# jobs, so opt this launcher into its documented immediate-close path.  Other
+# entrypoints retain SimulationAppLifecycle's graceful default.
+export IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP=1
 export PROJ=roborender_dagger_hsg_gb200_smoke
 export EXP="${RUN_PROFILE}_${RUN_ID}"
 export TRAIN_ABSOLUTE_TARGET

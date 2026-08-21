@@ -26,10 +26,12 @@ def _load_lifecycle_module():
 class _FakeApp:
     def __init__(self, close_error=None):
         self.close_calls = 0
+        self.close_kwargs = []
         self.close_error = close_error
 
-    def close(self):
+    def close(self, **kwargs):
         self.close_calls += 1
+        self.close_kwargs.append(kwargs)
         if self.close_error is not None:
             raise self.close_error
 
@@ -37,6 +39,10 @@ class _FakeApp:
 class SimulationAppLifecycleTest(unittest.TestCase):
     def setUp(self):
         self.module = _load_lifecycle_module()
+        self.environment = mock.patch.dict(
+            self.module.os.environ,
+            {"IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "0"},
+        )
         self.previous_handler = object()
         self.installed_handlers = []
         self.getsignal = mock.patch.object(
@@ -49,12 +55,14 @@ class SimulationAppLifecycleTest(unittest.TestCase):
             "signal",
             side_effect=lambda _signum, handler: self.installed_handlers.append(handler),
         )
+        self.environment.start()
         self.getsignal.start()
         self.signal.start()
 
     def tearDown(self):
         self.signal.stop()
         self.getsignal.stop()
+        self.environment.stop()
 
     def test_success_closes_once_and_restores_sigterm_handler(self):
         app = _FakeApp()
@@ -62,8 +70,32 @@ class SimulationAppLifecycleTest(unittest.TestCase):
             lifecycle.attach(app)
 
         self.assertEqual(app.close_calls, 1)
+        self.assertEqual(app.close_kwargs, [{}])
         self.assertEqual(len(self.installed_handlers), 2)
         self.assertIs(self.installed_handlers[-1], self.previous_handler)
+
+    def test_opt_in_uses_isaac_immediate_close(self):
+        app = _FakeApp()
+        with mock.patch.dict(
+            self.module.os.environ,
+            {"IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "1"},
+        ):
+            with self.module.SimulationAppLifecycle() as lifecycle:
+                lifecycle.attach(app)
+
+        self.assertEqual(app.close_calls, 1)
+        self.assertEqual(app.close_kwargs, [{"skip_cleanup": True}])
+
+    def test_invalid_opt_in_value_fails_closed_before_app_launch(self):
+        with mock.patch.dict(
+            self.module.os.environ,
+            {"IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "true"},
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP must be exactly 0 or 1",
+            ):
+                self.module.SimulationAppLifecycle()
 
     def test_body_error_wins_over_close_error(self):
         app = _FakeApp(close_error=OSError("close failed"))

@@ -413,6 +413,20 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             packed,
         )
 
+    def test_hsg_batch_smoke_opts_into_immediate_isaac_shutdown(self):
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        setting = "export IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP=1"
+        self.assertEqual(packed.count(setting), 1)
+        self.assertLess(
+            packed.index(setting),
+            packed.index('srun --nodes="$TRAINER_RANKS"'),
+        )
+        self.assertIn("export SLURM_EXPORT_ENV=ALL", packed)
+        self.assertLess(
+            packed.index("export SLURM_EXPORT_ENV=ALL"),
+            packed.index(setting),
+        )
+
     def test_hsg_wandb_media_watcher_is_fail_closed_and_drained(self):
         submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
         packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
