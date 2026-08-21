@@ -368,6 +368,25 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         self.assertIn("resume_continuity_gate.py", packed)
         self.assertIn("--expected-before-step 1 --expected-after-step 2", packed)
         self.assertIn("++env.config.image_dagger_policy_view_count=3", packed)
+        self.assertIn(
+            "SMOKE_MOTION_FILE=gr00t/rl/data/motions/g1_wsdpt/33demos_675_775/"
+            "record_2025-10-14_21-28-47_0.675m.npz",
+            packed,
+        )
+        self.assertIn(
+            "minimal_e2e|resume_minimal|calibration_3view", packed
+        )
+        self.assertIn(
+            "env.config.reset_from_dataset.use_motion_file_dir=false", packed
+        )
+        self.assertIn(
+            '"env.config.reset_from_dataset.motion_files=[$SMOKE_MOTION_FILE]"',
+            packed,
+        )
+        self.assertLess(
+            packed.index('"${SMOKE_DATASET_ARGS[@]}"'),
+            packed.index("algo.config.videogen.raytraced_mix_prob=0.0"),
+        )
         wrapper = (
             ROOT / "scripts/scaling/submit_hsg_gb200_resume_smoke.sh"
         ).read_text()

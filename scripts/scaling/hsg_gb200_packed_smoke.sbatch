@@ -350,6 +350,14 @@ export IMAGE3F_EXPECT_OUTPUT_VIEWS=head_color,hand_left,hand_right
 export IMAGE3F_EXPECT_OUTPUT_SHAPE=240,416,3
 export IMAGE3F_REQUEST_TIMEOUT_S=120
 export BASE_RENDER_SEED=42
+# A continuity/calibration smoke must exercise the real reset-data path, but
+# loading and resampling all 295 production demonstrations obscures failures
+# behind minutes of unrelated setup.  Pin one committed, representative motion
+# for the one-environment profiles; the 32/256 production profiles continue to
+# consume the complete configured motion directory.
+export SMOKE_MOTION_FILE=gr00t/rl/data/motions/g1_wsdpt/33demos_675_775/record_2025-10-14_21-28-47_0.675m.npz
+[ -s "$GR00T_ROOT/$SMOKE_MOTION_FILE" ] || \
+    fatal "pinned smoke motion is missing: $GR00T_ROOT/$SMOKE_MOTION_FILE"
 export IMAGE_DAGGER_EXPECT_PRIMARY_VIEW=head_color
 export IMAGE_DAGGER_EXPECT_POLICY_VIEWS=head_color,hand_left,hand_right
 export IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT=3
@@ -470,6 +478,15 @@ run_train_phase() {
                     --main_process_port "$MASTER_PORT" --same_network --rdzv_backend static
                     --max_restarts 0 --num_cpu_threads_per_process 16)
             fi
+            SMOKE_DATASET_ARGS=()
+            case "$RUN_PROFILE" in
+                minimal_e2e|resume_minimal|calibration_3view)
+                    SMOKE_DATASET_ARGS=(
+                        env.config.reset_from_dataset.use_motion_file_dir=false
+                        "env.config.reset_from_dataset.motion_files=[$SMOKE_MOTION_FILE]"
+                    )
+                    ;;
+            esac
             exec accelerate launch "${ACCELERATE_ARGS[@]}" gr00t/rl/train_agent_trl.py \
                 +exp=loco_manip/wsdpt_image_dagger_3view \
                 num_envs="$LOCAL_NUM_ENVS" algo.config.num_steps_per_env="$ROLLOUT_STEPS" \
@@ -487,6 +504,7 @@ run_train_phase() {
                 callbacks.model_save.test_stop_after_checkpoint_step="$STOP_AFTER_STEP" \
                 headless=true "$TRAIN_CHECKPOINT_ARG" "$TRAIN_RESUME_ARG" \
                 teacher_actor_path="$TEACHER_CKPT" \
+                "${SMOKE_DATASET_ARGS[@]}" \
                 algo.config.videogen.raytraced_mix_prob=0.0 ++algo.config.videogen.seed="$RANK_RENDER_SEED" \
                 ++algo.config.videogen.reference_lag=0 ++algo.config.videogen.primary_view=head_color \
                 simulator.config.cameras.policy_views="[head_color,hand_left,hand_right]" \
