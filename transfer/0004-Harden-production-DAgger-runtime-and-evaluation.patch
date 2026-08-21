@@ -1,0 +1,4215 @@
+diff --git a/gr00t/rl/agents/modules/ppo_modules.py b/gr00t/rl/agents/modules/ppo_modules.py
+index 87c138e..a989d24 100644
+--- a/gr00t/rl/agents/modules/ppo_modules.py
++++ b/gr00t/rl/agents/modules/ppo_modules.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from copy import deepcopy
+ 
+ import torch
+@@ -212,9 +213,17 @@ class VisionStateWithTransformModule(VisionStateModule):
+ 
+         from gr00t.data.schema import TrainableDatasetMetadata_V1_2
+ 
+-        metadata_path = Path(
+-            "/mnt/amlfs-03/shared/datasets/lerobot/trl_g1_fix_lower_right_hand/g1_fix_lower_right_hand.bar_20250522/meta/metadata.json"
+-        )
++        metadata_path_value = os.environ.get("GR00T_TRANSFORM_METADATA_PATH")
++        if not metadata_path_value:
++            raise RuntimeError(
++                "GR00T_TRANSFORM_METADATA_PATH is required when using "
++                "VisionStateWithTransformModule"
++            )
++        metadata_path = Path(metadata_path_value).expanduser()
++        if not metadata_path.is_file():
++            raise FileNotFoundError(
++                f"GR00T transform metadata does not exist: {metadata_path}"
++            )
+         with open(metadata_path, "r") as f:
+             metadata = TrainableDatasetMetadata_V1_2.model_validate(json.load(f))
+ 
+diff --git a/gr00t/rl/apps/isaaclab.python.headless.rendering.kit b/gr00t/rl/apps/isaaclab.python.headless.rendering.kit
+index 870c65b..1bd513d 100755
+--- a/gr00t/rl/apps/isaaclab.python.headless.rendering.kit
++++ b/gr00t/rl/apps/isaaclab.python.headless.rendering.kit
+@@ -50,10 +50,35 @@ isaac.startup.ros_bridge_extension = ""
+ # Disabling these settings reduces renderer VRAM usage and improves rendering performance, but at some quality cost
+ rtx.translucency.enabled = false
+ rtx.reflections.enabled = false
++rtx.reflections.denoiser.enabled = false
+ rtx.indirectDiffuse.enabled = false
++rtx.indirectDiffuse.denoiser.enabled = false
+ rtx-transient.dlssg.enabled = false
+-rtx.directLighting.sampledLighting.enabled = true
++# Match Isaac Lab's performance rendering preset.  The ARM64 Isaac runtime
++# shipped for GB200 does not package the NRD PackForNRD shader, so sampled
++# direct lighting must not force that denoiser path for camera observations.
++rtx.directLighting.sampledLighting.enabled = false
++rtx.directLighting.sampledLighting.autoEnable = false
++rtx.directLighting.sampledLighting.enforceDenoiser = false
++rtx.directLighting.sampledLighting.irradiance.denoiser.enabled = false
+ rtx.directLighting.sampledLighting.samplesPerPixel = 1
++rtx-defaults.directLighting.sampledLighting.enabled = false
++rtx-defaults.directLighting.sampledLighting.autoEnable = false
++rtx-defaults.directLighting.sampledLighting.enforceDenoiser = false
++rtx-defaults.directLighting.sampledLighting.irradiance.denoiser.enabled = false
++rtx-defaults.reflections.enabled = false
++rtx-defaults.reflections.denoiser.enabled = false
++rtx-defaults.indirectDiffuse.enabled = false
++rtx-defaults.indirectDiffuse.denoiser.enabled = false
++rtx-defaults.indirectDiffuse.nrd.enabled = false
++rtx-defaults.shadows.denoiser.enable = false
++rtx-defaults.ambientOcclusion.enabled = false
++rtx-defaults.translucency.enabled = false
++rtx-defaults.raytracing.cached.enabled = false
++rtx-defaults-transient.dlssg.enabled = false
++rtx-defaults-transient.dldenoiser.enabled = false
++rtx.indirectDiffuse.nrd.enabled = false
++rtx.shadows.denoiser.enable = false
+ rtx.sceneDb.ambientLightIntensity = 1.0
+ # rtx.shadows.enabled = false
+ 
+@@ -68,6 +93,9 @@ exts."omni.renderer.core".present.enabled=false
+ # Disabling these settings reduces renderer VRAM usage and improves rendering performance, but at some quality cost
+ rtx.raytracing.cached.enabled = false
+ rtx.ambientOcclusion.enabled = false
++rtx.ambientOcclusion.denoiserMode = 1
++rtx.raytracing.subpixel.mode = 0
++rtx-transient.dldenoiser.enabled = false
+ 
+ # Set the DLSS model
+ rtx.post.dlss.execMode = 0 # can be 0 (Performance), 1 (Balanced), 2 (Quality), or 3 (Auto)
+diff --git a/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit b/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit
+index 870c65b..1bd513d 100755
+--- a/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit
++++ b/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit
+@@ -50,10 +50,35 @@ isaac.startup.ros_bridge_extension = ""
+ # Disabling these settings reduces renderer VRAM usage and improves rendering performance, but at some quality cost
+ rtx.translucency.enabled = false
+ rtx.reflections.enabled = false
++rtx.reflections.denoiser.enabled = false
+ rtx.indirectDiffuse.enabled = false
++rtx.indirectDiffuse.denoiser.enabled = false
+ rtx-transient.dlssg.enabled = false
+-rtx.directLighting.sampledLighting.enabled = true
++# Match Isaac Lab's performance rendering preset.  The ARM64 Isaac runtime
++# shipped for GB200 does not package the NRD PackForNRD shader, so sampled
++# direct lighting must not force that denoiser path for camera observations.
++rtx.directLighting.sampledLighting.enabled = false
++rtx.directLighting.sampledLighting.autoEnable = false
++rtx.directLighting.sampledLighting.enforceDenoiser = false
++rtx.directLighting.sampledLighting.irradiance.denoiser.enabled = false
+ rtx.directLighting.sampledLighting.samplesPerPixel = 1
++rtx-defaults.directLighting.sampledLighting.enabled = false
++rtx-defaults.directLighting.sampledLighting.autoEnable = false
++rtx-defaults.directLighting.sampledLighting.enforceDenoiser = false
++rtx-defaults.directLighting.sampledLighting.irradiance.denoiser.enabled = false
++rtx-defaults.reflections.enabled = false
++rtx-defaults.reflections.denoiser.enabled = false
++rtx-defaults.indirectDiffuse.enabled = false
++rtx-defaults.indirectDiffuse.denoiser.enabled = false
++rtx-defaults.indirectDiffuse.nrd.enabled = false
++rtx-defaults.shadows.denoiser.enable = false
++rtx-defaults.ambientOcclusion.enabled = false
++rtx-defaults.translucency.enabled = false
++rtx-defaults.raytracing.cached.enabled = false
++rtx-defaults-transient.dlssg.enabled = false
++rtx-defaults-transient.dldenoiser.enabled = false
++rtx.indirectDiffuse.nrd.enabled = false
++rtx.shadows.denoiser.enable = false
+ rtx.sceneDb.ambientLightIntensity = 1.0
+ # rtx.shadows.enabled = false
+ 
+@@ -68,6 +93,9 @@ exts."omni.renderer.core".present.enabled=false
+ # Disabling these settings reduces renderer VRAM usage and improves rendering performance, but at some quality cost
+ rtx.raytracing.cached.enabled = false
+ rtx.ambientOcclusion.enabled = false
++rtx.ambientOcclusion.denoiserMode = 1
++rtx.raytracing.subpixel.mode = 0
++rtx-transient.dldenoiser.enabled = false
+ 
+ # Set the DLSS model
+ rtx.post.dlss.execMode = 0 # can be 0 (Performance), 1 (Balanced), 2 (Quality), or 3 (Auto)
+diff --git a/gr00t/rl/apps/phc.isaaclab.python.rendering.kit b/gr00t/rl/apps/phc.isaaclab.python.rendering.kit
+index d27498b..dc85ed4 100755
+--- a/gr00t/rl/apps/phc.isaaclab.python.rendering.kit
++++ b/gr00t/rl/apps/phc.isaaclab.python.rendering.kit
+@@ -51,10 +51,35 @@ isaac.startup.ros_bridge_extension = ""
+ # Disabling these settings reduces renderer VRAM usage and improves rendering performance, but at some quality cost
+ rtx.translucency.enabled = false
+ rtx.reflections.enabled = false
++rtx.reflections.denoiser.enabled = false
+ rtx.indirectDiffuse.enabled = false
++rtx.indirectDiffuse.denoiser.enabled = false
+ rtx-transient.dlssg.enabled = false
+-rtx.directLighting.sampledLighting.enabled = true
++# Match Isaac Lab's performance rendering preset.  The ARM64 Isaac runtime
++# shipped for GB200 does not package the NRD PackForNRD shader, so sampled
++# direct lighting must not force that denoiser path for camera observations.
++rtx.directLighting.sampledLighting.enabled = false
++rtx.directLighting.sampledLighting.autoEnable = false
++rtx.directLighting.sampledLighting.enforceDenoiser = false
++rtx.directLighting.sampledLighting.irradiance.denoiser.enabled = false
+ rtx.directLighting.sampledLighting.samplesPerPixel = 1
++rtx-defaults.directLighting.sampledLighting.enabled = false
++rtx-defaults.directLighting.sampledLighting.autoEnable = false
++rtx-defaults.directLighting.sampledLighting.enforceDenoiser = false
++rtx-defaults.directLighting.sampledLighting.irradiance.denoiser.enabled = false
++rtx-defaults.reflections.enabled = false
++rtx-defaults.reflections.denoiser.enabled = false
++rtx-defaults.indirectDiffuse.enabled = false
++rtx-defaults.indirectDiffuse.denoiser.enabled = false
++rtx-defaults.indirectDiffuse.nrd.enabled = false
++rtx-defaults.shadows.denoiser.enable = false
++rtx-defaults.ambientOcclusion.enabled = false
++rtx-defaults.translucency.enabled = false
++rtx-defaults.raytracing.cached.enabled = false
++rtx-defaults-transient.dlssg.enabled = false
++rtx-defaults-transient.dldenoiser.enabled = false
++rtx.indirectDiffuse.nrd.enabled = false
++rtx.shadows.denoiser.enable = false
+ rtx.sceneDb.ambientLightIntensity = 1.0
+ # rtx.shadows.enabled = false
+ 
+@@ -69,6 +94,9 @@ exts."omni.renderer.core".present.enabled=false
+ # Disabling these settings reduces renderer VRAM usage and improves rendering performance, but at some quality cost
+ rtx.raytracing.cached.enabled = false
+ rtx.ambientOcclusion.enabled = false
++rtx.ambientOcclusion.denoiserMode = 1
++rtx.raytracing.subpixel.mode = 0
++rtx-transient.dldenoiser.enabled = false
+ 
+ # Set the DLSS model
+ rtx.post.dlss.execMode = 0 # can be 0 (Performance), 1 (Balanced), 2 (Quality), or 3 (Auto)
+diff --git a/gr00t/rl/config/base.yaml b/gr00t/rl/config/base.yaml
+index 8e4263b..577f4c9 100755
+--- a/gr00t/rl/config/base.yaml
++++ b/gr00t/rl/config/base.yaml
+@@ -28,6 +28,10 @@ num_envs: 4096
+ ### Checkpoint logic
+ auto_load_latest: False
+ checkpoint: null
++# ``resume`` restores optimizer/scheduler/absolute step and requires the
++# checkpoint's original experiment directory and W&B run identity.  A plain
++# checkpoint with resume=false remains a legacy weight warm-start.
++resume: False
+ 
+ ### Naming and dir structure
+ project_name: TEST
+@@ -56,4 +60,3 @@ eval_overrides:
+   num_envs: 1
+   auto_load_latest: False
+   use_wandb: False
+-
+diff --git a/gr00t/rl/config/callbacks/model_save.yaml b/gr00t/rl/config/callbacks/model_save.yaml
+index 5163839..0e4875c 100755
+--- a/gr00t/rl/config/callbacks/model_save.yaml
++++ b/gr00t/rl/config/callbacks/model_save.yaml
+@@ -1,4 +1,8 @@
+ model_save:
+   _target_: gr00t.rl.trl.callbacks.model_save_callback.ModelSaveCallback
+   save_dir: ${experiment_dir}
+-  save_frequency: 1000
+\ No newline at end of file
++  save_frequency: 1000
++  save_initial_checkpoint: false
++  # Non-null only in the two-process checkpoint-mechanics smoke. Production
++  # launchers reject this test-only interruption control.
++  test_stop_after_checkpoint_step: null
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
+index 45a9bac..61c43be 100644
+--- a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
+@@ -59,11 +59,9 @@ algo:
+     videogen:
+       enable: true
+       mode: image_dagger
+-      image3f_endpoint_files:
+-        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint.txt
+-        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint_2.txt
+-        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint_3.txt
+-      anchor_pool_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets/anchor_pool_2048
++      # Site-specific renderer endpoints and anchors are launcher inputs.
++      image3f_endpoint_files: []
++      anchor_pool_dir: null
+       anchor_index: 0
+       raytraced_mix_prob: 0.5
+       save_raw_depth: false
+@@ -94,6 +92,6 @@ algo:
+       # The TRT engine contract is exactly two 416x240 views; the single ego
+       # view is duplicated into both slots and primary_view is used for obs.
+       dump_first_n_chunks: 0
+-      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
++      dump_dir: null
+       view_names: [head_color, hand_left, hand_right]
+       primary_view: head_color
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml
+index 3009f07..c1cb5db 100644
+--- a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml
+@@ -50,6 +50,9 @@ simulator:
+       # Views the POLICY consumes, in tile order (top to bottom). Each
+       # needs a conditioning camera; RGB requires depth_hi_robot_rgb: true.
+       policy_views: [head_color, hand_left, hand_right]
++      # Explicit production contract.  Both the simulator and Image3F relabel
++      # path concatenate the ordered views along the image-height axis.
++      policy_view_layout: vertical
+       add_scene_walls: true
+       wall_distance: 2.5
+       wall_height: 2.5
+@@ -63,6 +66,14 @@ simulator:
+         - {name: hand_left, link: left_wrist_yaw_link, pos: [-0.08, 0.0, -0.06], rot: [1.0, 0.0, 0.0, 0.0]}
+         - {name: hand_right, link: right_wrist_yaw_link, pos: [-0.08, 0.0, -0.06], rot: [1.0, 0.0, 0.0, 0.0]}
+         - {name: head_color, link: d435_link, pos: [0.0, 0.035, 0.0], rot: [0.99955, 0.0, 0.0299955, 0.0]}
++
++# The trainer receives env.config rather than the root Hydra object. Mirror the
++# root count here so the production gate can verify that the observation
++# dimension and ordered camera list describe the same three-view policy.
++env:
++  config:
++    image_dagger_policy_view_count: ${policy_view_count}
++
+ algo:
+   config:
+     num_mini_batches: 1
+@@ -76,11 +87,9 @@ algo:
+     videogen:
+       enable: true
+       mode: image_dagger
+-      image3f_endpoint_files:
+-        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint.txt
+-        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint_2.txt
+-        - /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint_3.txt
+-      anchor_pool_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets/anchor_pool_2048
++      # Site-specific renderer endpoints and anchors are launcher inputs.
++      image3f_endpoint_files: []
++      anchor_pool_dir: null
+       anchor_index: 0
+       raytraced_mix_prob: 0.5
+       save_raw_depth: false
+@@ -108,10 +117,10 @@ algo:
+       # student: student drives, seeing the last generated frame of the
+       #          previous chunk as (stale) vision input.
+       rollout_action_source: teacher
+-      # The TRT engine contract is exactly two 416x240 views; the single ego
+-      # view is duplicated into both slots and primary_view is used for obs.
++      # The Image3F runtime returns this exact ordered three-view tuple.  The
++      # trainer tiles all three generated images into the policy observation.
+       dump_first_n_chunks: 0
+-      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
++      dump_dir: null
+       view_names: [head_color, hand_left, hand_right]
+       primary_view: head_color
+ 
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
+index fefff65..cdfb856 100644
+--- a/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
+@@ -106,36 +106,9 @@ domain_rand:
+       extrinsics_noise_level_up_threshold: 70
+       extrinsics_noise_curriculum_degree: 0.001
+ 
+-
+-# teacher_actor_path: logs_rl/wsdpt_sd_teacher_tairan_DL_33demos_Sweep_CloseHand_qbenV/loco_manip/walk_stand_place_grasp_turn_homie_test_project_name-wsdpt_sd_teacher_tairan_DL_33demos_Sweep_CloseHand_qbenV_penalty_dof_vel--1.0_penalty_output_smoothness--9_hand_predrop_pos_distance-3.0_hand_object_distance-50_penalty_keep_hand_closed-9-20251014_232828/model_step_006300.pt
+-# teacher_actor_path: logs_rl/wsdpt_zerostage/walk_stand_place_grasp_turn_homie_baseline_project_name-wsdpt_zerostage_penalty_fast_right_arm_qvel--40.0_penalty_zero_XY_Ang_Ddp_ABS--120_penalty_zero_XY_Ddpt_ABS--40-20251024_191440/model_step_010700.pt
+-# teacher_actor_path: logs_rl/wsdpt_BFv2_teacher_sweep_1Node_resume/loco_manip/walk_stand_place_grasp_turn_homie_RESUME_test_project_name-wsdpt_BFv2_teacher_sweep_1Node_resume_150demos_penalty_upfront_heading--1000_penalty_fast_right_arm_qvel--80_terminate_by_finger_qvel_during_right_arm_qvel-False-20251027_022157/model_step_020000.pt    
+-
+-# v4v2 teacher
+-# teacher_actor_path: logs_rl/wsdpt_BFv4v2_teacher_150demos/loco_manip/walk_stand_place_grasp_turn_homie_tairanRESUME_test_project_name-wsdpt_BFv4v2_teacher_150demos_penalty_finger_qvel_during_single_foot_contact--315_penalty_arm_qvel_during_single_foot_contact--750_penalty_bottle_move_table_contact--1250-20251028_165520/model_step_024400.pt
+-
+-# v5 teacher 
+-# teacher_actor_path: logs_rl/wsdpt_BFv5_teacher_150demos/loco_manip/walk_stand_place_grasp_turn_homie_push_10_project_name-wsdpt_relative_push_penalty_bottle_relative_move--2000.0_wsdpt_push-True-20251030_081815/model_step_038100.pt
+-
+-# v6 teacher (including push)
+-# teacher_actor_path: logs_rl/wsdpt_BFv6_teacher_220demos/loco_manip/walk_stand_place_grasp_turn_homie_includingpush_project_name-wsdpt_predrop_Penalty_penalty_hand_predrop_pos_distance--10000.0-20251031_004756/model_step_040200.pt
+-
+-# v7.7 teacher
+-# teacher_actor_path: logs_rl/wsdpt_teacher_v7.7/loco_manip/walk_stand_place_grasp_turn_homie_btfv7_nopush_nopredrop_fi_project_name-wsdpt_teacher_bufferflyv7_finger_relative_penalty_finger_qvel_during_single_foot_contact--3250.0_wsdpt_push-True_penalty_bottle_lean_during_pick--100.0-20251101_074926/model_step_039100.pt
+-
+-# v8.q.8 teacher
+-# teacher_actor_path: logs_rl/wsdpt_teacher_bfv8q8/loco_manip/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q8_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--5000.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251104_210449/model_step_045100.pt
+-
+-
+-# v8.q.8.002 teacher
+-# teacher_actor_path: logs_rl/bfv8.q.2_teacher/002/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q8_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--5000.0_penalty_bottle_non_z_up_velocity_during_pick--500.0-20251104_210449/model_step_046200.pt
+-teacher_actor_path: logs_rl/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q9_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--3500.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251105_004910/model_step_044500.pt
+-
+-
+-# checkpoint: logs_rl/wsdpt_student_rgb_delay/loco_manip/wsdpt_student_for_teacher_bfv7.t.2.a1.qben_resnet_resume_rgb_delay_test_project_name-wsdpt_student_rgb_delay_rgb_image_delay_step-2_rgb_image_delay_random-False-20251103_011035/model_step_023200.pt
+-
+-
+-
++# The launcher must provide the expert labeler independently of student
++# initialization. No student checkpoint is implied by this setting.
++teacher_actor_path: ???
+ 
+ callbacks:
+   model_save:
+@@ -304,4 +277,3 @@ robot:
+ 
+   actions_dim: 31 # 15 + 14 + 2
+   check_action_dim: False
+-
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
+index 5a814c0..6131031 100644
+--- a/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
+@@ -61,6 +61,6 @@ algo:
+       # The TRT engine contract is exactly two 416x240 views; the single ego
+       # view is duplicated into both slots and primary_view is used for obs.
+       dump_first_n_chunks: 4
+-      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
++      dump_dir: null
+       view_names: [ext1, wrist]
+       primary_view: ext1
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
+index e85cbbf..1bcf533 100644
+--- a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
+@@ -59,7 +59,7 @@ algo:
+       mode: collect
+       save_raw_depth: true
+       save_raw_depth_native: true
+-      collect_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/data/videogen_dataset
++      collect_dir: null
+       host: 127.0.0.1
+       port: 18913
+       prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
+@@ -86,6 +86,6 @@ algo:
+       # The TRT engine contract is exactly two 416x240 views; the single ego
+       # view is duplicated into both slots and primary_view is used for obs.
+       dump_first_n_chunks: 0
+-      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
++      dump_dir: null
+       view_names: [ext1, wrist]
+       primary_view: ext1
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
+index 9784922..41d3530 100644
+--- a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
+@@ -47,7 +47,7 @@ algo:
+     videogen:
+       enable: true
+       mode: offline
+-      dataset_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/data/videogen_dataset
++      dataset_dir: null
+       host: 127.0.0.1
+       port: 18913
+       prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
+@@ -65,6 +65,6 @@ algo:
+       # The TRT engine contract is exactly two 416x240 views; the single ego
+       # view is duplicated into both slots and primary_view is used for obs.
+       dump_first_n_chunks: 0
+-      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
++      dump_dir: null
+       view_names: [ext1, wrist]
+       primary_view: ext1
+diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml
+index a05687d..0af7d51 100644
+--- a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml
++++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml
+@@ -55,7 +55,7 @@ algo:
+     videogen:
+       enable: true
+       mode: offline
+-      dataset_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/data/videogen_dataset
++      dataset_dir: null
+       host: 127.0.0.1
+       port: 18913
+       prompt: "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray."
+@@ -73,7 +73,7 @@ algo:
+       # The TRT engine contract is exactly two 416x240 views; the single ego
+       # view is duplicated into both slots and primary_view is used for obs.
+       dump_first_n_chunks: 0
+-      dump_dir: /lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/videogen_frames
++      dump_dir: null
+       view_names: [ext1, wrist]
+       primary_view: ext1
+ 
+diff --git a/gr00t/rl/eval_agent_trl.py b/gr00t/rl/eval_agent_trl.py
+index c5fc62c..a5b1ddf 100644
+--- a/gr00t/rl/eval_agent_trl.py
++++ b/gr00t/rl/eval_agent_trl.py
+@@ -39,6 +39,11 @@ from hydra.utils import instantiate
+ from loguru import logger
+ from omegaconf import OmegaConf
+ 
++from gr00t.rl.utils.camera_rendering_contract import (
++    configure_headless_camera_rendering,
++    reassert_headless_camera_rendering,
++    validate_headless_camera_rendering,
++)
+ from gr00t.rl.utils.config_utils import register_rl_resolvers
+ 
+ register_rl_resolvers()
+@@ -183,6 +188,7 @@ def main(override_config: OmegaConf):
+             or config.simulator.config.get("render_results", False)
+         )
+         args_cli.headless = config.headless
++        enforce_camera_rendering_contract = configure_headless_camera_rendering(args_cli)
+ 
+         # Copy headless rendering kit file if needed
+         dest_path = Path(isaaclab.__file__).resolve().parent.parent.parent.parent / "apps"
+@@ -255,6 +261,17 @@ def main(override_config: OmegaConf):
+ 
+     # --- Create environment ---
+     env = instantiate(config=config.env, device=device)
++    if simulator_type == "IsaacSim" and enforce_camera_rendering_contract:
++        import carb
++
++        reassert_headless_camera_rendering(carb.settings.get_settings())
++        resolved_rendering_settings = validate_headless_camera_rendering(
++            carb.settings.get_settings()
++        )
++        logger.info(
++            "Validated post-SimulationContext headless camera rendering contract: {}",
++            resolved_rendering_settings,
++        )
+ 
+     # --- Build policy and value models ---
+     process_output_dim_in_config(config)
+diff --git a/gr00t/rl/simulator/isaacsim/isaacsim.py b/gr00t/rl/simulator/isaacsim/isaacsim.py
+index 5d0a5ee..55b9b10 100644
+--- a/gr00t/rl/simulator/isaacsim/isaacsim.py
++++ b/gr00t/rl/simulator/isaacsim/isaacsim.py
+@@ -63,7 +63,7 @@ if DEFAULT_ISAACSIM_VERSION == "4.5":
+     )
+ 
+     # from gr00t.rl.simulator.isaaclab_cfg import IsaacLabCfg
+-    from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
++    from isaaclab.sim import PhysxCfg, RenderCfg, SimulationCfg, SimulationContext
+     from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
+     from isaaclab.utils.timer import Timer
+     from loguru import logger
+@@ -81,6 +81,9 @@ if DEFAULT_ISAACSIM_VERSION == "4.5":
+         randomize_table_material,
+     )
+     from gr00t.rl.simulator.isaacsim.isaacsim_articulation_cfg import ARTICULATION_CFG
++    from gr00t.rl.utils.camera_rendering_contract import (
++        headless_camera_render_cfg_kwargs,
++    )
+     from gr00t.rl.utils.helpers import dict_to_true_list
+ 
+ elif DEFAULT_ISAACSIM_VERSION == "4.2":
+@@ -207,6 +210,20 @@ class IsaacSim(BaseSimulator):
+         else:
+             self.scene_creation_callback = None
+ 
++        simulation_render_kwargs = {}
++        cameras_enabled = (
++            hasattr(self.simulator_config, "cameras")
++            and bool(self.simulator_config.cameras.enable_cameras)
++        ) or bool(self.simulator_config.get("render_results", False))
++        if (
++            DEFAULT_ISAACSIM_VERSION == "4.5"
++            and bool(config.headless)
++            and cameras_enabled
++        ):
++            simulation_render_kwargs["render"] = RenderCfg(
++                **headless_camera_render_cfg_kwargs()
++            )
++
+         sim_config: SimulationCfg = SimulationCfg(
+             dt=1.0 / self.simulator_config.sim.fps,
+             render_interval=self.simulator_config.sim.render_interval,
+@@ -217,6 +234,7 @@ class IsaacSim(BaseSimulator):
+                 max_velocity_iteration_count=255,
+                 gpu_max_rigid_patch_count=10 * 2**15,
+             ),
++            **simulation_render_kwargs,
+         )
+ 
+         # create a simulation context to control the simulator
+diff --git a/gr00t/rl/train_agent_trl.py b/gr00t/rl/train_agent_trl.py
+index 1cd6d89..d673f28 100644
+--- a/gr00t/rl/train_agent_trl.py
++++ b/gr00t/rl/train_agent_trl.py
+@@ -38,8 +38,10 @@ import glob
+ import logging
+ import os
+ import random
++import re
+ import shutil
+ import sys
++import tempfile
+ from pathlib import Path
+ 
+ import hydra
+@@ -50,11 +52,37 @@ from hydra.utils import instantiate
+ from loguru import logger
+ from omegaconf import OmegaConf
+ 
++from gr00t.rl.utils.camera_rendering_contract import (
++    configure_headless_camera_rendering,
++    reassert_headless_camera_rendering,
++    validate_headless_camera_rendering,
++)
+ from gr00t.rl.utils.config_utils import register_rl_resolvers
++from gr00t.rl.utils.policy_view_contract import bind_policy_view_count_contract
++from gr00t.rl.utils.simulation_app_lifecycle import SimulationAppLifecycle
+ 
+ register_rl_resolvers()
+ 
+ 
++def atomic_yaml_dump(payload, path):
++    """Durably replace small run-identity metadata without partial files."""
++
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    descriptor, temporary_name = tempfile.mkstemp(
++        prefix=f".{path.name}.", dir=path.parent
++    )
++    try:
++        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
++            yaml.safe_dump(payload, handle)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary_name, path)
++    finally:
++        if os.path.exists(temporary_name):
++            os.unlink(temporary_name)
++
++
+ def seeding(seed=0, torch_deterministic=False):
+     """Set random seeds for reproducibility across all libraries."""
+     import torch
+@@ -80,19 +108,51 @@ def seeding(seed=0, torch_deterministic=False):
+ 
+ 
+ def resume_training(config):
+-    """Find the latest checkpoint and update config for training resumption."""
++    """Select a checkpoint and bind resume to its original experiment dir."""
+     if config.get("checkpoint", None) is not None:
+-        last_existing_checkpoint = config.checkpoint
++        last_existing_checkpoint = Path(str(config.checkpoint)).expanduser().resolve()
+     else:
+         experiment_dir_base = os.path.join(
+             config.base_dir, config.project_name, config.experiment_name
+         )
+-        last_existing_checkpoint = sorted(
+-            glob.glob(os.path.join(f"{experiment_dir_base}-*", "last.pt"))
+-        )[-1]
+-    experiment_dir = os.path.dirname(last_existing_checkpoint)
+-    config.experiment_dir = experiment_dir
+-    config.checkpoint = last_existing_checkpoint
++        candidates = [
++            Path(path).resolve()
++            for path in glob.glob(os.path.join(f"{experiment_dir_base}-*", "last.pt"))
++        ]
++        if not candidates:
++            raise FileNotFoundError(
++                f"resume requested but no checkpoint exists below {experiment_dir_base}-*"
++            )
++        last_existing_checkpoint = max(
++            candidates, key=lambda path: path.stat().st_mtime_ns
++        )
++    if not last_existing_checkpoint.is_file() or last_existing_checkpoint.is_symlink():
++        raise FileNotFoundError(
++            f"resume checkpoint is missing or unsafe: {last_existing_checkpoint}"
++        )
++    experiment_dir = last_existing_checkpoint.parent
++    config.experiment_dir = str(experiment_dir)
++    config.checkpoint = str(last_existing_checkpoint)
++
++    if bool(config.get("use_wandb", False)):
++        meta_path = experiment_dir / "meta.yaml"
++        if not meta_path.is_file() or meta_path.is_symlink():
++            raise RuntimeError(
++                f"W&B resume requires the original experiment metadata: {meta_path}"
++            )
++        with meta_path.open("r", encoding="utf-8") as handle:
++            meta = yaml.safe_load(handle)
++        wandb_id = meta.get("wandb_run") if isinstance(meta, dict) else None
++        if not isinstance(wandb_id, str) or not re.fullmatch(
++            r"[A-Za-z0-9_-]{1,128}", wandb_id
++        ):
++            raise RuntimeError("original experiment has no valid W&B run ID")
++        configured_id = config.wandb.get("wandb_id", None)
++        if configured_id is not None and str(configured_id) != wandb_id:
++            raise RuntimeError(
++                "configured W&B run ID does not match the checkpoint experiment"
++            )
++        config.wandb.wandb_id = wandb_id
+     print(f"Resuming training from {last_existing_checkpoint}")
+ 
+ 
+@@ -166,10 +226,12 @@ def process_output_dim_in_config(config):
+             adapt_backbone_output_dim(config.algo.config.teacher_actor.backbone, "teacher_actor")
+ 
+ 
+-@hydra.main(config_path="config", config_name="base", version_base="1.1")
+-def main(config: OmegaConf):
++def _run_training(config: OmegaConf, simulation_lifecycle: SimulationAppLifecycle):
+     # Auto-calculate vision_feature_dim for history-based vision models
+     auto_calculate_vision_feature_dim(config)
++    resume_mode = bool(config.get("resume", False))
++    if resume_mode:
++        resume_training(config)
+ 
+     from transformers import HfArgumentParser
+     from trl import ModelConfig, PPOConfig, ScriptArguments
+@@ -203,10 +265,17 @@ def main(config: OmegaConf):
+ 
+     # Resume wandb run if meta.yaml exists from a previous run
+     meta_path = Path(config.experiment_dir) / "meta.yaml"
+-    if meta_path.exists():
+-        meta = yaml.safe_load(open(meta_path, "r"))
+-        config.wandb.wandb_id = meta["wandb_run"]
+-        print(f"resume wandb from run: {config.wandb.wandb_id}")
++    if bool(config.get("use_wandb", False)) and meta_path.exists():
++        with meta_path.open("r", encoding="utf-8") as handle:
++            meta = yaml.safe_load(handle)
++        meta_run_id = meta.get("wandb_run") if isinstance(meta, dict) else None
++        if resume_mode and meta_run_id != config.wandb.wandb_id:
++            raise RuntimeError(
++                "W&B metadata changed after resume checkpoint resolution"
++            )
++        if meta_run_id is not None:
++            config.wandb.wandb_id = meta_run_id
++            print(f"resume wandb from run: {config.wandb.wandb_id}")
+ 
+     # --- Isaac Sim setup ---
+     simulator_type = config.simulator["_target_"].split(".")[-1]
+@@ -243,6 +312,7 @@ def main(config: OmegaConf):
+         args_cli.multi_gpu = config.multi_gpu
+         args_cli.distributed = config.multi_gpu
+         args_cli.device = device
++        enforce_camera_rendering_contract = configure_headless_camera_rendering(args_cli)
+ 
+         # Copy headless rendering kit file if cameras are enabled in headless mode
+         dest_path = Path(isaaclab.__file__).resolve().parent.parent.parent.parent / "apps"
+@@ -254,6 +324,7 @@ def main(config: OmegaConf):
+ 
+         app_launcher = AppLauncher(args_cli)
+         simulation_app = app_launcher.app
++        simulation_lifecycle.attach(simulation_app)
+ 
+     # --- Imports that must come after Isaac Sim initialization ---
+     import wandb
+@@ -301,8 +372,10 @@ def main(config: OmegaConf):
+             dir=wandb_dir,
+             id=config.wandb.wandb_id,
+             group=wandb_group,
+-            resume="allow",
++            resume="must" if resume_mode else "allow",
+         )
++        if resume_mode and wandb.run.id != config.wandb.wandb_id:
++            raise RuntimeError("W&B resumed a different run ID than requested")
+ 
+     pre_process_config(config)
+ 
+@@ -310,6 +383,27 @@ def main(config: OmegaConf):
+     config.env.config.save_rendering_dir = str(Path(config.experiment_dir) / "renderings_training")
+     config.env.config.experiment_dir = str(Path(config.experiment_dir))
+     env = custom_instantiate(config.env, device=device, _resolve=False)
++    bound_policy_view_count = bind_policy_view_count_contract(
++        config,
++        env,
++        os.environ.get("IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT"),
++    )
++    if bound_policy_view_count is not None:
++        logger.info(
++            "Bound production policy view count onto runtime environment: {}",
++            bound_policy_view_count,
++        )
++    if simulator_type == "IsaacSim" and enforce_camera_rendering_contract:
++        import carb
++
++        reassert_headless_camera_rendering(carb.settings.get_settings())
++        resolved_rendering_settings = validate_headless_camera_rendering(
++            carb.settings.get_settings()
++        )
++        logger.info(
++            "Validated post-SimulationContext headless camera rendering contract: {}",
++            resolved_rendering_settings,
++        )
+ 
+     # --- Build policy and value models ---
+     ref_model = None
+@@ -413,7 +507,7 @@ def main(config: OmegaConf):
+         with open(experiment_save_dir / "config.yaml", "w") as file:
+             OmegaConf.save(unresolved_conf, file)
+         meta = {"wandb_run": wandb.run.id if wandb_run_exists() else None}
+-        yaml.safe_dump(meta, open(meta_path, "w"))
++        atomic_yaml_dump(meta, meta_path)
+         print("saved meta:", meta)
+ 
+     trainer = custom_instantiate(
+@@ -429,6 +523,7 @@ def main(config: OmegaConf):
+         eval_dataset=None,
+         callbacks=callbacks,
+         checkpoint=config.checkpoint,
++        resume=resume_mode,
+         local_seed=config.seed,
+         log_dir=experiment_save_dir,
+         accelerator=accelerator,
+@@ -438,8 +533,11 @@ def main(config: OmegaConf):
+     # --- Training loop ---
+     trainer.train()
+ 
+-    if simulator_type == "IsaacSim":
+-        simulation_app.close()
++
++@hydra.main(config_path="config", config_name="base", version_base="1.1")
++def main(config: OmegaConf):
++    with SimulationAppLifecycle() as simulation_lifecycle:
++        return _run_training(config, simulation_lifecycle)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/gr00t/rl/trl/callbacks/model_save_callback.py b/gr00t/rl/trl/callbacks/model_save_callback.py
+index 0b62522..17b5f08 100644
+--- a/gr00t/rl/trl/callbacks/model_save_callback.py
++++ b/gr00t/rl/trl/callbacks/model_save_callback.py
+@@ -6,6 +6,7 @@ import copy
+ import os
+ import subprocess
+ import sys
++import tempfile
+ from pathlib import Path
+ 
+ import torch
+@@ -15,16 +16,75 @@ from transformers import TrainerCallback
+ class ModelSaveCallback(TrainerCallback):
+     """Callback to save model state_dict during training."""
+ 
+-    def __init__(self, save_dir, save_frequency=1000):
++    def __init__(
++        self,
++        save_dir,
++        save_frequency=1000,
++        save_initial_checkpoint=False,
++        test_stop_after_checkpoint_step=None,
++    ):
+         """
+         Args:
+             save_dir (str): Directory to save model checkpoints
+             save_frequency (int): Save model every N steps
++            save_initial_checkpoint (bool): Save the fresh policy before the
++                first rollout/update. This provides an architecture-matched
++                iteration-zero baseline for fixed-seed evaluation.
++            test_stop_after_checkpoint_step (int | None): Test-only graceful
++                interruption point.  Training stops only after the ordinary
++                periodic checkpoint for this exact absolute step is durable.
+         """
+         self.save_dir = Path(save_dir)
+         self.save_frequency = save_frequency
++        self.save_initial_checkpoint = bool(save_initial_checkpoint)
++        stop_step = (
++            None
++            if test_stop_after_checkpoint_step in (None, 0, "0")
++            else int(test_stop_after_checkpoint_step)
++        )
++        if stop_step is not None:
++            if stop_step <= 0:
++                raise ValueError("test stop checkpoint step must be positive")
++            if stop_step % int(save_frequency) != 0:
++                raise ValueError(
++                    "test stop checkpoint step must be divisible by save_frequency"
++                )
++        self.test_stop_after_checkpoint_step = stop_step
+         self.save_dir.mkdir(parents=True, exist_ok=True)
+ 
++    def on_train_begin(self, args, state, control, **kwargs):
++        """Optionally persist the exact pre-update policy once, fail closed."""
++        if not self.save_initial_checkpoint:
++            return
++        if not state.is_world_process_zero or int(state.global_step) != 0:
++            return
++
++        model = kwargs.get("model")
++        optimizer = kwargs.get("optimizer")
++        lr_scheduler = kwargs.get("lr_scheduler")
++        env = kwargs.get("env")
++        if model is None or env is None:
++            raise RuntimeError(
++                "initial checkpoint requested but callback model/env is unavailable"
++            )
++        if env.is_evaluating:
++            raise RuntimeError("initial checkpoint requested in an evaluating environment")
++
++        path = self.save_dir / "initial_policy.pt"
++        if path.exists():
++            raise FileExistsError(
++                f"refusing to overwrite iteration-zero baseline: {path}"
++            )
++        ModelSaveCallback.save_checkpoint(
++            model,
++            optimizer,
++            lr_scheduler,
++            state,
++            env.get_env_state_dict(),
++            args,
++            str(path),
++        )
++
+     def on_step_end(self, args, state, control, **kwargs):
+         """Save model state_dict at the end of each step if frequency matches."""
+         model = kwargs.get("model")
+@@ -61,6 +121,29 @@ class ModelSaveCallback(TrainerCallback):
+             )
+             # self.export_policy_to_onnx(env, state, model)
+ 
++        if (
++            self.test_stop_after_checkpoint_step is not None
++            and int(state.global_step) == self.test_stop_after_checkpoint_step
++        ):
++            if env.is_evaluating:
++                raise RuntimeError("test checkpoint stop cannot run during evaluation")
++            checkpoint_path = self.save_dir / f"model_step_{state.global_step:06d}.pt"
++            if state.is_world_process_zero and not checkpoint_path.is_file():
++                raise RuntimeError(
++                    "test checkpoint stop reached before its checkpoint was persisted: "
++                    f"{checkpoint_path}"
++                )
++            # Every distributed rank receives the same callback and therefore
++            # exits the completed update coherently.  The launcher's smoke-only
++            # gate verifies the rank-zero checkpoint before declaring phase A
++            # successful.
++            control.should_training_stop = True
++            print(
++                "Test-only interruption requested after durable checkpoint "
++                f"step {state.global_step}"
++            )
++        return control
++
+     def get_example_obs(self, env):
+         obs_dict = copy.deepcopy(env.obs_buf_dict)
+         for obs_key in obs_dict.keys():
+@@ -96,7 +179,14 @@ class ModelSaveCallback(TrainerCallback):
+             _state = copy.deepcopy(state)
+             _state.__dict__.pop("log_history")
+             checkpoint = {
++                "checkpoint_schema": "gr00t.trl.full_state.v2",
+                 "policy_state_dict": model.policy.state_dict(),
++                # Bind the exact named-parameter subset so offline gates can
++                # reproduce the DDP synchronization digest without rebuilding
++                # the policy architecture or confusing buffers with weights.
++                "policy_parameter_names": sorted(
++                    name for name, _ in model.policy.named_parameters()
++                ),
+                 "value_state_dict": (
+                     model.value_model.state_dict() if model.value_model is not None else None
+                 ),  # Value model is not always preset (e.g. for distillation)
+@@ -111,12 +201,31 @@ class ModelSaveCallback(TrainerCallback):
+             if hasattr(model, "homie_model") and model.homie_model is not None:
+                 checkpoint["homie_state_dict"] = model.homie_model.state_dict()
+             for attempt in range(5):
++                destination = Path(save_path)
++                descriptor, temporary_name = tempfile.mkstemp(
++                    prefix=f".{destination.name}.", dir=destination.parent
++                )
++                os.close(descriptor)
+                 try:
+-                    torch.save(checkpoint, save_path)
+-                    print(f"Saved model checkpoint to {save_path}")
++                    torch.save(checkpoint, temporary_name)
++                    with open(temporary_name, "rb") as handle:
++                        os.fsync(handle.fileno())
++                    os.replace(temporary_name, destination)
++                    directory_fd = os.open(
++                        destination.parent,
++                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
++                    )
++                    try:
++                        os.fsync(directory_fd)
++                    finally:
++                        os.close(directory_fd)
++                    print(f"Saved model checkpoint atomically to {save_path}")
+                     break
+                 except Exception as e:
+                     if attempt == 4:  # Last attempt
+                         print(f"Failed to save checkpoint after 5 attempts. Error: {e}")
+                         raise
+                     print(f"Attempt {attempt + 1} failed to save checkpoint. Retrying...")
++                finally:
++                    if os.path.exists(temporary_name):
++                        os.unlink(temporary_name)
+diff --git a/gr00t/rl/trl/trainer/checkpoint_io.py b/gr00t/rl/trl/trainer/checkpoint_io.py
+new file mode 100644
+index 0000000..d972ca8
+--- /dev/null
++++ b/gr00t/rl/trl/trainer/checkpoint_io.py
+@@ -0,0 +1,97 @@
++"""Fail-closed checkpoint loading helpers.
++
++The checkpoint bytes are hashed and deserialized through the same open file
++descriptor.  This prevents a path replacement between an external hash check
++and ``torch.load`` from selecting different bytes.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import re
++import stat
++from pathlib import Path
++from typing import Any
++
++
++SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
++
++
++def select_rank_checkpoint_sha256(
++    raw_sha256s: str | None,
++    *,
++    rank: int,
++    world_size: int,
++    required: bool,
++) -> str | None:
++    """Select one rank's hash from an ordered, launcher-pinned CSV contract."""
++
++    if type(rank) is not int or type(world_size) is not int:
++        raise RuntimeError("runtime checkpoint rank and world size must be true integers")
++    if world_size < 1 or rank < 0 or rank >= world_size:
++        raise RuntimeError("runtime checkpoint rank/world-size contract is invalid")
++    if raw_sha256s in (None, "", "NONE"):
++        if required:
++            raise RuntimeError(
++                "strict production resume requires per-rank runtime checkpoint SHA-256s"
++            )
++        return None
++    values = tuple(value.strip() for value in str(raw_sha256s).split(","))
++    if len(values) != world_size:
++        raise RuntimeError(
++            "per-rank runtime checkpoint SHA-256 count does not match world size"
++        )
++    if any(SHA256_RE.fullmatch(value) is None for value in values):
++        raise RuntimeError("per-rank runtime checkpoint SHA-256 list is malformed")
++    return values[rank]
++
++
++def load_verified_torch_checkpoint(
++    torch_module: Any,
++    checkpoint_path: str | os.PathLike[str],
++    *,
++    map_location: Any,
++    expected_sha256: str | None = None,
++    require_expected_sha256: bool = False,
++) -> tuple[Any, str]:
++    """Hash and deserialize one regular checkpoint through one safe descriptor."""
++
++    expected = None if expected_sha256 in (None, "", "NONE") else expected_sha256
++    if require_expected_sha256 and expected is None:
++        raise RuntimeError("strict production resume requires a checkpoint SHA-256")
++    if expected is not None and (
++        not isinstance(expected, str) or SHA256_RE.fullmatch(expected) is None
++    ):
++        raise RuntimeError("expected checkpoint SHA-256 must be 64 lowercase hex characters")
++
++    path = Path(checkpoint_path).expanduser()
++    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
++    try:
++        descriptor = os.open(path, flags)
++    except OSError as exc:
++        raise RuntimeError(f"cannot safely open checkpoint {path}: {exc}") from exc
++
++    try:
++        metadata = os.fstat(descriptor)
++        if not stat.S_ISREG(metadata.st_mode):
++            raise RuntimeError(f"checkpoint is not a regular file: {path}")
++        with os.fdopen(descriptor, "rb", closefd=True) as handle:
++            descriptor = -1
++            digest = hashlib.sha256()
++            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++                digest.update(chunk)
++            actual_sha256 = digest.hexdigest()
++            if expected is not None and actual_sha256 != expected:
++                raise RuntimeError(
++                    "checkpoint SHA-256 mismatch at actual load "
++                    f"({actual_sha256} != {expected})"
++                )
++            handle.seek(0)
++            payload = torch_module.load(
++                handle, map_location=map_location, weights_only=False
++            )
++    finally:
++        if descriptor >= 0:
++            os.close(descriptor)
++    return payload, actual_sha256
+diff --git a/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py b/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
+index 0ae54f4..1aee3a8 100644
+--- a/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
++++ b/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
+@@ -3,6 +3,8 @@
+ 
+ 
+ import gc
++import hashlib
++import json
+ import os
+ import time
+ from copy import deepcopy
+@@ -591,6 +593,11 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+         self._eval_mode()
+         self.policy_model.eval_mode()
+         self.policy_model.init_rollout()
++        reset_image3f_evidence = getattr(
++            self, "_reset_image3f_fixed_eval_evidence", None
++        )
++        if callable(reset_image3f_evidence):
++            reset_image3f_evidence()
+         obs_dict = self.env.reset_all()
+         if self.config.get("init_at_random_ep_len", False):
+             self.env.episode_length_buf = torch.randint_like(
+@@ -650,6 +657,7 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+             self.env_episode_completed = torch.zeros(
+                 self.env.num_envs, dtype=torch.bool, device=device
+             )
++        fixed_seed_episode_records = {}
+ 
+         if self.config.eval.save_videos:
+             self.saved_episode_cnt = 0
+@@ -772,6 +780,48 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+                             valid_new_ids = new_ids
+ 
+                         if len(valid_new_ids) > 0:
++                            # Preserve one auditable record per environment before the
++                            # environment callback resets its episode-local state.  The
++                            # fixed-seed production gate pairs these records by the
++                            # Image3F condition fingerprint added below, rather than
++                            # relying on aggregate success rates alone.
++                            if eval_num_envs_episodes:
++                                flat_valid_ids = valid_new_ids.reshape(-1).tolist()
++                                reached = getattr(
++                                    getattr(self.env, "eval_metrics", {}),
++                                    "get",
++                                    lambda *_args, **_kwargs: None,
++                                )("episode_goal_reached")
++                                object_classes = getattr(
++                                    self.env, "eval_env_object_classes", None
++                                )
++                                for env_id in flat_valid_ids:
++                                    if env_id in fixed_seed_episode_records:
++                                        raise RuntimeError(
++                                            "fixed-seed evaluation observed a second "
++                                            f"first episode for environment {env_id}"
++                                        )
++                                    success = False
++                                    if reached is not None:
++                                        success = bool(reached[env_id].item())
++                                    object_class = None
++                                    if (
++                                        object_classes is not None
++                                        and env_id < len(object_classes)
++                                    ):
++                                        object_class = str(object_classes[env_id])
++                                    fixed_seed_episode_records[env_id] = {
++                                        "env_index": int(env_id),
++                                        "success": success,
++                                        "reward": float(
++                                            self.cur_reward_sum[env_id].item()
++                                        ),
++                                        "episode_length": int(
++                                            self.cur_episode_length[env_id].item()
++                                        ),
++                                        "object_class": object_class,
++                                    }
++
+                             if self.config.eval.save_videos:
+                                 self.batch_reset_data_writer(valid_new_ids, save_dirpath)
+ 
+@@ -811,6 +861,52 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+         eval_dict = self.env.get_eval_metrics_summary()
+         eval_dict["eval_time"] = end_time - start_time
+ 
++        image3f_evidence = None
++        get_image3f_evidence = getattr(
++            self, "_get_image3f_fixed_eval_evidence", None
++        )
++        if callable(get_image3f_evidence):
++            image3f_evidence = get_image3f_evidence()
++            eval_dict["_roborender_image3f_eval"] = image3f_evidence
++
++        if eval_num_envs_episodes:
++            condition_hashes = {}
++            generated_hashes = {}
++            if isinstance(image3f_evidence, dict):
++                condition_hashes = image3f_evidence.get(
++                    "first_condition_sha256_by_env", {}
++                )
++                generated_hashes = image3f_evidence.get(
++                    "first_generated_sha256_by_env", {}
++                )
++            records = []
++            for env_id in range(self.env.num_envs):
++                if env_id not in fixed_seed_episode_records:
++                    raise RuntimeError(
++                        "fixed-seed evaluation is missing the first episode for "
++                        f"environment {env_id}"
++                    )
++                record = fixed_seed_episode_records[env_id]
++                condition_sha256 = condition_hashes.get(str(env_id))
++                generated_sha256 = generated_hashes.get(str(env_id))
++                identity = {
++                    "seed": int(self.local_seed),
++                    "env_index": int(env_id),
++                    "first_condition_sha256": condition_sha256,
++                }
++                record["seed"] = int(self.local_seed)
++                record["first_condition_sha256"] = condition_sha256
++                record["first_generated_sha256"] = generated_sha256
++                record["scenario_id"] = hashlib.sha256(
++                    json.dumps(
++                        identity,
++                        sort_keys=True,
++                        separators=(",", ":"),
++                    ).encode("utf-8")
++                ).hexdigest()
++                records.append(record)
++            eval_dict["_roborender_fixed_seed_episodes"] = records
++
+         print(f"Eval time: {end_time - start_time} seconds")
+         print(f"Collected {eval_dict['collected_episodes']} episodes")
+         print(f"Average goal reached rate: {eval_dict['goal_reached_rate']:.3f}")
+@@ -847,4 +943,6 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+         self.cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float32, device=device)
+         self.cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.int32, device=device)
+ 
+-        return None
++        # Returning the same mapping that is written above lets the fail-closed
++        # evaluator adapter persist provenance without source-specific scraping.
++        return eval_dict
+diff --git a/gr00t/rl/trl/trainer/distill_trainer_videogen.py b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
+index 7b3cae9..09138cd 100644
+--- a/gr00t/rl/trl/trainer/distill_trainer_videogen.py
++++ b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
+@@ -27,9 +27,14 @@ video needs no upscaling; falls back to the ego camera's depth otherwise.
+ from __future__ import annotations
+ 
+ import glob
++import hashlib
++import json
+ import logging as _logging
++import math
+ import os
++import tempfile
+ import time
++from pathlib import Path
+ 
+ import numpy as np
+ import torch
+@@ -38,10 +43,238 @@ import torch.nn.functional as F
+ from gr00t.rl.trl.trainer.distill_trainer_obj_pred_homie_api import (
+     TRLDistillTrainerObjPredHomieAPI,
+ )
++from gr00t.rl.trl.trainer.checkpoint_io import (
++    load_verified_torch_checkpoint,
++    select_rank_checkpoint_sha256,
++)
++from gr00t.rl.utils.policy_view_contract import policy_view_count_for_trainer
+ 
+ logger = _logging.getLogger(__name__)
+ 
+ VIDEO_MODEL_CHUNK = 81
++IMAGE_DAGGER_RESUME_SCHEMA = 1
++
++
++def _parse_contract_csv(raw, name, cast=str):
++    """Parse a non-empty comma-separated production contract value."""
++    pieces = tuple(piece.strip() for piece in str(raw).split(","))
++    if not pieces or any(not piece for piece in pieces):
++        raise RuntimeError(f"production gate failed: invalid {name}: {raw!r}")
++    try:
++        return tuple(cast(piece) for piece in pieces)
++    except (TypeError, ValueError) as exc:
++        raise RuntimeError(
++            f"production gate failed: invalid {name}: {raw!r}"
++        ) from exc
++
++
++def _image3f_payload_sha256(*, views, groups, prompt=None, seed=None):
++    """Content-address one ordered Image3F condition or generated triplet."""
++    digest = hashlib.sha256()
++    if prompt is not None:
++        encoded = str(prompt).encode("utf-8")
++        digest.update(b"prompt\0" + len(encoded).to_bytes(8, "big") + encoded)
++    if seed is not None:
++        digest.update(b"seed\0" + str(int(seed)).encode("ascii"))
++    for group_name, arrays in groups:
++        digest.update(str(group_name).encode("utf-8") + b"\0")
++        for view in views:
++            value = np.ascontiguousarray(arrays[view])
++            name = str(view).encode("utf-8")
++            shape = ",".join(str(int(v)) for v in value.shape).encode("ascii")
++            dtype = value.dtype.str.encode("ascii")
++            digest.update(len(name).to_bytes(8, "big") + name)
++            digest.update(len(shape).to_bytes(8, "big") + shape)
++            digest.update(len(dtype).to_bytes(8, "big") + dtype)
++            digest.update(value.tobytes(order="C"))
++    return digest.hexdigest()
++
++
++def _enforce_policy_view_contract(
++    actual_views,
++    configured_count,
++    actual_layout,
++    actual_shape,
++    *,
++    expected_views=None,
++    expected_count=None,
++    expected_layout=None,
++    expected_shape=None,
++):
++    """Fail closed when an enabled production three-view contract differs.
++
++    Keeping this gate opt-in preserves historical/smoke configurations.  The
++    production launcher enables every field, making view order, config count,
++    tiling layout, and the tensor consumed by the policy one atomic contract.
++    """
++    if expected_views is not None:
++        expected = _parse_contract_csv(expected_views, "policy views")
++        actual = tuple(str(view) for view in actual_views)
++        if actual != expected:
++            raise RuntimeError(
++                "production gate failed: policy views mismatch "
++                f"(expected {expected}, got {actual})"
++            )
++
++    if expected_count is not None:
++        parsed = _parse_contract_csv(expected_count, "policy view count", int)
++        if len(parsed) != 1 or parsed[0] <= 0:
++            raise RuntimeError(
++                f"production gate failed: invalid policy view count: {expected_count!r}"
++            )
++        expected = parsed[0]
++        try:
++            actual = int(configured_count)
++        except (TypeError, ValueError) as exc:
++            raise RuntimeError(
++                "production gate failed: policy view count is missing or invalid"
++            ) from exc
++        if actual != expected or len(tuple(actual_views)) != expected:
++            raise RuntimeError(
++                "production gate failed: policy view count mismatch "
++                f"(expected {expected}, configured {actual}, views {len(tuple(actual_views))})"
++            )
++
++    if expected_layout is not None:
++        expected = str(expected_layout).strip()
++        if not expected:
++            raise RuntimeError("production gate failed: invalid policy view layout")
++        actual = None if actual_layout is None else str(actual_layout).strip()
++        if actual != expected:
++            raise RuntimeError(
++                "production gate failed: policy view layout mismatch "
++                f"(expected {expected!r}, got {actual!r})"
++            )
++
++    if expected_shape is not None:
++        expected = _parse_contract_csv(expected_shape, "policy image shape", int)
++        if len(expected) != 3 or any(dim <= 0 for dim in expected):
++            raise RuntimeError(
++                f"production gate failed: invalid policy image shape: {expected_shape!r}"
++            )
++        actual = None if actual_shape is None else tuple(int(dim) for dim in actual_shape)
++        if actual != expected:
++            raise RuntimeError(
++                "production gate failed: policy image shape mismatch "
++                f"(expected {expected}, got {actual})"
++            )
++
++
++def _sha256_named_parameters(named_parameters):
++    """Return a bit-exact, ordering-stable SHA-256 for model parameters."""
++    digest = hashlib.sha256()
++    count = 0
++    for name, parameter in sorted(named_parameters, key=lambda item: item[0]):
++        tensor = parameter.detach().contiguous().to(device="cpu")
++        metadata = json.dumps(
++            {
++                "name": str(name),
++                "dtype": str(tensor.dtype),
++                "shape": list(tensor.shape),
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++        payload = tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C")
++        digest.update(len(metadata).to_bytes(8, "big"))
++        digest.update(metadata)
++        digest.update(len(payload).to_bytes(8, "big"))
++        digest.update(payload)
++        count += 1
++    if count == 0:
++        raise RuntimeError("DDP sync verification found no policy parameters")
++    return digest.hexdigest(), count
++
++
++def _decode_rank_digests(gathered_values, world_size, digest_size=32):
++    """Decode gathered SHA-256 bytes and reject any cross-rank mismatch."""
++    payload = bytes(int(value) for value in gathered_values)
++    expected_bytes = int(world_size) * int(digest_size)
++    if len(payload) != expected_bytes:
++        raise RuntimeError(
++            "DDP sync verification gathered an invalid digest payload: "
++            f"expected {expected_bytes} bytes, got {len(payload)}"
++        )
++    rank_digests = tuple(
++        payload[offset : offset + digest_size].hex()
++        for offset in range(0, len(payload), digest_size)
++    )
++    if len(set(rank_digests)) != 1:
++        prefixes = [value[:12] for value in rank_digests]
++        raise RuntimeError(
++            "DDP sync verification failed: policy parameters differ across "
++            f"ranks (SHA-256 prefixes={prefixes})"
++        )
++    return rank_digests
++
++
++def _parse_dump_bounds(max_steps_raw=None, max_envs_raw=None):
++    """Parse bounded diagnostic output limits; ``None`` envs means all."""
++    try:
++        max_steps = 15 if max_steps_raw is None else int(max_steps_raw)
++        max_envs = None if max_envs_raw is None else int(max_envs_raw)
++    except (TypeError, ValueError) as exc:
++        raise RuntimeError(
++            "IMAGE_DAGGER_DUMP_MAX_STEPS and IMAGE_DAGGER_DUMP_MAX_ENVS "
++            "must be non-negative integers"
++        ) from exc
++    if max_steps < 0 or (max_envs is not None and max_envs < 0):
++        raise RuntimeError(
++            "IMAGE_DAGGER_DUMP_MAX_STEPS and IMAGE_DAGGER_DUMP_MAX_ENVS "
++            "must be non-negative integers"
++        )
++    return max_steps, max_envs
++
++
++def _parse_boolean_gate(raw, name):
++    """Parse an opt-in boolean environment gate without truthy ambiguity."""
++    if raw is None:
++        return False
++    normalized = str(raw).strip().lower()
++    if normalized in {"1", "true", "yes"}:
++        return True
++    if normalized in {"0", "false", "no"}:
++        return False
++    raise RuntimeError(f"{name} must be a boolean value")
++
++
++def _finite_nonnegative_loss_mean(values):
++    """Validate every gathered loss value before returning their mean."""
++    losses = tuple(float(value) for value in values)
++    if not losses:
++        raise RuntimeError("DAgger BC loss verification gathered no loss values")
++    if not all(math.isfinite(value) for value in losses):
++        raise RuntimeError(
++            "DAgger BC loss verification failed: non-finite loss detected"
++        )
++    if any(value < 0.0 for value in losses):
++        raise RuntimeError(
++            "DAgger BC loss verification failed: negative loss detected"
++        )
++    return math.fsum(losses) / len(losses)
++
++
++def _atomic_write_json(path, document):
++    """Durably replace one JSON marker without exposing a partial file."""
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
++    temporary = Path(temporary_name)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as handle:
++            json.dump(document, handle, indent=2, sort_keys=True, allow_nan=False)
++            handle.write("\n")
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
++        try:
++            os.fsync(directory_fd)
++        finally:
++            os.close(directory_fd)
++    finally:
++        if temporary.exists():
++            temporary.unlink()
+ 
+ 
+ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -50,6 +283,31 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+     def _init_trl(self, *args, **kwargs):
+         super()._init_trl(*args, **kwargs)
+ 
++        # FAST_ROBORENDER_DDP_SYNC_GATE_V1
++        _ddp_gate = os.environ.get("IMAGE_DAGGER_VERIFY_DDP_SYNC")
++        if _ddp_gate is None:
++            self._verify_ddp_sync = False
++        elif _ddp_gate.lower() in {"1", "true", "yes"}:
++            self._verify_ddp_sync = True
++        elif _ddp_gate.lower() in {"0", "false", "no"}:
++            self._verify_ddp_sync = False
++        else:
++            raise RuntimeError(
++                "IMAGE_DAGGER_VERIFY_DDP_SYNC must be a boolean value"
++            )
++        self._ddp_sync_verified = False
++        self._ddp_sync_digest = None
++        self._ddp_sync_parameter_count = 0
++        # FAST_ROBORENDER_FINITE_BC_LOSS_GATE_V1
++        self._require_finite_bc_loss = _parse_boolean_gate(
++            os.environ.get("IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS"),
++            "IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS",
++        )
++        self._id_dump_max_steps, self._id_dump_max_envs = _parse_dump_bounds(
++            os.environ.get("IMAGE_DAGGER_DUMP_MAX_STEPS"),
++            os.environ.get("IMAGE_DAGGER_DUMP_MAX_ENVS"),
++        )
++
+         vg = self.config.get("videogen", {})
+         self.vg_mode = vg.get("mode", "online")
+         assert self.vg_mode in ("online", "collect", "offline", "image_dagger")
+@@ -134,12 +392,19 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         if self.vg_enabled and self.vg_mode == "image_dagger":
+             from gr00t.rl.utils.image3f_frame_client import Image3FFrameClient
+ 
+-            self._id_endpoint_files = vg.get(
+-                "image3f_endpoint_files",
+-                ["/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/runtime/endpoints/image3f_server_endpoint.txt"])
++            self._id_endpoint_files = list(vg.get("image3f_endpoint_files") or [])
++            if not self._id_endpoint_files:
++                raise ValueError(
++                    "algo.config.videogen.image3f_endpoint_files is required "
++                    "for image_dagger mode"
++                )
+             self._id_env_clients = None  # one client per env, built lazily
+-            self.vg_anchor_pool_dir = vg.get(
+-                "anchor_pool_dir", "/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale/assets/anchor_pool_2048")
++            self.vg_anchor_pool_dir = vg.get("anchor_pool_dir")
++            if not self.vg_anchor_pool_dir:
++                raise ValueError(
++                    "algo.config.videogen.anchor_pool_dir is required "
++                    "for image_dagger mode"
++                )
+             self.vg_anchor_index = int(vg.get("anchor_index", 0))
+             # fraction of episodes (per env) trained on RAW ray-traced obs
+             # instead of generated obs — anti-forgetting mix
+@@ -147,12 +412,75 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+             self._id_use_raytraced = None
+             self._id_anchor_files = sorted(
+                 glob.glob(os.path.join(self.vg_anchor_pool_dir, "*.npz")))
+-            assert self._id_anchor_files, f"no anchors in {self.vg_anchor_pool_dir}"
++            if not self._id_anchor_files:
++                raise FileNotFoundError(
++                    f"no Image3F anchor .npz files in {self.vg_anchor_pool_dir}"
++                )
+             self._id_anchors = None      # per-env dict view->HxWx3
+             self._id_prompts = None      # per-env str
+             self._id_rng = np.random.RandomState(self.vg_seed)
+             self._id_gen_ms = []
+-
++            # FAST_ROBORENDER_SCALING_V1: explicit ordered stream metadata
++            self.vg_reference_lag = int(vg.get("reference_lag", 0))
++            self._id_rank = int(getattr(self.accelerator, "process_index", 0))
++            self._id_episode_ids = None
++            self._id_episode_steps = None
++            # FAST_ROBORENDER_PRODUCTION_GATES_V2
++            _gate_primary = os.environ.get('IMAGE_DAGGER_EXPECT_PRIMARY_VIEW')
++            if _gate_primary and str(self.vg_primary_view) != _gate_primary:
++                raise RuntimeError('production gate failed: primary view mismatch')
++            _expected_policy_view_count = os.environ.get(
++                'IMAGE_DAGGER_EXPECT_POLICY_VIEW_COUNT'
++            )
++            _configured_policy_view_count = policy_view_count_for_trainer(
++                self.env, _expected_policy_view_count
++            )
++            _enforce_policy_view_contract(
++                self._policy_views,
++                _configured_policy_view_count,
++                getattr(_cams, 'policy_view_layout', None),
++                getattr(self, 'camera_resolution', None),
++                expected_views=os.environ.get('IMAGE_DAGGER_EXPECT_POLICY_VIEWS'),
++                expected_count=_expected_policy_view_count,
++                expected_layout=os.environ.get('IMAGE_DAGGER_EXPECT_POLICY_VIEW_LAYOUT'),
++                expected_shape=os.environ.get('IMAGE_DAGGER_EXPECT_POLICY_IMAGE_SHAPE'),
++            )
++            _gate_rollout_source = os.environ.get('IMAGE_DAGGER_EXPECT_ROLLOUT_ACTION_SOURCE')
++            if _gate_rollout_source is not None and str(getattr(self, 'vg_rollout_action_source', None)) != _gate_rollout_source:
++                raise RuntimeError('production gate failed: rollout action source mismatch')
++            _gate_beta_schedule = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_SCHEDULE')
++            if _gate_beta_schedule is not None and str(getattr(self, 'vg_beta_schedule', None)) != _gate_beta_schedule:
++                raise RuntimeError('production gate failed: beta schedule mismatch')
++            _gate_beta_start = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_START')
++            if _gate_beta_start is not None and abs(float(getattr(self, 'vg_beta_start', -1.0)) - float(_gate_beta_start)) > 1e-9:
++                raise RuntimeError('production gate failed: beta start mismatch')
++            _gate_beta_end = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_END')
++            if _gate_beta_end is not None and abs(float(getattr(self, 'vg_beta_end', -1.0)) - float(_gate_beta_end)) > 1e-9:
++                raise RuntimeError('production gate failed: beta end mismatch')
++            _gate_warmup = os.environ.get('IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS')
++            if _gate_warmup is not None and int(self.config.get('rollout_with_teacher_num_steps', -1)) != int(_gate_warmup):
++                raise RuntimeError('production gate failed: teacher warmup mismatch')
++            _gate_enforce = os.environ.get('IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER')
++            if _gate_enforce is not None:
++                _gate_enforce_bool = _gate_enforce.lower() == 'true'
++                if bool(self.config.get('enforce_teacher_rollout', False)) != _gate_enforce_bool:
++                    raise RuntimeError('production gate failed: behavior source mismatch')
++            _gate_ratio = os.environ.get('IMAGE_DAGGER_EXPECT_TEACHER_RATIO')
++            if _gate_ratio is not None and abs(float(self.config.get('ratio_teacher_rollout', -1.0)) - float(_gate_ratio)) > 1e-9:
++                raise RuntimeError('production gate failed: teacher ratio mismatch')
++            _gate_epochs = os.environ.get('IMAGE_DAGGER_EXPECT_LEARNING_EPOCHS')
++            if _gate_epochs is not None and int(self.config.get('num_learning_epochs', -1)) != int(_gate_epochs):
++                raise RuntimeError('production gate failed: learning epochs mismatch')
++            _gate_value_loss = os.environ.get('IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF')
++            if _gate_value_loss is not None and abs(float(self.config.get('value_loss_coef', -1.0)) - float(_gate_value_loss)) > 1e-12:
++                raise RuntimeError('production gate failed: value loss coefficient mismatch')
++            _gate_entropy = os.environ.get('IMAGE_DAGGER_EXPECT_ENTROPY_COEF')
++            if _gate_entropy is not None and abs(float(self.config.get('entropy_coef', -1.0)) - float(_gate_entropy)) > 1e-12:
++                raise RuntimeError('production gate failed: entropy coefficient mismatch')
++            # FAST_ROBORENDER_DAGGER_TELEMETRY_V1
++            from gr00t.rl.utils.dagger_telemetry import DaggerTelemetry
++            self._id_telemetry_step = 0
++            self._id_telemetry = DaggerTelemetry.from_environment(rank=self._id_rank)
+         if self.vg_mode == "collect":
+             assert self.vg_collect_dir, "videogen.collect_dir required in collect mode"
+             os.makedirs(self.vg_collect_dir, exist_ok=True)
+@@ -192,6 +520,359 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         # earlier chunks, and so the renderer can group same-env sequences.
+         self._vg_run_tag = os.environ.get("SLURM_JOB_ID", "local")
+ 
++    def _rank_resume_state_path(self, checkpoint_step: int) -> Path:
++        """Return the immutable per-rank runtime state paired with a checkpoint."""
++
++        run_dir = os.environ.get("TRAIN_RUN_DIR") or str(self.log_dir)
++        return (
++            Path(run_dir).expanduser().resolve()
++            / "resume_state"
++            / f"rank_{self._id_rank:04d}_step_{int(checkpoint_step):09d}.pt"
++        )
++
++    def _image_dagger_runtime_state(self, checkpoint_step: int) -> dict:
++        """Capture non-model state that differs on every distributed rank."""
++
++        episode_ids = (
++            None if self._id_episode_ids is None else self._id_episode_ids.copy()
++        )
++        episode_steps = (
++            None if self._id_episode_steps is None else self._id_episode_steps.copy()
++        )
++        return {
++            "schema_version": IMAGE_DAGGER_RESUME_SCHEMA,
++            "checkpoint_step": int(checkpoint_step),
++            "rank": int(self._id_rank),
++            "world_size": int(getattr(self.accelerator, "num_processes", 1)),
++            "local_num_envs": int(self.env.num_envs),
++            "rollout_steps": int(self.num_steps_per_env),
++            "beta_iteration": int(self._beta_iter),
++            "telemetry_step": int(self._id_telemetry_step),
++            "rng_state": self._id_rng.get_state(),
++            "episode_ids": episode_ids,
++            "episode_steps": episode_steps,
++            "vg_rollout_counter": int(self._vg_rollout_counter),
++            "vg_total_gen_time": float(self._vg_total_gen_time),
++            "vg_total_chunks": int(self._vg_total_chunks),
++            "vg_saved_chunks": int(self._vg_saved_chunks),
++        }
++
++    def _sync_image_dagger_checkpoint_state(self, payload: dict) -> None:
++        """Expose rank-zero runtime provenance in the ordinary trainer state."""
++
++        self.state.image_dagger_resume_schema = int(payload["schema_version"])
++        self.state.image_dagger_beta_iteration = int(payload["beta_iteration"])
++        self.state.image_dagger_telemetry_step = int(payload["telemetry_step"])
++        self.state.image_dagger_runtime_rank = int(payload["rank"])
++        self.state.image_dagger_runtime_world_size = int(payload["world_size"])
++
++    def _persist_image_dagger_runtime_state(self, checkpoint_step: int) -> Path:
++        """Atomically persist this rank's restart state before the DDP update."""
++
++        payload = self._image_dagger_runtime_state(checkpoint_step)
++        if payload["beta_iteration"] != int(checkpoint_step):
++            raise RuntimeError(
++                "Image3F resume state beta iteration is not aligned with the "
++                f"next checkpoint step ({payload['beta_iteration']} != {checkpoint_step})"
++            )
++        expected_telemetry = int(checkpoint_step) * int(self.num_steps_per_env)
++        if payload["telemetry_step"] != expected_telemetry:
++            raise RuntimeError(
++                "Image3F resume telemetry is not aligned with the next checkpoint: "
++                f"{payload['telemetry_step']} != {expected_telemetry}"
++            )
++        path = self._rank_resume_state_path(checkpoint_step)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        descriptor, temporary_name = tempfile.mkstemp(
++            prefix=f".{path.name}.", dir=path.parent
++        )
++        os.close(descriptor)
++        try:
++            torch.save(payload, temporary_name)
++            with open(temporary_name, "rb") as handle:
++                os.fsync(handle.fileno())
++            os.replace(temporary_name, path)
++            directory_fd = os.open(
++                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
++            )
++            try:
++                os.fsync(directory_fd)
++            finally:
++                os.close(directory_fd)
++        finally:
++            if os.path.exists(temporary_name):
++                os.unlink(temporary_name)
++        self._sync_image_dagger_checkpoint_state(payload)
++        return path
++
++    def _restore_image_dagger_runtime_state(self, checkpoint_step: int) -> None:
++        """Restore this rank's runtime stream state and reject partial resumes."""
++
++        path = self._rank_resume_state_path(checkpoint_step)
++        world_size = int(getattr(self.accelerator, "num_processes", 1))
++        production_resume = (
++            bool(getattr(self, "resume_mode", False))
++            and os.environ.get("RUN_PROFILE") == "production_256x300"
++        )
++        expected_runtime_sha256 = select_rank_checkpoint_sha256(
++            os.environ.get("EXPECTED_IMAGE_DAGGER_RUNTIME_SHA256S"),
++            rank=int(self._id_rank),
++            world_size=world_size,
++            required=production_resume,
++        )
++        payload, _runtime_sha256 = load_verified_torch_checkpoint(
++            torch,
++            path,
++            map_location="cpu",
++            expected_sha256=expected_runtime_sha256,
++            require_expected_sha256=production_resume,
++        )
++        if not isinstance(payload, dict):
++            raise RuntimeError(f"Image3F resume state is malformed: {path}")
++        expected = {
++            "schema_version": IMAGE_DAGGER_RESUME_SCHEMA,
++            "checkpoint_step": int(checkpoint_step),
++            "rank": int(self._id_rank),
++            "world_size": world_size,
++            "local_num_envs": int(self.env.num_envs),
++            "rollout_steps": int(self.num_steps_per_env),
++            "beta_iteration": int(checkpoint_step),
++            "telemetry_step": int(checkpoint_step) * int(self.num_steps_per_env),
++        }
++        for key in expected:
++            value = payload.get(key)
++            if type(value) is not int:
++                raise RuntimeError(
++                    f"Image3F resume state field {key!r} is not a true integer"
++                )
++        mismatches = {
++            key: (payload.get(key), value)
++            for key, value in expected.items()
++            if payload.get(key) != value
++        }
++        if mismatches:
++            raise RuntimeError(
++                f"Image3F resume state contract mismatch in {path}: {mismatches}"
++            )
++        for key in ("rng_state", "episode_ids", "episode_steps"):
++            if key not in payload:
++                raise RuntimeError(
++                    f"Image3F resume state is missing required field {key!r}"
++                )
++        episode_ids = payload["episode_ids"]
++        episode_steps = payload["episode_steps"]
++        if checkpoint_step > 0 and (episode_ids is None or episode_steps is None):
++            raise RuntimeError("Image3F resume state has no per-environment stream counters")
++        if episode_ids is not None:
++            episode_ids = np.asarray(episode_ids, dtype=np.int64)
++            episode_steps = np.asarray(episode_steps, dtype=np.int64)
++            if episode_ids.shape != (self.env.num_envs,) or episode_steps.shape != (
++                self.env.num_envs,
++            ):
++                raise RuntimeError(
++                    "Image3F resume stream counter shape does not match local environments"
++                )
++            # A new Isaac process resets physics, so each stream starts a new
++            # episode.  Incrementing the durable ID prevents server replay of
++            # a pre-restart (episode, step) request.
++            self._id_episode_ids = episode_ids + 1
++            self._id_episode_steps = np.zeros_like(episode_steps)
++        self._id_rng.set_state(payload["rng_state"])
++        self._beta_iter = int(payload["beta_iteration"])
++        self._id_telemetry_step = int(payload["telemetry_step"])
++        self._vg_rollout_counter = int(payload.get("vg_rollout_counter", checkpoint_step))
++        self._vg_total_gen_time = float(payload.get("vg_total_gen_time", 0.0))
++        self._vg_total_chunks = int(payload.get("vg_total_chunks", 0))
++        self._vg_saved_chunks = int(payload.get("vg_saved_chunks", 0))
++        self._id_anchors = None
++        self._id_prompts = None
++        self._id_use_raytraced = None
++        restored = self._image_dagger_runtime_state(checkpoint_step)
++        self._sync_image_dagger_checkpoint_state(restored)
++
++    def load_checkpoint(self, checkpoint_path):
++        checkpoint = super().load_checkpoint(checkpoint_path)
++        if (
++            bool(getattr(self, "resume_mode", False))
++            and self.vg_enabled
++            and self.vg_mode == "image_dagger"
++        ):
++            self._restore_image_dagger_runtime_state(int(self.state.global_step))
++        return checkpoint
++
++    def _verify_dagger_bc_loss(self):
++        """Fail closed on invalid cross-rank BC loss and attest this update."""
++        run_dir_raw = os.environ.get("TRAIN_RUN_DIR")
++        if not run_dir_raw:
++            raise RuntimeError(
++                "IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS requires TRAIN_RUN_DIR"
++            )
++        run_dir = Path(run_dir_raw)
++        if not run_dir.is_absolute():
++            raise RuntimeError(
++                "IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS requires an absolute "
++                "TRAIN_RUN_DIR"
++            )
++
++        local_losses = self.dagger_bc_loss_stats.detach().reshape(-1)
++        gathered_losses = self.accelerator.gather(local_losses).reshape(-1)
++        loss = _finite_nonnegative_loss_mean(
++            gathered_losses.to(device="cpu", dtype=torch.float64).tolist()
++        )
++        world_size = int(self.accelerator.num_processes)
++        if world_size <= 0:
++            raise RuntimeError("DAgger BC loss verification found invalid world size")
++        update_index = int(getattr(self.state, "global_step", 0)) + 1
++        marker = {
++            "schema": "fast_roborender.dagger_bc_loss.v1",
++            "update": update_index,
++            "world_size": world_size,
++            "loss": loss,
++            "finite_verified": True,
++            "nonnegative_verified": True,
++        }
++
++        marker_error = None
++        marker_ok = 1
++        if int(self.accelerator.process_index) == 0:
++            marker_path = (
++                run_dir
++                / "validation"
++                / f"dagger_bc_loss_step_{update_index:09d}.json"
++            )
++            try:
++                _atomic_write_json(marker_path, marker)
++            except Exception as exc:
++                marker_ok = 0
++                marker_error = exc
++
++        marker_status = torch.tensor(
++            [marker_ok], dtype=torch.uint8, device=self.accelerator.device
++        )
++        gathered_status = self.accelerator.gather(marker_status).reshape(-1)
++        if int(torch.min(gathered_status).item()) != 1:
++            message = (
++                "DAgger BC loss verification could not write the rank-0 JSON marker"
++            )
++            if marker_error is not None:
++                raise RuntimeError(message) from marker_error
++            raise RuntimeError(message)
++
++        logger.info(
++            "DAgger BC loss verified after update %d across %d ranks: %.9g",
++            update_index,
++            world_size,
++            loss,
++        )
++        return {
++            "production/dagger_bc_loss_finite_verified": 1.0,
++            "production/dagger_bc_loss_nonnegative_verified": 1.0,
++            "production/dagger_bc_loss_world_size": float(world_size),
++            "production/dagger_bc_loss": loss,
++        }
++
++    def _verify_ddp_policy_parameter_sync(self):
++        """Bit-compare policy parameters once after the first optimizer update."""
++        if self._ddp_sync_verified:
++            return {
++                "production/ddp_policy_sync_verified": 1.0,
++                "production/ddp_policy_sync_world_size": float(
++                    self.accelerator.num_processes
++                ),
++                "production/ddp_policy_parameter_count": float(
++                    self._ddp_sync_parameter_count
++                ),
++            }
++
++        run_dir_raw = os.environ.get("TRAIN_RUN_DIR")
++        if not run_dir_raw:
++            raise RuntimeError(
++                "IMAGE_DAGGER_VERIFY_DDP_SYNC requires TRAIN_RUN_DIR"
++            )
++        run_dir = Path(run_dir_raw)
++        if not run_dir.is_absolute():
++            raise RuntimeError(
++                "IMAGE_DAGGER_VERIFY_DDP_SYNC requires an absolute TRAIN_RUN_DIR"
++            )
++
++        model = self.accelerator.unwrap_model(self.model)
++        policy = getattr(model, "policy", None)
++        if policy is None:
++            raise RuntimeError("DDP sync verification cannot locate unwrapped policy")
++        digest_hex, parameter_count = _sha256_named_parameters(
++            policy.named_parameters()
++        )
++        digest_tensor = torch.tensor(
++            list(bytes.fromhex(digest_hex)),
++            dtype=torch.uint8,
++            device=self.accelerator.device,
++        )
++        gathered = self.accelerator.gather(digest_tensor).reshape(-1)
++        world_size = int(self.accelerator.num_processes)
++        _decode_rank_digests(
++            gathered.to("cpu").reshape(-1).tolist(),
++            world_size,
++            hashlib.sha256().digest_size,
++        )
++
++        update_index = int(getattr(self.state, "global_step", 0)) + 1
++        marker = {
++            "schema": "fast_roborender.ddp_policy_sync.v1",
++            "verified": True,
++            "optimizer_update": update_index,
++            "world_size": world_size,
++            "policy_parameter_count": parameter_count,
++            "policy_parameters_sha256": digest_hex,
++        }
++        marker_error = None
++        marker_ok = 1
++        if int(self.accelerator.process_index) == 0:
++            marker_path = (
++                run_dir
++                / "validation"
++                / f"ddp_policy_sync_step_{update_index:09d}.json"
++            )
++            try:
++                _atomic_write_json(marker_path, marker)
++            except Exception as exc:
++                marker_ok = 0
++                marker_error = exc
++
++        marker_status = torch.tensor(
++            [marker_ok], dtype=torch.uint8, device=self.accelerator.device
++        )
++        gathered_status = self.accelerator.gather(marker_status).reshape(-1)
++        if int(torch.min(gathered_status).item()) != 1:
++            message = "DDP sync verification could not write the rank-0 JSON marker"
++            if marker_error is not None:
++                raise RuntimeError(message) from marker_error
++            raise RuntimeError(message)
++
++        self._ddp_sync_verified = True
++        self._ddp_sync_digest = digest_hex
++        self._ddp_sync_parameter_count = parameter_count
++        logger.info(
++            "DDP policy sync verified after optimizer update %d across %d ranks: %s",
++            update_index,
++            world_size,
++            digest_hex,
++        )
++        return {
++            "production/ddp_policy_sync_verified": 1.0,
++            "production/ddp_policy_sync_world_size": float(world_size),
++            "production/ddp_policy_parameter_count": float(parameter_count),
++        }
++
++    def _get_train_metrics(self):
++        finite_bc_metrics = {}
++        if self._require_finite_bc_loss:
++            finite_bc_metrics = self._verify_dagger_bc_loss()
++        metrics = super()._get_train_metrics()
++        metrics.update(finite_bc_metrics)
++        if self._verify_ddp_sync:
++            metrics.update(self._verify_ddp_policy_parameter_sync())
++        return metrics
++
+     # ------------------------------------------------------------------ rollout
+     def _get_depth_frame(self) -> torch.Tensor:
+         hi = None
+@@ -200,6 +881,33 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         depth = hi if hi is not None else self.env.simulator.get_depth_image()
+         return depth[..., :1].detach().to("cpu", torch.float32)
+ 
++    def _reset_image3f_fixed_eval_evidence(self):
++        self._image3f_eval_generated_policy_steps = 0
++        self._image3f_eval_generated_frames = 0
++        self._image3f_eval_first_condition_sha256 = {}
++        self._image3f_eval_first_generated_sha256 = {}
++
++    def _get_image3f_fixed_eval_evidence(self):
++        return {
++            "schema": "fast_roborender.image3f_fixed_eval_runtime.v1",
++            "eval_relabel_enabled": os.environ.get("IMAGE_DAGGER_EVAL_RELABEL")
++            == "1",
++            "raytraced_mix_prob": float(self.vg_raytraced_mix_prob),
++            "reference_lag": int(self.vg_reference_lag),
++            "generation_seed": int(self.vg_seed),
++            "policy_views": list(self._policy_views),
++            "generated_policy_steps": int(
++                self._image3f_eval_generated_policy_steps
++            ),
++            "generated_frames": int(self._image3f_eval_generated_frames),
++            "first_condition_sha256_by_env": dict(
++                self._image3f_eval_first_condition_sha256
++            ),
++            "first_generated_sha256_by_env": dict(
++                self._image3f_eval_first_generated_sha256
++            ),
++        }
++
+     def policy_step(self, policy_model, obs_dict, cur_dones=None):
+         if (not self._in_train_rollout and self.vg_enabled
+                 and self.vg_mode == "image_dagger"
+@@ -330,6 +1038,13 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         if self._id_anchors is None:
+             self._id_anchors = [None] * B
+             self._id_prompts = [None] * B
++            if self._id_episode_ids is None:
++                self._id_episode_ids = np.zeros(B, dtype=np.int64)
++                self._id_episode_steps = np.zeros(B, dtype=np.int64)
++            elif self._id_episode_ids.shape != (B,) or self._id_episode_steps.shape != (B,):
++                raise RuntimeError(
++                    "restored Image3F stream counters do not match the rollout batch"
++                )
+             for b in range(B):
+                 self._id_sample_anchor(b)
+         if cur_dones is not None:
+@@ -337,7 +1052,8 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+             for b in done_idx:
+                 if b < B:
+                     self._id_sample_anchor(b)
+-
++                    self._id_episode_ids[b] += 1
++                    self._id_episode_steps[b] = 0
+         cam_h, cam_w = int(self.camera_resolution[0]), int(self.camera_resolution[1])
+         t0 = time.perf_counter()
+         vision = obs_dict["vision_obs"]
+@@ -374,15 +1090,72 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         def _render(b):
+             depth_d, mask_d, prev_d = reqs[b]
+             return self._id_env_clients[b].render_frame(
+-                depth_d, mask_d, prev_d, prompt=self._id_prompts[b], seed=self.vg_seed)
+-
++                depth_d, mask_d, prev_d, prompt=self._id_prompts[b],
++                seed=self.vg_seed,
++                stream_id=(f"{os.environ.get('IMAGE3F_RUN_ID', 'run')}:"
++                           f"rank{self._id_rank}:env{self._id_rank * B + b}"),
++                episode_id=int(self._id_episode_ids[b]),
++                step=int(self._id_episode_steps[b]),
++                reference_lag=self.vg_reference_lag,
++                trainer_step=int(self._id_telemetry_step))
+         gens = {}
+         if gen_envs:
+             with ThreadPoolExecutor(max_workers=len(gen_envs)) as pool:
+                 for b, g in zip(gen_envs, pool.map(_render, gen_envs)):
+                     gens[b] = g
+-
++        if not self._in_train_rollout:
++            self._image3f_eval_generated_policy_steps += 1
++            self._image3f_eval_generated_frames += len(gens)
++            for b in gen_envs:
++                key = str(int(b))
++                if key not in self._image3f_eval_first_condition_sha256:
++                    depth_d, mask_d, prev_d = reqs[b]
++                    self._image3f_eval_first_condition_sha256[key] = (
++                        _image3f_payload_sha256(
++                            views=self.vg_view_names,
++                            groups=(
++                                ("depth", depth_d),
++                                ("mask", mask_d),
++                                ("previous_rgb", prev_d),
++                            ),
++                            prompt=self._id_prompts[b],
++                            seed=self.vg_seed,
++                        )
++                    )
++                    self._image3f_eval_first_generated_sha256[key] = (
++                        _image3f_payload_sha256(
++                            views=self.vg_view_names,
++                            groups=(("generated", gens[b]),),
++                        )
++                    )
++        if self._id_telemetry is not None and (
++                not isinstance(gens, dict) or 0 in gens):
++            _id_metadata = dict(getattr(self._id_env_clients[0], 'last_metadata', {}))
++            _id_metadata['parallel_batch_wall_ms'] = (time.perf_counter() - t0) * 1000.0
++            _id_metadata['parallel_batch_size'] = len(gens)
++            try:
++                self._id_telemetry.record(
++                    trainer_step=int(self._id_telemetry_step),
++                    depth=reqs[0][0], mask=reqs[0][1],
++                    client_anchor=reqs[0][2], generated=gens[0],
++                    client_metadata=_id_metadata)
++            except Exception:
++                if os.environ.get('IMAGE_DAGGER_TELEMETRY_REQUIRED', '0').lower() in {'1', 'true', 'yes'}:
++                    raise
++                logger.exception('image_dagger telemetry disabled after write failure')
++                self._id_telemetry = None
++        # Advance only after every environment response succeeded.
++        self._id_episode_steps += 1
++        self._id_telemetry_step += 1
+         dump_dir = os.environ.get("IMAGE_DAGGER_DUMP_DIR")
++        dump_sim_rgb = os.environ.get(
++            "IMAGE_DAGGER_DUMP_SIM_RGB", "0"
++        ).lower() in {"1", "true", "yes"}
++        dump_envs = set(
++            gen_envs
++            if self._id_dump_max_envs is None
++            else gen_envs[: self._id_dump_max_envs]
++        )
+         for b in gen_envs:
+             gen = gens[b]
+             # Match the policy's observation layout: with several policy views the three
+@@ -392,13 +1165,47 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+                 rgb = np.concatenate([gen[v] for v in self._policy_views], axis=0)
+             else:
+                 rgb = gen[self._policy_views[0]]  # 240x416x3 u8
+-            if dump_dir and len(self._id_gen_ms) < 15:
++            if (
++                dump_dir
++                and len(self._id_gen_ms) < self._id_dump_max_steps
++                and b in dump_envs
++            ):
+                 from PIL import Image as _PILImage
+                 os.makedirs(dump_dir, exist_ok=True)
+                 step_i = len(self._id_gen_ms)
+-                panel = np.concatenate(
+-                    [np.stack([reqs[b][0][v]] * 3, -1) for v in self.vg_view_names]
+-                    + [gen[v] for v in self.vg_view_names], axis=1)
++                depth_row = np.concatenate(
++                    [np.stack([reqs[b][0][v]] * 3, -1) for v in self.vg_view_names],
++                    axis=1,
++                )
++                generated_row = np.concatenate(
++                    [gen[v] for v in self.vg_view_names], axis=1
++                )
++                if dump_sim_rgb:
++                    sim_tiles = []
++                    for v in self._policy_views:
++                        sim_rgb = views[v].get("rgb")
++                        if sim_rgb is None:
++                            raise RuntimeError(
++                                "camera diagnostic requested but simulator RGB is "
++                                f"missing for policy view {v}"
++                            )
++                        sim_rgb = sim_rgb[b, ..., :3].detach().to("cpu").numpy()
++                        if sim_rgb.dtype != np.uint8:
++                            if sim_rgb.size and float(np.max(sim_rgb)) <= 1.0:
++                                sim_rgb = sim_rgb * 255.0
++                            sim_rgb = np.clip(sim_rgb, 0, 255).astype(np.uint8)
++                        tile_shape = tuple(reqs[b][0][v].shape[:2])
++                        if sim_rgb.shape[:2] != tile_shape:
++                            sim_rgb = self._resize_seq(
++                                sim_rgb[None, None], list(tile_shape)
++                            )[0, 0].astype(np.uint8)
++                        sim_tiles.append(sim_rgb)
++                    sim_row = np.concatenate(sim_tiles, axis=1)
++                    panel = np.concatenate(
++                        [depth_row, sim_row, generated_row], axis=0
++                    )
++                else:
++                    panel = np.concatenate([depth_row, generated_row], axis=1)
+                 _PILImage.fromarray(panel).save(
+                     os.path.join(dump_dir, f"step{step_i:03d}_env{b}.png"))
+             rgb_t = torch.from_numpy(rgb.copy()).float() / 255.0
+@@ -436,6 +1243,14 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+                 self._videogen_relabel()
+             elif self.vg_mode == "collect":
+                 self._save_collected_chunks()
++        if self.vg_enabled and self.vg_mode == "image_dagger":
++            # This rank-local file is tagged with the checkpoint step that the
++            # optimizer update immediately following this rollout will create.
++            # If that update fails, no matching model checkpoint exists and a
++            # later strict resume ignores the orphaned runtime state.
++            self._persist_image_dagger_runtime_state(
++                int(self.state.global_step) + 1
++            )
+         return out_obs
+ 
+     # --------------------------------------------------------------- conversion
+diff --git a/gr00t/rl/trl/trainer/ppo_trainer.py b/gr00t/rl/trl/trainer/ppo_trainer.py
+index 8d9c4c9..8785a67 100644
+--- a/gr00t/rl/trl/trainer/ppo_trainer.py
++++ b/gr00t/rl/trl/trainer/ppo_trainer.py
+@@ -3,9 +3,12 @@
+ 
+ 
+ from collections import deque
++from collections.abc import Mapping as ABCMapping
+ from copy import deepcopy
+ from typing import Dict, Optional
+ 
++import os
++
+ import pandas as pd
+ import torch
+ import torchvision
+@@ -18,6 +21,7 @@ from trl.trainer.ppo_trainer import *
+ 
+ from gr00t.rl.agents.modules.data_utils import RolloutStorage
+ from gr00t.rl.trl.callbacks.hv_callback_handler import HVCallbackHandler
++from gr00t.rl.trl.trainer.checkpoint_io import load_verified_torch_checkpoint
+ from gr00t.rl.trl.utils.common import wandb_run_exists
+ from gr00t.rl.trl.utils.rl import compute_episode_attnmask
+ from gr00t.rl.trl.utils.scheduler import update_scheduled_params
+@@ -228,11 +232,16 @@ class TRLPPOTrainer(PPOTrainer):
+         peft_config=None,
+         use_ref_model=False,
+         checkpoint=None,
++        resume=False,
+         local_seed=None,
+         schedule_dict=None,
+         accelerator=None,
+     ) -> None:
+         self.accelerator = accelerator
++        self.resume_mode = bool(resume)
++        # Storage setup runs before an optional checkpoint is loaded and uses
++        # this flag to distinguish fresh initialization from restored state.
++        self._checkpoint_loaded = False
+         self._init_trl(
+             args,
+             config,
+@@ -630,8 +639,19 @@ class TRLPPOTrainer(PPOTrainer):
+                 "normalized_actions", shape=(self.num_act,), dtype=torch.float
+             )
+ 
+-        self.state.rewbuffer = deque(maxlen=100)
+-        self.state.lenbuffer = deque(maxlen=100)
++        # A restarted process builds fresh simulator tensors, but cumulative
++        # trainer statistics must not jump back to zero.  Checkpoints restore
++        # these state fields before ``train`` calls this method.
++        if self._checkpoint_loaded:
++            self.state.rewbuffer = deque(
++                getattr(self.state, "rewbuffer", ()), maxlen=100
++            )
++            self.state.lenbuffer = deque(
++                getattr(self.state, "lenbuffer", ()), maxlen=100
++            )
++        else:
++            self.state.rewbuffer = deque(maxlen=100)
++            self.state.lenbuffer = deque(maxlen=100)
+         self.cur_reward_sum = torch.zeros(
+             self.env.num_envs, dtype=torch.float, device=self.accelerator.device
+         )
+@@ -642,10 +662,11 @@ class TRLPPOTrainer(PPOTrainer):
+         self.state.cur_reward_sum = self.cur_reward_sum
+         self.state.cur_episode_length = self.cur_episode_length
+         self.ep_infos = []
+-        self.state.tot_timesteps = 0
+-        self.state.tot_time = 0
+-        self.state.eval_step = 0
+-        self.state.eval_render_step = 0
++        if not self._checkpoint_loaded:
++            self.state.tot_timesteps = 0
++            self.state.tot_time = 0
++            self.state.eval_step = 0
++            self.state.eval_render_step = 0
+ 
+     def policy_step(self, policy_model, obs_dict, cur_dones=None, store_hidden_states=True):
+         actor_obs_dict = deepcopy(obs_dict)
+@@ -1373,7 +1394,24 @@ class TRLPPOTrainer(PPOTrainer):
+         for obs_key in obs_dict.keys():
+             obs_dict[obs_key] = obs_dict[obs_key].to(device)
+ 
+-        for batch_idx in range(1, args.num_total_batches + 1):
++        target_step = int(args.num_total_batches)
++        completed_step = int(self.state.global_step)
++        if completed_step < 0:
++            raise RuntimeError(
++                f"checkpoint global_step must be non-negative, got {completed_step}"
++            )
++        if completed_step > target_step:
++            raise RuntimeError(
++                "checkpoint is newer than the requested absolute training target: "
++                f"checkpoint step {completed_step}, target {target_step}"
++            )
++        accelerator.print(
++            "Training absolute step interval: "
++            f"({completed_step}, {target_step}] "
++            f"({target_step - completed_step} update(s) remaining)"
++        )
++
++        for batch_idx in range(completed_step + 1, target_step + 1):
+             batch_start_time = time.time()
+             self.state.episode += 1 * args.batch_size
+             data = next(iter_dataloader)
+@@ -1587,9 +1625,12 @@ class TRLPPOTrainer(PPOTrainer):
+                 break
+ 
+         if self.control.should_training_stop:
+-            return
++            accelerator.print(
++                f"Training stopped cleanly after absolute step {self.state.global_step}"
++            )
+ 
+-        # HF trainer specifics
++        # HF trainer specifics. This must also run after a callback-requested
++        # graceful interruption so loggers flush and W&B closes cleanly.
+         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+         if self.control.should_save:
+             self._save_checkpoint(model, trial=None, metrics=None)
+@@ -1770,9 +1811,81 @@ class TRLPPOTrainer(PPOTrainer):
+             checkpoint_path (str): Path to the checkpoint file
+         """
+         print(f"Loading checkpoint from {checkpoint_path}")
+-        checkpoint = torch.load(
+-            checkpoint_path, map_location=self.accelerator.device, weights_only=False
++        strict_resume = bool(getattr(self, "resume_mode", False))
++        production_resume = (
++            strict_resume and os.environ.get("RUN_PROFILE") == "production_256x300"
+         )
++        checkpoint, checkpoint_sha256 = load_verified_torch_checkpoint(
++            torch,
++            checkpoint_path,
++            map_location=self.accelerator.device,
++            expected_sha256=os.environ.get("EXPECTED_TRAIN_CHECKPOINT_SHA256"),
++            require_expected_sha256=production_resume,
++        )
++        if not isinstance(checkpoint, dict):
++            raise RuntimeError("checkpoint payload must be a dictionary")
++
++        if strict_resume:
++            if checkpoint.get("checkpoint_schema") != "gr00t.trl.full_state.v2":
++                raise RuntimeError(
++                    "strict resume requires an atomic full-state v2 checkpoint"
++                )
++            required = {
++                "policy_state_dict",
++                "optimizer_state_dict",
++                "lr_scheduler_state_dict",
++                "state",
++                "args",
++                "env_state_dict",
++            }
++            if "actor_model_state_dict" in checkpoint:
++                required.discard("policy_state_dict")
++            missing = sorted(key for key in required if key not in checkpoint)
++            if missing:
++                raise RuntimeError(
++                    f"strict resume checkpoint is missing required fields: {missing}"
++                )
++            saved_state = checkpoint["state"]
++            saved_step_value = (
++                saved_state.get("global_step")
++                if isinstance(saved_state, ABCMapping)
++                else getattr(saved_state, "global_step", None)
++            )
++            if (
++                isinstance(saved_step_value, bool)
++                or not isinstance(saved_step_value, (int, float))
++                or saved_step_value < 0
++                or int(saved_step_value) != saved_step_value
++            ):
++                raise RuntimeError("strict resume checkpoint has invalid global_step")
++            saved_step = int(saved_step_value)
++            optimizer_state = checkpoint.get("optimizer_state_dict")
++            if not isinstance(optimizer_state, ABCMapping):
++                raise RuntimeError("strict resume checkpoint has malformed optimizer state")
++            if not isinstance(optimizer_state.get("state"), ABCMapping):
++                raise RuntimeError("strict resume optimizer state mapping is malformed")
++            if saved_step > 0 and not optimizer_state["state"]:
++                raise RuntimeError(
++                    "strict resume optimizer has no state entries after step zero"
++                )
++            param_groups = optimizer_state.get("param_groups")
++            if not isinstance(param_groups, list) or not param_groups:
++                raise RuntimeError("strict resume optimizer has no parameter groups")
++            if any(not isinstance(group, ABCMapping) for group in param_groups):
++                raise RuntimeError("strict resume optimizer parameter groups are malformed")
++            scheduler_state = checkpoint.get("lr_scheduler_state_dict")
++            if not isinstance(scheduler_state, ABCMapping) or not scheduler_state:
++                raise RuntimeError("strict resume checkpoint has malformed scheduler state")
++            if not isinstance(checkpoint.get("env_state_dict"), ABCMapping):
++                raise RuntimeError("strict resume checkpoint has malformed environment state")
++            saved_args = checkpoint["args"]
++            saved_target = getattr(saved_args, "num_total_batches", None)
++            current_target = getattr(self.args, "num_total_batches", None)
++            if saved_target != current_target:
++                raise RuntimeError(
++                    "strict resume must preserve the checkpoint's absolute target "
++                    f"({saved_target!r} != {current_target!r})"
++                )
+ 
+         # Load model state
+         model = self.accelerator.unwrap_model(self.model)
+@@ -1784,7 +1897,11 @@ class TRLPPOTrainer(PPOTrainer):
+             model.value_model.load_state_dict(checkpoint["value_state_dict"])
+ 
+         # Load optimizer state
+-        if "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
++        if (
++            strict_resume
++            and "optimizer_state_dict" in checkpoint
++            and checkpoint["optimizer_state_dict"] is not None
++        ):
+             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+ 
+             # Update learning rate if available
+@@ -1795,15 +1912,16 @@ class TRLPPOTrainer(PPOTrainer):
+ 
+         # Load learning rate scheduler state
+         if (
+-            "lr_scheduler_state_dict" in checkpoint
++            strict_resume
++            and "lr_scheduler_state_dict" in checkpoint
+             and checkpoint["lr_scheduler_state_dict"] is not None
+         ):
+             self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+ 
+-        if "env_state_dict" in checkpoint:
++        if strict_resume and "env_state_dict" in checkpoint:
+             self.env.load_env_state_dict(checkpoint["env_state_dict"])
+ 
+-        if "state" in checkpoint:
++        if strict_resume and "state" in checkpoint:
+             for key, value in checkpoint["state"].__dict__.items():
+                 if key in ["cur_reward_sum", "cur_episode_length"]:
+                     setattr(self, key, value)
+@@ -1815,7 +1933,21 @@ class TRLPPOTrainer(PPOTrainer):
+                 ]:
+                     setattr(self.state, key, value)
+ 
+-        print(f"Loaded checkpoint from step {self.state.global_step}")
++        try:
++            restored_step = int(self.state.global_step)
++        except (TypeError, ValueError) as exc:
++            raise RuntimeError("checkpoint global_step is not an integer") from exc
++        if restored_step < 0 or restored_step != self.state.global_step:
++            raise RuntimeError(
++                f"checkpoint global_step must be a non-negative integer, got {self.state.global_step!r}"
++            )
++        self._checkpoint_loaded = strict_resume
++
++        load_kind = "strict resume" if strict_resume else "weight warm-start"
++        print(
++            f"Loaded {load_kind} checkpoint from step {self.state.global_step} "
++            f"(sha256={checkpoint_sha256})"
++        )
+         return checkpoint
+ 
+     def eval(self, save_dirpath: Optional[str] = None):
+diff --git a/gr00t/rl/utils/camera_rendering_contract.py b/gr00t/rl/utils/camera_rendering_contract.py
+new file mode 100644
+index 0000000..5b7a6e4
+--- /dev/null
++++ b/gr00t/rl/utils/camera_rendering_contract.py
+@@ -0,0 +1,122 @@
++"""Fail-closed rendering settings for headless Isaac camera workloads.
++
++Isaac Lab applies its rendering-mode preset after the experience file is
++loaded.  Headless camera runs therefore provide NRD-disable settings as early
++Kit command-line arguments, select the performance preset, and verify the
++resolved Carb settings after SimulationContext construction.
++"""
++
++from __future__ import annotations
++
++HEADLESS_CAMERA_RENDERING_MODE = "performance"
++
++ACTIVE_REQUIRED_DISABLED_CARB_SETTINGS = (
++    "/rtx/directLighting/sampledLighting/enabled",
++    "/rtx/directLighting/sampledLighting/autoEnable",
++    "/rtx/directLighting/sampledLighting/enforceDenoiser",
++    "/rtx/directLighting/sampledLighting/irradiance/denoiser/enabled",
++    "/rtx/reflections/denoiser/enabled",
++    "/rtx/indirectDiffuse/denoiser/enabled",
++    "/rtx/indirectDiffuse/nrd/enabled",
++    "/rtx/shadows/denoiser/enable",
++    "/rtx-transient/dldenoiser/enabled",
++)
++
++
++def _rtx_default_mirrors(paths: tuple[str, ...]) -> tuple[str, ...]:
++    mirrors = []
++    for path in paths:
++        if path.startswith("/rtx/"):
++            mirrors.append(f"/rtx-defaults/{path.removeprefix('/rtx/')}")
++        elif path.startswith("/rtx-transient/"):
++            mirrors.append(
++                f"/rtx-defaults-transient/{path.removeprefix('/rtx-transient/')}"
++            )
++    return tuple(mirrors)
++
++
++# USD stage initialization reapplies the /rtx-defaults namespace after Kit
++# startup.  Pin and validate both namespaces so those defaults cannot restore
++# NRD after the active /rtx paths were disabled.
++DEFAULT_REQUIRED_DISABLED_CARB_SETTINGS = _rtx_default_mirrors(
++    ACTIVE_REQUIRED_DISABLED_CARB_SETTINGS
++)
++REQUIRED_DISABLED_CARB_SETTINGS = (
++    ACTIVE_REQUIRED_DISABLED_CARB_SETTINGS
++    + DEFAULT_REQUIRED_DISABLED_CARB_SETTINGS
++)
++
++# These broader renderer paths are already disabled in the camera experience,
++# but enforcing them on Kit's command line prevents extension startup from
++# transiently constructing an NRD pipeline before the experience is resolved.
++ACTIVE_EARLY_DISABLED_CARB_SETTINGS = ACTIVE_REQUIRED_DISABLED_CARB_SETTINGS + (
++    "/rtx/reflections/enabled",
++    "/rtx/indirectDiffuse/enabled",
++    "/rtx/ambientOcclusion/enabled",
++    "/rtx/translucency/enabled",
++    "/rtx/raytracing/cached/enabled",
++    "/rtx-transient/dlssg/enabled",
++)
++EARLY_DISABLED_CARB_SETTINGS = (
++    ACTIVE_EARLY_DISABLED_CARB_SETTINGS
++    + _rtx_default_mirrors(ACTIVE_EARLY_DISABLED_CARB_SETTINGS)
++)
++
++
++def configure_headless_camera_rendering(args_cli) -> bool:
++    """Enforce NRD-free Kit startup and the matching Isaac render preset."""
++
++    enabled = bool(args_cli.enable_cameras) and bool(args_cli.headless)
++    if enabled:
++        args_cli.rendering_mode = HEADLESS_CAMERA_RENDERING_MODE
++        enforced_prefixes = tuple(f"--{path}=" for path in EARLY_DISABLED_CARB_SETTINGS)
++        existing = str(getattr(args_cli, "kit_args", "") or "").split()
++        preserved = [token for token in existing if not token.startswith(enforced_prefixes)]
++        enforced = [f"--{path}=false" for path in EARLY_DISABLED_CARB_SETTINGS]
++        args_cli.kit_args = " ".join((*preserved, *enforced))
++    return enabled
++
++
++def headless_camera_render_cfg_kwargs() -> dict[str, object]:
++    """Build the late-binding RenderCfg overrides used by SimulationContext."""
++
++    return {
++        "rendering_mode": HEADLESS_CAMERA_RENDERING_MODE,
++        # Keep the non-sampled direct-lighting path available for nonblack RGB.
++        "enable_direct_lighting": True,
++        "carb_settings": {
++            path: False for path in REQUIRED_DISABLED_CARB_SETTINGS
++        },
++    }
++
++
++def validate_headless_camera_rendering(settings) -> dict[str, object]:
++    """Validate resolved post-launch Carb settings or fail before training."""
++
++    resolved = {path: settings.get(path) for path in REQUIRED_DISABLED_CARB_SETTINGS}
++    invalid = {
++        path: value
++        for path, value in resolved.items()
++        if value is None or value not in (False, 0)
++    }
++    if invalid:
++        details = ", ".join(f"{path}={value!r}" for path, value in invalid.items())
++        raise RuntimeError(
++            "Unsafe headless camera rendering configuration: NRD-dependent "
++            f"paths are not disabled ({details})"
++        )
++    return resolved
++
++
++def reassert_headless_camera_rendering(settings) -> dict[str, object]:
++    """Reapply the required disables after environment construction.
++
++    Isaac scene and camera initialization can reapply RTX defaults after the
++    SimulationContext has been created.  Write every required active/default
++    setting again at that lifecycle boundary, then fail closed if any write did
++    not stick.
++    """
++
++    for path in REQUIRED_DISABLED_CARB_SETTINGS:
++        settings.set_bool(path, False)
++    return validate_headless_camera_rendering(settings)
+diff --git a/gr00t/rl/utils/dagger_telemetry.py b/gr00t/rl/utils/dagger_telemetry.py
+new file mode 100644
+index 0000000..31e9511
+--- /dev/null
++++ b/gr00t/rl/utils/dagger_telemetry.py
+@@ -0,0 +1,497 @@
++#!/usr/bin/env python3
++"""Rank-zero media/scalar producer for online Image3F DAgger rollouts.
++
++The trainer integration installs this module beside ``image3f_frame_client``
++in Raven's external GR00T tree.  It deliberately has no W&B dependency:
++artifacts are written atomically beneath ``TRAIN_RUN_DIR/telemetry`` and the
++rank-zero W&B sidecar uploads only complete files.
++
++Each record contains the first environment's synchronized camera triplet:
++depth, robot mask, the client-supplied RGB anchor, and generated RGB. The
++server may replace that anchor with generated RGB at the configured lag; a
++numeric source signal makes that distinction observable without returning a
++second image payload. Short videos contain the generated triplet over time.
++FFmpeg is probed explicitly; when it is
++missing or encoding fails, the exact clip frames are retained as a compressed
++NumPy bundle with a JSON reason instead of silently dropping telemetry.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import os
++import shutil
++import struct
++import subprocess
++import tempfile
++import time
++import zlib
++from collections import deque
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from typing import Mapping, Sequence
++
++import numpy as np
++
++
++LABEL_HEIGHT = 20
++GRID_GAP = 2
++
++
++@dataclass(frozen=True)
++class VideoCapability:
++    available: bool
++    backend: str
++    executable: str | None
++    reason: str | None
++
++
++def probe_video_capability(ffmpeg_path: str | None = None) -> VideoCapability:
++    """Return the explicit MP4 capability used by this producer.
++
++    ``ffmpeg_path=""`` intentionally disables encoding, which is useful for
++    dependency-restricted deployments and deterministic fallback tests.
++    """
++
++    if ffmpeg_path == "":
++        return VideoCapability(False, "none", None, "FFmpeg explicitly disabled")
++    candidate = ffmpeg_path or os.environ.get("IMAGE_DAGGER_FFMPEG") or shutil.which("ffmpeg")
++    if not candidate:
++        return VideoCapability(False, "none", None, "FFmpeg executable not found")
++    resolved = str(Path(candidate).expanduser().resolve())
++    if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
++        return VideoCapability(False, "none", resolved, "FFmpeg is not executable")
++    return VideoCapability(True, "ffmpeg", resolved, None)
++
++
++def _atomic_write(path: Path, payload: bytes) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
++    try:
++        with os.fdopen(descriptor, "wb") as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary_name, path)
++    finally:
++        if os.path.exists(temporary_name):
++            os.unlink(temporary_name)
++
++
++def _atomic_json(path: Path, document: Mapping[str, object]) -> None:
++    payload = (json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
++    _atomic_write(path, payload)
++
++
++def _png_chunk(kind: bytes, payload: bytes) -> bytes:
++    return (
++        struct.pack("!I", len(payload))
++        + kind
++        + payload
++        + struct.pack("!I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
++    )
++
++
++def _png_bytes(rgb: np.ndarray) -> bytes:
++    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
++    if rgb.ndim != 3 or rgb.shape[2] != 3:
++        raise ValueError(f"PNG image must be HxWx3, got {rgb.shape}")
++    height, width = rgb.shape[:2]
++    scanlines = b"".join(b"\x00" + row.tobytes() for row in rgb)
++    header = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
++    return (
++        b"\x89PNG\r\n\x1a\n"
++        + _png_chunk(b"IHDR", header)
++        + _png_chunk(b"IDAT", zlib.compress(scanlines, level=6))
++        + _png_chunk(b"IEND", b"")
++    )
++
++
++def _to_uint8_rgb(array: np.ndarray) -> np.ndarray:
++    image = np.asarray(array)
++    if image.ndim == 3 and image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
++        image = np.moveaxis(image, 0, -1)
++    if image.ndim == 2:
++        image = np.repeat(image[..., None], 3, axis=2)
++    elif image.ndim == 3 and image.shape[2] == 1:
++        image = np.repeat(image, 3, axis=2)
++    elif image.ndim == 3 and image.shape[2] >= 3:
++        image = image[..., :3]
++    else:
++        raise ValueError(f"unsupported telemetry image shape {image.shape}")
++
++    if image.dtype == np.uint8:
++        return np.ascontiguousarray(image)
++    image = image.astype(np.float32, copy=False)
++    finite = np.isfinite(image)
++    if not finite.all():
++        image = np.where(finite, image, 0.0)
++    if image.size and float(image.min()) >= 0.0 and float(image.max()) <= 1.0:
++        image = image * 255.0
++    return np.ascontiguousarray(np.clip(np.rint(image), 0, 255).astype(np.uint8))
++
++
++def _resize_nearest(image: np.ndarray, height: int, width: int) -> np.ndarray:
++    if image.shape[:2] == (height, width):
++        return image
++    source_h, source_w = image.shape[:2]
++    if source_h < 1 or source_w < 1:
++        raise ValueError("telemetry image cannot have an empty dimension")
++    rows = np.minimum((np.arange(height) * source_h // height), source_h - 1)
++    columns = np.minimum((np.arange(width) * source_w // width), source_w - 1)
++    return np.ascontiguousarray(image[rows[:, None], columns[None, :]])
++
++
++def _draw_label(image: np.ndarray, text: str) -> None:
++    """Draw text when Pillow exists; the labeled header remains without it."""
++
++    try:
++        from PIL import Image, ImageDraw
++    except ImportError:
++        return
++    canvas = Image.fromarray(image)
++    ImageDraw.Draw(canvas).text((4, 3), text, fill=(255, 255, 255))
++    image[:] = np.asarray(canvas)
++
++
++def build_contact_sheet(
++    depth: Mapping[str, np.ndarray],
++    mask: Mapping[str, np.ndarray],
++    client_anchor: Mapping[str, np.ndarray],
++    generated: Mapping[str, np.ndarray],
++    *,
++    view_order: Sequence[str] | None = None,
++) -> np.ndarray:
++    """Build a labeled 4-by-3 RGB sheet without rescaling source resolution."""
++
++    views = tuple(view_order or generated.keys())
++    if len(views) != 3 or len(set(views)) != 3:
++        raise ValueError(f"DAgger telemetry requires exactly three distinct views, got {views}")
++    modalities = (
++        ("depth", depth),
++        ("mask", mask),
++        ("client_anchor", client_anchor),
++        ("generated", generated),
++    )
++    for modality, images in modalities:
++        missing = [view for view in views if view not in images]
++        if missing:
++            raise ValueError(f"{modality} is missing telemetry views: {missing}")
++
++    base = _to_uint8_rgb(generated[views[0]])
++    height, width = base.shape[:2]
++    cell_height = LABEL_HEIGHT + height
++    sheet_height = len(modalities) * cell_height + (len(modalities) - 1) * GRID_GAP
++    sheet_width = len(views) * width + (len(views) - 1) * GRID_GAP
++    sheet = np.full((sheet_height, sheet_width, 3), 20, dtype=np.uint8)
++    for row, (modality, images) in enumerate(modalities):
++        y = row * (cell_height + GRID_GAP)
++        for column, view in enumerate(views):
++            x = column * (width + GRID_GAP)
++            tile = _resize_nearest(_to_uint8_rgb(images[view]), height, width)
++            sheet[y + LABEL_HEIGHT : y + cell_height, x : x + width] = tile
++            header = sheet[y : y + LABEL_HEIGHT, x : x + width]
++            header[:] = (11, 35, 50)
++            _draw_label(header, f"{modality} / {view}")
++    return sheet
++
++
++def build_generated_triplet(
++    generated: Mapping[str, np.ndarray], *, view_order: Sequence[str]
++) -> np.ndarray:
++    """Build one labeled 3-view RGB frame for the temporal MP4."""
++
++    views = tuple(view_order)
++    base = _to_uint8_rgb(generated[views[0]])
++    height, width = base.shape[:2]
++    frame = np.full((height + LABEL_HEIGHT, 3 * width + 2 * GRID_GAP, 3), 20, np.uint8)
++    for column, view in enumerate(views):
++        x = column * (width + GRID_GAP)
++        frame[LABEL_HEIGHT:, x : x + width] = _resize_nearest(
++            _to_uint8_rgb(generated[view]), height, width
++        )
++        header = frame[:LABEL_HEIGHT, x : x + width]
++        header[:] = (11, 35, 50)
++        _draw_label(header, f"generated / {view}")
++    return frame
++
++
++def _flatten_finite_metrics(
++    values: Mapping[str, object], *, prefix: str = "renderer"
++) -> dict[str, int | float]:
++    clean: dict[str, int | float] = {}
++
++    def visit(path: str, value: object) -> None:
++        if isinstance(value, Mapping):
++            for key, nested in value.items():
++                visit(f"{path}/{key}" if path else str(key), nested)
++        elif isinstance(value, (bool, np.bool_)):
++            clean[path] = int(value)
++        elif isinstance(value, (int, float, np.integer, np.floating)):
++            numeric = float(value)
++            if math.isfinite(numeric):
++                clean[path] = int(value) if isinstance(value, (int, np.integer)) else numeric
++
++    visit(prefix, values)
++    return clean
++
++
++def _reference_source_metrics(metadata: Mapping[str, object]) -> dict[str, int]:
++    """Encode the server's string source as stable numeric W&B signals."""
++
++    source = str(metadata.get("reference_source", "unknown"))
++    categories = {
++        "anchor": source == "anchor",
++        "generated_lag": source.startswith("generated_t-"),
++        "idempotent_replay": source == "idempotent_replay",
++        "client": source == "client",
++    }
++    output = {
++        f"renderer/reference_source_{name}": int(enabled)
++        for name, enabled in categories.items()
++    }
++    output["renderer/reference_source_unknown"] = int(not any(categories.values()))
++    if categories["generated_lag"]:
++        try:
++            output["renderer/reference_lag_frames"] = int(source.rsplit("-", 1)[1])
++        except (IndexError, ValueError):
++            output["renderer/reference_source_unknown"] = 1
++    return output
++
++
++class DaggerTelemetry:
++    """Atomic first-environment DAgger observability producer."""
++
++    def __init__(
++        self,
++        run_dir: str | os.PathLike[str],
++        *,
++        scalar_every: int = 10,
++        image_every: int = 300,
++        clip_every: int = 300,
++        clip_frames: int = 32,
++        clip_fps: int = 10,
++        rollout_steps: int = 300,
++        ffmpeg_path: str | None = None,
++        require_video: bool = False,
++    ):
++        if (
++            scalar_every < 1
++            or image_every < 1
++            or clip_every < 0
++            or clip_frames < 2
++            or clip_fps < 1
++            or rollout_steps < 1
++        ):
++            raise ValueError("invalid DAgger telemetry interval or clip configuration")
++        self.run_dir = Path(run_dir).expanduser().resolve()
++        self.root = self.run_dir / "telemetry"
++        self.image_dir = self.root / "images"
++        self.video_dir = self.root / "videos"
++        self.scalar_dir = self.root / "scalars"
++        self.fallback_dir = self.root / "video_fallback"
++        for directory in (self.image_dir, self.video_dir, self.scalar_dir):
++            directory.mkdir(parents=True, exist_ok=True)
++        self.scalar_every = int(scalar_every)
++        self.image_every = int(image_every)
++        self.clip_every = int(clip_every)
++        self.clip_frames = int(clip_frames)
++        self.clip_fps = int(clip_fps)
++        self.rollout_steps = int(rollout_steps)
++        self.video_capability = probe_video_capability(ffmpeg_path)
++        self.require_video = bool(require_video)
++        if self.require_video and not self.video_capability.available:
++            raise RuntimeError(
++                "required DAgger MP4 telemetry is unavailable: "
++                f"{self.video_capability.reason or 'unknown video backend error'}"
++            )
++        self._frames: deque[np.ndarray] = deque(maxlen=self.clip_frames)
++        _atomic_json(self.root / "video_capability.json", asdict(self.video_capability))
++
++    @classmethod
++    def from_environment(cls, *, rank: int) -> "DaggerTelemetry | None":
++        """Construct only on rank zero when the production run dir is set.
++
++        ``TRAIN_RUN_DIR`` is the production contract. ``RUN_DIR`` remains a
++        compatibility fallback for direct/manual trainer launches.  When the
++        launcher also exports ``ROBORENDER_TELEMETRY_DIR``, its value must
++        agree exactly with ``<run-dir>/telemetry`` so a typo cannot silently
++        split local artifacts from the W&B watcher.
++        """
++
++        if int(rank) != 0:
++            return None
++        run_dir = os.environ.get("TRAIN_RUN_DIR") or os.environ.get("RUN_DIR")
++        if not run_dir:
++            return None
++        expected_telemetry = Path(run_dir).expanduser().resolve() / "telemetry"
++        configured_telemetry = os.environ.get("ROBORENDER_TELEMETRY_DIR")
++        if configured_telemetry and Path(configured_telemetry).expanduser().resolve() != expected_telemetry:
++            raise ValueError(
++                "ROBORENDER_TELEMETRY_DIR must equal TRAIN_RUN_DIR/telemetry"
++            )
++        return cls(
++            run_dir,
++            scalar_every=int(os.environ.get("IMAGE_DAGGER_TELEMETRY_SCALAR_EVERY", "10")),
++            image_every=int(os.environ.get("IMAGE_DAGGER_TELEMETRY_IMAGE_EVERY", "300")),
++            clip_every=int(os.environ.get("IMAGE_DAGGER_TELEMETRY_CLIP_EVERY", "300")),
++            clip_frames=int(os.environ.get("IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES", "32")),
++            clip_fps=int(os.environ.get("IMAGE_DAGGER_TELEMETRY_CLIP_FPS", "10")),
++            rollout_steps=int(os.environ.get("ROLLOUT_STEPS", "300")),
++            ffmpeg_path=os.environ.get("IMAGE_DAGGER_FFMPEG"),
++            require_video=os.environ.get(
++                "IMAGE_DAGGER_TELEMETRY_REQUIRE_VIDEO", "0"
++            ).strip().lower()
++            in {"1", "true", "yes"},
++        )
++
++    def _write_mp4(self, path: Path, frames: Sequence[np.ndarray]) -> None:
++        capability = self.video_capability
++        if not capability.available or not capability.executable:
++            raise RuntimeError(capability.reason or "MP4 encoder unavailable")
++        height = max(frame.shape[0] for frame in frames)
++        width = max(frame.shape[1] for frame in frames)
++        # yuv420p requires even dimensions. Padding preserves every source pixel.
++        height += height % 2
++        width += width % 2
++        normalized = []
++        for frame in frames:
++            canvas = np.zeros((height, width, 3), dtype=np.uint8)
++            canvas[: frame.shape[0], : frame.shape[1]] = frame
++            normalized.append(canvas)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        descriptor, temporary_name = tempfile.mkstemp(
++            prefix=f".{path.stem}.", suffix=".mp4", dir=path.parent
++        )
++        os.close(descriptor)
++        try:
++            command = [
++                capability.executable,
++                "-y",
++                "-loglevel",
++                "error",
++                "-f",
++                "rawvideo",
++                "-pix_fmt",
++                "rgb24",
++                "-s:v",
++                f"{width}x{height}",
++                "-r",
++                str(self.clip_fps),
++                "-i",
++                "pipe:0",
++                "-an",
++                "-c:v",
++                "libx264",
++                "-pix_fmt",
++                "yuv420p",
++                "-movflags",
++                "+faststart",
++                temporary_name,
++            ]
++            subprocess.run(
++                command,
++                input=b"".join(frame.tobytes() for frame in normalized),
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.PIPE,
++                check=True,
++                timeout=120,
++            )
++            os.replace(temporary_name, path)
++        finally:
++            if os.path.exists(temporary_name):
++                os.unlink(temporary_name)
++
++    def _write_video_or_fallback(self, trainer_step: int) -> Path:
++        frames = tuple(self._frames)
++        destination = self.video_dir / f"step_{trainer_step:09d}_generated_triplet.mp4"
++        try:
++            self._write_mp4(destination, frames)
++            return destination
++        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
++            if self.require_video:
++                raise RuntimeError(
++                    "required DAgger MP4 telemetry encoding failed"
++                ) from exc
++            self.fallback_dir.mkdir(parents=True, exist_ok=True)
++            fallback = self.fallback_dir / f"step_{trainer_step:09d}_generated_triplet.npz"
++            descriptor, temporary_name = tempfile.mkstemp(
++                prefix=f".{fallback.name}.", dir=fallback.parent
++            )
++            try:
++                with os.fdopen(descriptor, "wb") as handle:
++                    np.savez_compressed(handle, frames=np.stack(frames), fps=self.clip_fps)
++                    handle.flush()
++                    os.fsync(handle.fileno())
++                os.replace(temporary_name, fallback)
++            finally:
++                if os.path.exists(temporary_name):
++                    os.unlink(temporary_name)
++            _atomic_json(
++                fallback.with_suffix(".json"),
++                {
++                    "step": trainer_step,
++                    "fallback": fallback.name,
++                    "reason": f"{type(exc).__name__}: {exc}",
++                    "capability": asdict(self.video_capability),
++                },
++            )
++            return fallback
++
++    def record(
++        self,
++        *,
++        trainer_step: int,
++        depth: Mapping[str, np.ndarray],
++        mask: Mapping[str, np.ndarray],
++        client_anchor: Mapping[str, np.ndarray],
++        generated: Mapping[str, np.ndarray],
++        client_metadata: Mapping[str, object] | None = None,
++    ) -> dict[str, Path]:
++        """Atomically record one first-environment render and its timing data."""
++
++        if isinstance(trainer_step, bool) or int(trainer_step) < 0:
++            raise ValueError("trainer_step must be a non-negative integer")
++        trainer_step = int(trainer_step)
++        views = tuple(generated.keys())
++        # Build every frame so the periodic clip remains temporally contiguous.
++        triplet = build_generated_triplet(generated, view_order=views)
++        self._frames.append(triplet)
++        artifacts: dict[str, Path] = {}
++
++        if trainer_step % self.image_every == 0:
++            sheet = build_contact_sheet(
++                depth, mask, client_anchor, generated, view_order=views
++            )
++            image_path = self.image_dir / f"step_{trainer_step:09d}_conditions_generated.png"
++            _atomic_write(image_path, _png_bytes(sheet))
++            artifacts["image"] = image_path
++
++        if trainer_step % self.scalar_every == 0:
++            metadata = client_metadata or {}
++            metrics = _flatten_finite_metrics(metadata)
++            metrics.update(_reference_source_metrics(metadata))
++            metrics.update(
++                {
++                    "telemetry/view_count": len(views),
++                    "telemetry/generated_height": int(triplet.shape[0] - LABEL_HEIGHT),
++                    "telemetry/generated_triplet_width": int(triplet.shape[1]),
++                    "telemetry/video_encoder_available": int(self.video_capability.available),
++                    "telemetry/recorded_unix_s": float(time.time()),
++                    "rendered_frame_count": trainer_step,
++                    "rollout_frame_step": trainer_step % self.rollout_steps,
++                    "policy_update_index": trainer_step // self.rollout_steps,
++                }
++            )
++            scalar_path = self.scalar_dir / f"step_{trainer_step:09d}.json"
++            _atomic_json(scalar_path, {"step": trainer_step, "metrics": metrics})
++            artifacts["scalar"] = scalar_path
++
++        if (
++            self.clip_every > 0
++            and (trainer_step + 1) % self.clip_every == 0
++            and len(self._frames) >= 2
++        ):
++            artifacts["video"] = self._write_video_or_fallback(trainer_step)
++        return artifacts
+diff --git a/gr00t/rl/utils/image3f_frame_client.py b/gr00t/rl/utils/image3f_frame_client.py
+old mode 100644
+new mode 100755
+index 91960ad..3a9f63b
+--- a/gr00t/rl/utils/image3f_frame_client.py
++++ b/gr00t/rl/utils/image3f_frame_client.py
+@@ -1,111 +1,336 @@
+-# Copyright (c) 2026. Client for the warm Image3F per-frame render server.
+-"""Per-frame 3-view image render client (fixed-lag DAgger conditioning).
++#!/usr/bin/env python3
++"""Production Image3F TCP client for the external GR00T DAgger trainer.
+ 
+-Server: fast_roborender/image3f_server.py (TCP mode). Protocol identical to
+-videogen_client: length-prefixed pickles, arrays as raw-bytes dicts.
++This file is installed into ``GR00T-VisualSim2Real/gr00t/rl/utils`` by
++``scripts/scaling/install_gr00t_integration.py``.  Its legacy ``render_frame``
++call remains compatible with Raven's trainer while optionally adding:
++
++* rank-aware endpoint sharding across a Slurm renderer fleet;
++* stable stream/episode/step metadata for server-side lag-256 references;
++* socket timeouts and per-request telemetry.
+ """
++
+ from __future__ import annotations
+ 
++import hashlib
++import itertools
++import os
+ import pickle
+ import socket
+ import struct
++import threading
+ import time
+-from typing import Dict, Optional
++from pathlib import Path
++from typing import Mapping
+ 
+ import numpy as np
+ 
+-from gr00t.rl.utils.videogen_client import encode_array, decode_array
++
++PROTOCOL_VERSION = 2
++
++
++def _recv_exact(sock: socket.socket, size: int) -> bytes:
++    chunks = bytearray()
++    while len(chunks) < size:
++        chunk = sock.recv(size - len(chunks))
++        if not chunk:
++            raise ConnectionError("Image3F server closed the connection")
++        chunks.extend(chunk)
++    return bytes(chunks)
++
++
++def _send_msg(sock: socket.socket, obj: object) -> None:
++    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
++    sock.sendall(struct.pack("!Q", len(payload)) + payload)
++
++
++def _recv_msg(sock: socket.socket) -> object:
++    size = struct.unpack("!Q", _recv_exact(sock, 8))[0]
++    return pickle.loads(_recv_exact(sock, size))  # noqa: S301 - trusted cluster protocol
++
++
++def _encode_array(array: np.ndarray) -> dict[str, object]:
++    array = np.ascontiguousarray(array)
++    return {
++        "__nd__": True,
++        "dtype": str(array.dtype),
++        "shape": tuple(array.shape),
++        "data": array.tobytes(),
++    }
++
++
++def _decode_array(obj: object) -> np.ndarray:
++    if not isinstance(obj, dict) or not obj.get("__nd__"):
++        raise TypeError("malformed Image3F ndarray response")
++    return np.frombuffer(obj["data"], dtype=np.dtype(obj["dtype"])).reshape(obj["shape"]).copy()
++
++
++def _validate_output_views(views: dict[str, np.ndarray]) -> None:
++    """Enforce the opt-in production output order and per-view tensor contract."""
++    expected_raw = os.environ.get("IMAGE3F_EXPECT_OUTPUT_VIEWS")
++    shape_raw = os.environ.get("IMAGE3F_EXPECT_OUTPUT_SHAPE")
++    if expected_raw is None and shape_raw is None:
++        return
++    if not expected_raw or not shape_raw:
++        raise RuntimeError(
++            "IMAGE3F_EXPECT_OUTPUT_VIEWS and IMAGE3F_EXPECT_OUTPUT_SHAPE must be set together"
++        )
++    expected_views = tuple(value.strip() for value in expected_raw.split(","))
++    try:
++        expected_shape = tuple(int(value.strip()) for value in shape_raw.split(","))
++    except ValueError as exc:
++        raise RuntimeError("invalid IMAGE3F_EXPECT_OUTPUT_SHAPE") from exc
++    if any(not value for value in expected_views) or len(expected_shape) != 3 or any(
++        value <= 0 for value in expected_shape
++    ):
++        raise RuntimeError("invalid Image3F output contract")
++    if tuple(views) != expected_views:
++        raise RuntimeError(
++            "Image3F response view order mismatch: "
++            f"expected {expected_views}, got {tuple(views)}"
++        )
++    for view, image in views.items():
++        if image.dtype != np.uint8 or tuple(image.shape) != expected_shape:
++            raise RuntimeError(
++                f"Image3F response shape/dtype mismatch for {view}: expected "
++                f"uint8 {expected_shape}, got {image.dtype} {image.shape}"
++            )
++
++
++def _read_endpoint(path: str | os.PathLike[str]) -> tuple[str, int]:
++    fields = Path(path).read_text(encoding="utf-8").split()
++    if len(fields) != 2:
++        raise ValueError(f"malformed endpoint file {path}: expected 'host port'")
++    return fields[0], int(fields[1])
+ 
+ 
+ class Image3FFrameClient:
+-    def __init__(self, host: str, port: int, timeout_s: float = 120.0,
+-                 connect_retries: int = 30, connect_retry_interval_s: float = 5.0):
+-        self.host, self.port = host, port
+-        self.timeout_s = timeout_s
+-        self.connect_retries = connect_retries
+-        self.connect_retry_interval_s = connect_retry_interval_s
+-        self._sock: Optional[socket.socket] = None
++    """One persistent socket and one ordered DAgger environment stream."""
++
++    _counter = itertools.count()
++    _counter_lock = threading.Lock()
++
++    def __init__(
++        self,
++        host: str,
++        port: int,
++        *,
++        stream_slot: int | None = None,
++        timeout_s: float | None = None,
++    ):
++        self.host = str(host)
++        self.port = int(port)
++        self.timeout_s = float(timeout_s or os.environ.get("IMAGE3F_REQUEST_TIMEOUT_S", 120))
++        self._socket: socket.socket | None = None
++        self._lock = threading.Lock()
++        self._stream_slot = int(stream_slot or 0)
++        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
++        run_id = os.environ.get("IMAGE3F_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
++        self._stream_id = f"{run_id}:rank{rank}:env{self._stream_slot}"
++        self._auto_episode = -1
++        self._auto_step = 0
++        self._anchor_object_ids: tuple[tuple[str, int], ...] | None = None
++        self._anchor_signature: bytes | None = None
++        self.last_metadata: dict[str, object] = {}
+ 
+     @classmethod
+-    def from_endpoint_file(cls, path: str, **kw):
+-        with open(path) as f:
+-            host, port = f.read().split()
+-        c = cls(host, int(port), **kw)
+-        c._endpoint_path = path
+-        return c
+-
+-    def _connect(self):
+-        last = None
+-        for _ in range(self.connect_retries):
+-            try:
+-                ep = getattr(self, "_endpoint_path", None)
+-                if ep:
+-                    # server may have been restarted on a new host/port:
+-                    # re-read the endpoint file before every attempt
+-                    try:
+-                        with open(ep) as f:
+-                            h, p = f.read().split()
+-                        self.host, self.port = h, int(p)
+-                    except (OSError, ValueError):
+-                        pass
+-                s = socket.create_connection((self.host, self.port), timeout=self.timeout_s)
+-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+-                return s
+-            except OSError as exc:
+-                last = exc
+-                time.sleep(self.connect_retry_interval_s)
+-        raise ConnectionError(f"image3f server unreachable {self.host}:{self.port}: {last}")
+-
+-    def _sockget(self):
+-        if self._sock is None:
+-            self._sock = self._connect()
+-        return self._sock
+-
+-    def close(self):
+-        if self._sock is not None:
+-            try:
+-                self._sock.close()
+-            finally:
+-                self._sock = None
++    def from_endpoint_file(cls, endpoint_file: str | os.PathLike[str]):
++        """Create a client, optionally remapping it across the production fleet.
++
++        Raven's trainer creates clients rank-locally starting at environment 0.
++        When ``IMAGE3F_ENDPOINT_DIR`` is set, this method offsets allocation by
++        global rank so all ranks use the complete fleet instead of repeatedly
++        concentrating traffic on its first endpoints.
++        """
++        with cls._counter_lock:
++            local_slot = next(cls._counter)
++        selected = Path(endpoint_file)
++        endpoint_manifest = os.environ.get("IMAGE3F_ENDPOINT_MANIFEST")
++        endpoint_dir = os.environ.get("IMAGE3F_ENDPOINT_DIR")
++        local_envs = int(os.environ.get("IMAGE3F_LOCAL_ENVS", "0"))
++        if endpoint_manifest or endpoint_dir:
++            if endpoint_manifest:
++                files = [
++                    Path(line.strip())
++                    for line in Path(endpoint_manifest).read_text(encoding="utf-8").splitlines()
++                    if line.strip()
++                ]
++            else:
++                files = sorted(Path(endpoint_dir).glob("renderer_*.txt"))
++            if not files:
++                raise FileNotFoundError(
++                    f"no selected Image3F endpoints in {endpoint_manifest or endpoint_dir}"
++                )
++            rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
++            if local_envs < 1:
++                raise ValueError("IMAGE3F_LOCAL_ENVS must be set with IMAGE3F_ENDPOINT_DIR")
++            global_slot = rank * local_envs + local_slot
++            selected = files[global_slot % len(files)]
++        else:
++            global_slot = local_slot
++        host, port = _read_endpoint(selected)
++        client = cls(host, port, stream_slot=global_slot)
++        client.endpoint_file = str(selected)
++        return client
++
++    def _connect(self) -> socket.socket:
++        if self._socket is None:
++            self._socket = socket.create_connection((self.host, self.port), timeout=self.timeout_s)
++            self._socket.settimeout(self.timeout_s)
++            self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++        return self._socket
++
++    def close(self) -> None:
++        with self._lock:
++            if self._socket is not None:
++                try:
++                    self._socket.close()
++                finally:
++                    self._socket = None
+ 
+     @staticmethod
+-    def _recv_exact(sock, n):
+-        buf = b""
+-        while len(buf) < n:
+-            c = sock.recv(n - len(buf))
+-            if not c:
+-                raise ConnectionError("server closed connection")
+-            buf += c
+-        return buf
+-
+-    def _roundtrip(self, req: dict) -> dict:
+-        payload = pickle.dumps(req, protocol=pickle.HIGHEST_PROTOCOL)
+-        for attempt in range(2):
++    def _signature(previous_rgb: Mapping[str, np.ndarray], prompt: str) -> bytes:
++        digest = hashlib.blake2b(digest_size=16)
++        digest.update(prompt.encode("utf-8"))
++        for view in sorted(previous_rgb):
++            array = np.ascontiguousarray(previous_rgb[view])
++            digest.update(view.encode("utf-8"))
++            digest.update(str(array.dtype).encode("ascii"))
++            digest.update(repr(array.shape).encode("ascii"))
++            digest.update(memoryview(array))
++        return digest.digest()
++
++    def _auto_metadata(
++        self, previous_rgb: Mapping[str, np.ndarray], prompt: str
++    ) -> tuple[str, int, int]:
++        # Raven's trainer retains each sampled anchor array for the episode.
++        # Object identity lets us detect an episode reset even in the rare case
++        # that the same anchor file is sampled twice consecutively.
++        object_ids = tuple((view, id(previous_rgb[view])) for view in sorted(previous_rgb))
++        signature = self._signature(previous_rgb, prompt)
++        if object_ids != self._anchor_object_ids or signature != self._anchor_signature:
++            self._anchor_object_ids = object_ids
++            self._anchor_signature = signature
++            self._auto_episode += 1
++            self._auto_step = 0
++        return self._stream_id, self._auto_episode, self._auto_step
++
++    def _request(
++        self, payload: dict[str, object], *, retries: int | None = None
++    ) -> dict[str, object]:
++        retries = int(
++            retries if retries is not None else os.environ.get("IMAGE3F_REQUEST_RETRIES", "10")
++        )
++        response = None
++        last_error = None
++        for attempt in range(retries + 1):
+             try:
+-                sock = self._sockget()
+-                sock.sendall(struct.pack("!Q", len(payload)) + payload)
+-                n = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
+-                return pickle.loads(self._recv_exact(sock, n))
+-            except (ConnectionError, OSError):
+-                self.close()
+-                if attempt == 1:
++                with self._lock:
++                    sock = self._connect()
++                    _send_msg(sock, payload)
++                    response = _recv_msg(sock)
++                if not isinstance(response, dict):
++                    raise RuntimeError(
++                        f"malformed Image3F response: {type(response).__name__}"
++                    )
++                if response.get("ok"):
++                    return response
++                if response.get("retryable") and attempt < retries:
++                    time.sleep(min(2.0, 0.1 * (2**attempt)))
++                    continue
++                break
++            except (ConnectionError, OSError, EOFError, pickle.UnpicklingError) as exc:
++                last_error = exc
++                with self._lock:
++                    if self._socket is not None:
++                        try:
++                            self._socket.close()
++                        finally:
++                            self._socket = None
++                if attempt >= retries:
+                     raise
+-        raise ConnectionError("unreachable")
+-
+-    def ping(self) -> bool:
+-        return bool(self._roundtrip({"cmd": "ping"}).get("ok"))
+-
+-    def render_frame(self, depth: Dict[str, np.ndarray], mask: Dict[str, np.ndarray],
+-                     prev: Dict[str, np.ndarray], prompt: str, seed: int = 42
+-                     ) -> Dict[str, np.ndarray]:
+-        """depth: view->HxW u8 (or HxWx3); mask/prev: view->HxWx3 u8.
+-        Returns view -> 240x416x3 u8 generated RGB."""
+-        resp = self._roundtrip({
+-            "cmd": "render_frame", "prompt": prompt, "seed": seed,
+-            "depth": {v: encode_array(a) for v, a in depth.items()},
+-            "mask": {v: encode_array(a) for v, a in mask.items()},
+-            "prev": {v: encode_array(a) for v, a in prev.items()},
+-        })
+-        if not resp.get("ok"):
+-            raise RuntimeError(f"image3f render failed: {resp.get('error')}")
+-        return {v: decode_array(a) for v, a in resp["views"].items()}
++                time.sleep(min(2.0, 0.1 * (2**attempt)))
++        if response is None:
++            raise RuntimeError(f"Image3F request produced no response: {last_error}")
++        if not response.get("ok"):
++            raise RuntimeError(f"Image3F render failed: {response.get('error', 'unknown error')}")
++        return response
++
++    def ping(self) -> dict[str, object]:
++        started = time.perf_counter()
++        response = self._request({"cmd": "ping", "protocol_version": PROTOCOL_VERSION})
++        response["client_rtt_ms"] = (time.perf_counter() - started) * 1000.0
++        return response
++
++    def render_frame(
++        self,
++        depth: Mapping[str, np.ndarray],
++        mask: Mapping[str, np.ndarray],
++        previous_rgb: Mapping[str, np.ndarray],
++        *,
++        prompt: str,
++        seed: int = 42,
++        stream_id: str | None = None,
++        episode_id: str | int | None = None,
++        step: int | None = None,
++        reference_lag: int | None = None,
++        trainer_step: int | None = None,
++    ) -> dict[str, np.ndarray]:
++        reference_lag = int(
++            reference_lag
++            if reference_lag is not None
++            else os.environ.get("IMAGE3F_REFERENCE_LAG", "0")
++        )
++        using_auto_metadata = reference_lag > 0 and (
++            stream_id is None or episode_id is None or step is None
++        )
++        if using_auto_metadata:
++            stream_id, episode_id, step = self._auto_metadata(previous_rgb, prompt)
++        payload: dict[str, object] = {
++            "cmd": "render_frame",
++            "protocol_version": PROTOCOL_VERSION,
++            "depth": {view: _encode_array(image) for view, image in depth.items()},
++            "mask": {view: _encode_array(image) for view, image in mask.items()},
++            "prev": {view: _encode_array(image) for view, image in previous_rgb.items()},
++            "prompt": str(prompt),
++            "seed": int(seed),
++        }
++        if reference_lag > 0:
++            payload.update(
++                stream_id=str(stream_id),
++                episode_id=str(episode_id),
++                step=int(step),
++                reference_lag=reference_lag,
++                request_id=f"{stream_id}|{episode_id}|{step}",
++            )
++        if trainer_step is not None:
++            if isinstance(trainer_step, bool) or int(trainer_step) < 0:
++                raise ValueError("trainer_step must be a non-negative integer")
++            payload["trainer_step"] = int(trainer_step)
++        started = time.perf_counter()
++        response = self._request(payload)
++        self.last_metadata = {
++            key: value for key, value in response.items() if key not in ("ok", "views")
++        }
++        self.last_metadata["client_wall_ms"] = (time.perf_counter() - started) * 1000.0
++        if using_auto_metadata:
++            self._auto_step += 1
++        views = response.get("views")
++        if not isinstance(views, dict):
++            raise RuntimeError("Image3F response has no views")
++        decoded = {view: _decode_array(image) for view, image in views.items()}
++        _validate_output_views(decoded)
++        return decoded
++
++    def reset_stream(self) -> bool:
++        response = self._request({"cmd": "reset_stream", "stream_id": self._stream_id})
++        self._anchor_object_ids = None
++        self._anchor_signature = None
++        self._auto_step = 0
++        return bool(response.get("removed"))
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *_exc_info):
++        self.close()
+diff --git a/gr00t/rl/utils/policy_view_contract.py b/gr00t/rl/utils/policy_view_contract.py
+new file mode 100644
+index 0000000..d8ecc0d
+--- /dev/null
++++ b/gr00t/rl/utils/policy_view_contract.py
+@@ -0,0 +1,180 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Runtime binding for the image-DAgger policy-view count contract."""
++
++from __future__ import annotations
++
++
++_BOUND_POLICY_VIEW_COUNT_ATTRIBUTE = "_image_dagger_bound_policy_view_count"
++
++
++def _get_config_value(config, key):
++    if config is None:
++        return None
++    getter = getattr(config, "get", None)
++    if callable(getter):
++        return getter(key, None)
++    return getattr(config, key, None)
++
++
++def _positive_integer(value, label):
++    if isinstance(value, bool):
++        raise RuntimeError(f"production gate failed: invalid {label}: {value!r}")
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError) as exc:
++        raise RuntimeError(
++            f"production gate failed: invalid {label}: {value!r}"
++        ) from exc
++    if parsed <= 0 or (isinstance(value, float) and not value.is_integer()):
++        raise RuntimeError(f"production gate failed: invalid {label}: {value!r}")
++    return parsed
++
++
++def bind_policy_view_count_contract(root_config, env, expected_count=None):
++    """Bind the composed root view count onto the constructed environment.
++
++    Hydra's root configuration is the authority for observation sizing.  Some
++    environment construction paths detach or rebuild ``env.config`` and can
++    lose the mirrored ``image_dagger_policy_view_count`` field.  Production
++    launchers provide ``expected_count``; in that mode this function verifies
++    the root declaration and composed env mirror agree, rejects a conflicting
++    runtime value, and then publishes one validated scalar on both the runtime
++    config for the trainer to consume.
++
++    When no production expectation is enabled this is intentionally a no-op,
++    preserving historical single-view entry points.
++    """
++
++    if expected_count is None:
++        return None
++
++    expected = _positive_integer(expected_count, "expected policy view count")
++    root_count = _positive_integer(
++        _get_config_value(root_config, "policy_view_count"),
++        "root policy view count",
++    )
++    composed_env = _get_config_value(root_config, "env")
++    composed_env_config = _get_config_value(composed_env, "config")
++    composed_count = _positive_integer(
++        _get_config_value(
++            composed_env_config, "image_dagger_policy_view_count"
++        ),
++        "composed env policy view count",
++    )
++
++    if root_count != expected or composed_count != root_count:
++        raise RuntimeError(
++            "production gate failed: policy view count declarations disagree "
++            f"(expected {expected}, root {root_count}, composed env {composed_count})"
++        )
++
++    runtime_config = getattr(env, "config", None)
++    if runtime_config is None:
++        raise RuntimeError("production gate failed: runtime env config is missing")
++    runtime_raw = _get_config_value(
++        runtime_config, "image_dagger_policy_view_count"
++    )
++    if runtime_raw is not None:
++        runtime_count = _positive_integer(
++            runtime_raw, "runtime env policy view count"
++        )
++        if runtime_count != root_count:
++            raise RuntimeError(
++                "production gate failed: runtime policy view count disagrees "
++                f"(root {root_count}, runtime {runtime_count})"
++            )
++
++    try:
++        setattr(runtime_config, "image_dagger_policy_view_count", root_count)
++    except (AttributeError, TypeError, ValueError) as exc:
++        raise RuntimeError(
++            "production gate failed: could not bind runtime policy view count"
++        ) from exc
++
++    rebound = _positive_integer(
++        _get_config_value(runtime_config, "image_dagger_policy_view_count"),
++        "bound runtime env policy view count",
++    )
++    if rebound != root_count:
++        raise RuntimeError(
++            "production gate failed: runtime policy view count binding did not persist"
++        )
++
++    # Keep the validated scalar on the stable environment object as well as on
++    # its config.  Some Isaac environment wrappers expose ``config`` through a
++    # property that returns a detached/fresh object; a value published only on
++    # one such object can disappear before the trainer's subclass initialization
++    # runs.  The private environment attribute is therefore the durable handoff
++    # from this root/composed/runtime validation gate to the trainer gate.
++    prior_bound_raw = getattr(env, _BOUND_POLICY_VIEW_COUNT_ATTRIBUTE, None)
++    if prior_bound_raw is not None:
++        prior_bound = _positive_integer(
++            prior_bound_raw, "previously bound policy view count"
++        )
++        if prior_bound != root_count:
++            raise RuntimeError(
++                "production gate failed: bound policy view count disagrees "
++                f"(root {root_count}, bound {prior_bound})"
++            )
++    try:
++        setattr(env, _BOUND_POLICY_VIEW_COUNT_ATTRIBUTE, root_count)
++    except (AttributeError, TypeError, ValueError) as exc:
++        raise RuntimeError(
++            "production gate failed: could not persist policy view count on runtime env"
++        ) from exc
++    persisted = _positive_integer(
++        getattr(env, _BOUND_POLICY_VIEW_COUNT_ATTRIBUTE, None),
++        "persisted policy view count",
++    )
++    if persisted != root_count:
++        raise RuntimeError(
++            "production gate failed: runtime env policy view count did not persist"
++        )
++    return root_count
++
++
++def policy_view_count_for_trainer(env, expected_count=None):
++    """Return the count consumed by the trainer's production contract gate.
++
++    Production mode accepts only the stable scalar installed by
++    :func:`bind_policy_view_count_contract`; this proves the root, composed, and
++    initially constructed runtime configs were already checked.  A currently
++    visible runtime-config mirror is checked too, but may legitimately be absent
++    when an environment exposes a fresh/detached config object on each access.
++
++    Without a production expectation this preserves the historical behavior and
++    simply returns the value currently visible on ``env.config``.
++    """
++
++    runtime_config = getattr(env, "config", None)
++    runtime_raw = _get_config_value(
++        runtime_config, "image_dagger_policy_view_count"
++    )
++    if expected_count is None:
++        return runtime_raw
++
++    expected = _positive_integer(expected_count, "expected policy view count")
++    bound_raw = getattr(env, _BOUND_POLICY_VIEW_COUNT_ATTRIBUTE, None)
++    if bound_raw is None:
++        raise RuntimeError(
++            "production gate failed: validated policy view count binding is missing"
++        )
++    bound = _positive_integer(bound_raw, "bound policy view count")
++    if bound != expected:
++        raise RuntimeError(
++            "production gate failed: bound policy view count disagrees "
++            f"(expected {expected}, bound {bound})"
++        )
++
++    if runtime_raw is not None:
++        runtime_count = _positive_integer(
++            runtime_raw, "runtime env policy view count"
++        )
++        if runtime_count != bound:
++            raise RuntimeError(
++                "production gate failed: runtime policy view count disagrees "
++                f"(bound {bound}, runtime {runtime_count})"
++            )
++    return bound
+diff --git a/gr00t/rl/utils/simulation_app_lifecycle.py b/gr00t/rl/utils/simulation_app_lifecycle.py
+new file mode 100644
+index 0000000..2f2623a
+--- /dev/null
++++ b/gr00t/rl/utils/simulation_app_lifecycle.py
+@@ -0,0 +1,176 @@
++"""Deterministic lifecycle management for an Isaac ``SimulationApp``.
++
++This module intentionally uses only the Python standard library so its failure
++semantics can be tested without importing Isaac Sim.
++"""
++
++from __future__ import annotations
++
++import os
++import signal
++import sys
++import traceback
++from types import FrameType
++from typing import Any, Optional, Type
++
++
++_SKIP_CLEANUP_ENV = "IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP"
++
++
++def _skip_cleanup_from_environment() -> bool:
++    """Return the explicitly selected Isaac shutdown behavior.
++
++    Isaac Sim's default graceful close is preserved unless the batch launcher
++    opts into ``SimulationApp.close(skip_cleanup=True)``.  Restricting the
++    accepted values to literal ``0`` and ``1`` prevents a typo from silently
++    changing process-shutdown semantics.
++    """
++
++    raw_value = os.environ.get(_SKIP_CLEANUP_ENV)
++    if raw_value is None or raw_value == "0":
++        return False
++    if raw_value == "1":
++        return True
++    raise RuntimeError(
++        f"{_SKIP_CLEANUP_ENV} must be exactly 0 or 1 when set; "
++        f"received {raw_value!r}"
++    )
++
++
++class SimulationAppLifecycle:
++    """Own one optional ``SimulationApp`` and close it exactly once.
++
++    ``SIGTERM`` is converted to ``SystemExit`` while the context is active so
++    Python unwinds through ``__exit__`` instead of abandoning the app.  A close
++    failure is propagated after a successful body.  If the body is already
++    failing, a close failure is reported but cannot replace the active error.
++    """
++
++    def __init__(self) -> None:
++        self._skip_cleanup = _skip_cleanup_from_environment()
++        self._app: Any = None
++        self._close_attempted = False
++        self._previous_sigterm_handler: Any = None
++        self._entered = False
++        self._used = False
++
++    @staticmethod
++    def _handle_sigterm(signum: int, _frame: Optional[FrameType]) -> None:
++        raise SystemExit(128 + signum)
++
++    @staticmethod
++    def _report_secondary_failure(label: str, error: BaseException) -> None:
++        try:
++            print(
++                f"SimulationApp lifecycle {label}; preserving the active exception:",
++                file=sys.stderr,
++            )
++            traceback.print_exception(
++                type(error), error, error.__traceback__, file=sys.stderr
++            )
++            sys.stderr.flush()
++        except BaseException:
++            # Diagnostic I/O must never replace the exception already in flight.
++            pass
++
++    @staticmethod
++    def _report_active_exception(
++        exception_type: Type[BaseException],
++        exception: BaseException,
++        exception_traceback: Any,
++    ) -> None:
++        """Expose a body failure before ``SimulationApp.close()`` can block."""
++
++        try:
++            print(
++                "SimulationApp lifecycle body failed; active exception before close:",
++                file=sys.stderr,
++            )
++            traceback.print_exception(
++                exception_type,
++                exception,
++                exception_traceback,
++                file=sys.stderr,
++            )
++        except BaseException:
++            # Failure reporting must never replace the exception from the body.
++            pass
++        try:
++            sys.stderr.flush()
++        except BaseException:
++            # Preserve the body exception even if the diagnostic stream is broken.
++            pass
++
++    def __enter__(self) -> "SimulationAppLifecycle":
++        if self._used:
++            raise RuntimeError("SimulationAppLifecycle cannot be reused")
++        self._used = True
++        self._previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
++        signal.signal(signal.SIGTERM, self._handle_sigterm)
++        self._entered = True
++        return self
++
++    def attach(self, app: Any) -> None:
++        """Transfer ownership of a newly launched app to this context."""
++
++        if not self._entered:
++            raise RuntimeError("SimulationApp must be attached inside its lifecycle")
++        if app is None:
++            raise ValueError("SimulationApp cannot be None")
++        if self._app is not None:
++            raise RuntimeError("SimulationAppLifecycle already owns an app")
++        self._app = app
++
++    def _close_once(self) -> None:
++        if self._app is None or self._close_attempted:
++            return
++        self._close_attempted = True
++        if self._skip_cleanup:
++            self._app.close(skip_cleanup=True)
++        else:
++            # Keep Isaac's graceful default, including its replicator wait,
++            # byte-for-byte equivalent to the lifecycle's original behavior.
++            self._app.close()
++
++    def __exit__(
++        self,
++        exception_type: Optional[Type[BaseException]],
++        exception: Optional[BaseException],
++        exception_traceback: Any,
++    ) -> bool:
++        if exception_type is not None and exception is not None:
++            self._report_active_exception(
++                exception_type, exception, exception_traceback
++            )
++
++        close_error: Optional[BaseException] = None
++        restore_error: Optional[BaseException] = None
++        try:
++            self._close_once()
++        except BaseException as error:  # cleanup must also handle SystemExit
++            close_error = error
++        finally:
++            self._entered = False
++            try:
++                signal.signal(signal.SIGTERM, self._previous_sigterm_handler)
++            except BaseException as error:
++                restore_error = error
++
++        if exception_type is not None:
++            if close_error is not None:
++                self._report_secondary_failure("close failed", close_error)
++            if restore_error is not None:
++                self._report_secondary_failure(
++                    "SIGTERM handler restoration failed", restore_error
++                )
++            return False
++
++        if close_error is not None:
++            if restore_error is not None:
++                self._report_secondary_failure(
++                    "SIGTERM handler restoration also failed", restore_error
++                )
++            raise close_error
++        if restore_error is not None:
++            raise restore_error
++        return False
+diff --git a/tests/test_camera_rendering_contract.py b/tests/test_camera_rendering_contract.py
+new file mode 100644
+index 0000000..d4aac6f
+--- /dev/null
++++ b/tests/test_camera_rendering_contract.py
+@@ -0,0 +1,82 @@
++import ast
++from pathlib import Path
++
++import pytest
++
++from gr00t.rl.utils.camera_rendering_contract import (
++    ACTIVE_REQUIRED_DISABLED_CARB_SETTINGS,
++    DEFAULT_REQUIRED_DISABLED_CARB_SETTINGS,
++    REQUIRED_DISABLED_CARB_SETTINGS,
++    reassert_headless_camera_rendering,
++)
++
++
++class FakeSettings:
++    def __init__(self, values, ignored_paths=()):
++        self.values = dict(values)
++        self.ignored_paths = set(ignored_paths)
++        self.set_calls = []
++
++    def get(self, path):
++        return self.values.get(path)
++
++    def set_bool(self, path, value):
++        self.set_calls.append((path, value))
++        if path not in self.ignored_paths:
++            self.values[path] = value
++
++
++def test_reassert_writes_and_validates_every_required_setting():
++    settings = FakeSettings({path: True for path in REQUIRED_DISABLED_CARB_SETTINGS})
++
++    resolved = reassert_headless_camera_rendering(settings)
++
++    assert settings.set_calls == [
++        (path, False) for path in REQUIRED_DISABLED_CARB_SETTINGS
++    ]
++    assert resolved == {path: False for path in REQUIRED_DISABLED_CARB_SETTINGS}
++
++
++def test_reassert_fails_closed_when_a_setting_write_does_not_stick():
++    unsafe_path = "/rtx/directLighting/sampledLighting/enabled"
++    settings = FakeSettings(
++        {path: True for path in REQUIRED_DISABLED_CARB_SETTINGS},
++        ignored_paths=(unsafe_path,),
++    )
++
++    with pytest.raises(RuntimeError, match=unsafe_path):
++        reassert_headless_camera_rendering(settings)
++
++
++def test_required_settings_cover_active_default_and_transient_namespaces():
++    assert set(REQUIRED_DISABLED_CARB_SETTINGS) == {
++        *ACTIVE_REQUIRED_DISABLED_CARB_SETTINGS,
++        *DEFAULT_REQUIRED_DISABLED_CARB_SETTINGS,
++    }
++    assert any(path.startswith("/rtx-transient/") for path in REQUIRED_DISABLED_CARB_SETTINGS)
++    assert any(path.startswith("/rtx-defaults/") for path in REQUIRED_DISABLED_CARB_SETTINGS)
++    assert any(
++        path.startswith("/rtx-defaults-transient/")
++        for path in REQUIRED_DISABLED_CARB_SETTINGS
++    )
++
++
++@pytest.mark.parametrize(
++    "script_name",
++    ("train_agent_trl.py", "eval_agent_trl.py"),
++)
++def test_train_and_eval_reassert_before_the_existing_validation(script_name):
++    repo_root = Path(__file__).resolve().parents[1]
++    tree = ast.parse((repo_root / "gr00t" / "rl" / script_name).read_text())
++    lifecycle_calls = {
++        node.func.id: node.lineno
++        for node in ast.walk(tree)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Name)
++        and node.func.id
++        in {"reassert_headless_camera_rendering", "validate_headless_camera_rendering"}
++    }
++
++    assert lifecycle_calls["reassert_headless_camera_rendering"] < lifecycle_calls[
++        "validate_headless_camera_rendering"
++    ]
+diff --git a/tests/test_policy_view_contract.py b/tests/test_policy_view_contract.py
+new file mode 100644
+index 0000000..9ad902d
+--- /dev/null
++++ b/tests/test_policy_view_contract.py
+@@ -0,0 +1,146 @@
++import unittest
++from types import SimpleNamespace
++
++from omegaconf import OmegaConf
++
++from gr00t.rl.utils.policy_view_contract import (
++    bind_policy_view_count_contract,
++    policy_view_count_for_trainer,
++)
++
++
++class AttrConfig(SimpleNamespace):
++    def get(self, key, default=None):
++        return getattr(self, key, default)
++
++
++class FreshConfigEnv:
++    """Model wrappers whose config property returns a detached object."""
++
++    @property
++    def config(self):
++        return AttrConfig()
++
++
++def make_root(root_count=3, composed_count=3):
++    return AttrConfig(
++        policy_view_count=root_count,
++        env=AttrConfig(
++            config=AttrConfig(
++                image_dagger_policy_view_count=composed_count,
++            )
++        ),
++    )
++
++
++class PolicyViewRuntimeBindingTest(unittest.TestCase):
++    def test_missing_runtime_mirror_is_bound_from_validated_root(self):
++        env = SimpleNamespace(config=AttrConfig())
++
++        result = bind_policy_view_count_contract(make_root(), env, "3")
++
++        self.assertEqual(result, 3)
++        self.assertEqual(env.config.image_dagger_policy_view_count, 3)
++        self.assertEqual(env.config.get("image_dagger_policy_view_count"), 3)
++
++    def test_matching_runtime_mirror_is_republished_for_trainer(self):
++        env = SimpleNamespace(
++            config=AttrConfig(image_dagger_policy_view_count="3")
++        )
++
++        bind_policy_view_count_contract(make_root(), env, 3)
++
++        self.assertEqual(env.config.get("image_dagger_policy_view_count"), 3)
++
++    def test_stable_env_binding_survives_fresh_runtime_config_objects(self):
++        env = FreshConfigEnv()
++
++        bind_policy_view_count_contract(make_root(), env, "3")
++
++        # A later config lookup cannot see the value bound on the earlier copy.
++        self.assertIsNone(env.config.get("image_dagger_policy_view_count"))
++        self.assertEqual(policy_view_count_for_trainer(env, "3"), 3)
++
++    def test_stable_env_binding_survives_runtime_config_replacement(self):
++        env = SimpleNamespace(config=AttrConfig())
++
++        bind_policy_view_count_contract(make_root(), env, "3")
++        env.config = AttrConfig()
++
++        self.assertEqual(policy_view_count_for_trainer(env, "3"), 3)
++
++        env.config.image_dagger_policy_view_count = 2
++        with self.assertRaisesRegex(RuntimeError, "runtime policy view count disagrees"):
++            policy_view_count_for_trainer(env, "3")
++
++    def test_interpolated_omegaconf_is_bound_to_runtime_dictconfig(self):
++        root = OmegaConf.create(
++            {
++                "policy_view_count": 3,
++                "env": {
++                    "config": {
++                        "image_dagger_policy_view_count": "${policy_view_count}",
++                    }
++                },
++            }
++        )
++        runtime_config = OmegaConf.create({})
++        OmegaConf.set_struct(runtime_config, False)
++        env = SimpleNamespace(config=runtime_config)
++
++        bind_policy_view_count_contract(root, env, "3")
++
++        self.assertEqual(env.config.image_dagger_policy_view_count, 3)
++        self.assertIsInstance(env.config.image_dagger_policy_view_count, int)
++
++    def test_declaration_or_runtime_disagreement_fails_closed(self):
++        cases = (
++            (make_root(root_count=2), AttrConfig(), "declarations disagree"),
++            (make_root(composed_count=2), AttrConfig(), "declarations disagree"),
++            (
++                make_root(),
++                AttrConfig(image_dagger_policy_view_count=2),
++                "runtime policy view count disagrees",
++            ),
++            (
++                make_root(),
++                AttrConfig(image_dagger_policy_view_count="three"),
++                "invalid runtime env policy view count",
++            ),
++        )
++        for root, runtime, message in cases:
++            with self.subTest(message=message), self.assertRaisesRegex(
++                RuntimeError, message
++            ):
++                bind_policy_view_count_contract(
++                    root, SimpleNamespace(config=runtime), 3
++                )
++
++    def test_nonproduction_entrypoint_is_unchanged(self):
++        env = SimpleNamespace(config=AttrConfig())
++
++        self.assertIsNone(bind_policy_view_count_contract(make_root(), env, None))
++        self.assertIsNone(env.config.get("image_dagger_policy_view_count"))
++
++    def test_trainer_gate_rejects_unvalidated_or_conflicting_bindings(self):
++        env = SimpleNamespace(
++            config=AttrConfig(image_dagger_policy_view_count=3)
++        )
++        with self.assertRaisesRegex(RuntimeError, "validated.*binding is missing"):
++            policy_view_count_for_trainer(env, "3")
++
++        bind_policy_view_count_contract(make_root(), env, "3")
++        env.config.image_dagger_policy_view_count = 2
++        with self.assertRaisesRegex(RuntimeError, "runtime policy view count disagrees"):
++            policy_view_count_for_trainer(env, "3")
++
++    def test_nonproduction_trainer_lookup_preserves_visible_config_value(self):
++        env = SimpleNamespace(
++            config=AttrConfig(image_dagger_policy_view_count="legacy")
++        )
++
++        self.assertEqual(policy_view_count_for_trainer(env), "legacy")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_simulation_app_lifecycle.py b/tests/test_simulation_app_lifecycle.py
+new file mode 100644
+index 0000000..6bebd9c
+--- /dev/null
++++ b/tests/test_simulation_app_lifecycle.py
+@@ -0,0 +1,144 @@
++import io
++
++import pytest
++
++from gr00t.rl.utils import simulation_app_lifecycle as lifecycle_module
++from gr00t.rl.utils.simulation_app_lifecycle import SimulationAppLifecycle
++
++
++class RecordingStderr(io.StringIO):
++    def __init__(self, events):
++        super().__init__()
++        self.events = events
++
++    def write(self, text):
++        self.events.append(("write", text))
++        return super().write(text)
++
++    def flush(self):
++        self.events.append(("flush", None))
++        return super().flush()
++
++
++class RecordingApp:
++    def __init__(self, events, close_error=None):
++        self.events = events
++        self.close_error = close_error
++
++    def close(self):
++        self.events.append(("close", None))
++        if self.close_error is not None:
++            raise self.close_error
++
++
++class ImmediateCloseRecordingApp:
++    def __init__(self):
++        self.close_kwargs = []
++
++    def close(self, **kwargs):
++        self.close_kwargs.append(kwargs)
++
++
++class BrokenStderr:
++    def write(self, _text):
++        raise OSError("stderr is unavailable")
++
++    def flush(self):
++        raise OSError("stderr is unavailable")
++
++
++@pytest.fixture
++def isolated_lifecycle(monkeypatch):
++    monkeypatch.delenv(
++        "IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP", raising=False
++    )
++    previous_handler = object()
++    monkeypatch.setattr(
++        lifecycle_module.signal, "getsignal", lambda _signum: previous_handler
++    )
++    monkeypatch.setattr(lifecycle_module.signal, "signal", lambda *_args: None)
++
++
++def test_body_exception_is_printed_and_flushed_before_close(
++    monkeypatch, isolated_lifecycle
++):
++    events = []
++    stderr = RecordingStderr(events)
++    app = RecordingApp(events)
++    original_error = RuntimeError("body exploded")
++    monkeypatch.setattr(lifecycle_module.sys, "stderr", stderr)
++
++    with pytest.raises(RuntimeError) as raised:
++        with SimulationAppLifecycle() as lifecycle:
++            lifecycle.attach(app)
++            raise original_error
++
++    assert raised.value is original_error
++    close_index = events.index(("close", None))
++    before_close = events[:close_index]
++    before_close_text = "".join(
++        value for kind, value in before_close if kind == "write"
++    )
++    assert "active exception before close" in before_close_text
++    assert "RuntimeError: body exploded" in before_close_text
++    assert ("flush", None) in before_close
++
++
++def test_close_failure_does_not_replace_body_exception(monkeypatch, isolated_lifecycle):
++    events = []
++    stderr = RecordingStderr(events)
++    close_error = OSError("close exploded")
++    app = RecordingApp(events, close_error=close_error)
++    original_error = ValueError("body remains primary")
++    monkeypatch.setattr(lifecycle_module.sys, "stderr", stderr)
++
++    with pytest.raises(ValueError) as raised:
++        with SimulationAppLifecycle() as lifecycle:
++            lifecycle.attach(app)
++            raise original_error
++
++    assert raised.value is original_error
++    assert app.events.count(("close", None)) == 1
++    assert "OSError: close exploded" in stderr.getvalue()
++
++
++def test_broken_stderr_and_close_failure_do_not_replace_body_exception(
++    monkeypatch, isolated_lifecycle
++):
++    events = []
++    app = RecordingApp(events, close_error=OSError("close exploded"))
++    original_error = ValueError("body remains primary")
++    monkeypatch.setattr(lifecycle_module.sys, "stderr", BrokenStderr())
++
++    with pytest.raises(ValueError) as raised:
++        with SimulationAppLifecycle() as lifecycle:
++            lifecycle.attach(app)
++            raise original_error
++
++    assert raised.value is original_error
++    assert app.events.count(("close", None)) == 1
++
++
++def test_immediate_close_is_an_explicit_opt_in(monkeypatch, isolated_lifecycle):
++    monkeypatch.setenv("IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP", "1")
++    app = ImmediateCloseRecordingApp()
++
++    with SimulationAppLifecycle() as lifecycle:
++        lifecycle.attach(app)
++
++    assert app.close_kwargs == [{"skip_cleanup": True}]
++
++
++@pytest.mark.parametrize("invalid_value", ["", "true", "yes", "2", " 1"])
++def test_invalid_immediate_close_value_fails_closed(
++    monkeypatch, isolated_lifecycle, invalid_value
++):
++    monkeypatch.setenv(
++        "IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP", invalid_value
++    )
++
++    with pytest.raises(
++        RuntimeError,
++        match="IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP must be exactly 0 or 1",
++    ):
++        SimulationAppLifecycle()
+

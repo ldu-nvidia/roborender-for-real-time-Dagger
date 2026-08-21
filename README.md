@@ -12,8 +12,25 @@ Code lives in `GR00T-VisualSim2Real/`; launchers and assets live here in `fast_r
 
 ## Setup
 
-OCI uses three separate environments because the host telemetry process, Image3F renderer,
-and Isaac/GR00T trainer have incompatible runtime requirements:
+The primary production target is HSG GB200.  It uses two sealed ARM64 containers: one for the
+SM100 Image3F/TensorRT renderer and one for Isaac Sim 5.1, Isaac Lab, GR00T, and W&B telemetry.
+The source checkout is staged separately as an immutable, content-addressed snapshot and mounted
+read-only into both containers.  The HSG launchers live under `scripts/scaling/hsg_gb200_*` and
+fail closed on source, container, model, engine, anchor-pool, teacher, camera, predecessor-smoke,
+and personal-W&B identities.
+
+Always point `ROOT` at the exact read-only snapshot created for the campaign, never the mutable
+`$STAGE_ROOT/src/fast_roborender` compatibility path:
+
+```bash
+export STAGE_ROOT=/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/ldu/roborender_gb200_sm100
+export ROOT="$STAGE_ROOT/src_snapshots/fast_roborender_<fast7>_<gr00t7>_sealed"
+export GR00T_ROOT="$ROOT/GR00T-VisualSim2Real"
+```
+
+The older OCI/H100 setup remains available for development and portability testing.  OCI uses
+three separate environments because the host telemetry process, Image3F renderer, and
+Isaac/GR00T trainer have incompatible runtime requirements:
 
 | Environment | Built by | Used for |
 |---|---|---|
@@ -311,10 +328,10 @@ the student's undiluted state distribution, which is the point of DAgger. β aff
 training rollouts only; evaluation always runs the student.
 
 ```bash
-# The packed launcher starts both renderer and trainer steps inside one allocation.
-source scripts/setup/oci_env.sh
-DRY_RUN=1 bash scripts/scaling/submit_oci_packed.sh
-bash scripts/scaling/submit_oci_packed.sh
+# The HSG packed launcher starts renderer and trainer steps inside one allocation.
+RUN_PROFILE=production_256x300 DRY_RUN=1 \
+  bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
+bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
 ```
 
 ### Observation mixing
@@ -334,7 +351,7 @@ relabelling is requested with no live renderer, and warns when there are fewer s
 `ceil(envs × (1 − MIX) / 5)`. Too few servers does not fail — it serialises the rollout, so
 watch `Iteration time` (expect ~145 s at 16 envs / 3 servers / `MIX=0.5`).
 
-That table describes the earlier small-run launcher. OCI production fixes `MIX=0`, starts
+That table describes the earlier small-run launcher. HSG production fixes `MIX=0`, starts
 the student from base initialization (`CKPT=none`), and validates all 52 renderer endpoints
 inside the packed job before training.
 
@@ -362,10 +379,15 @@ base model path, while the expert checkpoint is used only to label actions.
 
 ### Production scale: 256 environments × 300 rollout steps
 
-Production is one packed Slurm allocation: **8 nodes × 8 H100 GPUs = 64 H100s**. Inside that
-allocation, one concurrent step runs 52 persistent Image3F renderer tasks (up to seven per
-node), and a second step runs eight synchronized trainer ranks (one per node). Four GPUs remain
-as placement slack. There are no independently scheduled renderer or trainer jobs.
+For exact fresh, resume, validation-only, lease, and artifact procedures, see
+[`docs/HSG_GB200_PRODUCTION_RUNBOOK.md`](docs/HSG_GB200_PRODUCTION_RUNBOOK.md).
+
+HSG production is one packed Slurm allocation on `batch_long`: **15 nodes × 4 GB200 GPUs =
+60 GB200s** for eight hours.  One concurrent step runs 52 persistent Image3F renderer tasks;
+the first seven nodes host four renderers each and the remaining eight host three renderers plus
+one synchronized trainer rank.  The launcher attests this exact host/GPU placement before the
+first rollout.  There are no independently scheduled renderer or trainer jobs and no hidden GPU
+slack in this layout.
 
 Each trainer rank owns 32 Isaac environments, giving 256 globally. `num_envs` is rank-local in
 GR00T, so passing 256 to every rank would accidentally create 2,048 environments. Every outer
@@ -394,15 +416,12 @@ python scripts/scaling/install_gr00t_integration.py \
 # inspect the exact 256x300 capacity calculation
 python scripts/scaling/scale_plan.py
 
-# validate the single packed command without submitting
-DRY_RUN=1 bash scripts/scaling/submit_oci_packed.sh
+# inspect the exact HSG scheduler request without submitting it
+RUN_PROFILE=production_256x300 DRY_RUN=1 \
+  bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
 
-# submit the packed 8-node allocation
-bash scripts/scaling/submit_oci_packed.sh
-
-# Compatibility entry points resolve to the same packed launcher.
-bash scripts/scaling/submit_production.sh
-bash scripts/scaling/submit_8h_256env.sh
+# submit the packed 15-node allocation after all promotion gates pass
+bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
 ```
 
 The wall time covers renderer startup, endpoint validation, training, telemetry drain, and
@@ -411,13 +430,16 @@ dies while training is live, it signals the trainer and fails the job; on any ex
 both steps. Slurm sends `USR1` five minutes before the allocation limit, allowing the trainer to
 retain its latest periodic checkpoint and drain telemetry before the job ends. Submission and
 packed manifests record the single job ID, both repository revisions, asset identities, and the
-52+8+4 GPU layout.
+exact 52-renderer + 8-trainer GPU placement.
 
 The production contract fixes 256 environments, 300 rollout steps, eight trainer ranks,
-52 renderers, `MIX=0`, fixed anchors, and fresh student initialization. Useful campaign-level
-overrides are `NUM_ROLLOUT_ITERATIONS`, `SAVE_FREQUENCY`, `PROJ`, `EXP`, `RUN_ID`, and
-`RUN_WALLTIME`; source and asset identities remain pinned. `ROLLOUT_STEPS=300` is the collection
-horizon of each outer iteration, not an optimizer-batch size or run length.
+52 renderers, `MIX=0`, fixed anchors, fresh student initialization, an absolute target of 500
+updates, and checkpoints every five updates.  `ROLLOUT_STEPS=300` is the collection horizon of
+each outer iteration, not an optimizer-batch size or run length.  A restart must reuse the exact
+logical `RUN_ID`, immutable run identity, W&B run IDs, latest durable periodic checkpoint, and
+optimizer/scheduler/per-rank DAgger stream state.  A completed step-500 checkpoint can enter the
+validation-only recovery path; it is never retrained or silently accepted without telemetry and
+post-run validation.
 
 Production behavior is explicit and recorded in both manifests. It uses per-decision β mixing,
 annealed linearly from 1.0 to 0.0 over 500 rollout iterations: the expert dominates while the
@@ -430,37 +452,38 @@ contract.
 
 ### Explicit production gates
 
-Release validation is deliberately sequential. First run
-`scripts/scaling/submit_oci_calibration_3view.sh`; its two diagnostic panels are
+Release validation is deliberately sequential. First submit the HSG calibration profile; its two
+diagnostic panels are
 technical artifacts only and remain `awaiting_visual_acceptance`. After checking that the three
 columns are the head, left-wrist, and right-wrist cameras with correct orientation, create the
 content-addressed acceptance record (the confirmation text is intentionally exact):
 
 ```bash
-python scripts/scaling/camera_calibration_gate.py accept \
+RUN_PROFILE=calibration_3view bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+
+python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
   --manifest /absolute/run/path/validation/camera_calibration_manifest.json \
   --output "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json" \
   --reviewer ldu@nvidia.com \
   --confirm 'I reviewed both three-view calibration panels and accept the camera mapping.' \
-  --expected-fast-roborender-revision "$(git rev-parse HEAD)" \
-  --expected-gr00t-revision "$(git -C GR00T-VisualSim2Real rev-parse HEAD)"
+  --expected-fast-roborender-revision "$(cat "$ROOT/.source_revision")" \
+  --expected-gr00t-revision "$(cat "$GR00T_ROOT/.source_revision")"
 ```
 
 The acceptance binds both panel hashes, their PNG dimensions, ordered camera semantics, and both
 repository revisions. Any source, panel, or revision change invalidates it. The bounded validation
-sequence then runs `submit_oci_smoke_32x300.sh` followed by
-`submit_oci_smoke_256x300.sh`; the latter proves one synchronized optimizer update across all eight
-trainer ranks. Publish each successful run without copying or editing its manifest, then advance
-to the next gate:
+sequence then runs the HSG `smoke_32x300` profile followed by `smoke_256x300`; the latter proves
+one synchronized optimizer update across all eight trainer ranks. Publish each successful run
+without copying or editing its manifest, then advance to the next gate:
 
 ```bash
-ln -s /absolute/smoke32/run/profile_validation_manifest.txt \
-  "$STAGE_ROOT/runtime/validation/smoke_32x300_profile_validation_manifest.txt"
-bash scripts/scaling/submit_oci_smoke_256x300.sh
+RUN_PROFILE=smoke_32x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
 
-ln -s /absolute/smoke256/run/profile_validation_manifest.txt \
-  "$STAGE_ROOT/runtime/validation/smoke_256x300_profile_validation_manifest.txt"
-bash scripts/scaling/submit_production.sh
+# After publishing the validated smoke-32 manifest at the path printed by the job:
+RUN_PROFILE=smoke_256x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+
+# After publishing the validated smoke-256 manifest:
+bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
 ```
 
 The submitter and packed allocation independently rehash the predecessor manifest, checkpoints,
@@ -470,7 +493,7 @@ remains blocked until every predecessor artifact validates against the same sour
 | Gate | Must pass before/while running |
 |---|---|
 | Source and assets | Clean, run-pinned `fast_roborender` and integrated GR00T revisions; exact expert-labeler SHA; base student initialization; versioned Image3F client and telemetry integration |
-| Scale and behavior | 8 nodes × 8 H100s; 8 ranks × 32 environments = 256; 300-step rollout; 52 renderers + 4 slack; `MIX=0`; FT-FIXED lag 0; β 1→0 over 500 iterations; pure DAgger BC |
+| Scale and behavior | 15 nodes × 4 GB200s; 8 ranks × 32 environments = 256; 300-step rollout; 52 renderers; exact host/GPU placement; `MIX=0`; FT-FIXED lag 0; β 1→0 over 500 iterations; pure DAgger BC |
 | Camera semantics | Human-accepted, content-addressed calibration for exact head/left-wrist/right-wrist order, orientations, tile shapes, panels, and source revisions |
 | Renderer provenance | All 52 live endpoints report exact three-view order/layout/shape, fine-tuned release/adapter SHA, five-step sampler, TeaCache 0.3, CFG 1.0, CUDA graph setting, and a load-verified TensorRT engine compatible with the serving GPU/software stack |
 | Training integrity | One-node predecessor smoke passes; full 8-rank predecessor smoke proves synchronized post-update policy SHA; every update has finite/nonnegative cross-rank BC loss; initial and exact terminal checkpoints exist |
@@ -478,10 +501,10 @@ remains blocked until every predecessor artifact validates against the same sour
 | Runtime semantics | The composed trainer agrees with every behavior, primary-view, epoch, and loss-coefficient assertion before its first rollout |
 | Scientific result | Baseline/early/mid/final fixed-seed evaluation is complete; the final policy improves success by at least 2 absolute points and the paired 95% bootstrap interval has a lower bound above zero |
 
-The packed topology requires eight OCI H100 nodes at once. Source alone is not sufficient: the
+The packed topology requires 15 HSG GB200 nodes at once. Source alone is not sufficient: the
 integrated GR00T checkout, expert labeler, Image3F adapter and foundation weights, anchor pool,
-target-built H100 TensorRT engine, three ready environments, and W&B authentication must all be
-present. A failed gate never becomes a nominal production run.
+target-built SM100 TensorRT engine, sealed dual-container runtime, and W&B authentication must all
+be present. A failed gate never becomes a nominal production run.
 
 ### W&B production telemetry
 
@@ -495,13 +518,14 @@ written media. Production checkpoints are saved every five rollout iterations so
 policy behavior can be evaluated with fixed seeds and the same expert/reference configuration.
 The media watcher is a production gate: if it exits while the trainer is live, the distributed
 step is stopped. `RUN_DONE` is written only after a successful trainer and telemetry drain;
-failures write `RUN_FAILED` with the preserved trainer exit status.
+production failures write attempt-scoped `ATTEMPT_FAILED` and a hash-bound resume candidate with
+the preserved trainer exit status.
 
 ### Fixed-seed policy-improvement gate
 
 The packed production launcher intentionally submits only the training allocation; it does not
 silently create follow-on evaluation jobs. After training, the fixed-seed evaluation entrypoints
-can compare a declared baseline, early, midpoint, and final checkpoint on the same eight Isaac
+compare a declared baseline, early, midpoint, and final checkpoint on the same eight Isaac
 seed blocks with 32 environments per block. Each environment contributes exactly one episode,
 giving 256 matched episodes per checkpoint without letting fast-terminating policies advance the
 reset RNG to different scenarios. Because production starts a fresh student, the baseline must be
@@ -512,8 +536,15 @@ and scheduler state, and records the actual staged checkpoint/config hashes befo
 in-tree adapter captures the mapping returned by `trainer.eval()` and writes it atomically; the
 gate does not rely on a particular trainer variant happening to emit `metrics_eval.json`.
 
-The machine-readable report is
-`<training_run>/fixed_seed_eval/fixed_seed_improvement_report.json`. The gate passes only when
+Two distinct gates are provided. `submit_hsg_gb200_fixed_seed_gate.sh` is a secondary
+simulator-RGB policy-mechanics diagnostic; it must not be presented as evidence for the deployed
+observation distribution. `submit_hsg_gb200_image3f_fixed_seed_gate.sh` is the primary production
+gate: it uses the certified three-view Image3F stream, one warm seven-renderer fleet, sequential
+baseline/early/mid/final evaluation, paired condition fingerprints, and before/after renderer
+request/error/runtime attestations.
+
+The machine-readable production report is stored below the training run's Image3F fixed-seed
+evaluation directory. The gate passes only when
 final-minus-baseline success is at least two absolute percentage points and the lower bound of
 its paired seed-block bootstrap 95% interval is above zero. Reward and its paired interval are
 reported as a diagnostic but are not silently mixed into the success criterion. Training loss
@@ -522,7 +553,7 @@ Wilson intervals, reward intervals, and the gate result are logged to a separate
 in the same personal W&B project. This post-run scientific gate does not change the lifecycle or
 ownership of the completed packed production job.
 
-Before the full job, validate environment imports, the H100 renderer smoke test, endpoint
+Before the full job, validate environment imports, the GB200 renderer smoke test, endpoint
 identity checks, and a bounded distributed rollout. Acceptance requires exact global transition
 counts, finite BC loss, balanced endpoint request counts, zero render errors, correct FT-FIXED
 anchor resets, and synchronized policy checkpoints across ranks.
@@ -625,10 +656,13 @@ ancestor of the branch, so they apply without a rebase:
 ```bash
 cd GR00T-VisualSim2Real
 git am ../transfer/0001-*.patch ../transfer/0002-*.patch ../transfer/0003-*.patch
+git apply ../transfer/0004-*.patch
 ```
 
 0001 = videogen pipeline (trainer, render clients, conditioning cameras, scene walls,
-configs) · 0002 = three-view policy · 0003 = DAgger beta schedule.
+configs) · 0002 = three-view policy · 0003 = DAgger beta schedule · 0004 = cumulative
+production hardening, restart state, telemetry, camera/lifecycle gates, and fixed-seed
+Image3F evaluation evidence.
 
 The patches carry code only. Also needed on the target machine, none of it in this repo:
 
@@ -641,11 +675,11 @@ The patches carry code only. Also needed on the target machine, none of it in th
 | Rendered dataset | `scripts/data/` (offline BC only) |
 | Launchers and this README | `fast_roborender/` |
 
-Every launcher in `scripts/` now targets the OCI cluster (`general_cs_infra`,
-`grizzly` for the packed 8-node job, `backfill_block1` for single-node GPU work,
-`cpu_short` for host-only utilities, and the shared Lustre stage root). The current
-`grizzly` QoS caps each packed stage at four hours. On a workstation with no Slurm, run the training
-command directly — the launchers are thin wrappers around it:
+The canonical production launchers target HSG account `llmservice_nemotron_ultra`: bounded probes
+use `batch`, while the 15-node production allocation uses `batch_long` with normal QoS and an
+eight-hour limit.  The OCI launchers remain as legacy H100 portability paths under
+`general_cs_infra`. On a workstation with no Slurm, run the training command directly—the
+launchers are thin wrappers around it:
 
 ```bash
 cd GR00T-VisualSim2Real
@@ -732,8 +766,8 @@ every arm by 0.7-1.2 dB. Training was never affected -- it always went through t
   from a previous run. Verify the endpoint's hostname matches the server job's node.
 - **Shared storage stalls.** Check `ps -o wchan` and the Lustre client state when a job
   runs with an empty log; never work around this by writing large artifacts to the root disk.
-- **Slurm.** `--nodelist=A,B` requests *all* listed nodes. OCI production uses
-  `--gpus-per-node=8` for the packed run and `--gpus-per-node=1` for single-GPU helpers.
+- **Slurm.** `--nodelist=A,B` requests *all* listed nodes. HSG production requests
+  15 nodes with four GB200 GPUs per node; placement is 52 renderer tasks plus eight trainer ranks.
   Hydra needs a `+` prefix for keys absent from
-  the base config. Training runs end in `TIMEOUT` at their limit; that is normal, and
-  `--dependency=afterany` (not `afterok`) is what chains an eval behind them.
+  the base config. A timeout is an interrupted attempt, never a success marker: resume from the
+  latest hash-bound five-step checkpoint under the original logical run ID.

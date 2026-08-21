@@ -13,6 +13,7 @@ import socket
 import struct
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -84,6 +85,7 @@ def capability_error(
     expected_teacache_threshold: float | None = None,
     expected_cfg_scale: float | None = None,
     expected_cuda_graph: bool | None = None,
+    expected_engine_sha256: str | None = None,
     require_tensorrt_engine: bool = False,
     expected_output_views: tuple[str, ...] | None = None,
     expected_output_layout: str | None = None,
@@ -134,6 +136,7 @@ def capability_error(
             expected_teacache_threshold,
             expected_cfg_scale,
             expected_cuda_graph,
+            expected_engine_sha256,
         )
     ) or require_tensorrt_engine
     if not identity_required:
@@ -183,7 +186,7 @@ def capability_error(
         if cuda_graph is not expected_cuda_graph:
             return f"CUDA graph enabled={cuda_graph} != required {expected_cuda_graph}"
 
-    if require_tensorrt_engine:
+    if require_tensorrt_engine or expected_engine_sha256 is not None:
         runtime = identity.get("runtime")
         engine = identity.get("engine")
         if not isinstance(runtime, dict):
@@ -201,6 +204,11 @@ def capability_error(
         engine_sha256 = engine.get("sha256")
         if not isinstance(engine_sha256, str) or not _SHA256_RE.fullmatch(engine_sha256):
             return "TensorRT engine SHA-256 is missing or malformed"
+        if expected_engine_sha256 is not None and engine_sha256 != expected_engine_sha256:
+            return (
+                f"TensorRT engine SHA-256 {engine_sha256} != required "
+                f"{expected_engine_sha256}"
+            )
         if engine.get("adapter_sha256") != adapter_sha256:
             return "TensorRT engine adapter SHA-256 does not match the runtime adapter"
         for field in (
@@ -249,6 +257,7 @@ def main() -> int:
     parser.add_argument(
         "--expected-cuda-graph", choices=("enabled", "disabled"), default=None
     )
+    parser.add_argument("--expected-engine-sha256")
     parser.add_argument("--require-tensorrt-engine", action="store_true")
     parser.add_argument("--expected-output-views")
     parser.add_argument("--expected-output-layout")
@@ -256,9 +265,29 @@ def main() -> int:
     parser.add_argument("--expected-output-stacked-shape")
     parser.add_argument("--write-manifest", type=Path, default=None)
     parser.add_argument("--write-report", type=Path, default=None)
+    parser.add_argument("--expected-host-counts", type=Path, default=None)
+    parser.add_argument("--write-placement-report", type=Path, default=None)
     parser.add_argument("--hydra-list", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    expected_host_counts: dict[str, int] | None = None
+    if args.expected_host_counts is not None:
+        try:
+            payload = json.loads(args.expected_host_counts.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"--expected-host-counts is invalid: {type(exc).__name__}") from None
+        counts = payload.get("host_counts") if isinstance(payload, dict) else None
+        schema = payload.get("schema") if isinstance(payload, dict) else None
+        if (
+            schema != "fast_roborender.renderer_placement_plan.v1"
+            or not isinstance(counts, dict)
+            or any(not isinstance(host, str) or not host for host in counts)
+            or any(isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in counts.values())
+        ):
+            raise SystemExit("--expected-host-counts has an invalid placement contract")
+        expected_host_counts = dict(sorted(counts.items()))
+        if sum(expected_host_counts.values()) != args.expected:
+            raise SystemExit("--expected-host-counts total does not match --expected")
     def parse_csv(raw, *, cast, flag):
         if raw is None:
             return None
@@ -299,6 +328,10 @@ def main() -> int:
         args.expected_adapter_sha256
     ):
         raise SystemExit("--expected-adapter-sha256 must be 64 lowercase hex characters")
+    if args.expected_engine_sha256 is not None and not _SHA256_RE.fullmatch(
+        args.expected_engine_sha256
+    ):
+        raise SystemExit("--expected-engine-sha256 must be 64 lowercase hex characters")
     if args.expected_release_id is not None and not args.expected_release_id.strip():
         raise SystemExit("--expected-release-id must be non-empty")
     for flag, value in (
@@ -336,6 +369,7 @@ def main() -> int:
                     if args.expected_cuda_graph is not None
                     else None
                 ),
+                expected_engine_sha256=args.expected_engine_sha256,
                 require_tensorrt_engine=args.require_tensorrt_engine,
                 expected_output_views=expected_output_views,
                 expected_output_layout=args.expected_output_layout,
@@ -356,7 +390,14 @@ def main() -> int:
             "healthy": healthy,
             "errors": errors,
         }
-        if len(capable) >= args.expected and duplicate_count == 0:
+        capable_host_counts = dict(sorted(Counter(item["host"] for item in capable).items()))
+        last_report["capable_host_counts"] = capable_host_counts
+        placement_matches = (
+            expected_host_counts is None or capable_host_counts == expected_host_counts
+        )
+        last_report["expected_host_counts"] = expected_host_counts
+        last_report["placement_matches"] = placement_matches
+        if len(capable) == args.expected and duplicate_count == 0 and placement_matches:
             selected = capable[: args.expected]
             last_report["selected"] = selected
             if args.write_manifest:
@@ -378,6 +419,26 @@ def main() -> int:
                     encoding="utf-8",
                 )
                 os.replace(tmp, args.write_report)
+            if args.write_placement_report:
+                placement = {
+                    "schema": "fast_roborender.renderer_placement_attestation.v1",
+                    "status": "PASS",
+                    "renderer_count": len(selected),
+                    "expected_host_counts": expected_host_counts,
+                    "actual_host_counts": capable_host_counts,
+                    "unique_endpoint_count": len(
+                        {(item["host"], item["port"]) for item in selected}
+                    ),
+                }
+                args.write_placement_report.parent.mkdir(parents=True, exist_ok=True)
+                tmp = args.write_placement_report.with_name(
+                    f".{args.write_placement_report.name}.{os.getpid()}.tmp"
+                )
+                tmp.write_text(
+                    json.dumps(placement, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp, args.write_placement_report)
             if args.hydra_list:
                 print("[" + ",".join(item["file"] for item in selected) + "]")
             elif args.json:

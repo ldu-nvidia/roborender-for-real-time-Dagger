@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 
-EXPECTED_FIELDS = frozenset(
+LEGACY_EXPECTED_FIELDS = frozenset(
     {
         "run_profile",
         "fast_roborender_revision",
@@ -46,18 +46,66 @@ EXPECTED_FIELDS = frozenset(
         "status",
     }
 )
+HSG_EXPECTED_FIELDS = frozenset(
+    {
+        "manifest_schema",
+        "run_profile",
+        "fast_roborender_revision",
+        "fast_roborender_source_tree_sha256",
+        "gr00t_revision",
+        "gr00t_source_tree_sha256",
+        "source_snapshot_attestation_sha256",
+        "source_snapshot_inventory_sha256",
+        "immutable_asset_contract_sha256",
+        "global_envs",
+        "rollout_steps",
+        "trainer_nodes",
+        "policy_views",
+        "policy_view_count",
+        "policy_view_layout",
+        "policy_image_shape",
+        "initial_policy_checkpoint",
+        "initial_checkpoint_sha256",
+        "initial_policy_state_sha256",
+        "final_checkpoint",
+        "final_checkpoint_sha256",
+        "final_policy_state_sha256",
+        "policy_change_marker",
+        "policy_change_marker_sha256",
+        "finite_bc_loss_marker",
+        "finite_bc_loss_marker_sha256",
+        "ddp_sync_marker",
+        "ddp_sync_marker_sha256",
+        "renderer_placement",
+        "renderer_placement_sha256",
+        "wandb_media_drain",
+        "wandb_media_drain_sha256",
+        "wandb_remote_readback",
+        "wandb_remote_readback_sha256",
+        "wandb_trainer_run_id",
+        "wandb_sidecar_run_id",
+        "camera_calibration_manifest",
+        "camera_calibration_manifest_sha256",
+        "rollout_iterations",
+        "status",
+    }
+)
 PROFILE_CONTRACTS = {
     "smoke_32x300": {
         "global_envs": 32,
         "rollout_steps": 300,
         "trainer_nodes": 1,
         "ddp_world_size": None,
+        "renderer_count": 7,
+        "renderer_host_count": 2,
     },
     "smoke_256x300": {
         "global_envs": 256,
         "rollout_steps": 300,
         "trainer_nodes": 8,
         "ddp_world_size": 8,
+        "renderer_count": 52,
+        "renderer_host_count": 15,
     },
 }
 EXPECTED_POLICY = {
@@ -71,6 +119,7 @@ DDP_SCHEMA = "fast_roborender.ddp_policy_sync.v1"
 _REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _KEY = re.compile(r"[a-z][a-z0-9_]*\Z")
+_RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 class GateError(RuntimeError):
@@ -123,6 +172,8 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def load_manifest(path: Path) -> tuple[Path, dict[str, str]]:
+    if path.is_symlink():
+        raise GateError(f"manifest must not be a symbolic link: {path}")
     try:
         resolved = path.resolve(strict=True)
     except OSError as exc:
@@ -150,9 +201,11 @@ def load_manifest(path: Path) -> tuple[Path, dict[str, str]]:
             raise GateError(f"duplicate manifest key {key!r}")
         fields[key] = value
 
-    missing = sorted(EXPECTED_FIELDS - fields.keys())
-    unexpected = sorted(fields.keys() - EXPECTED_FIELDS)
-    if missing or unexpected:
+    field_set = frozenset(fields)
+    if field_set not in {LEGACY_EXPECTED_FIELDS, HSG_EXPECTED_FIELDS}:
+        expected = HSG_EXPECTED_FIELDS if "manifest_schema" in fields else LEGACY_EXPECTED_FIELDS
+        missing = sorted(expected - fields.keys())
+        unexpected = sorted(fields.keys() - expected)
         raise GateError(
             f"manifest field set mismatch: missing={missing!r}, "
             f"unexpected={unexpected!r}"
@@ -188,6 +241,8 @@ def _artifact(
     declared = Path(value)
     if not declared.is_absolute():
         raise GateError(f"manifest {path_key} must be an absolute path")
+    if declared.is_symlink():
+        raise GateError(f"manifest {path_key} must not be a symbolic link")
     expected = (manifest_path.parent / relative_path).resolve()
     try:
         actual = declared.resolve(strict=True)
@@ -308,6 +363,13 @@ def validate_profile(
     expected_fast_revision: str,
     expected_gr00t_revision: str,
     expected_manifest_sha256: str | None = None,
+    expected_fast_source_tree_sha256: str | None = None,
+    expected_gr00t_source_tree_sha256: str | None = None,
+    expected_source_snapshot_attestation_sha256: str | None = None,
+    expected_source_snapshot_inventory_sha256: str | None = None,
+    expected_asset_contract_sha256: str | None = None,
+    expected_wandb_email: str | None = None,
+    expected_wandb_entity: str | None = None,
 ) -> dict[str, Any]:
     if expected_profile not in PROFILE_CONTRACTS:
         raise GateError(
@@ -332,6 +394,39 @@ def validate_profile(
     _require_exact(fields, "run_profile", expected_profile)
     _require_exact(fields, "fast_roborender_revision", fast_revision)
     _require_exact(fields, "gr00t_revision", gr00t_revision)
+    is_hsg = fields.get("manifest_schema") == "fast_roborender.hsg_profile_validation.v2"
+    requires_hsg = any(
+        value is not None
+        for value in (
+            expected_fast_source_tree_sha256,
+            expected_gr00t_source_tree_sha256,
+            expected_source_snapshot_attestation_sha256,
+            expected_source_snapshot_inventory_sha256,
+            expected_asset_contract_sha256,
+            expected_wandb_email,
+            expected_wandb_entity,
+        )
+    )
+    if requires_hsg and not is_hsg:
+        raise GateError("legacy predecessor manifest cannot authorize an HSG run")
+    if is_hsg:
+        expected_hsg_values = {
+            "fast_roborender_source_tree_sha256": expected_fast_source_tree_sha256,
+            "gr00t_source_tree_sha256": expected_gr00t_source_tree_sha256,
+            "source_snapshot_attestation_sha256": (
+                expected_source_snapshot_attestation_sha256
+            ),
+            "source_snapshot_inventory_sha256": (
+                expected_source_snapshot_inventory_sha256
+            ),
+            "immutable_asset_contract_sha256": expected_asset_contract_sha256,
+        }
+        for key, expected in expected_hsg_values.items():
+            if expected is None:
+                raise GateError(f"expected {key} is required for an HSG manifest")
+            _require_exact(fields, key, _require_sha256(expected, key))
+        if not expected_wandb_email or not expected_wandb_entity:
+            raise GateError("expected personal W&B identity is required for an HSG manifest")
     contract = PROFILE_CONTRACTS[expected_profile]
     for key in ("global_envs", "rollout_steps", "trainer_nodes"):
         _require_int(fields, key, contract[key])
@@ -345,7 +440,7 @@ def validate_profile(
         fields,
         manifest_path,
         "initial_policy_checkpoint",
-        "initial_policy_sha256",
+        "initial_checkpoint_sha256" if is_hsg else "initial_policy_sha256",
         Path("initial_policy.pt"),
     )
     final_path, final_hash = _artifact(
@@ -364,6 +459,133 @@ def validate_profile(
     )
     loss = _validate_finite_marker(finite_path, contract["trainer_nodes"])
 
+    initial_policy_state_hash = ""
+    final_policy_state_hash = ""
+    placement_hash = ""
+    wandb_drain_hash = ""
+    wandb_readback_hash = ""
+    if is_hsg:
+        initial_policy_state_hash = _require_sha256(
+            fields["initial_policy_state_sha256"], "initial policy-state SHA-256"
+        )
+        final_policy_state_hash = _require_sha256(
+            fields["final_policy_state_sha256"], "final policy-state SHA-256"
+        )
+        if initial_policy_state_hash == final_policy_state_hash:
+            raise GateError("HSG predecessor policy tensors did not change")
+        policy_path, _ = _artifact(
+            fields,
+            manifest_path,
+            "policy_change_marker",
+            "policy_change_marker_sha256",
+            Path("validation/checkpoint_policy_change.json"),
+        )
+        policy_marker = load_json(policy_path)
+        if (
+            policy_marker.get("schema")
+            != "fast_roborender.checkpoint_policy_change.v1"
+            or policy_marker.get("status") != "PASS"
+            or policy_marker.get("initial", {}).get("checkpoint_sha256") != initial_hash
+            or policy_marker.get("final", {}).get("checkpoint_sha256") != final_hash
+            or policy_marker.get("initial", {}).get("policy_sha256")
+            != initial_policy_state_hash
+            or policy_marker.get("final", {}).get("policy_sha256")
+            != final_policy_state_hash
+        ):
+            raise GateError("HSG predecessor policy-state marker is inconsistent")
+        placement_path, placement_hash = _artifact(
+            fields,
+            manifest_path,
+            "renderer_placement",
+            "renderer_placement_sha256",
+            Path("validation/renderer_placement.json"),
+        )
+        placement = load_json(placement_path)
+        renderer_count = contract["renderer_count"]
+        expected_counts = placement.get("expected_host_counts")
+        actual_counts = placement.get("actual_host_counts")
+        if (
+            placement.get("schema")
+            != "fast_roborender.renderer_placement_attestation.v1"
+            or placement.get("status") != "PASS"
+            or placement.get("renderer_count") != renderer_count
+            or placement.get("unique_endpoint_count") != renderer_count
+            or not isinstance(expected_counts, dict)
+            or actual_counts != expected_counts
+            or len(expected_counts) != contract["renderer_host_count"]
+            or any(
+                not isinstance(host, str)
+                or not host
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 1
+                for host, count in expected_counts.items()
+            )
+            or sum(expected_counts.values()) != renderer_count
+        ):
+            raise GateError("HSG predecessor renderer placement is invalid")
+        drain_path, wandb_drain_hash = _artifact(
+            fields,
+            manifest_path,
+            "wandb_media_drain",
+            "wandb_media_drain_sha256",
+            Path("validation/wandb_media_drain.json"),
+        )
+        readback_path, wandb_readback_hash = _artifact(
+            fields,
+            manifest_path,
+            "wandb_remote_readback",
+            "wandb_remote_readback_sha256",
+            Path("validation/wandb_training_readback.json"),
+        )
+        drain = load_json(drain_path)
+        readback = load_json(readback_path)
+        trainer_run_id = fields["wandb_trainer_run_id"]
+        sidecar_run_id = fields["wandb_sidecar_run_id"]
+        if _RUN_ID.fullmatch(trainer_run_id) is None or _RUN_ID.fullmatch(sidecar_run_id) is None:
+            raise GateError("HSG predecessor W&B run ID is malformed")
+        kinds = drain.get("artifact_kinds")
+        local_counts = readback.get("local_artifact_counts")
+        required_trainer = readback.get("required_trainer_keys")
+        observed_trainer = readback.get("observed_trainer_keys")
+        required_sidecar = readback.get("required_sidecar_keys")
+        observed_sidecar = readback.get("observed_sidecar_keys")
+        if (
+            drain.get("schema") != "fast_roborender.wandb_media_drain.v1"
+            or drain.get("status") != "PASS"
+            or readback.get("schema")
+            != "fast_roborender.wandb_training_readback.v1"
+            or readback.get("status") != "PASS"
+            or readback.get("account_email") != expected_wandb_email
+            or readback.get("entity") != expected_wandb_entity
+            or readback.get("personal") is not True
+            or readback.get("trainer_run_id") != trainer_run_id
+            or readback.get("sidecar_run_id") != sidecar_run_id
+            or drain.get("wandb_run_id") != sidecar_run_id
+            or not isinstance(kinds, dict)
+            or not isinstance(local_counts, dict)
+            or any(
+                isinstance(kinds.get(kind), bool)
+                or not isinstance(kinds.get(kind), int)
+                or kinds[kind] < 1
+                or local_counts.get(kind) != kinds[kind]
+                for kind in ("scalar", "image", "video")
+            )
+            or not isinstance(required_trainer, list)
+            or not isinstance(observed_trainer, list)
+            or any(not isinstance(key, str) for key in required_trainer)
+            or any(not isinstance(key, str) for key in observed_trainer)
+            or "production/dagger_bc_loss" not in required_trainer
+            or not set(required_trainer).issubset(observed_trainer)
+            or not isinstance(required_sidecar, list)
+            or not required_sidecar
+            or not isinstance(observed_sidecar, list)
+            or any(not isinstance(key, str) for key in required_sidecar)
+            or any(not isinstance(key, str) for key in observed_sidecar)
+            or not set(required_sidecar).issubset(observed_sidecar)
+        ):
+            raise GateError("HSG predecessor W&B evidence is inconsistent")
+
     ddp_path: Path | None = None
     ddp_hash = ""
     parameter_hash = ""
@@ -379,6 +601,10 @@ def validate_profile(
             Path("validation/ddp_policy_sync_step_000000001.json"),
         )
         parameter_hash = _validate_ddp_marker(ddp_path, contract["ddp_world_size"])
+        if is_hsg and parameter_hash != final_policy_state_hash:
+            raise GateError(
+                "DDP synchronized policy digest does not match the persisted final policy"
+            )
 
     return {
         "schema": "fast_roborender.profile_validation_verification.v1",
@@ -387,21 +613,39 @@ def validate_profile(
         "manifest": str(manifest_path),
         "manifest_sha256": manifest_hash,
         "fast_roborender_revision": fast_revision,
+        "fast_roborender_source_tree_sha256": (
+            fields.get("fast_roborender_source_tree_sha256", "")
+        ),
         "gr00t_revision": gr00t_revision,
+        "gr00t_source_tree_sha256": fields.get("gr00t_source_tree_sha256", ""),
+        "source_snapshot_attestation_sha256": fields.get(
+            "source_snapshot_attestation_sha256", ""
+        ),
+        "source_snapshot_inventory_sha256": fields.get(
+            "source_snapshot_inventory_sha256", ""
+        ),
+        "immutable_asset_contract_sha256": fields.get(
+            "immutable_asset_contract_sha256", ""
+        ),
         "global_envs": contract["global_envs"],
         "rollout_steps": contract["rollout_steps"],
         "trainer_nodes": contract["trainer_nodes"],
         "policy_views": EXPECTED_POLICY["policy_views"].split(","),
         "initial_policy_checkpoint": str(initial_path),
         "initial_policy_sha256": initial_hash,
+        "initial_policy_state_sha256": initial_policy_state_hash,
         "final_checkpoint": str(final_path),
         "final_checkpoint_sha256": final_hash,
+        "final_policy_state_sha256": final_policy_state_hash,
         "finite_bc_loss_marker": str(finite_path),
         "finite_bc_loss_marker_sha256": finite_hash,
         "finite_bc_loss": loss,
         "ddp_sync_marker": "" if ddp_path is None else str(ddp_path),
         "ddp_sync_marker_sha256": ddp_hash,
         "ddp_policy_parameters_sha256": parameter_hash,
+        "renderer_placement_sha256": placement_hash,
+        "wandb_media_drain_sha256": wandb_drain_hash,
+        "wandb_remote_readback_sha256": wandb_readback_hash,
     }
 
 
@@ -416,6 +660,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-fast-revision", required=True)
     parser.add_argument("--expected-gr00t-revision", required=True)
     parser.add_argument("--expected-manifest-sha256")
+    parser.add_argument("--expected-fast-source-tree-sha256")
+    parser.add_argument("--expected-gr00t-source-tree-sha256")
+    parser.add_argument("--expected-source-snapshot-attestation-sha256")
+    parser.add_argument("--expected-source-snapshot-inventory-sha256")
+    parser.add_argument("--expected-asset-contract-sha256")
+    parser.add_argument("--expected-wandb-email")
+    parser.add_argument("--expected-wandb-entity")
     return parser
 
 
@@ -428,6 +679,13 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_fast_revision,
             args.expected_gr00t_revision,
             args.expected_manifest_sha256,
+            args.expected_fast_source_tree_sha256,
+            args.expected_gr00t_source_tree_sha256,
+            args.expected_source_snapshot_attestation_sha256,
+            args.expected_source_snapshot_inventory_sha256,
+            args.expected_asset_contract_sha256,
+            args.expected_wandb_email,
+            args.expected_wandb_entity,
         )
     except GateError as exc:
         print(f"FATAL: {exc}", file=sys.stderr)

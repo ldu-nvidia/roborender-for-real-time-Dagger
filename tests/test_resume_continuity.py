@@ -27,6 +27,8 @@ def _snapshot(step: int, policy: str, *, max_telemetry: int) -> dict:
         "absolute_target": 2,
         "policy_sha256": policy,
         "optimizer_state_present": True,
+        "optimizer_state_entry_count": 1,
+        "optimizer_param_group_count": 1,
         "scheduler_state_present": True,
         "run_dir": "/run",
         "trainer_wandb_run_id": "trainer-stable",
@@ -123,6 +125,55 @@ class ResumeContinuityGateTest(unittest.TestCase):
                 expected_world_size=2,
             )
 
+    def test_rejects_non_integer_or_inconsistent_rank_runtime_fields(self):
+        mutations = (
+            ("rank", True),
+            ("telemetry_step", "600"),
+            ("rollout_steps", 0),
+            ("local_num_envs", 0),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                before = _snapshot(1, "policy-before", max_telemetry=290)
+                after = _snapshot(2, "policy-after", max_telemetry=590)
+                after["runtime_ranks"][0][key] = value
+                with self.assertRaises(GateError):
+                    verify(
+                        before,
+                        after,
+                        expected_before_step=1,
+                        expected_after_step=2,
+                        rollout_steps=300,
+                        expected_world_size=2,
+                    )
+
+        before = _snapshot(1, "policy-before", max_telemetry=290)
+        after = _snapshot(2, "policy-after", max_telemetry=590)
+        after["runtime_ranks"][1]["local_num_envs"] = 31
+        with self.assertRaisesRegex(GateError, "local environment counts differ"):
+            verify(
+                before,
+                after,
+                expected_before_step=1,
+                expected_after_step=2,
+                rollout_steps=300,
+                expected_world_size=2,
+            )
+
+    def test_rejects_empty_post_update_optimizer_state(self):
+        before = _snapshot(1, "policy-before", max_telemetry=290)
+        after = _snapshot(2, "policy-after", max_telemetry=590)
+        after["optimizer_state_entry_count"] = 0
+        with self.assertRaisesRegex(GateError, "empty after step zero"):
+            verify(
+                before,
+                after,
+                expected_before_step=1,
+                expected_after_step=2,
+                rollout_steps=300,
+                expected_world_size=2,
+            )
+
     def test_cli_verifier_writes_a_pass_report(self):
         before = _snapshot(1, "policy-before", max_telemetry=290)
         after = _snapshot(2, "policy-after", max_telemetry=590)
@@ -173,7 +224,8 @@ class ProductionResumeSourceContractTest(unittest.TestCase):
         self.assertIn(
             "range(completed_step + 1, target_step + 1)", source
         )
-        self.assertIn("strict resume checkpoint has no optimizer state", source)
+        self.assertIn("strict resume checkpoint has malformed optimizer state", source)
+        self.assertIn("strict resume optimizer has no state entries after step zero", source)
         self.assertIn("self._checkpoint_loaded = strict_resume", source)
         self.assertIn("Training stopped cleanly after absolute step", source)
         self.assertNotIn(
@@ -201,6 +253,8 @@ class ProductionResumeSourceContractTest(unittest.TestCase):
         self.assertIn("self._id_rng.set_state", source)
         self.assertIn("episode_ids + 1", source)
         self.assertIn("telemetry_step", source)
+        self.assertIn("EXPECTED_IMAGE_DAGGER_RUNTIME_SHA256S", source)
+        self.assertIn("require_expected_sha256=production_resume", source)
 
     def test_wandb_and_launcher_resume_fail_closed(self):
         train_agent = (

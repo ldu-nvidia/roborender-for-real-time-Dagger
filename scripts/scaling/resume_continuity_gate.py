@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,6 +24,7 @@ from typing import Any, Mapping
 SNAPSHOT_SCHEMA = "fast_roborender.resume_continuity.snapshot.v1"
 REPORT_SCHEMA = "fast_roborender.resume_continuity.report.v1"
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class GateError(RuntimeError):
@@ -35,6 +37,49 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _load_torch_checkpoint(
+    torch: Any,
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Hash and deserialize a checkpoint through the same safe descriptor."""
+
+    expected = None if expected_sha256 in (None, "", "NONE") else expected_sha256
+    if expected is not None and (
+        not isinstance(expected, str) or SHA256_RE.fullmatch(expected) is None
+    ):
+        raise GateError("expected checkpoint SHA-256 is malformed")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise GateError(f"cannot safely open checkpoint {path}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise GateError(f"checkpoint is not a regular file: {path}")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            actual_sha256 = digest.hexdigest()
+            if expected is not None and actual_sha256 != expected:
+                raise GateError(
+                    "checkpoint SHA-256 mismatch at actual load "
+                    f"({actual_sha256} != {expected})"
+                )
+            handle.seek(0)
+            payload = torch.load(handle, map_location="cpu", weights_only=False)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(payload, dict):
+        raise GateError("checkpoint payload is not a dictionary")
+    return payload, actual_sha256
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -73,6 +118,10 @@ def _policy_digest(torch: Any, state: Mapping[str, Any]) -> str:
         if not torch.is_tensor(tensor):
             raise GateError(f"policy state {name!r} is not a tensor")
         cpu = tensor.detach().contiguous().to(device="cpu")
+        if (cpu.is_floating_point() or cpu.is_complex()) and not bool(
+            torch.isfinite(cpu).all().item()
+        ):
+            raise GateError(f"policy state {name!r} contains NaN or infinity")
         metadata = json.dumps(
             {"name": str(name), "dtype": str(cpu.dtype), "shape": list(cpu.shape)},
             sort_keys=True,
@@ -87,6 +136,46 @@ def _policy_digest(torch: Any, state: Mapping[str, Any]) -> str:
     if count == 0:
         raise GateError("checkpoint policy has no parameters")
     return digest.hexdigest()
+
+
+def _policy_schema_digest(
+    torch: Any, state: Mapping[str, Any], names: list[str]
+) -> str:
+    """Digest exact ordered parameter names, dtypes, and shapes."""
+
+    digest = hashlib.sha256()
+    for name in names:
+        tensor = state.get(name)
+        if not torch.is_tensor(tensor):
+            raise GateError(f"policy parameter {name!r} is not a tensor")
+        metadata = json.dumps(
+            {"name": name, "dtype": str(tensor.dtype), "shape": list(tensor.shape)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+    return digest.hexdigest()
+
+
+def _validate_resumable_state(payload: Mapping[str, Any], checkpoint_step: int = 0) -> None:
+    optimizer = payload.get("optimizer_state_dict")
+    if not isinstance(optimizer, Mapping):
+        raise GateError("checkpoint optimizer state is malformed")
+    if not isinstance(optimizer.get("state"), Mapping):
+        raise GateError("checkpoint optimizer state mapping is malformed")
+    if checkpoint_step > 0 and not optimizer["state"]:
+        raise GateError("checkpoint optimizer has no state entries after step zero")
+    param_groups = optimizer.get("param_groups")
+    if not isinstance(param_groups, list) or not param_groups:
+        raise GateError("checkpoint optimizer has no parameter groups")
+    if any(not isinstance(group, Mapping) for group in param_groups):
+        raise GateError("checkpoint optimizer parameter groups are malformed")
+    scheduler = payload.get("lr_scheduler_state_dict")
+    if not isinstance(scheduler, Mapping) or not scheduler:
+        raise GateError("checkpoint scheduler state is malformed")
+    if not isinstance(payload.get("env_state_dict"), Mapping):
+        raise GateError("checkpoint environment state is malformed")
 
 
 def _read_run_id(path: Path, label: str) -> str:
@@ -123,6 +212,7 @@ def snapshot(
     expected_world_size: int,
     *,
     require_wandb: bool = True,
+    expected_checkpoint_sha256: str | None = None,
 ) -> dict[str, Any]:
     try:
         import torch
@@ -132,15 +222,13 @@ def snapshot(
             "snapshot requires the sealed trainer environment with torch and PyYAML"
         ) from exc
 
-    checkpoint = checkpoint.expanduser().resolve()
+    checkpoint = Path(os.path.abspath(checkpoint.expanduser()))
     run_dir = run_dir.expanduser().resolve()
-    if not checkpoint.is_file() or checkpoint.is_symlink():
-        raise GateError(f"checkpoint is missing or unsafe: {checkpoint}")
-    if checkpoint.parent != run_dir:
+    if checkpoint.parent.resolve() != run_dir:
         raise GateError("strict resume checkpoint must be inside the reused run directory")
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise GateError("checkpoint payload is not a dictionary")
+    payload, checkpoint_sha256 = _load_torch_checkpoint(
+        torch, checkpoint, expected_sha256=expected_checkpoint_sha256
+    )
     if payload.get("checkpoint_schema") != "gr00t.trl.full_state.v2":
         raise GateError("checkpoint is not an atomic full-state v2 checkpoint")
     required = {
@@ -154,9 +242,8 @@ def snapshot(
     missing = sorted(required.difference(payload))
     if missing:
         raise GateError(f"checkpoint is missing strict-resume fields: {missing}")
-    if payload["optimizer_state_dict"] is None or payload["lr_scheduler_state_dict"] is None:
-        raise GateError("checkpoint optimizer or scheduler state is empty")
     step = _state_step(payload["state"])
+    _validate_resumable_state(payload, step)
     saved_args = payload["args"]
     absolute_target = (
         saved_args.get("num_total_batches")
@@ -200,6 +287,8 @@ def snapshot(
             raise GateError("W&B upload state is not bound to the media run ID")
 
     runtime_summaries = []
+    runtime_rollout_steps: set[int] = set()
+    runtime_local_envs: set[int] = set()
     for rank in range(expected_world_size):
         path = (
             run_dir
@@ -208,9 +297,7 @@ def snapshot(
         )
         if not path.is_file() or path.is_symlink():
             raise GateError(f"rank {rank} runtime resume state is missing")
-        runtime = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(runtime, dict):
-            raise GateError(f"rank {rank} runtime resume state is malformed")
+        runtime, runtime_sha256 = _load_torch_checkpoint(torch, path)
         expected = {
             "schema_version": 1,
             "checkpoint_step": step,
@@ -218,6 +305,22 @@ def snapshot(
             "world_size": expected_world_size,
             "beta_iteration": step,
         }
+        typed_contract = {
+            "schema_version": 0,
+            "checkpoint_step": 0,
+            "rank": 0,
+            "world_size": 1,
+            "beta_iteration": 0,
+            "telemetry_step": 0,
+            "rollout_steps": 1,
+            "local_num_envs": 1,
+        }
+        for key, minimum in typed_contract.items():
+            value = runtime.get(key)
+            if type(value) is not int or value < minimum:
+                raise GateError(
+                    f"rank {rank} runtime {key} must be an integer >= {minimum}"
+                )
         mismatch = {
             key: (runtime.get(key), value)
             for key, value in expected.items()
@@ -225,24 +328,38 @@ def snapshot(
         }
         if mismatch:
             raise GateError(f"rank {rank} runtime resume state mismatch: {mismatch}")
+        if runtime["telemetry_step"] != step * runtime["rollout_steps"]:
+            raise GateError(
+                f"rank {rank} runtime telemetry is not checkpoint-aligned"
+            )
+        runtime_rollout_steps.add(runtime["rollout_steps"])
+        runtime_local_envs.add(runtime["local_num_envs"])
         runtime_summaries.append(
             {
                 "rank": rank,
-                "sha256": _sha256_file(path),
+                "sha256": runtime_sha256,
                 "telemetry_step": int(runtime["telemetry_step"]),
                 "rollout_steps": int(runtime["rollout_steps"]),
                 "local_num_envs": int(runtime["local_num_envs"]),
             }
         )
+    if len(runtime_rollout_steps) != 1:
+        raise GateError("per-rank runtime rollout lengths are inconsistent")
+    if len(runtime_local_envs) != 1:
+        raise GateError("per-rank local environment counts are inconsistent")
 
     return {
         "schema": SNAPSHOT_SCHEMA,
         "checkpoint": str(checkpoint),
-        "checkpoint_sha256": _sha256_file(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_step": step,
         "absolute_target": absolute_target,
         "policy_sha256": _policy_digest(torch, payload["policy_state_dict"]),
         "optimizer_state_present": bool(payload["optimizer_state_dict"]),
+        "optimizer_state_entry_count": len(payload["optimizer_state_dict"]["state"]),
+        "optimizer_param_group_count": len(
+            payload["optimizer_state_dict"]["param_groups"]
+        ),
         "scheduler_state_present": bool(payload["lr_scheduler_state_dict"]),
         "run_dir": str(run_dir),
         "trainer_wandb_run_id": trainer_run_id,
@@ -286,6 +403,18 @@ def verify(
     for key in ("optimizer_state_present", "scheduler_state_present"):
         if before.get(key) is not True or after.get(key) is not True:
             raise GateError(f"{key} is not present in both checkpoints")
+    for label, value, step in (
+        ("before", before, expected_before_step),
+        ("after", after, expected_after_step),
+    ):
+        optimizer_entries = value.get("optimizer_state_entry_count")
+        parameter_groups = value.get("optimizer_param_group_count")
+        if type(optimizer_entries) is not int or optimizer_entries < 0:
+            raise GateError(f"{label} optimizer state entry count is invalid")
+        if step > 0 and optimizer_entries == 0:
+            raise GateError(f"{label} optimizer state is empty after step zero")
+        if type(parameter_groups) is not int or parameter_groups < 1:
+            raise GateError(f"{label} optimizer parameter group count is invalid")
     if before.get("wandb_required") != require_wandb or after.get(
         "wandb_required"
     ) != require_wandb:
@@ -320,11 +449,30 @@ def verify(
         ranks = value.get("runtime_ranks")
         if not isinstance(ranks, list) or len(ranks) != expected_world_size:
             raise GateError(f"{label} snapshot has incomplete per-rank resume state")
-        for rank in ranks:
-            if rank.get("rollout_steps") != rollout_steps:
+        local_env_counts: set[int] = set()
+        for expected_rank, rank in enumerate(ranks):
+            if not isinstance(rank, Mapping):
+                raise GateError(f"{label} rank {expected_rank} summary is malformed")
+            for key, minimum in (
+                ("rank", 0),
+                ("telemetry_step", 0),
+                ("rollout_steps", 1),
+                ("local_num_envs", 1),
+            ):
+                field = rank.get(key)
+                if type(field) is not int or field < minimum:
+                    raise GateError(
+                        f"{label} rank {expected_rank} {key} must be an integer >= {minimum}"
+                    )
+            if rank["rank"] != expected_rank:
+                raise GateError(f"{label} rank ordering is invalid")
+            if rank["rollout_steps"] != rollout_steps:
                 raise GateError(f"{label} rank rollout length changed")
-            if rank.get("telemetry_step") != step * rollout_steps:
+            if rank["telemetry_step"] != step * rollout_steps:
                 raise GateError(f"{label} rank telemetry offset is not checkpoint-aligned")
+            local_env_counts.add(rank["local_num_envs"])
+        if len(local_env_counts) != 1:
+            raise GateError(f"{label} per-rank local environment counts differ")
 
     return {
         "schema": REPORT_SCHEMA,
@@ -362,6 +510,11 @@ def _parser() -> argparse.ArgumentParser:
     snap.add_argument(
         "--wandb-mode", choices=("required", "disabled"), default="required"
     )
+    snap.add_argument(
+        "--expected-checkpoint-sha256",
+        default="NONE",
+        help="optional lowercase SHA-256 pinned by the launcher",
+    )
     snap.add_argument("--output", type=Path, required=True)
     check = subparsers.add_parser("verify")
     check.add_argument("--before", type=Path, required=True)
@@ -388,6 +541,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.run_dir,
                 args.expected_world_size,
                 require_wandb=args.wandb_mode == "required",
+                expected_checkpoint_sha256=args.expected_checkpoint_sha256,
             )
         else:
             if args.rollout_steps < 1:

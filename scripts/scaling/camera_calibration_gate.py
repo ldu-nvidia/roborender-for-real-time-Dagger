@@ -193,6 +193,9 @@ def validate_technical_manifest(
     manifest_path: Path,
     expected_fast_roborender_revision: str,
     expected_gr00t_revision: str,
+    expected_fast_source_tree_sha256: str | None = None,
+    expected_gr00t_source_tree_sha256: str | None = None,
+    expected_asset_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate the complete technical calibration artifact set."""
 
@@ -214,6 +217,30 @@ def validate_technical_manifest(
     gr00t_revision = _require_expected_revision(
         manifest.get("gr00t_revision"), expected_gr00t_revision, "gr00t_revision"
     )
+    expected_hashes = {
+        "fast_roborender_source_tree_sha256": expected_fast_source_tree_sha256,
+        "gr00t_source_tree_sha256": expected_gr00t_source_tree_sha256,
+        "immutable_asset_contract_sha256": expected_asset_contract_sha256,
+    }
+    if any(value is not None for value in expected_hashes.values()) and any(
+        value is None for value in expected_hashes.values()
+    ):
+        raise GateError(
+            "source-tree and immutable-asset expectations must be supplied together"
+        )
+    normalized_hashes: dict[str, str] = {}
+    for key, expected in expected_hashes.items():
+        actual = manifest.get(key)
+        if expected is not None:
+            actual_hash = _require_sha256(actual, key)
+            expected_hash = _require_sha256(expected, f"expected {key}")
+            if actual_hash != expected_hash:
+                raise GateError(
+                    f"{key} mismatch: manifest has {actual_hash}, expected {expected_hash}"
+                )
+            normalized_hashes[key] = actual_hash
+        elif actual is not None:
+            normalized_hashes[key] = _require_sha256(actual, key)
     _require_exact_sequence(manifest.get("policy_views"), EXPECTED_VIEWS, "policy_views")
     _require_exact_sequence(manifest.get("columns"), EXPECTED_VIEWS, "columns")
     _require_exact_sequence(manifest.get("rows"), EXPECTED_ROWS, "rows")
@@ -270,6 +297,7 @@ def validate_technical_manifest(
         "manifest_sha256": sha256_file(manifest_path),
         "fast_roborender_revision": fast_revision,
         "gr00t_revision": gr00t_revision,
+        **normalized_hashes,
         "policy_views": list(EXPECTED_VIEWS),
         "columns": list(EXPECTED_VIEWS),
         "rows": list(EXPECTED_ROWS),
@@ -330,6 +358,9 @@ def accept_manifest(
     confirmation: str,
     expected_fast_roborender_revision: str,
     expected_gr00t_revision: str,
+    expected_fast_source_tree_sha256: str | None = None,
+    expected_gr00t_source_tree_sha256: str | None = None,
+    expected_asset_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     if confirmation != CONFIRMATION:
         raise GateError(
@@ -339,6 +370,9 @@ def accept_manifest(
         manifest_path,
         expected_fast_roborender_revision,
         expected_gr00t_revision,
+        expected_fast_source_tree_sha256,
+        expected_gr00t_source_tree_sha256,
+        expected_asset_contract_sha256,
     )
     acceptance = {
         "schema": ACCEPTANCE_SCHEMA,
@@ -361,6 +395,13 @@ def accept_manifest(
         "panel_shape_hwc": technical["panel_shape_hwc"],
         "panels": technical["panels"],
     }
+    for key in (
+        "fast_roborender_source_tree_sha256",
+        "gr00t_source_tree_sha256",
+        "immutable_asset_contract_sha256",
+    ):
+        if key in technical:
+            acceptance[key] = technical[key]
     atomic_json_create(output_path, acceptance)
     return acceptance
 
@@ -383,6 +424,9 @@ def verify_acceptance(
     *,
     manifest_path: Path | None = None,
     expected_acceptance_sha256: str | None = None,
+    expected_fast_source_tree_sha256: str | None = None,
+    expected_gr00t_source_tree_sha256: str | None = None,
+    expected_asset_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     try:
         acceptance_path = acceptance_path.resolve(strict=True)
@@ -442,7 +486,12 @@ def verify_acceptance(
             f"{declared_manifest_hash}, file has {actual_manifest_hash}"
         )
     technical = validate_technical_manifest(
-        recorded_manifest, fast_revision, gr00t_revision
+        recorded_manifest,
+        fast_revision,
+        gr00t_revision,
+        expected_fast_source_tree_sha256,
+        expected_gr00t_source_tree_sha256,
+        expected_asset_contract_sha256,
     )
 
     for key in (
@@ -455,6 +504,13 @@ def verify_acceptance(
     ):
         if acceptance.get(key) != technical[key]:
             raise GateError(f"acceptance {key} does not match its technical manifest")
+    for key in (
+        "fast_roborender_source_tree_sha256",
+        "gr00t_source_tree_sha256",
+        "immutable_asset_contract_sha256",
+    ):
+        if key in technical and acceptance.get(key) != technical[key]:
+            raise GateError(f"acceptance {key} does not match its technical manifest")
 
     return {
         "schema": VERIFICATION_SCHEMA,
@@ -465,6 +521,15 @@ def verify_acceptance(
         "source_manifest_sha256": technical["manifest_sha256"],
         "fast_roborender_revision": fast_revision,
         "gr00t_revision": gr00t_revision,
+        **{
+            key: technical[key]
+            for key in (
+                "fast_roborender_source_tree_sha256",
+                "gr00t_source_tree_sha256",
+                "immutable_asset_contract_sha256",
+            )
+            if key in technical
+        },
         "policy_views": list(EXPECTED_VIEWS),
         "panels_verified": len(technical["panels"]),
         "reviewer": acceptance["reviewer"],
@@ -484,6 +549,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--expected-fast-roborender-revision", "--expected-fast-revision", required=True
     )
     accept.add_argument("--expected-gr00t-revision", required=True)
+    accept.add_argument("--expected-fast-source-tree-sha256")
+    accept.add_argument("--expected-gr00t-source-tree-sha256")
+    accept.add_argument("--expected-asset-contract-sha256")
 
     verify = subparsers.add_parser("verify", help="verify an acceptance and all inputs")
     verify.add_argument("--acceptance", type=Path, required=True)
@@ -493,6 +561,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--expected-gr00t-revision", required=True)
     verify.add_argument("--expected-acceptance-sha256")
+    verify.add_argument("--expected-fast-source-tree-sha256")
+    verify.add_argument("--expected-gr00t-source-tree-sha256")
+    verify.add_argument("--expected-asset-contract-sha256")
     return parser
 
 
@@ -507,12 +578,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.confirm,
                 args.expected_fast_roborender_revision,
                 args.expected_gr00t_revision,
+                args.expected_fast_source_tree_sha256,
+                args.expected_gr00t_source_tree_sha256,
+                args.expected_asset_contract_sha256,
             )
             report = verify_acceptance(
                 args.output,
                 args.expected_fast_roborender_revision,
                 args.expected_gr00t_revision,
                 manifest_path=args.manifest,
+                expected_fast_source_tree_sha256=args.expected_fast_source_tree_sha256,
+                expected_gr00t_source_tree_sha256=args.expected_gr00t_source_tree_sha256,
+                expected_asset_contract_sha256=args.expected_asset_contract_sha256,
             )
         else:
             report = verify_acceptance(
@@ -521,6 +598,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.expected_gr00t_revision,
                 manifest_path=args.manifest,
                 expected_acceptance_sha256=args.expected_acceptance_sha256,
+                expected_fast_source_tree_sha256=args.expected_fast_source_tree_sha256,
+                expected_gr00t_source_tree_sha256=args.expected_gr00t_source_tree_sha256,
+                expected_asset_contract_sha256=args.expected_asset_contract_sha256,
             )
     except GateError as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
