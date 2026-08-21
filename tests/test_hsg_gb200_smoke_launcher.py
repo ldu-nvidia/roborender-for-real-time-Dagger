@@ -1053,6 +1053,18 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         self.assertNotIn('rm -f "$TRAIN_RUN_DIR/telemetry/WANDB_SIDECAR_RUN_ID"', packed)
         self.assertNotIn('rm -f "$TRAIN_RUN_DIR/telemetry/.wandb_upload_state.json"', packed)
         self.assertIn("PACKED_QOS=interactive IMAGE_DAGGER_DUMP_SIM_RGB=0 USE_WANDB=0", submit)
+        self.assertIn(
+            "else\n"
+            "    # Keep the sanitized sbatch export total even when telemetry is disabled.\n"
+            "    # The batch entrypoint requires every exported contract field to be\n"
+            "    # nonempty before it branches on USE_WANDB; `null` is also Hydra's literal\n"
+            "    # disabled entity value.\n"
+            "    WANDB_ENTITY=null\n"
+            "    WANDB_ONLINE_VALIDATION=NONE\n"
+            "    EXPECTED_WANDB_ONLINE_VALIDATION_SHA256=NONE\n"
+            "fi",
+            submit,
+        )
         self.assertIn("--wandb-mode disabled", packed)
 
     def test_hsg_signal_handlers_cannot_publish_success(self):

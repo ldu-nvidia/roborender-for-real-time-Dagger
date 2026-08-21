@@ -257,6 +257,11 @@ PY
     ) || fatal "W&B online validation manifest is invalid"
     EXPECTED_WANDB_ONLINE_VALIDATION_SHA256=$(sha256sum "$WANDB_ONLINE_VALIDATION" | awk '{print $1}')
 else
+    # Keep the sanitized sbatch export total even when telemetry is disabled.
+    # The batch entrypoint requires every exported contract field to be
+    # nonempty before it branches on USE_WANDB; `null` is also Hydra's literal
+    # disabled entity value.
+    WANDB_ENTITY=null
     WANDB_ONLINE_VALIDATION=NONE
     EXPECTED_WANDB_ONLINE_VALIDATION_SHA256=NONE
 fi
