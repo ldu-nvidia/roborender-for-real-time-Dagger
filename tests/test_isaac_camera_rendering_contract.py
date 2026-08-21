@@ -85,14 +85,35 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
                     self.assertEqual(settings.get(key), expected, key)
 
     def test_headless_camera_launch_forces_performance_mode(self):
-        args = SimpleNamespace(enable_cameras=True, headless=True, rendering_mode="balanced")
+        args = SimpleNamespace(
+            enable_cameras=True,
+            headless=True,
+            rendering_mode="balanced",
+            kit_args=(
+                "--/unrelated/setting=kept "
+                "--/rtx/directLighting/sampledLighting/enabled=true"
+            ),
+        )
         self.assertTrue(self.contract.configure_headless_camera_rendering(args))
         self.assertEqual(args.rendering_mode, "performance")
+        tokens = args.kit_args.split()
+        self.assertIn("--/unrelated/setting=kept", tokens)
+        self.assertNotIn(
+            "--/rtx/directLighting/sampledLighting/enabled=true", tokens
+        )
+        for path in self.contract.EARLY_DISABLED_CARB_SETTINGS:
+            self.assertEqual(tokens.count(f"--{path}=false"), 1, path)
 
     def test_non_headless_camera_launch_preserves_requested_mode(self):
-        args = SimpleNamespace(enable_cameras=True, headless=False, rendering_mode="quality")
+        args = SimpleNamespace(
+            enable_cameras=True,
+            headless=False,
+            rendering_mode="quality",
+            kit_args="--/rtx/reflections/enabled=true",
+        )
         self.assertFalse(self.contract.configure_headless_camera_rendering(args))
         self.assertEqual(args.rendering_mode, "quality")
+        self.assertEqual(args.kit_args, "--/rtx/reflections/enabled=true")
 
     def test_resolved_settings_are_validated_fail_closed(self):
         values = {
