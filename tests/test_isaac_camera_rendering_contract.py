@@ -67,6 +67,8 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
             "rtx-defaults.ambientOcclusion.enabled": "false",
             "rtx-defaults.translucency.enabled": "false",
             "rtx-defaults.raytracing.cached.enabled": "false",
+            "rtx-defaults-transient.dlssg.enabled": "false",
+            "rtx-defaults-transient.dldenoiser.enabled": "false",
             "rtx.indirectDiffuse.nrd.enabled": "false",
             "rtx.shadows.denoiser.enable": "false",
             "rtx.ambientOcclusion.enabled": "false",
@@ -161,6 +163,9 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
         self.assertNotIn("/rtx/directLighting/enabled", carb_settings)
         self.assertIn(
             "/rtx-defaults/directLighting/sampledLighting/enabled", carb_settings
+        )
+        self.assertIn(
+            "/rtx-defaults-transient/dldenoiser/enabled", carb_settings
         )
 
     def test_simulation_render_cfg_is_applied_before_context_and_cameras(self):
