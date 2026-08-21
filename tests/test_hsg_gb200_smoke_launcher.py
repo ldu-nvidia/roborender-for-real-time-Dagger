@@ -337,6 +337,10 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         self.assertIn('--container-image="$TRAINER_CONTAINER"', packed)
         self.assertIn('--gpus="$EXPECTED_RENDERERS" --gpus-per-task=1', packed)
         self.assertIn('--gpus="$TRAINER_RANKS" --gpus-per-task=1', packed)
+        self.assertEqual(
+            packed.count('--gpus=0 --cpus-per-task=2 --mem=4G --exact --exclusive'),
+            4,
+        )
         self.assertIn("$IMAGE3F_GENERATED_ROOT:/opt/roborender/assets/generated:ro", packed)
         self.assertGreaterEqual(
             packed.count("$GR00T_ROOT:/opt/GR00T-VisualSim2Real:ro"), 2

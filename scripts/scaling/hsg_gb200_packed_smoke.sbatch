@@ -126,7 +126,7 @@ LOCAL_NUM_ENVS=$((GLOBAL_NUM_ENVS / TRAINER_RANKS))
 # so a missing Slurm export cannot silently fall back to PATH.
 FFMPEG_PREFLIGHT="$RUN_ROOT/trainer_ffmpeg_preflight.txt"
 srun --nodes=1 --ntasks=1 --nodelist="$MASTER_ADDR" \
-    --cpus-per-task=2 --mem=4G --exact --exclusive \
+    --gpus=0 --cpus-per-task=2 --mem=4G --exact --exclusive \
     --container-image="$TRAINER_CONTAINER" \
     --container-mounts="$STAGE_ROOT:$STAGE_ROOT" \
     env IMAGE_DAGGER_FFMPEG="$IMAGE_DAGGER_FFMPEG" \
@@ -168,7 +168,7 @@ PY
     WANDB_PREFLIGHT=(python "$ROOT/scripts/scaling/wandb_preflight.py"
         --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" --format shell)
     WANDB_PREFLIGHT_OUTPUT=$(srun --nodes=1 --ntasks=1 --nodelist="$MASTER_ADDR" \
-        --cpus-per-task=2 --mem=4G --exact --exclusive \
+        --gpus=0 --cpus-per-task=2 --mem=4G --exact --exclusive \
         --container-image="$TRAINER_CONTAINER" \
         --container-mounts="$STAGE_ROOT:$STAGE_ROOT,$GR00T_ROOT:/opt/GR00T-VisualSim2Real:ro" \
         --container-workdir=/opt/GR00T-VisualSim2Real \
@@ -404,7 +404,7 @@ if [ "$USE_WANDB" -eq 1 ]; then
     # restarted process.  Only per-process lifecycle markers are disposable.
     rm -f "$WANDB_WATCHER_READY" "$TRAIN_RUN_DIR/WANDB_UPLOAD_STOP"
     srun --nodes=1 --ntasks=1 --nodelist="$MASTER_ADDR" \
-        --cpus-per-task=2 --mem=4G --exact --exclusive \
+        --gpus=0 --cpus-per-task=2 --mem=4G --exact --exclusive \
         --container-image="$TRAINER_CONTAINER" \
         --container-mounts="$STAGE_ROOT:$STAGE_ROOT,$GR00T_ROOT:/opt/GR00T-VisualSim2Real:ro" \
         --container-workdir=/opt/GR00T-VisualSim2Real \
@@ -563,7 +563,7 @@ run_train_phase() {
 resume_snapshot() {
     local checkpoint=$1 output=$2
     srun --nodes=1 --ntasks=1 --nodelist="$MASTER_ADDR" \
-        --cpus-per-task=2 --mem=4G --exact --exclusive \
+        --gpus=0 --cpus-per-task=2 --mem=4G --exact --exclusive \
         --container-image="$TRAINER_CONTAINER" \
         --container-mounts="$STAGE_ROOT:$STAGE_ROOT,$GR00T_ROOT:/opt/GR00T-VisualSim2Real:ro" \
         --container-workdir=/opt/GR00T-VisualSim2Real \
