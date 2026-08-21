@@ -724,6 +724,14 @@ class NoRetiredSiteReferencesTest(unittest.TestCase):
         failures = []
         for path in sorted(set(paths)):
             text = path.read_text(encoding="utf-8", errors="ignore")
+            if path.suffix == ".patch":
+                # A remediation patch necessarily carries retired references
+                # on deletion lines. Audit only content the patch introduces.
+                text = "\n".join(
+                    line[1:]
+                    for line in text.splitlines()
+                    if line.startswith("+") and not line.startswith("+++")
+                )
             for label, pattern in forbidden.items():
                 match = pattern.search(text)
                 if match:

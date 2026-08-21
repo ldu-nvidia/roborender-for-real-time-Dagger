@@ -241,7 +241,11 @@ copy_tracked_tree() {
                 IFS= read -r pointer_version || true
                 IFS= read -r pointer_oid_line || true
                 IFS= read -r pointer_size_line || true
-                IFS= read -r extra_line && fatal "LFS pointer has unexpected fields: $repo/$path"
+                if [ "$pointer_version" = \
+                     "version https://git-lfs.github.com/spec/v1" ]; then
+                    IFS= read -r extra_line && \
+                        fatal "LFS pointer has unexpected fields: $repo/$path"
+                fi
             } < <(git -C "$repo" cat-file blob "$object")
         fi
         if [ "$pointer_version" = "version https://git-lfs.github.com/spec/v1" ]; then

@@ -131,6 +131,87 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
             self.assertNotEqual(locked.returncode, 0)
             self.assertEqual(lock_sentinel.read_text(), "other-publisher\n")
 
+    def test_small_multiline_non_lfs_blob_is_not_parsed_as_pointer(self):
+        with tempfile.TemporaryDirectory(prefix="rr_snapshot_non_lfs_") as temporary:
+            root = Path(temporary)
+            fast = root / "fast"
+            gr00t = fast / "GR00T-VisualSim2Real"
+            output = root / "output"
+            gr00t.mkdir(parents=True)
+            for repo in (fast, gr00t):
+                subprocess.run(["git", "init", "-q", str(repo)], check=True)
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", "user.name", "test"],
+                    check=True,
+                )
+            (gr00t / "nested.txt").write_text("nested\n")
+            subprocess.run(
+                ["git", "-C", str(gr00t), "add", "nested.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(gr00t), "commit", "-q", "-m", "nested"],
+                check=True,
+            )
+            normal_blob = "one\ntwo\nthree\nfour\nfive\n"
+            (fast / ".gitignore").write_text(
+                "GR00T-VisualSim2Real/\n__pycache__/\n*.pyc\n*.pyo\n"
+            )
+            (fast / "normal.txt").write_text(normal_blob)
+            gate = fast / "scripts/scaling/hsg_gb200_smoke_gate.py"
+            gate.parent.mkdir(parents=True)
+            shutil.copy2(
+                ROOT / "scripts/scaling/hsg_gb200_smoke_gate.py", gate
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(fast),
+                    "add",
+                    ".gitignore",
+                    "normal.txt",
+                    "scripts/scaling/hsg_gb200_smoke_gate.py",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(fast), "commit", "-q", "-m", "top"],
+                check=True,
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "FAST_REPO": str(fast),
+                    "GR00T_REPO": str(gr00t),
+                    "LOCAL_OUTPUT_ROOT": str(output),
+                    "STAGE_ROOT": "/tmp/unused_hsg_stage",
+                    "REMOTE_OUTPUT_ROOT": "/tmp/unused_hsg_stage/src_snapshots",
+                    "LOCAL_ONLY": "1",
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/scaling/stage_hsg_source_snapshot.sh")],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            fast_sha = subprocess.check_output(
+                ["git", "-C", str(fast), "rev-parse", "HEAD"], text=True
+            ).strip()
+            gr00t_sha = subprocess.check_output(
+                ["git", "-C", str(gr00t), "rev-parse", "HEAD"], text=True
+            ).strip()
+            snapshot = output / (
+                f"fast_roborender_{fast_sha[:7]}_{gr00t_sha[:7]}_sealed"
+            )
+            self.assertEqual((snapshot / "normal.txt").read_text(), normal_blob)
+
 
 if __name__ == "__main__":
     unittest.main()
