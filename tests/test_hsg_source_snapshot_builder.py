@@ -22,7 +22,7 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
         self.assertIn('LFS working file size does not match committed pointer', self.script)
         self.assertIn('assert_repo_state "$FAST_REPO"', self.script)
         self.assertIn('assert_repo_state "$GR00T_REPO"', self.script)
-        self.assertNotIn("rsync", self.script)
+        self.assertIn("rsync -a --checksum --delete --no-owner --no-group", self.script)
 
     def test_untracked_source_is_fail_closed_except_explicit_allowlist(self):
         self.assertIn('"ls-files", "--others", "--exclude-standard", "-z"', self.script)
@@ -52,6 +52,12 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
         self.assertIn("[ -x /usr/bin/zstd ]", self.script)
         self.assertIn("zstd -q -1 -T0 -c", self.script)
         self.assertIn("/usr/bin/zstd -q -d -c | tar -xf -", self.script)
+        self.assertIn("REMOTE_SEED_ROOT", self.script)
+        self.assertIn('cp -a --reflink=auto "$canonical_seed/."', self.script)
+        self.assertIn(
+            'case "$canonical_seed" in "$output_root"/fast_roborender_*_sealed',
+            self.script,
+        )
 
     def test_publication_is_atomic_and_never_overwrites(self):
         self.assertIn('[ ! -e "$LOCAL_DESTINATION" ]', self.script)

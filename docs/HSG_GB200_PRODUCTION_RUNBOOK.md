@@ -35,6 +35,12 @@ export ROOT="$STAGE_ROOT/src_snapshots/fast_roborender_<fast7>_<gr00t7>_sealed"
 export GR00T_ROOT="$ROOT/GR00T-VisualSim2Real"
 ```
 
+When HSG already contains an older sealed snapshot with the same large LFS assets, set
+`REMOTE_SEED_ROOT` to that canonical snapshot path. The builder clones it server-side, uses
+checksum-mode rsync only for byte differences, and still rejects publication unless the complete
+remote tree, inventory, deterministic archive, revisions, and permissions match the new local
+attestation exactly.
+
 The snapshot must contain a 40-hex `.source_revision` in each repository, plus
 the builder's internal v2 manifest. Beside `ROOT`, the builder publishes
 `$ROOT.snapshot_attestation.json` and `$ROOT.inventory.json`. The launcher

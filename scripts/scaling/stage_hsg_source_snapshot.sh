@@ -9,6 +9,7 @@ LOCAL_OUTPUT_ROOT=${LOCAL_OUTPUT_ROOT:-/mnt/data1/ldu/research/.roborender_sourc
 HSG_HOST=${HSG_HOST:-oci-hsg}
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/ldu/roborender_gb200_sm100}
 REMOTE_OUTPUT_ROOT=${REMOTE_OUTPUT_ROOT:-$STAGE_ROOT/src_snapshots}
+REMOTE_SEED_ROOT=${REMOTE_SEED_ROOT:-NONE}
 ALLOW_UNTRACKED_FAST=${ALLOW_UNTRACKED_FAST:-}
 ALLOW_UNTRACKED_GR00T=${ALLOW_UNTRACKED_GR00T:-}
 LOCAL_ONLY=${LOCAL_ONLY:-0}
@@ -19,8 +20,12 @@ case "$LOCAL_ONLY" in 0|1) ;; *) fatal "LOCAL_ONLY must be 0 or 1" ;; esac
 for path in "$LOCAL_OUTPUT_ROOT" "$STAGE_ROOT" "$REMOTE_OUTPUT_ROOT"; do
     [[ "$path" =~ ^/[A-Za-z0-9_./-]+$ ]] || fatal "unsafe absolute path: $path"
 done
+if [ "$REMOTE_SEED_ROOT" != NONE ]; then
+    [[ "$REMOTE_SEED_ROOT" =~ ^/[A-Za-z0-9_./-]+$ ]] || \
+        fatal "unsafe absolute remote seed path: $REMOTE_SEED_ROOT"
+fi
 for command in git install find chmod mv python3 realpath mktemp tar sha256sum \
-               ssh stat awk wc cmp dd grep unlink zstd; do
+               ssh stat awk wc cmp dd grep unlink zstd rsync; do
     command -v "$command" >/dev/null 2>&1 || fatal "required command is missing: $command"
 done
 
@@ -67,10 +72,17 @@ if [ ! -e "$destination" ]; then
                 "$inventory_temporary" "$inventory"; do
         [ ! -e "$path" ] || unlink "$path"
     done
-    if [ -d "$temporary" ] && [ ! -L "$temporary" ]; then
-        chmod -R u+w "$temporary"
-        find "$temporary" -xdev -depth -delete
-    fi
+    # A TERM can race the remote extraction process. Retry after restoring
+    # owner write permission so files created just after the first chmod do
+    # not strand the invocation's private temporary publication.
+    for _attempt in 1 2 3 4 5; do
+        if [ -d "$temporary" ] && [ ! -L "$temporary" ]; then
+            chmod -R u+w "$temporary" || true
+            find "$temporary" -xdev -depth -delete 2>/dev/null || true
+        fi
+        [ ! -e "$temporary" ] && break
+        sleep 1
+    done
     if [ -d "$lock" ] && [ ! -L "$lock" ]; then
         find "$lock" -xdev -depth -delete
     fi
@@ -445,11 +457,11 @@ REMOTE_LOCK=$REMOTE_OUTPUT_ROOT/.${SNAPSHOT_NAME}.publish.lock
 ssh -o BatchMode=yes "$HSG_HOST" /bin/bash -s -- "$STAGE_ROOT" "$REMOTE_OUTPUT_ROOT" \
     "$REMOTE_DESTINATION" "$REMOTE_TEMPORARY" "$REMOTE_ATTESTATION" \
     "$REMOTE_ATTESTATION_TEMP" "$REMOTE_INVENTORY" "$REMOTE_INVENTORY_TEMP" \
-    "$REMOTE_LOCK" <<'REMOTE_PREPARE'
+    "$REMOTE_LOCK" "$REMOTE_SEED_ROOT" <<'REMOTE_PREPARE'
 set -Eeuo pipefail
 stage_root=$1; output_root=$2; destination=$3; temporary=$4
 attestation=$5; attestation_temporary=$6; inventory=$7; inventory_temporary=$8
-lock=$9
+lock=$9; seed=${10}
 lock_owned=0
 cleanup_prepare() {
     local rc=$?
@@ -463,6 +475,7 @@ cleanup_prepare() {
 trap cleanup_prepare EXIT
 [ -d "$stage_root" ] && [ ! -L "$stage_root" ]
 [ -x /usr/bin/zstd ]
+[ -x /usr/bin/rsync ]
 mkdir -p "$output_root"
 [ -d "$output_root" ] && [ ! -L "$output_root" ]
 [ "$(realpath -e "$output_root")" = "$output_root" ]
@@ -475,11 +488,27 @@ for path in "$destination" "$temporary" "$attestation" "$attestation_temporary" 
     [ ! -e "$path" ]
 done
 mkdir "$temporary"
+if [ "$seed" != NONE ]; then
+    [ -d "$seed" ] && [ ! -L "$seed" ]
+    canonical_seed=$(realpath -e "$seed")
+    [ "$canonical_seed" = "$seed" ]
+    case "$canonical_seed" in "$output_root"/fast_roborender_*_sealed) ;; *) exit 2 ;; esac
+    [ "$canonical_seed" != "$destination" ] && [ "$canonical_seed" != "$temporary" ]
+    cp -a --reflink=auto "$canonical_seed/." "$temporary/"
+    chmod -R u+w "$temporary"
+fi
 REMOTE_PREPARE
 REMOTE_PREPARED=1
-tar -cf - -C "$LOCAL_DESTINATION" . | zstd -q -1 -T0 -c | \
-    ssh -o BatchMode=yes "$HSG_HOST" \
-        "/bin/bash -c '/usr/bin/zstd -q -d -c | tar -xf - -C \"$REMOTE_TEMPORARY\"'"
+if [ "$REMOTE_SEED_ROOT" = NONE ]; then
+    tar -cf - -C "$LOCAL_DESTINATION" . | zstd -q -1 -T0 -c | \
+        ssh -o BatchMode=yes "$HSG_HOST" \
+            "/bin/bash -c '/usr/bin/zstd -q -d -c | tar -xf - -C \"$REMOTE_TEMPORARY\"'"
+else
+    rsync -a --checksum --delete --no-owner --no-group \
+        --rsync-path=/usr/bin/rsync \
+        -e "ssh -o BatchMode=yes" \
+        "$LOCAL_DESTINATION/" "$HSG_HOST:$REMOTE_TEMPORARY/"
+fi
 ssh -o BatchMode=yes "$HSG_HOST" \
     "/bin/bash -c 'dd of=\"$REMOTE_ATTESTATION_TEMP\" status=none'" \
     < "$LOCAL_ATTESTATION"
