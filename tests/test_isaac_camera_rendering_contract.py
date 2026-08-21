@@ -54,6 +54,19 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
             "rtx.directLighting.sampledLighting.autoEnable": "false",
             "rtx.directLighting.sampledLighting.enforceDenoiser": "false",
             "rtx.directLighting.sampledLighting.irradiance.denoiser.enabled": "false",
+            "rtx-defaults.directLighting.sampledLighting.enabled": "false",
+            "rtx-defaults.directLighting.sampledLighting.autoEnable": "false",
+            "rtx-defaults.directLighting.sampledLighting.enforceDenoiser": "false",
+            "rtx-defaults.directLighting.sampledLighting.irradiance.denoiser.enabled": "false",
+            "rtx-defaults.reflections.enabled": "false",
+            "rtx-defaults.reflections.denoiser.enabled": "false",
+            "rtx-defaults.indirectDiffuse.enabled": "false",
+            "rtx-defaults.indirectDiffuse.denoiser.enabled": "false",
+            "rtx-defaults.indirectDiffuse.nrd.enabled": "false",
+            "rtx-defaults.shadows.denoiser.enable": "false",
+            "rtx-defaults.ambientOcclusion.enabled": "false",
+            "rtx-defaults.translucency.enabled": "false",
+            "rtx-defaults.raytracing.cached.enabled": "false",
             "rtx.indirectDiffuse.nrd.enabled": "false",
             "rtx.shadows.denoiser.enable": "false",
             "rtx.ambientOcclusion.enabled": "false",
@@ -146,6 +159,9 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
         )
         self.assertTrue(all(value is False for value in carb_settings.values()))
         self.assertNotIn("/rtx/directLighting/enabled", carb_settings)
+        self.assertIn(
+            "/rtx-defaults/directLighting/sampledLighting/enabled", carb_settings
+        )
 
     def test_simulation_render_cfg_is_applied_before_context_and_cameras(self):
         path = (
