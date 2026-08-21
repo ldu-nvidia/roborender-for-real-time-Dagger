@@ -20,7 +20,7 @@ for path in "$LOCAL_OUTPUT_ROOT" "$STAGE_ROOT" "$REMOTE_OUTPUT_ROOT"; do
     [[ "$path" =~ ^/[A-Za-z0-9_./-]+$ ]] || fatal "unsafe absolute path: $path"
 done
 for command in git install find chmod mv python3 realpath mktemp tar sha256sum \
-               ssh stat awk wc cmp dd grep unlink; do
+               ssh stat awk wc cmp dd grep unlink zstd; do
     command -v "$command" >/dev/null 2>&1 || fatal "required command is missing: $command"
 done
 
@@ -462,6 +462,7 @@ cleanup_prepare() {
 }
 trap cleanup_prepare EXIT
 [ -d "$stage_root" ] && [ ! -L "$stage_root" ]
+[ -x /usr/bin/zstd ]
 mkdir -p "$output_root"
 [ -d "$output_root" ] && [ ! -L "$output_root" ]
 [ "$(realpath -e "$output_root")" = "$output_root" ]
@@ -476,9 +477,9 @@ done
 mkdir "$temporary"
 REMOTE_PREPARE
 REMOTE_PREPARED=1
-tar -cf - -C "$LOCAL_DESTINATION" . | \
+tar -cf - -C "$LOCAL_DESTINATION" . | zstd -q -1 -T0 -c | \
     ssh -o BatchMode=yes "$HSG_HOST" \
-        "/bin/bash -c 'tar -xf - -C \"$REMOTE_TEMPORARY\"'"
+        "/bin/bash -c '/usr/bin/zstd -q -d -c | tar -xf - -C \"$REMOTE_TEMPORARY\"'"
 ssh -o BatchMode=yes "$HSG_HOST" \
     "/bin/bash -c 'dd of=\"$REMOTE_ATTESTATION_TEMP\" status=none'" \
     < "$LOCAL_ATTESTATION"

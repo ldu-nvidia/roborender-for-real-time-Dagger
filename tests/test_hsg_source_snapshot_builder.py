@@ -47,6 +47,12 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
         self.assertIn("inventory_sha256", self.script)
         self.assertIn("REMOTE_VERIFY", self.script)
 
+    def test_remote_transport_is_stream_compressed_and_fail_closed(self):
+        self.assertIn("ssh stat awk wc cmp dd grep unlink zstd", self.script)
+        self.assertIn("[ -x /usr/bin/zstd ]", self.script)
+        self.assertIn("zstd -q -1 -T0 -c", self.script)
+        self.assertIn("/usr/bin/zstd -q -d -c | tar -xf -", self.script)
+
     def test_publication_is_atomic_and_never_overwrites(self):
         self.assertIn('[ ! -e "$LOCAL_DESTINATION" ]', self.script)
         self.assertIn('for path in "$destination" "$temporary"', self.script)
