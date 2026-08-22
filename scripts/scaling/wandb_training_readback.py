@@ -13,11 +13,20 @@ from pathlib import Path
 
 import yaml
 
-from wandb_preflight import _load_wandb, query_identity
-from wandb_run_watcher import discover_artifacts, discover_scalars, load_scalar_file
+try:
+    from scripts.scaling.wandb_preflight import _load_wandb, query_identity
+    from scripts.scaling.wandb_run_watcher import (
+        discover_artifacts,
+        discover_scalars,
+        load_scalar_file,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/scaling.
+    from wandb_preflight import _load_wandb, query_identity
+    from wandb_run_watcher import discover_artifacts, discover_scalars, load_scalar_file
 
 
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+REPORT_SCHEMA = "fast_roborender.wandb_training_readback.v2"
 
 
 class ReadbackError(RuntimeError):
@@ -77,15 +86,22 @@ def _atomic_json(path: Path, payload: dict[str, object]) -> None:
             os.unlink(temporary)
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--entity", required=True)
     parser.add_argument("--expected-email", required=True)
+    parser.add_argument(
+        "--authorization-scope", required=True, choices=("team",)
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout-s", type=float, default=180.0)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = _parser().parse_args()
     if args.timeout_s <= 0:
         raise SystemExit("--timeout-s must be positive")
 
@@ -102,7 +118,7 @@ def main() -> int:
         wandb,
         expected_email=args.expected_email,
         requested_entity=args.entity,
-        require_personal=True,
+        authorization_scope=args.authorization_scope,
     )
     api = wandb.Api(timeout=30)
     observed_trainer: set[str] = set()
@@ -129,10 +145,13 @@ def main() -> int:
         else "FAIL"
     )
     report: dict[str, object] = {
-        "schema": "fast_roborender.wandb_training_readback.v1",
+        "schema": REPORT_SCHEMA,
         "status": status,
         "account_email": identity.email,
         "entity": identity.entity,
+        "authorization_scope": identity.authorization_scope,
+        "team_member": identity.team_member,
+        "entity_is_team": identity.entity_is_team,
         "personal": identity.personal,
         "project": args.project,
         "trainer_run_id": trainer_run_id,

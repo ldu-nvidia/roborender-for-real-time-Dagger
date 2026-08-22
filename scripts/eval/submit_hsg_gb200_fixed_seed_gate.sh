@@ -17,7 +17,9 @@ FIXED_EVAL_SEEDS=${FIXED_EVAL_SEEDS:-1729,3253,4519,5987,7411,8863,10193,12203}
 FIXED_EVAL_NUM_ENVS=${FIXED_EVAL_NUM_ENVS:-32}
 MIN_SUCCESS_DELTA=${MIN_SUCCESS_DELTA:-0.02}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
-WANDB_ONLINE_VALIDATION=${WANDB_ONLINE_VALIDATION:-$STAGE_ROOT/runtime/validation/wandb_online_smoke_acceptance.json}
+WANDB_ENTITY=${WANDB_ENTITY:-nvidia}
+WANDB_AUTHORIZATION_SCOPE=${WANDB_AUTHORIZATION_SCOPE:-team}
+WANDB_ONLINE_VALIDATION=${WANDB_ONLINE_VALIDATION:-$STAGE_ROOT/runtime/validation/wandb_online_smoke_nvidia_acceptance.json}
 PROJ=${PROJ:-roborender_dagger_hsg_simulator_rgb_fixed_seed_eval}
 RUN_ID=${RUN_ID:-hsg_fixed_seed_eval_$(date -u +%Y%m%dT%H%M%SZ)}
 EVAL_DIR=${EVAL_DIR:-$TRAIN_RUN_DIR/fixed_seed_eval/$RUN_ID}
@@ -30,6 +32,8 @@ case "$DRY_RUN" in 0|1) ;; *) fatal "DRY_RUN must be 0 or 1" ;; esac
 [ "$FIXED_EVAL_NUM_ENVS" -eq 32 ] || fatal "HSG fixed evaluation is pinned to 32 envs per seed"
 [ "$MIN_SUCCESS_DELTA" = 0.02 ] || fatal "HSG minimum success delta is pinned to 0.02"
 [ "$WANDB_EXPECTED_EMAIL" = ldu@nvidia.com ] || fatal "HSG evaluation is pinned to ldu@nvidia.com"
+[ "$WANDB_ENTITY" = nvidia ] || fatal "HSG evaluation is pinned to W&B team nvidia"
+[ "$WANDB_AUTHORIZATION_SCOPE" = team ] || fatal "HSG W&B authorization scope is pinned to team"
 for command in sbatch scontrol; do
     [ -x "$SLURM_BIN_DIR/$command" ] || fatal "missing HSG Slurm command $command"
 done
@@ -58,21 +62,13 @@ NETRC="$STAGE_ROOT/runtime/home/.netrc"
 [ -s "$NETRC" ] || fatal "W&B credential missing: $NETRC"
 [ "$(stat -c %u "$NETRC")" -eq "$(id -u)" ] || fatal "W&B netrc owner mismatch"
 case "$(stat -c %a "$NETRC")" in 400|600) ;; *) fatal "W&B netrc must be 0400 or 0600" ;; esac
-[ -s "$WANDB_ONLINE_VALIDATION" ] || fatal "personal-workspace W&B acceptance is missing"
-WANDB_ENTITY=$(python3 - "$WANDB_ONLINE_VALIDATION" "$WANDB_EXPECTED_EMAIL" <<'PY'
-import json, re, sys
-from pathlib import Path
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-required = {"validation/scalar", "validation/image", "validation/video"}
-if payload.get("schema") != "fast_roborender.wandb_online_smoke.v1": raise SystemExit("bad schema")
-if payload.get("status") != "PASS" or payload.get("personal") is not True: raise SystemExit("not personal PASS")
-if payload.get("account_email") != sys.argv[2]: raise SystemExit("wrong account")
-if not required.issubset(payload.get("observed_keys", [])): raise SystemExit("incomplete readback")
-entity = payload.get("entity")
-if not isinstance(entity, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", entity) is None: raise SystemExit("bad entity")
-print(entity)
-PY
-) || fatal "W&B personal-workspace acceptance is invalid"
+[ -s "$WANDB_ONLINE_VALIDATION" ] || \
+    fatal "authorized-team W&B scalar/image/video acceptance is missing"
+WANDB_ENTITY=$(python3 "$ROOT/scripts/eval/wandb_team_contract.py" \
+    --acceptance "$WANDB_ONLINE_VALIDATION" \
+    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
+    --authorization-scope "$WANDB_AUTHORIZATION_SCOPE") || \
+    fatal "authorized-team W&B acceptance is invalid"
 WANDB_ONLINE_VALIDATION_SHA256=$(sha256sum "$WANDB_ONLINE_VALIDATION" | awk '{print $1}')
 
 [ ! -e "$EVAL_DIR" ] || fatal "refusing to reuse existing evaluation directory $EVAL_DIR"
@@ -93,12 +89,14 @@ python3 "$ROOT/scripts/eval/hsg_gb200_fixed_seed_eval_gate.py" preflight \
     --fixed-seed-manifest "$EVAL_MANIFEST" \
     --fixed-seed-manifest-sha256 "$EXPECTED_EVAL_MANIFEST_SHA256" \
     --train-run-dir "$TRAIN_RUN_DIR" --expected-seeds "$FIXED_EVAL_SEEDS" \
-    --expected-num-envs "$FIXED_EVAL_NUM_ENVS" > "$PREFLIGHT"
+    --expected-num-envs "$FIXED_EVAL_NUM_ENVS" \
+    --wandb-acceptance "$WANDB_ONLINE_VALIDATION" \
+    --wandb-acceptance-sha256 "$WANDB_ONLINE_VALIDATION_SHA256" > "$PREFLIGHT"
 EXPECTED_PREFLIGHT_SHA256=$(sha256sum "$PREFLIGHT" | awk '{print $1}')
 EXPECTED_FAST_SOURCE_TREE_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fast_roborender_source_tree_sha256"])' "$PREFLIGHT")
 EXPECTED_GR00T_SOURCE_TREE_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["gr00t_source_tree_sha256"])' "$PREFLIGHT")
 
-EXPORTS="PATH=$SLURM_BIN_DIR:/usr/local/bin:/usr/bin:/bin,SLURM_BIN_DIR=$SLURM_BIN_DIR,STAGE_ROOT=$STAGE_ROOT,ROOT=$ROOT,GR00T_ROOT=$GR00T_ROOT,TRAIN_RUN_DIR=$TRAIN_RUN_DIR,EVAL_DIR=$EVAL_DIR,EVAL_MANIFEST=$EVAL_MANIFEST,EXPECTED_EVAL_MANIFEST_SHA256=$EXPECTED_EVAL_MANIFEST_SHA256,PREFLIGHT=$PREFLIGHT,EXPECTED_PREFLIGHT_SHA256=$EXPECTED_PREFLIGHT_SHA256,TRAINER_CONTAINER=$TRAINER_CONTAINER,EXPECTED_TRAINER_CONTAINER_SHA256=$EXPECTED_TRAINER_CONTAINER_SHA256,EXPECTED_FAST_ROBORENDER_REVISION=$FAST_REVISION,EXPECTED_GR00T_REVISION=$GR00T_REVISION,EXPECTED_FAST_SOURCE_TREE_SHA256=$EXPECTED_FAST_SOURCE_TREE_SHA256,EXPECTED_GR00T_SOURCE_TREE_SHA256=$EXPECTED_GR00T_SOURCE_TREE_SHA256,RESNET18_WEIGHTS=$RESNET18_WEIGHTS,EXPECTED_RESNET18_SHA256=$EXPECTED_RESNET18_SHA256,FIXED_EVAL_SEEDS=$FIXED_EVAL_SEEDS,FIXED_EVAL_NUM_ENVS=$FIXED_EVAL_NUM_ENVS,MIN_SUCCESS_DELTA=$MIN_SUCCESS_DELTA,WANDB_EXPECTED_EMAIL=$WANDB_EXPECTED_EMAIL,WANDB_ENTITY=$WANDB_ENTITY,WANDB_ONLINE_VALIDATION=$WANDB_ONLINE_VALIDATION,WANDB_ONLINE_VALIDATION_SHA256=$WANDB_ONLINE_VALIDATION_SHA256,PROJ=$PROJ,EXP=$RUN_ID"
+EXPORTS="PATH=$SLURM_BIN_DIR:/usr/local/bin:/usr/bin:/bin,SLURM_BIN_DIR=$SLURM_BIN_DIR,STAGE_ROOT=$STAGE_ROOT,ROOT=$ROOT,GR00T_ROOT=$GR00T_ROOT,TRAIN_RUN_DIR=$TRAIN_RUN_DIR,EVAL_DIR=$EVAL_DIR,EVAL_MANIFEST=$EVAL_MANIFEST,EXPECTED_EVAL_MANIFEST_SHA256=$EXPECTED_EVAL_MANIFEST_SHA256,PREFLIGHT=$PREFLIGHT,EXPECTED_PREFLIGHT_SHA256=$EXPECTED_PREFLIGHT_SHA256,TRAINER_CONTAINER=$TRAINER_CONTAINER,EXPECTED_TRAINER_CONTAINER_SHA256=$EXPECTED_TRAINER_CONTAINER_SHA256,EXPECTED_FAST_ROBORENDER_REVISION=$FAST_REVISION,EXPECTED_GR00T_REVISION=$GR00T_REVISION,EXPECTED_FAST_SOURCE_TREE_SHA256=$EXPECTED_FAST_SOURCE_TREE_SHA256,EXPECTED_GR00T_SOURCE_TREE_SHA256=$EXPECTED_GR00T_SOURCE_TREE_SHA256,RESNET18_WEIGHTS=$RESNET18_WEIGHTS,EXPECTED_RESNET18_SHA256=$EXPECTED_RESNET18_SHA256,FIXED_EVAL_SEEDS=$FIXED_EVAL_SEEDS,FIXED_EVAL_NUM_ENVS=$FIXED_EVAL_NUM_ENVS,MIN_SUCCESS_DELTA=$MIN_SUCCESS_DELTA,WANDB_EXPECTED_EMAIL=$WANDB_EXPECTED_EMAIL,WANDB_ENTITY=$WANDB_ENTITY,WANDB_AUTHORIZATION_SCOPE=$WANDB_AUTHORIZATION_SCOPE,WANDB_ONLINE_VALIDATION=$WANDB_ONLINE_VALIDATION,WANDB_ONLINE_VALIDATION_SHA256=$WANDB_ONLINE_VALIDATION_SHA256,PROJ=$PROJ,EXP=$RUN_ID"
 CMD=("$SLURM_BIN_DIR/sbatch" --parsable --account=llmservice_nemotron_ultra \
     --partition=batch_long --qos=normal --nodes=1 --gpus-per-node=4 \
     --cpus-per-gpu=32 --mem=800G --time=08:00:00 --signal=B:USR1@300 \
@@ -129,6 +127,10 @@ baseline_sha256=$BASELINE_SHA256
 reference_config_sha256=$REFERENCE_CONFIG_SHA256
 wandb_online_validation_sha256=$WANDB_ONLINE_VALIDATION_SHA256
 wandb_entity=$WANDB_ENTITY
+wandb_authorization_scope=$WANDB_AUTHORIZATION_SCOPE
+wandb_team_member=true
+wandb_entity_is_team=true
+wandb_personal=false
 EOF
 if [ "$DRY_RUN" = 1 ]; then
     printf 'DRY RUN:'; printf ' %q' "${CMD[@]}"; printf '\n'

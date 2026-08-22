@@ -19,6 +19,13 @@ SPEC.loader.exec_module(gate)
 
 FAST_REVISION = "1" * 40
 GR00T_REVISION = "2" * 40
+PROVENANCE = {
+    "fast_roborender_source_tree_sha256": "3" * 64,
+    "gr00t_source_tree_sha256": "4" * 64,
+    "source_snapshot_attestation_sha256": "5" * 64,
+    "source_snapshot_inventory_sha256": "6" * 64,
+    "immutable_asset_contract_sha256": "7" * 64,
+}
 
 
 def sha256(path: Path) -> str:
@@ -110,6 +117,63 @@ class CameraCalibrationGateTest(unittest.TestCase):
         self.assertEqual(report["panels_verified"], 2)
         self.assertEqual(report["fast_roborender_revision"], FAST_REVISION)
         self.assertEqual(report["gr00t_revision"], GR00T_REVISION)
+
+    def test_accept_and_verify_bind_full_sealed_source_provenance(self):
+        document = self.manifest_document()
+        document.update(PROVENANCE)
+        self.write_manifest(document)
+        accepted = gate.accept_manifest(
+            self.manifest,
+            self.acceptance,
+            "reviewer@example.com",
+            gate.CONFIRMATION,
+            FAST_REVISION,
+            GR00T_REVISION,
+            PROVENANCE["fast_roborender_source_tree_sha256"],
+            PROVENANCE["gr00t_source_tree_sha256"],
+            PROVENANCE["source_snapshot_attestation_sha256"],
+            PROVENANCE["source_snapshot_inventory_sha256"],
+            PROVENANCE["immutable_asset_contract_sha256"],
+        )
+        report = self.verify(
+            expected_fast_source_tree_sha256=PROVENANCE[
+                "fast_roborender_source_tree_sha256"
+            ],
+            expected_gr00t_source_tree_sha256=PROVENANCE[
+                "gr00t_source_tree_sha256"
+            ],
+            expected_source_snapshot_attestation_sha256=PROVENANCE[
+                "source_snapshot_attestation_sha256"
+            ],
+            expected_source_snapshot_inventory_sha256=PROVENANCE[
+                "source_snapshot_inventory_sha256"
+            ],
+            expected_asset_contract_sha256=PROVENANCE[
+                "immutable_asset_contract_sha256"
+            ],
+        )
+        for key, value in PROVENANCE.items():
+            self.assertEqual(accepted[key], value)
+            self.assertEqual(report[key], value)
+
+        with self.assertRaisesRegex(
+            gate.GateError, "source_snapshot_attestation_sha256 mismatch"
+        ):
+            self.verify(
+                expected_fast_source_tree_sha256=PROVENANCE[
+                    "fast_roborender_source_tree_sha256"
+                ],
+                expected_gr00t_source_tree_sha256=PROVENANCE[
+                    "gr00t_source_tree_sha256"
+                ],
+                expected_source_snapshot_attestation_sha256="8" * 64,
+                expected_source_snapshot_inventory_sha256=PROVENANCE[
+                    "source_snapshot_inventory_sha256"
+                ],
+                expected_asset_contract_sha256=PROVENANCE[
+                    "immutable_asset_contract_sha256"
+                ],
+            )
 
     def test_accept_requires_exact_confirmation_and_explicit_reviewer(self):
         with self.assertRaisesRegex(gate.GateError, "explicit confirmation"):

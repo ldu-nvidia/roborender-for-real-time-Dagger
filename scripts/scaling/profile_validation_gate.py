@@ -426,7 +426,7 @@ def validate_profile(
                 raise GateError(f"expected {key} is required for an HSG manifest")
             _require_exact(fields, key, _require_sha256(expected, key))
         if not expected_wandb_email or not expected_wandb_entity:
-            raise GateError("expected personal W&B identity is required for an HSG manifest")
+            raise GateError("expected authorized-team W&B identity is required for an HSG manifest")
     contract = PROFILE_CONTRACTS[expected_profile]
     for key in ("global_envs", "rollout_steps", "trainer_nodes"):
         _require_int(fields, key, contract[key])
@@ -554,11 +554,14 @@ def validate_profile(
             drain.get("schema") != "fast_roborender.wandb_media_drain.v1"
             or drain.get("status") != "PASS"
             or readback.get("schema")
-            != "fast_roborender.wandb_training_readback.v1"
+            != "fast_roborender.wandb_training_readback.v2"
             or readback.get("status") != "PASS"
             or readback.get("account_email") != expected_wandb_email
             or readback.get("entity") != expected_wandb_entity
-            or readback.get("personal") is not True
+            or readback.get("authorization_scope") != "team"
+            or readback.get("team_member") is not True
+            or readback.get("entity_is_team") is not True
+            or readback.get("personal") is not False
             or readback.get("trainer_run_id") != trainer_run_id
             or readback.get("sidecar_run_id") != sidecar_run_id
             or drain.get("wandb_run_id") != sidecar_run_id

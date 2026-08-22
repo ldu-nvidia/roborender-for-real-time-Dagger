@@ -631,28 +631,36 @@ if [ "$USE_WANDB" -eq 1 ]; then
     [ "$(sha256sum "$WANDB_ONLINE_VALIDATION" | awk '{print $1}')" = \
       "$EXPECTED_WANDB_ONLINE_VALIDATION_SHA256" ] || \
         fatal "W&B online validation changed after submission"
-    ACCEPTED_WANDB_ENTITY=$(python3 - "$WANDB_ONLINE_VALIDATION" "$WANDB_EXPECTED_EMAIL" <<'PY'
+    ACCEPTED_WANDB_ENTITY=$(python3 - "$WANDB_ONLINE_VALIDATION" "$WANDB_EXPECTED_EMAIL" "$WANDB_ENTITY" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if payload.get("schema") != "fast_roborender.wandb_online_smoke.v1":
-    raise SystemExit("invalid W&B validation schema")
-if payload.get("status") != "PASS" or payload.get("personal") is not True:
-    raise SystemExit("W&B validation is not a successful personal-workspace write")
-if payload.get("account_email") != sys.argv[2]:
-    raise SystemExit("W&B validation account changed")
+expected = {
+    "schema": "fast_roborender.wandb_online_smoke.v2",
+    "status": "PASS",
+    "account_email": sys.argv[2],
+    "entity": sys.argv[3],
+    "authorization_scope": "team",
+    "team_member": True,
+    "entity_is_team": True,
+    "personal": False,
+}
+for key, value in expected.items():
+    if payload.get(key) != value:
+        raise SystemExit(f"W&B validation {key} mismatch")
 required = {"validation/scalar", "validation/image", "validation/video"}
 if not required.issubset(payload.get("observed_keys", [])):
     raise SystemExit("W&B validation media readback is incomplete")
-print(payload.get("entity", ""))
+print(payload["entity"])
 PY
     ) || fatal "W&B online validation is invalid"
     [ -n "$WANDB_ENTITY" ] && [ "$WANDB_ENTITY" = "$ACCEPTED_WANDB_ENTITY" ] || \
-        fatal "W&B entity is not bound to the accepted personal-workspace write"
+        fatal "W&B entity is not bound to the accepted authorized-team write"
     WANDB_PREFLIGHT=(python "$ROOT/scripts/scaling/wandb_preflight.py"
-        --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" --format shell)
+        --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
+        --authorization-scope team --format shell)
     WANDB_PREFLIGHT_OUTPUT=$(srun --nodes=1 --ntasks=1 --nodelist="$MASTER_ADDR" \
         --gpus=0 --cpus-per-task=2 --mem=4G --exact --exclusive \
         --container-image="$TRAINER_CONTAINER" \
@@ -1155,6 +1163,7 @@ if [ "$USE_WANDB" -eq 1 ]; then
         "$ROOT/scripts/scaling/wandb_run_watcher.py" \
         --run-dir "$TRAIN_RUN_DIR" --project "$PROJ" --name "${EXP}-media" \
         --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
+        --authorization-scope team \
         --poll-interval-s "$WANDB_WATCHER_POLL_S" \
         --ready-marker "$WANDB_WATCHER_READY" \
         --max-consecutive-error-scans 4 --finish-marker WANDB_UPLOAD_STOP \
@@ -1440,7 +1449,8 @@ PY
         /usr/local/bin/roborender-trainer-sm100 python \
         "$ROOT/scripts/scaling/wandb_training_readback.py" \
         --run-dir "$TRAIN_RUN_DIR" --project "$PROJ" --entity "$WANDB_ENTITY" \
-        --expected-email "$WANDB_EXPECTED_EMAIL" --timeout-s 180 \
+        --expected-email "$WANDB_EXPECTED_EMAIL" --authorization-scope team \
+        --timeout-s 180 \
         --output "$WANDB_TRAINING_READBACK"
 fi
 

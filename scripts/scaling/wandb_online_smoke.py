@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and read back a tiny scalar/image/video W&B validation run."""
+"""Create and read back a tiny scalar/image/video W&B team validation run."""
 
 from __future__ import annotations
 
@@ -10,12 +10,22 @@ from pathlib import Path
 
 import numpy as np
 
-from wandb_preflight import _load_wandb, query_identity
+try:
+    from scripts.scaling.wandb_preflight import _load_wandb, query_identity
+except ModuleNotFoundError:  # Direct execution from scripts/scaling.
+    from wandb_preflight import _load_wandb, query_identity
+
+
+REPORT_SCHEMA = "fast_roborender.wandb_online_smoke.v2"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-email", required=True)
+    parser.add_argument("--entity", required=True)
+    parser.add_argument(
+        "--authorization-scope", required=True, choices=("team",)
+    )
     parser.add_argument("--project", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -38,7 +48,12 @@ def _media() -> tuple[np.ndarray, np.ndarray]:
 def main() -> int:
     args = _parser().parse_args()
     wandb = _load_wandb()
-    identity = query_identity(wandb, expected_email=args.expected_email)
+    identity = query_identity(
+        wandb,
+        expected_email=args.expected_email,
+        requested_entity=args.entity,
+        authorization_scope=args.authorization_scope,
+    )
     image, video = _media()
     run = wandb.init(
         entity=identity.entity,
@@ -80,10 +95,13 @@ def main() -> int:
         time.sleep(5)
     status = "PASS" if required.issubset(found) else "FAIL"
     report = {
-        "schema": "fast_roborender.wandb_online_smoke.v1",
+        "schema": REPORT_SCHEMA,
         "status": status,
         "account_email": identity.email,
         "entity": identity.entity,
+        "authorization_scope": identity.authorization_scope,
+        "team_member": identity.team_member,
+        "entity_is_team": identity.entity_is_team,
         "personal": identity.personal,
         "project": args.project,
         "run_id": args.run_id,

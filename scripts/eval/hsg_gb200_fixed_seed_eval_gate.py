@@ -4,7 +4,7 @@
 The scientific scoring implementation lives in :mod:`fixed_seed_gate`.  This
 module adds the HSG deployment boundary around it: immutable source revisions,
 source-tree digests, the sealed SM100 trainer image, exact checkpoint/config
-bytes, and a successful personal-workspace W&B upload marker.
+bytes, and a successful upload/readback marker for the authorized W&B team.
 
 The evaluator intentionally uses synchronized *simulator RGB* observations.
 It does not set ``IMAGE_DAGGER_EVAL_RELABEL=1`` and therefore must not be cited
@@ -22,12 +22,16 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import fixed_seed_gate
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import fixed_seed_gate  # noqa: E402
+import wandb_team_contract as team_contract  # noqa: E402
 
 
-SCHEMA = "fast_roborender.hsg_fixed_seed_preflight.v1"
-ACCEPTANCE_SCHEMA = "fast_roborender.hsg_fixed_seed_acceptance.v1"
-WANDB_SCHEMA = "fast_roborender.hsg_fixed_seed_wandb_upload.v1"
+SCHEMA = "fast_roborender.hsg_fixed_seed_preflight.v2"
+ACCEPTANCE_SCHEMA = "fast_roborender.hsg_fixed_seed_acceptance.v2"
+WANDB_SCHEMA = "fast_roborender.hsg_fixed_seed_wandb_upload.v2"
 ROLE_ORDER = ("baseline", "early", "mid", "final")
 EXPECTED_PROTOCOL = "one_episode_per_environment_fixed_seed_blocks"
 EXPECTED_OBSERVATION_MODE = "raytraced"
@@ -264,6 +268,26 @@ def validate_fixed_seed_manifest(
     }
 
 
+def validate_wandb_acceptance(path: Path, expected_sha256: str) -> dict[str, Any]:
+    acceptance_path = _require_file(path, "authorized-team W&B acceptance")
+    acceptance_hash = _require_hash(
+        acceptance_path,
+        expected_sha256,
+        "authorized-team W&B acceptance",
+    )
+    try:
+        normalized = team_contract.validate_online_acceptance(
+            team_contract.load_json(acceptance_path)
+        )
+    except team_contract.TeamContractError as exc:
+        raise GateError(str(exc)) from None
+    return {
+        "path": str(acceptance_path),
+        "sha256": acceptance_hash,
+        **normalized,
+    }
+
+
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
     root = _require_dir(args.root, "fast_roborender source")
     gr00t = _require_dir(args.gr00t_root, "GR00T source")
@@ -284,6 +308,10 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     )
     if fixed["manifest_sha256"] != expected_manifest_hash:
         raise GateError("fixed-seed manifest hash changed before HSG preflight")
+    wandb_acceptance = validate_wandb_acceptance(
+        args.wandb_acceptance,
+        args.wandb_acceptance_sha256,
+    )
     return {
         "schema": SCHEMA,
         "status": "validated",
@@ -299,6 +327,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "trainer_container": str(_require_file(args.trainer_container, "SM100 trainer container")),
         "trainer_container_sha256": container_hash,
         "fixed_seed": fixed,
+        "wandb_online_acceptance": wandb_acceptance,
     }
 
 
@@ -317,6 +346,22 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
         raise GateError("HSG fixed-seed observation-mode attestation changed")
     if preflight_payload.get("production_observation_distribution_validated") is not False:
         raise GateError("simulator-RGB gate cannot attest the production observation distribution")
+    preflight_wandb = preflight_payload.get("wandb_online_acceptance")
+    if not isinstance(preflight_wandb, dict):
+        raise GateError("HSG preflight lacks its authorized-team W&B binding")
+    try:
+        team_contract.validate_online_acceptance(preflight_wandb)
+        team_contract.validate_authorized_request(
+            expected_email=args.expected_wandb_email,
+            entity=args.expected_wandb_entity,
+            authorization_scope=team_contract.AUTHORIZED_SCOPE,
+        )
+    except team_contract.TeamContractError as exc:
+        raise GateError(str(exc)) from None
+    preflight_wandb_hash = _require_sha256(
+        preflight_wandb.get("sha256"),
+        "preflight W&B online acceptance SHA-256",
+    )
 
     manifest_path = _require_file(args.fixed_seed_manifest, "fixed-seed manifest")
     manifest_hash = sha256_file(manifest_path)
@@ -345,11 +390,13 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
     expected_wandb = {
         "schema": WANDB_SCHEMA,
         "status": "PASS",
-        "account_email": args.expected_wandb_email,
-        "entity": args.expected_wandb_entity,
-        "personal": True,
+        **team_contract.team_binding(),
         "manifest_sha256": manifest_hash,
         "summary_sha256": sha256_file(summary_path),
+        "wandb_online_acceptance_sha256": preflight_wandb_hash,
+        "wandb_online_acceptance_observed_keys": sorted(
+            team_contract.REQUIRED_OBSERVED_KEYS
+        ),
     }
     for key, expected in expected_wandb.items():
         if wandb.get(key) != expected:
@@ -401,6 +448,11 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
         "summary_sha256": sha256_file(summary_path),
         "wandb_upload": str(wandb_path.resolve()),
         "wandb_upload_sha256": sha256_file(wandb_path),
+        "wandb_account_email": team_contract.AUTHORIZED_EMAIL,
+        "wandb_entity": team_contract.AUTHORIZED_ENTITY,
+        "wandb_authorization_scope": team_contract.AUTHORIZED_SCOPE,
+        "wandb_authorization": team_contract.team_binding(),
+        "wandb_online_acceptance_sha256": preflight_wandb_hash,
         "paired_success_delta": summary["gate"]["paired_success_delta"],
         "paired_success_delta_ci95_low": summary["gate"][
             "paired_success_delta_seed_block_bootstrap95_low"
@@ -438,6 +490,8 @@ def build_parser() -> argparse.ArgumentParser:
     pre.add_argument("--train-run-dir", type=Path, required=True)
     pre.add_argument("--expected-seeds", required=True)
     pre.add_argument("--expected-num-envs", type=int, required=True)
+    pre.add_argument("--wandb-acceptance", type=Path, required=True)
+    pre.add_argument("--wandb-acceptance-sha256", required=True)
 
     post = subparsers.add_parser("postrun")
     post.add_argument("--preflight", type=Path, required=True)

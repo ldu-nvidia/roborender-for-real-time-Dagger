@@ -59,7 +59,8 @@ TRAINER_CONTAINER_IMAGE=${TRAINER_CONTAINER_IMAGE:-nvcr.io#nvidia/isaac-sim:5.1.
 TRAINER_CONTAINER_MOUNTS=${TRAINER_CONTAINER_MOUNTS:-$STAGE_ROOT:$STAGE_ROOT}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 WANDB_MODE=${WANDB_MODE:-online}
-WANDB_ENTITY=${WANDB_ENTITY:-}
+WANDB_ENTITY=${WANDB_ENTITY:-nvidia}
+WANDB_AUTHORIZATION_SCOPE=${WANDB_AUTHORIZATION_SCOPE:-team}
 USE_WANDB=${USE_WANDB:-1}
 VIRAL_ENV=${VIRAL_ENV:-$STAGE_ROOT/runtime/envs/viral}
 VIRAL_PYTHON=${VIRAL_PYTHON:-$VIRAL_ENV/bin/python}
@@ -489,7 +490,7 @@ export IMAGE_DAGGER_EXPECT_TEACHER_RATIO="$TEACHER_ROLLOUT_RATIO"
 export IMAGE_DAGGER_EXPECT_LEARNING_EPOCHS="$NUM_LEARNING_EPOCHS"
 export IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF=0.0
 export IMAGE_DAGGER_EXPECT_ENTROPY_COEF=0.0
-export WANDB_EXPECTED_EMAIL WANDB_MODE WANDB_ENTITY WANDB_PYTHON USE_WANDB
+export WANDB_EXPECTED_EMAIL WANDB_MODE WANDB_ENTITY WANDB_AUTHORIZATION_SCOPE WANDB_PYTHON USE_WANDB
 export ROOT GR00T_ROOT FLEET_DIR GLOBAL_NUM_ENVS ROLLOUT_STEPS MIX REFERENCE_LAG
 export RUN_PROFILE
 export STAGE_ROOT ANCHORS TEACHER_CKPT EXPECTED_TEACHER_CKPT_SHA256
@@ -523,15 +524,22 @@ WANDB_WATCHER_READY="$TRAIN_RUN_DIR/telemetry/WANDB_WATCHER_READY.json"
 # process resume that same media run instead of immediately final-draining.
 rm -f "$WANDB_WATCHER_READY" "$TRAIN_RUN_DIR/WANDB_UPLOAD_STOP"
 if [ "$USE_WANDB" = 1 ]; then
+    [ "$WANDB_EXPECTED_EMAIL" = ldu@nvidia.com ] || {
+        echo "FATAL: W&B account binding changed"; exit 2;
+    }
+    [ "$WANDB_ENTITY" = nvidia ] || {
+        echo "FATAL: W&B team entity binding changed"; exit 2;
+    }
+    [ "$WANDB_AUTHORIZATION_SCOPE" = team ] || {
+        echo "FATAL: W&B authorization scope changed"; exit 2;
+    }
     [ -x "$WANDB_PYTHON" ] || {
         echo "FATAL: trainer W&B Python is not executable: $WANDB_PYTHON"
         exit 2
     }
     WANDB_PREFLIGHT=("$WANDB_PYTHON" "$ROOT/scripts/scaling/wandb_preflight.py"
-        --expected-email "$WANDB_EXPECTED_EMAIL" --format shell)
-    if [ -n "$WANDB_ENTITY" ]; then
-        WANDB_PREFLIGHT+=(--entity "$WANDB_ENTITY")
-    fi
+        --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY"
+        --authorization-scope "$WANDB_AUTHORIZATION_SCOPE" --format shell)
     WANDB_IDENTITY=$(WANDB_MODE="$WANDB_MODE" "${WANDB_PREFLIGHT[@]}")
     case "$WANDB_IDENTITY" in
         WANDB_ENTITY=?*) WANDB_ENTITY=${WANDB_IDENTITY#WANDB_ENTITY=} ;;
@@ -545,6 +553,7 @@ if [ "$USE_WANDB" = 1 ]; then
         --name "${EXP}-media-${SLURM_JOB_ID}" \
         --expected-email "$WANDB_EXPECTED_EMAIL" \
         --entity "$WANDB_ENTITY" \
+        --authorization-scope "$WANDB_AUTHORIZATION_SCOPE" \
         --poll-interval-s "$WANDB_WATCHER_POLL_S" \
         --ready-marker "$WANDB_WATCHER_READY" \
         --max-consecutive-error-scans 4 \

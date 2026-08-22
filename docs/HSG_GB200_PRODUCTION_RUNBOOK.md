@@ -56,9 +56,9 @@ stage root is writable.
 
 Do not submit production until all of these gates have passed. The camera and
 scale-smoke evidence is bound to the same source-tree and immutable-asset
-hashes; the W&B smoke is a separate personal-workspace connectivity check:
+hashes; the W&B smoke is a separate authorized-team connectivity check:
 
-1. W&B online validation under the personal `ldu@nvidia.com` workspace, with
+1. W&B online validation as `ldu@nvidia.com` under exact team entity `nvidia`, with
    scalar, image, and video remote readback.
 2. Three-view camera calibration plus explicit human acceptance. Acceptance is
    bound to both source-tree hashes, the immutable model/engine/anchor/teacher
@@ -69,7 +69,7 @@ hashes; the W&B smoke is a separate personal-workspace connectivity check:
    sidecar scalar/image/video readback.
 
 ```bash
-export WANDB_ACCEPTANCE="$STAGE_ROOT/runtime/validation/wandb_online_smoke_acceptance.json"
+export WANDB_ACCEPTANCE="$STAGE_ROOT/runtime/validation/wandb_online_smoke_nvidia_acceptance.json"
 sbatch "$ROOT/scripts/scaling/hsg_gb200_wandb_validate.sbatch"
 # A PASS atomically creates $WANDB_ACCEPTANCE from the job-specific JSON. A
 # different existing acceptance is never overwritten.
@@ -86,6 +86,16 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["immutable_asset_contract_sha256"])
 PY
 )
+export SOURCE_SNAPSHOT_ATTESTATION_SHA256=$(python - "$CALIBRATION_MANIFEST" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["source_snapshot_attestation_sha256"])
+PY
+)
+export SOURCE_SNAPSHOT_INVENTORY_SHA256=$(python - "$CALIBRATION_MANIFEST" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["source_snapshot_inventory_sha256"])
+PY
+)
 python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
   --manifest "$CALIBRATION_MANIFEST" \
   --output "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json" \
@@ -95,6 +105,8 @@ python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
   --expected-gr00t-revision "$(cat "$GR00T_ROOT/.source_revision")" \
   --expected-fast-source-tree-sha256 "$FAST_TREE_SHA256" \
   --expected-gr00t-source-tree-sha256 "$GR00T_TREE_SHA256" \
+  --expected-source-snapshot-attestation-sha256 "$SOURCE_SNAPSHOT_ATTESTATION_SHA256" \
+  --expected-source-snapshot-inventory-sha256 "$SOURCE_SNAPSHOT_INVENTORY_SHA256" \
   --expected-asset-contract-sha256 "$ASSET_CONTRACT_SHA256"
 
 RUN_PROFILE=smoke_32x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Verify W&B authentication without printing or persisting credentials.
+"""Verify the campaign's explicitly authorized W&B team identity.
 
 The production DAgger launcher runs under a shared cluster account, so an
 existing ``~/.netrc`` can silently select the wrong W&B user.  This preflight
-performs a read-only viewer query, checks the expected account email, and
-returns the personal entity slug that should be passed to ``wandb.init``.
-W&B's ``viewer.entity`` is intentionally ignored for this decision because it
-is the account's configured default and may name a team; only
-``viewer.username`` proves the personal workspace.
+performs read-only viewer and entity queries and accepts exactly the authorized
+``ldu@nvidia.com`` account writing to the ``nvidia`` team.
+
+Team authorization requires two independent facts: ``nvidia`` must occur in
+the viewer's team memberships, and the resolved entity must report
+``isTeam=true``.  A matching viewer username or default entity is not evidence
+of team membership and is never used as a fallback.
 
 No API key, netrc contents, or W&B settings are included in either successful
 or failed output.
@@ -23,8 +25,13 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 
+AUTHORIZED_EMAIL = "ldu@nvidia.com"
+AUTHORIZED_ENTITY = "nvidia"
+AUTHORIZED_SCOPE = "team"
+
+
 class WandbPreflightError(RuntimeError):
-    """A credential, identity, or configuration check failed."""
+    """A credential, identity, or authorization check failed."""
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,9 @@ class WandbIdentity:
     email: str
     username: str
     entity: str
+    authorization_scope: str
+    team_member: bool
+    entity_is_team: bool
     personal: bool
     mode: str
 
@@ -49,6 +59,23 @@ def _nonempty(value: object) -> str | None:
     return text or None
 
 
+def validate_authorized_request(
+    *, expected_email: str, requested_entity: str, authorization_scope: str
+) -> None:
+    """Reject any authorization request outside the user-approved team scope."""
+
+    if expected_email != AUTHORIZED_EMAIL:
+        raise WandbPreflightError(
+            "expected W&B account is outside the authorized campaign scope"
+        )
+    if requested_entity != AUTHORIZED_ENTITY:
+        raise WandbPreflightError(
+            "requested W&B entity is outside the authorized campaign scope"
+        )
+    if authorization_scope != AUTHORIZED_SCOPE:
+        raise WandbPreflightError("unsupported W&B authorization scope")
+
+
 def validate_mode(environment: Mapping[str, str] | None = None) -> str:
     """Reject modes that would make a production run look monitored when it is not."""
 
@@ -63,52 +90,93 @@ def validate_mode(environment: Mapping[str, str] | None = None) -> str:
     return mode
 
 
+def _team_names(viewer: object) -> tuple[str, ...]:
+    """Return explicitly listed viewer team names from supported SDK shapes."""
+
+    teams = _field(viewer, "teams")
+    if teams is None:
+        raise WandbPreflightError(
+            "W&B viewer response did not include team memberships"
+        )
+
+    if isinstance(teams, Mapping):
+        entries = teams.get("edges")
+    else:
+        entries = teams
+    if not isinstance(entries, (list, tuple)):
+        raise WandbPreflightError("W&B viewer team memberships are malformed")
+
+    names: list[str] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            name = _nonempty(entry)
+        else:
+            node = _field(entry, "node")
+            if node is None:
+                node = entry
+            name = _nonempty(_field(node, "name"))
+        if name is None:
+            raise WandbPreflightError("W&B viewer team membership is malformed")
+        names.append(name)
+    return tuple(names)
+
+
+def _entity_is_team(entity_record: object) -> bool:
+    value = _field(entity_record, "isTeam")
+    if value is None:
+        value = _field(entity_record, "is_team")
+    return value is True
+
+
 def validate_identity(
     viewer: object,
+    entity_record: object,
     *,
     expected_email: str,
-    requested_entity: str | None = None,
+    requested_entity: str,
+    authorization_scope: str,
     mode: str = "online",
-    require_personal: bool = True,
 ) -> WandbIdentity:
-    """Validate viewer identity and derive a personal entity slug.
+    """Validate the pinned viewer, team membership, and team entity type."""
 
-    W&B entities are slugs, not email addresses.  A personal workspace uses the
-    authenticated viewer's username.  ``viewer.entity`` is the configured
-    default entity and can be a team, so it must never be accepted as evidence
-    that an entity is personal.  Team entities are deliberately rejected unless
-    ``require_personal`` is disabled by the caller.
-    """
-
-    expected_email = expected_email.strip().lower()
-    if not expected_email:
-        raise WandbPreflightError("an expected W&B account email is required")
+    validate_authorized_request(
+        expected_email=expected_email,
+        requested_entity=requested_entity,
+        authorization_scope=authorization_scope,
+    )
 
     email = _nonempty(_field(viewer, "email"))
     username = _nonempty(_field(viewer, "username"))
     if email is None:
         raise WandbPreflightError("W&B viewer response did not include an email address")
-    if email.lower() != expected_email:
+    if email.lower() != AUTHORIZED_EMAIL:
         raise WandbPreflightError(
-            "authenticated W&B account does not match the expected email"
+            "authenticated W&B account does not match the authorized account"
         )
     if username is None:
+        raise WandbPreflightError("W&B viewer response did not include a username")
+
+    if requested_entity not in _team_names(viewer):
         raise WandbPreflightError(
-            "W&B viewer response did not include a personal username"
+            "authorized W&B entity is not in the viewer's team memberships"
         )
 
-    entity = _nonempty(requested_entity) or username
-    personal = entity == username
-    if require_personal and not personal:
-        raise WandbPreflightError(
-            "requested W&B entity is not the authenticated user's personal workspace"
-        )
+    entity_name = _nonempty(_field(entity_record, "name"))
+    if entity_name != requested_entity:
+        raise WandbPreflightError("resolved W&B entity does not match the authorized team")
+    if not _entity_is_team(entity_record):
+        raise WandbPreflightError("authorized W&B entity did not report isTeam=true")
 
     return WandbIdentity(
-        email=email,
+        # Emit the pinned canonical identity rather than server casing so the
+        # acceptance artifact has one stable byte-level account binding.
+        email=AUTHORIZED_EMAIL,
         username=username,
-        entity=entity,
-        personal=personal,
+        entity=requested_entity,
+        authorization_scope=authorization_scope,
+        team_member=True,
+        entity_is_team=True,
+        personal=False,
         mode=mode,
     )
 
@@ -117,27 +185,34 @@ def query_identity(
     wandb_module: object,
     *,
     expected_email: str,
-    requested_entity: str | None = None,
+    requested_entity: str,
+    authorization_scope: str,
     timeout_s: float = 15.0,
     environment: Mapping[str, str] | None = None,
-    require_personal: bool = True,
 ) -> WandbIdentity:
-    """Perform the read-only W&B viewer query and validate the result."""
+    """Perform read-only W&B viewer/team queries and validate both results."""
 
+    validate_authorized_request(
+        expected_email=expected_email,
+        requested_entity=requested_entity,
+        authorization_scope=authorization_scope,
+    )
     mode = validate_mode(environment)
     try:
         api = wandb_module.Api(timeout=timeout_s)
         viewer = api.viewer
+        entity_record = api.team(requested_entity)
     except Exception as exc:  # Keep third-party errors from leaking credentials/settings.
         raise WandbPreflightError(
-            f"W&B authentication/viewer query failed ({type(exc).__name__})"
+            f"W&B authentication/team query failed ({type(exc).__name__})"
         ) from None
     return validate_identity(
         viewer,
+        entity_record,
         expected_email=expected_email,
         requested_entity=requested_entity,
+        authorization_scope=authorization_scope,
         mode=mode,
-        require_personal=require_personal,
     )
 
 
@@ -153,20 +228,21 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--expected-email",
-        default=os.environ.get("WANDB_EXPECTED_EMAIL"),
-        help="authenticated account required for this run (or WANDB_EXPECTED_EMAIL)",
+        required=True,
+        help="authenticated account explicitly authorized for this run",
     )
     parser.add_argument(
         "--entity",
-        default=os.environ.get("WANDB_ENTITY"),
-        help="personal entity slug to validate; omitted means derive it from the viewer",
+        required=True,
+        help="team entity explicitly authorized for this run",
+    )
+    parser.add_argument(
+        "--authorization-scope",
+        required=True,
+        choices=(AUTHORIZED_SCOPE,),
+        help="explicit W&B authorization scope",
     )
     parser.add_argument("--timeout-s", type=float, default=15.0)
-    parser.add_argument(
-        "--allow-team-entity",
-        action="store_true",
-        help="allow a non-personal entity (production RoboRender should not use this)",
-    )
     parser.add_argument(
         "--format",
         choices=("text", "json", "shell"),
@@ -178,19 +254,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if not args.expected_email:
-        print(
-            "W&B preflight failed: --expected-email or WANDB_EXPECTED_EMAIL is required",
-            file=sys.stderr,
-        )
-        return 2
     try:
         identity = query_identity(
             _load_wandb(),
             expected_email=args.expected_email,
             requested_entity=args.entity,
+            authorization_scope=args.authorization_scope,
             timeout_s=args.timeout_s,
-            require_personal=not args.allow_team_entity,
         )
     except WandbPreflightError as exc:
         print(f"W&B preflight failed: {exc}", file=sys.stderr)
@@ -199,8 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "json":
         print(json.dumps(asdict(identity), sort_keys=True))
     elif args.format == "shell":
-        # W&B entity slugs are restricted to a shell-safe character set, but
-        # reject anything unexpected instead of attempting clever quoting.
+        # The entity is pinned, but retain a local shell-safety assertion.
         if not identity.entity.replace("-", "").replace("_", "").isalnum():
             print("W&B preflight failed: entity slug is not shell-safe", file=sys.stderr)
             return 2
@@ -208,7 +277,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"W&B preflight OK: account={identity.email} "
-            f"entity={identity.entity} personal={str(identity.personal).lower()}"
+            f"entity={identity.entity} authorization_scope={identity.authorization_scope} "
+            f"team_member={str(identity.team_member).lower()} "
+            f"entity_is_team={str(identity.entity_is_team).lower()}"
         )
     return 0
 

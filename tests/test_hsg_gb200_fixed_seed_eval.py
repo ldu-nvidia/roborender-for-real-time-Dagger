@@ -33,6 +33,7 @@ wandb_upload = load_module(
     "hsg_gb200_fixed_seed_wandb",
     ROOT / "scripts/eval/hsg_gb200_fixed_seed_wandb.py",
 )
+team_contract = sys.modules["wandb_team_contract"]
 
 
 def write(path: Path, payload: bytes) -> str:
@@ -67,6 +68,23 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
             b"      policy_views: [head_color, hand_left, hand_right]\n",
         )
         self.manifest = self.base / "eval/manifest.json"
+        self.wandb_acceptance = self.base / "eval/wandb_online_smoke_nvidia_acceptance.json"
+        write(
+            self.wandb_acceptance,
+            (
+                json.dumps(
+                    {
+                        "schema": team_contract.ONLINE_SMOKE_SCHEMA,
+                        "status": "PASS",
+                        **team_contract.team_binding(),
+                        "observed_keys": sorted(team_contract.REQUIRED_OBSERVED_KEYS),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode(),
+        )
         fixed.create_manifest(
             train_run_dir=self.run_dir,
             baseline_checkpoint=self.baseline,
@@ -94,6 +112,8 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
             train_run_dir=self.run_dir,
             expected_seeds="11,29",
             expected_num_envs=4,
+            wandb_acceptance=self.wandb_acceptance,
+            wandb_acceptance_sha256=hsg.sha256_file(self.wandb_acceptance),
         )
 
     def test_preflight_binds_sources_container_config_and_four_checkpoints(self):
@@ -105,6 +125,11 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
         self.assertEqual(len(report["fixed_seed"]["roles"]), 4)
         self.assertEqual(report["fixed_seed"]["roles"][-1]["step"], 15)
         self.assertEqual(report["trainer_container_sha256"], self.container_hash)
+        self.assertEqual(report["wandb_online_acceptance"]["entity"], "nvidia")
+        self.assertEqual(
+            report["wandb_online_acceptance"]["authorization_scope"], "team"
+        )
+        self.assertFalse(report["wandb_online_acceptance"]["personal"])
 
     def test_preflight_rejects_checkpoint_and_observation_substitution(self):
         middle = self.run_dir / "model_step_000010.pt"
@@ -165,11 +190,15 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
                 {
                     "schema": hsg.WANDB_SCHEMA,
                     "status": "PASS",
-                    "account_email": "ldu@nvidia.com",
-                    "entity": "ldu",
-                    "personal": True,
+                    **team_contract.team_binding(),
                     "manifest_sha256": hsg.sha256_file(self.manifest),
                     "summary_sha256": hsg.sha256_file(summary),
+                    "wandb_online_acceptance_sha256": hsg.sha256_file(
+                        self.wandb_acceptance
+                    ),
+                    "wandb_online_acceptance_observed_keys": sorted(
+                        team_contract.REQUIRED_OBSERVED_KEYS
+                    ),
                     "observed_checkpoint_ordinals": [0, 1, 2, 3],
                     "observed_history_keys": list(wandb_upload.HISTORY_KEYS),
                     "observed_summary_keys": list(wandb_upload.SUMMARY_KEYS),
@@ -187,12 +216,15 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
             min_success_delta=0.02,
             wandb_upload=wandb,
             expected_wandb_email="ldu@nvidia.com",
-            expected_wandb_entity="ldu",
+            expected_wandb_entity="nvidia",
         )
         report = hsg.postrun(args)
         self.assertEqual(report["status"], "PASS")
         self.assertEqual(report["readiness_scope"], "secondary_policy_mechanics_gate")
         self.assertFalse(report["production_observation_distribution_validated"])
+        self.assertEqual(report["wandb_entity"], "nvidia")
+        self.assertEqual(report["wandb_authorization_scope"], "team")
+        self.assertEqual(report["wandb_authorization"], team_contract.team_binding())
         self.assertGreater(report["paired_success_delta_ci95_low"], 0.0)
         self.assertEqual(len(report["results"]), 8)
 
@@ -213,12 +245,17 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
         with self.assertRaisesRegex(hsg.GateError, "summary keys"):
             hsg.postrun(args)
         payload["observed_summary_keys"] = list(wandb_upload.SUMMARY_KEYS)
+        payload["personal"] = True
+        wandb.write_text(json.dumps(payload) + "\n")
+        with self.assertRaisesRegex(hsg.GateError, "personal mismatch"):
+            hsg.postrun(args)
+        payload["personal"] = False
         payload["entity"] = "wrong"
         wandb.write_text(json.dumps(payload) + "\n")
         with self.assertRaisesRegex(hsg.GateError, "entity mismatch"):
             hsg.postrun(args)
 
-    def test_launchers_pin_hsg_resources_personal_wandb_and_simulator_rgb(self):
+    def test_launchers_pin_hsg_resources_team_wandb_and_simulator_rgb(self):
         submit = (ROOT / "scripts/eval/submit_hsg_gb200_fixed_seed_gate.sh").read_text()
         packed = (ROOT / "scripts/eval/hsg_gb200_fixed_seed_policy_eval.sbatch").read_text()
         task = (ROOT / "scripts/eval/hsg_gb200_fixed_seed_task.sh").read_text()
@@ -235,7 +272,8 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
             "--gpus-per-node=4",
             "roborender-isaac-gr00t-arm64-sm100-isaac5.1-r5.sqsh",
             "WANDB_ONLINE_VALIDATION",
-            "personal-workspace W&B acceptance is missing",
+            "wandb_online_smoke_nvidia_acceptance.json",
+            "authorized-team W&B scalar/image/video acceptance is missing",
             'fixed_seed_gate.py" prepare',
         ):
             self.assertIn(contract, submit)
@@ -244,6 +282,8 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
         self.assertIn("#SBATCH --time=08:00:00", packed)
         self.assertGreaterEqual(packed.count("--gpus=0"), 2)
         self.assertIn('hsg_gb200_fixed_seed_wandb.py"', packed)
+        self.assertIn('wandb_team_contract.py"', packed)
+        self.assertIn('--authorization-scope "$WANDB_AUTHORIZATION_SCOPE"', packed)
         self.assertIn('hsg_gb200_fixed_seed_eval_gate.py" postrun', packed)
         self.assertIn("IMAGE_DAGGER_EVAL_RELABEL=0", task)
         self.assertIn("head_color,hand_left,hand_right", task)
@@ -251,6 +291,52 @@ class HsgGb200FixedSeedGateTests(unittest.TestCase):
         self.assertIn("secondary_policy_mechanics_gate", submit)
         self.assertIn("image3f_in_the_loop=false", packed)
         self.assertNotIn("WANDB_API_KEY", submit + packed + task)
+
+    def test_wandb_team_acceptance_rejects_personal_stale_or_wrong_scope(self):
+        payload = json.loads(self.wandb_acceptance.read_text())
+        normalized = team_contract.validate_online_acceptance(payload)
+        self.assertEqual(normalized["entity"], "nvidia")
+        self.assertEqual(normalized["authorization_scope"], "team")
+        self.assertFalse(normalized["personal"])
+
+        mutations = (
+            ("schema", "fast_roborender.wandb_online_smoke.v1"),
+            ("entity", "ldu"),
+            ("authorization_scope", "personal"),
+            ("personal", True),
+            ("team_member", False),
+            ("entity_is_team", False),
+            ("team_member", 1),
+            ("entity_is_team", 1),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                changed = dict(payload)
+                changed[key] = value
+                with self.assertRaisesRegex(team_contract.TeamContractError, key):
+                    team_contract.validate_online_acceptance(changed)
+
+    def test_image3f_eval_uses_the_same_exact_team_binding(self):
+        submit = (
+            ROOT / "scripts/eval/submit_hsg_gb200_image3f_fixed_seed_gate.sh"
+        ).read_text()
+        packed = (
+            ROOT / "scripts/eval/hsg_gb200_image3f_fixed_seed_policy_eval.sbatch"
+        ).read_text()
+        gate_source = (
+            ROOT / "scripts/eval/hsg_gb200_image3f_fixed_seed_gate.py"
+        ).read_text()
+        upload_source = (
+            ROOT / "scripts/eval/hsg_gb200_image3f_fixed_seed_wandb.py"
+        ).read_text()
+        self.assertIn("wandb_online_smoke_nvidia_acceptance.json", submit)
+        self.assertIn("WANDB_ENTITY=${WANDB_ENTITY:-nvidia}", submit)
+        self.assertIn("WANDB_AUTHORIZATION_SCOPE=${WANDB_AUTHORIZATION_SCOPE:-team}", submit)
+        self.assertIn('--authorization-scope "$WANDB_AUTHORIZATION_SCOPE"', packed)
+        self.assertIn('--wandb-acceptance "$WANDB_ONLINE_VALIDATION"', packed)
+        self.assertIn("hsg_image3f_fixed_seed_wandb_upload.v2", gate_source)
+        self.assertIn("authorization_scope=team_contract.AUTHORIZED_SCOPE", upload_source)
+        self.assertNotIn("require_personal", gate_source + upload_source)
 
     def test_wandb_readback_requires_every_checkpoint_and_gate_summary(self):
         rows = [

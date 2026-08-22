@@ -12,11 +12,14 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scaling"))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "scaling"))
 from wandb_preflight import _load_wandb, query_identity  # noqa: E402
 
 import fixed_seed_gate  # noqa: E402
 import hsg_gb200_image3f_fixed_seed_gate as image3f_gate  # noqa: E402
+import wandb_team_contract as team_contract  # noqa: E402
 
 
 SCHEMA = image3f_gate.WANDB_SCHEMA
@@ -128,6 +131,20 @@ def _runtime_by_role(results_dir: Path) -> dict[str, dict[str, int]]:
 def upload(args: argparse.Namespace) -> dict[str, Any]:
     if SAFE_ID.fullmatch(args.run_id) is None:
         raise UploadError("run ID is malformed")
+    try:
+        team_contract.validate_authorized_request(
+            expected_email=args.expected_email,
+            entity=args.entity,
+            authorization_scope=team_contract.AUTHORIZED_SCOPE,
+        )
+        online_acceptance = team_contract.validate_online_acceptance(
+            team_contract.load_json(args.wandb_acceptance)
+        )
+    except team_contract.TeamContractError as exc:
+        raise UploadError(str(exc)) from None
+    acceptance_hash = fixed_seed_gate.sha256_file(args.wandb_acceptance)
+    if acceptance_hash != args.wandb_acceptance_sha256:
+        raise UploadError("W&B online acceptance SHA-256 mismatch")
     manifest = load_json(args.manifest)
     summary = load_json(args.summary)
     if manifest.get("observation_mode") != image3f_gate.OBSERVATION_MODE:
@@ -140,8 +157,12 @@ def upload(args: argparse.Namespace) -> dict[str, Any]:
         wandb,
         expected_email=args.expected_email,
         requested_entity=args.entity,
-        require_personal=True,
+        authorization_scope=team_contract.AUTHORIZED_SCOPE,
     )
+    try:
+        identity_binding = team_contract.validate_live_identity(identity)
+    except team_contract.TeamContractError as exc:
+        raise UploadError(str(exc)) from None
     run = wandb.init(
         entity=identity.entity,
         project=args.project,
@@ -217,14 +238,14 @@ def upload(args: argparse.Namespace) -> dict[str, Any]:
     report = {
         "schema": SCHEMA,
         "status": "PASS" if readback is not None else "FAIL",
-        "account_email": identity.email,
-        "entity": identity.entity,
-        "personal": identity.personal,
+        **identity_binding,
         "project": args.project,
         "run_id": args.run_id,
         "run_path": run_path,
         "manifest_sha256": fixed_seed_gate.sha256_file(args.manifest),
         "summary_sha256": fixed_seed_gate.sha256_file(args.summary),
+        "wandb_online_acceptance_sha256": acceptance_hash,
+        "wandb_online_acceptance_observed_keys": online_acceptance["observed_keys"],
         "last_api_error_type": last_error,
         **(readback or {}),
     }
@@ -244,6 +265,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--manifest", type=Path, required=True)
     result.add_argument("--summary", type=Path, required=True)
     result.add_argument("--results-dir", type=Path, required=True)
+    result.add_argument("--wandb-acceptance", type=Path, required=True)
+    result.add_argument("--wandb-acceptance-sha256", required=True)
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--timeout-s", type=float, default=180.0)
     return result

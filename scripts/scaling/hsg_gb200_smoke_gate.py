@@ -675,11 +675,14 @@ def validate_wandb_evidence(
         raise GateError("W&B media drain lacks scalar/image/video evidence")
     readback = load_json(require_file(readback_path, "W&B remote readback marker"))
     expected = {
-        "schema": "fast_roborender.wandb_training_readback.v1",
+        "schema": "fast_roborender.wandb_training_readback.v2",
         "status": "PASS",
         "account_email": expected_email,
         "entity": expected_entity,
-        "personal": True,
+        "authorization_scope": "team",
+        "team_member": True,
+        "entity_is_team": True,
+        "personal": False,
         "sidecar_run_id": drain.get("wandb_run_id"),
     }
     for key, value in expected.items():

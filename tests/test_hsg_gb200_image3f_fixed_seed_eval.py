@@ -132,7 +132,9 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
         base = {
             "fast_roborender_source_tree_sha256": "a" * 64,
             "gr00t_source_tree_sha256": "b" * 64,
-            "asset_contract_sha256": "c" * 64,
+            "source_snapshot_attestation_sha256": "c" * 64,
+            "source_snapshot_inventory_sha256": "d" * 64,
+            "asset_contract_sha256": "e" * 64,
         }
         panels = [
             self.base / "step000_env0.png",
@@ -153,6 +155,12 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
                     ],
                     "gr00t_source_tree_sha256": base[
                         "gr00t_source_tree_sha256"
+                    ],
+                    "source_snapshot_attestation_sha256": base[
+                        "source_snapshot_attestation_sha256"
+                    ],
+                    "source_snapshot_inventory_sha256": base[
+                        "source_snapshot_inventory_sha256"
                     ],
                     "immutable_asset_contract_sha256": base[
                         "asset_contract_sha256"
@@ -187,6 +195,8 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
             gr00t_revision,
             base["fast_roborender_source_tree_sha256"],
             base["gr00t_source_tree_sha256"],
+            base["source_snapshot_attestation_sha256"],
+            base["source_snapshot_inventory_sha256"],
             base["asset_contract_sha256"],
         )
         args = argparse.Namespace(

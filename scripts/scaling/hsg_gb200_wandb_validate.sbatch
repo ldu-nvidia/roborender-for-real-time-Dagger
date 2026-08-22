@@ -1,5 +1,5 @@
 #!/bin/bash
-# Validate the authenticated personal W&B workspace and media transport.
+# Validate the explicitly authorized nvidia W&B team and media transport.
 #SBATCH --account=llmservice_nemotron_ultra
 #SBATCH --partition=batch
 #SBATCH --qos=interactive
@@ -15,14 +15,19 @@ STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs1/portfolios/llmservice/projects/l
 ROOT=${ROOT:-$STAGE_ROOT/src/fast_roborender}
 CONTAINER=${CONTAINER:-$STAGE_ROOT/containers/roborender-isaac-gr00t-arm64-sm100-isaac5.1-r5.sqsh}
 EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
+EXPECTED_ENTITY=${WANDB_ENTITY:-nvidia}
+AUTHORIZATION_SCOPE=${WANDB_AUTHORIZATION_SCOPE:-team}
 PROJECT=${WANDB_PROJECT:-roborender_dagger_gb200_validation}
 RUN_ID=${WANDB_RUN_ID:-gb200_wandb_smoke_${SLURM_JOB_ID}}
 OUTPUT=${OUTPUT:-$STAGE_ROOT/runtime/validation/wandb_online_smoke_${SLURM_JOB_ID}.json}
-WANDB_ACCEPTANCE=${WANDB_ACCEPTANCE:-$STAGE_ROOT/runtime/validation/wandb_online_smoke_acceptance.json}
+WANDB_ACCEPTANCE=${WANDB_ACCEPTANCE:-$STAGE_ROOT/runtime/validation/wandb_online_smoke_nvidia_acceptance.json}
 WANDB_HOME=${WANDB_HOME:-$STAGE_ROOT/runtime/home}
 WANDB_SCRATCH=${WANDB_SCRATCH:-$STAGE_ROOT/runtime/wandb-validation/$SLURM_JOB_ID}
-export STAGE_ROOT ROOT CONTAINER EXPECTED_EMAIL PROJECT RUN_ID OUTPUT WANDB_ACCEPTANCE WANDB_HOME WANDB_SCRATCH
+export STAGE_ROOT ROOT CONTAINER EXPECTED_EMAIL EXPECTED_ENTITY AUTHORIZATION_SCOPE PROJECT RUN_ID OUTPUT WANDB_ACCEPTANCE WANDB_HOME WANDB_SCRATCH
 
+[ "$EXPECTED_EMAIL" = ldu@nvidia.com ] || { echo "FATAL: W&B account is outside the authorized scope" >&2; exit 2; }
+[ "$EXPECTED_ENTITY" = nvidia ] || { echo "FATAL: W&B entity is outside the authorized scope" >&2; exit 2; }
+[ "$AUTHORIZATION_SCOPE" = team ] || { echo "FATAL: W&B authorization scope must be team" >&2; exit 2; }
 [ -s "$CONTAINER" ] || { echo "FATAL: trainer container missing: $CONTAINER" >&2; exit 2; }
 [ -s "$WANDB_HOME/.netrc" ] || { echo "FATAL: W&B credential missing" >&2; exit 2; }
 mkdir -p "$STAGE_ROOT/runtime/validation" "$STAGE_ROOT/runtime/wandb-validation"
@@ -101,10 +106,14 @@ srun --nodes=1 --ntasks=1 --gpus=0 --cpus-per-task=8 --mem=32G \
         /usr/local/bin/roborender-trainer-sm100 \
         python "$ROOT/scripts/scaling/wandb_online_smoke.py" \
             --expected-email "$EXPECTED_EMAIL" \
+            --entity "$EXPECTED_ENTITY" \
+            --authorization-scope "$AUTHORIZATION_SCOPE" \
             --project "$PROJECT" --run-id "$RUN_ID" --output "$OUTPUT"
 
 grep -q '"status": "PASS"' "$OUTPUT"
 python3 "$ROOT/scripts/scaling/promote_wandb_acceptance.py" \
     --source "$OUTPUT" --destination "$WANDB_ACCEPTANCE" \
-    --expected-email "$EXPECTED_EMAIL"
+    --expected-email "$EXPECTED_EMAIL" \
+    --expected-entity "$EXPECTED_ENTITY" \
+    --authorization-scope "$AUTHORIZATION_SCOPE"
 echo "HSG_GB200_WANDB_ONLINE_PASS"

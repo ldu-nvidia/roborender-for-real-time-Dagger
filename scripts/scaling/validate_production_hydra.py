@@ -89,7 +89,7 @@ def production_overrides() -> list[str]:
         "algo.config.videogen.anchor_index=0",
         "simulator.config.render_results=false",
         "use_wandb=true",
-        "wandb.wandb_entity=ldu",
+        "wandb.wandb_entity=nvidia",
         "wandb.wandb_group=null",
         "project_name=roborender_dagger_config_validation",
         "experiment_name=production_contract",

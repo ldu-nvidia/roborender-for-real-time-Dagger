@@ -195,6 +195,8 @@ def validate_technical_manifest(
     expected_gr00t_revision: str,
     expected_fast_source_tree_sha256: str | None = None,
     expected_gr00t_source_tree_sha256: str | None = None,
+    expected_source_snapshot_attestation_sha256: str | None = None,
+    expected_source_snapshot_inventory_sha256: str | None = None,
     expected_asset_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate the complete technical calibration artifact set."""
@@ -220,13 +222,17 @@ def validate_technical_manifest(
     expected_hashes = {
         "fast_roborender_source_tree_sha256": expected_fast_source_tree_sha256,
         "gr00t_source_tree_sha256": expected_gr00t_source_tree_sha256,
+        "source_snapshot_attestation_sha256": (
+            expected_source_snapshot_attestation_sha256
+        ),
+        "source_snapshot_inventory_sha256": expected_source_snapshot_inventory_sha256,
         "immutable_asset_contract_sha256": expected_asset_contract_sha256,
     }
     if any(value is not None for value in expected_hashes.values()) and any(
         value is None for value in expected_hashes.values()
     ):
         raise GateError(
-            "source-tree and immutable-asset expectations must be supplied together"
+            "source-tree, snapshot, and immutable-asset expectations must be supplied together"
         )
     normalized_hashes: dict[str, str] = {}
     for key, expected in expected_hashes.items():
@@ -360,6 +366,8 @@ def accept_manifest(
     expected_gr00t_revision: str,
     expected_fast_source_tree_sha256: str | None = None,
     expected_gr00t_source_tree_sha256: str | None = None,
+    expected_source_snapshot_attestation_sha256: str | None = None,
+    expected_source_snapshot_inventory_sha256: str | None = None,
     expected_asset_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     if confirmation != CONFIRMATION:
@@ -372,6 +380,8 @@ def accept_manifest(
         expected_gr00t_revision,
         expected_fast_source_tree_sha256,
         expected_gr00t_source_tree_sha256,
+        expected_source_snapshot_attestation_sha256,
+        expected_source_snapshot_inventory_sha256,
         expected_asset_contract_sha256,
     )
     acceptance = {
@@ -398,6 +408,8 @@ def accept_manifest(
     for key in (
         "fast_roborender_source_tree_sha256",
         "gr00t_source_tree_sha256",
+        "source_snapshot_attestation_sha256",
+        "source_snapshot_inventory_sha256",
         "immutable_asset_contract_sha256",
     ):
         if key in technical:
@@ -426,6 +438,8 @@ def verify_acceptance(
     expected_acceptance_sha256: str | None = None,
     expected_fast_source_tree_sha256: str | None = None,
     expected_gr00t_source_tree_sha256: str | None = None,
+    expected_source_snapshot_attestation_sha256: str | None = None,
+    expected_source_snapshot_inventory_sha256: str | None = None,
     expected_asset_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     try:
@@ -491,6 +505,8 @@ def verify_acceptance(
         gr00t_revision,
         expected_fast_source_tree_sha256,
         expected_gr00t_source_tree_sha256,
+        expected_source_snapshot_attestation_sha256,
+        expected_source_snapshot_inventory_sha256,
         expected_asset_contract_sha256,
     )
 
@@ -507,6 +523,8 @@ def verify_acceptance(
     for key in (
         "fast_roborender_source_tree_sha256",
         "gr00t_source_tree_sha256",
+        "source_snapshot_attestation_sha256",
+        "source_snapshot_inventory_sha256",
         "immutable_asset_contract_sha256",
     ):
         if key in technical and acceptance.get(key) != technical[key]:
@@ -526,6 +544,8 @@ def verify_acceptance(
             for key in (
                 "fast_roborender_source_tree_sha256",
                 "gr00t_source_tree_sha256",
+                "source_snapshot_attestation_sha256",
+                "source_snapshot_inventory_sha256",
                 "immutable_asset_contract_sha256",
             )
             if key in technical
@@ -551,6 +571,8 @@ def _build_parser() -> argparse.ArgumentParser:
     accept.add_argument("--expected-gr00t-revision", required=True)
     accept.add_argument("--expected-fast-source-tree-sha256")
     accept.add_argument("--expected-gr00t-source-tree-sha256")
+    accept.add_argument("--expected-source-snapshot-attestation-sha256")
+    accept.add_argument("--expected-source-snapshot-inventory-sha256")
     accept.add_argument("--expected-asset-contract-sha256")
 
     verify = subparsers.add_parser("verify", help="verify an acceptance and all inputs")
@@ -563,6 +585,8 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--expected-acceptance-sha256")
     verify.add_argument("--expected-fast-source-tree-sha256")
     verify.add_argument("--expected-gr00t-source-tree-sha256")
+    verify.add_argument("--expected-source-snapshot-attestation-sha256")
+    verify.add_argument("--expected-source-snapshot-inventory-sha256")
     verify.add_argument("--expected-asset-contract-sha256")
     return parser
 
@@ -580,6 +604,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.expected_gr00t_revision,
                 args.expected_fast_source_tree_sha256,
                 args.expected_gr00t_source_tree_sha256,
+                args.expected_source_snapshot_attestation_sha256,
+                args.expected_source_snapshot_inventory_sha256,
                 args.expected_asset_contract_sha256,
             )
             report = verify_acceptance(
@@ -589,6 +615,12 @@ def main(argv: list[str] | None = None) -> int:
                 manifest_path=args.manifest,
                 expected_fast_source_tree_sha256=args.expected_fast_source_tree_sha256,
                 expected_gr00t_source_tree_sha256=args.expected_gr00t_source_tree_sha256,
+                expected_source_snapshot_attestation_sha256=(
+                    args.expected_source_snapshot_attestation_sha256
+                ),
+                expected_source_snapshot_inventory_sha256=(
+                    args.expected_source_snapshot_inventory_sha256
+                ),
                 expected_asset_contract_sha256=args.expected_asset_contract_sha256,
             )
         else:
@@ -600,6 +632,12 @@ def main(argv: list[str] | None = None) -> int:
                 expected_acceptance_sha256=args.expected_acceptance_sha256,
                 expected_fast_source_tree_sha256=args.expected_fast_source_tree_sha256,
                 expected_gr00t_source_tree_sha256=args.expected_gr00t_source_tree_sha256,
+                expected_source_snapshot_attestation_sha256=(
+                    args.expected_source_snapshot_attestation_sha256
+                ),
+                expected_source_snapshot_inventory_sha256=(
+                    args.expected_source_snapshot_inventory_sha256
+                ),
                 expected_asset_contract_sha256=args.expected_asset_contract_sha256,
             )
     except GateError as exc:

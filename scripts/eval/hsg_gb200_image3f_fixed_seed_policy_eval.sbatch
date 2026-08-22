@@ -24,7 +24,8 @@ required=(STAGE_ROOT ROOT GR00T_ROOT TRAIN_RUN_DIR EVAL_DIR EVAL_RUN_ID EVAL_MAN
           EXPECTED_IMAGE3F_ADAPTER_SHA256 EXPECTED_IMAGE3F_ENGINE_SHA256 CAMERA_CALIBRATION_ACCEPTANCE
           EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256 MIN_SUCCESS_DELTA
           FIXED_EVAL_SEEDS FIXED_EVAL_NUM_ENVS EXPECTED_RENDERERS WANDB_EXPECTED_EMAIL
-          WANDB_ENTITY WANDB_ONLINE_VALIDATION WANDB_ONLINE_VALIDATION_SHA256
+          WANDB_ENTITY WANDB_AUTHORIZATION_SCOPE WANDB_ONLINE_VALIDATION
+          WANDB_ONLINE_VALIDATION_SHA256
           PROJ EXP SLURM_BIN_DIR)
 for name in "${required[@]}"; do
     [ -n "${!name:-}" ] || { echo "FATAL: missing sanitized launch variable $name" >&2; exit 2; }
@@ -42,6 +43,9 @@ ACTUAL_ACCOUNT=${SLURM_JOB_ACCOUNT:-}
 [ "$ACTUAL_ACCOUNT" = llmservice_nemotron_ultra ] || fatal "account changed"
 [ "$EXPECTED_RENDERERS" -eq 7 ] || fatal "renderer count changed"
 [ "$FIXED_EVAL_NUM_ENVS" -eq 32 ] || fatal "environment count changed"
+[ "$WANDB_EXPECTED_EMAIL" = ldu@nvidia.com ] || fatal "W&B account binding changed"
+[ "$WANDB_ENTITY" = nvidia ] || fatal "W&B team entity binding changed"
+[ "$WANDB_AUTHORIZATION_SCOPE" = team ] || fatal "W&B authorization scope changed"
 [ "$RENDERER_CONTAINER" != "$TRAINER_CONTAINER" ] || fatal "renderer/trainer images must differ"
 [ "$(sha256sum "$RENDERER_CONTAINER" | awk '{print $1}')" = "$EXPECTED_RENDERER_CONTAINER_SHA256" ] || \
     fatal "renderer container changed"
@@ -52,7 +56,13 @@ ACTUAL_ACCOUNT=${SLURM_JOB_ACCOUNT:-}
 [ "$(sha256sum "$PREFLIGHT" | awk '{print $1}')" = "$EXPECTED_PREFLIGHT_SHA256" ] || \
     fatal "preflight changed"
 [ "$(sha256sum "$WANDB_ONLINE_VALIDATION" | awk '{print $1}')" = "$WANDB_ONLINE_VALIDATION_SHA256" ] || \
-    fatal "personal W&B acceptance changed"
+    fatal "authorized-team W&B acceptance changed"
+VALIDATED_WANDB_ENTITY=$(python3 "$ROOT/scripts/eval/wandb_team_contract.py" \
+    --acceptance "$WANDB_ONLINE_VALIDATION" \
+    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
+    --authorization-scope "$WANDB_AUTHORIZATION_SCOPE") || \
+    fatal "authorized-team W&B acceptance is invalid"
+[ "$VALIDATED_WANDB_ENTITY" = "$WANDB_ENTITY" ] || fatal "W&B acceptance entity changed"
 [ "$(tr -d '\r\n' < "$ROOT/.source_revision")" = "$EXPECTED_FAST_ROBORENDER_REVISION" ] || \
     fatal "fast_roborender revision changed"
 [ "$(tr -d '\r\n' < "$GR00T_ROOT/.source_revision")" = "$EXPECTED_GR00T_REVISION" ] || \
@@ -107,9 +117,10 @@ WANDB_PREFLIGHT_OUTPUT=$(srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" \
     env HOME="$STAGE_ROOT/runtime/home" WANDB_MODE=online \
     /usr/local/bin/roborender-trainer-sm100 python \
     "$ROOT/scripts/scaling/wandb_preflight.py" \
-    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" --format shell)
+    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
+    --authorization-scope "$WANDB_AUTHORIZATION_SCOPE" --format shell)
 [ "$(printf '%s\n' "$WANDB_PREFLIGHT_OUTPUT" | grep -c "^WANDB_ENTITY=$WANDB_ENTITY$")" -eq 1 ] || \
-    fatal "containerized personal W&B preflight failed"
+    fatal "containerized authorized-team W&B preflight failed"
 
 RUN_DONE="$EVAL_DIR/RUN_DONE"
 RUN_FAILED="$EVAL_DIR/RUN_FAILED"
@@ -281,6 +292,8 @@ srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" --gpus=0 --cpus-per-task=2 \
     --project "$PROJ" --run-id "i3ffixedeval${SLURM_JOB_ID}" \
     --run-name "${EXP}-image3f-fixed-seed-gate" --manifest "$EVAL_MANIFEST" \
     --summary "$SUMMARY" --results-dir "$EVAL_DIR/results" \
+    --wandb-acceptance "$WANDB_ONLINE_VALIDATION" \
+    --wandb-acceptance-sha256 "$WANDB_ONLINE_VALIDATION_SHA256" \
     --output "$EVAL_DIR/wandb_upload.json"
 
 python3 "$ROOT/scripts/eval/hsg_gb200_image3f_fixed_seed_gate.py" postrun \

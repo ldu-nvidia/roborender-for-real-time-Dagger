@@ -447,11 +447,14 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 "artifact_kinds": {"scalar": 1, "image": 1, "video": 1},
             }
             readback = {
-                "schema": "fast_roborender.wandb_training_readback.v1",
+                "schema": "fast_roborender.wandb_training_readback.v2",
                 "status": "PASS",
                 "account_email": "ldu@nvidia.com",
-                "entity": "ldu",
-                "personal": True,
+                "entity": "nvidia",
+                "authorization_scope": "team",
+                "team_member": True,
+                "entity_is_team": True,
+                "personal": False,
                 "project": "roborender_dagger_3view_production",
                 "trainer_run_id": "trainer-run",
                 "sidecar_run_id": "sidecar-run",
@@ -520,7 +523,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 source_snapshot_inventory_sha256="e" * 64,
                 asset_contract_sha256="c" * 64,
                 wandb_expected_email="ldu@nvidia.com",
-                wandb_entity="ldu",
+                wandb_entity="nvidia",
             )
             report = gate.postrun(args)
             validated = profile_gate.validate_profile(
@@ -534,7 +537,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 expected_source_snapshot_inventory_sha256="e" * 64,
                 expected_asset_contract_sha256="c" * 64,
                 expected_wandb_email="ldu@nvidia.com",
-                expected_wandb_entity="ldu",
+                expected_wandb_entity="nvidia",
             )
             self.assertEqual(validated["status"], "verified")
 
@@ -560,7 +563,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 source_snapshot_inventory_sha256="e" * 64,
                 asset_contract_sha256="c" * 64,
                 wandb_expected_email="ldu@nvidia.com",
-                wandb_entity="ldu",
+                wandb_entity="nvidia",
             )
             report = gate.postrun(args)
             validated = profile_gate.validate_profile(
@@ -574,7 +577,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 expected_source_snapshot_inventory_sha256="e" * 64,
                 expected_asset_contract_sha256="c" * 64,
                 expected_wandb_email="ldu@nvidia.com",
-                expected_wandb_entity="ldu",
+                expected_wandb_entity="nvidia",
             )
             self.assertEqual(validated["status"], "verified")
             self.assertEqual(validated["trainer_nodes"], 8)
@@ -606,7 +609,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 source_snapshot_inventory_sha256="e" * 64,
                 asset_contract_sha256="c" * 64,
                 wandb_expected_email="ldu@nvidia.com",
-                wandb_entity="ldu",
+                wandb_entity="nvidia",
             )
             report = gate.postrun(args)
             self.assertEqual(report["final_checkpoint_step"], 500)
@@ -913,7 +916,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         ).read_text()
         self.assertIn(
             "WANDB_ACCEPTANCE=${WANDB_ACCEPTANCE:-$STAGE_ROOT/runtime/validation/"
-            "wandb_online_smoke_acceptance.json}",
+            "wandb_online_smoke_nvidia_acceptance.json}",
             validator,
         )
         self.assertIn("promote_wandb_acceptance.py", validator)
@@ -925,13 +928,16 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "wandb_online_smoke_123.json"
-            destination = root / "wandb_online_smoke_acceptance.json"
+            destination = root / "wandb_online_smoke_nvidia_acceptance.json"
             document = {
-                "schema": "fast_roborender.wandb_online_smoke.v1",
+                "schema": "fast_roborender.wandb_online_smoke.v2",
                 "status": "PASS",
                 "account_email": "ldu@nvidia.com",
-                "personal": True,
-                "entity": "ldu",
+                "entity": "nvidia",
+                "authorization_scope": "team",
+                "team_member": True,
+                "entity_is_team": True,
+                "personal": False,
                 "observed_keys": [
                     "validation/scalar",
                     "validation/image",
@@ -941,13 +947,23 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             }
             source.write_text(json.dumps(document) + "\n", encoding="utf-8")
             digest = wandb_promotion.promote(
-                source, destination, "ldu@nvidia.com"
+                source,
+                destination,
+                expected_email="ldu@nvidia.com",
+                expected_entity="nvidia",
+                authorization_scope="team",
             )
             self.assertEqual(digest, hashlib.sha256(source.read_bytes()).hexdigest())
             self.assertEqual(destination.read_bytes(), source.read_bytes())
             self.assertEqual(destination.stat().st_mode & 0o777, 0o444)
             self.assertEqual(
-                wandb_promotion.promote(source, destination, "ldu@nvidia.com"),
+                wandb_promotion.promote(
+                    source,
+                    destination,
+                    expected_email="ldu@nvidia.com",
+                    expected_entity="nvidia",
+                    authorization_scope="team",
+                ),
                 digest,
             )
 
@@ -957,7 +973,13 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 wandb_promotion.PromotionError, "refusing to replace different"
             ):
-                wandb_promotion.promote(other, destination, "ldu@nvidia.com")
+                wandb_promotion.promote(
+                    other,
+                    destination,
+                    expected_email="ldu@nvidia.com",
+                    expected_entity="nvidia",
+                    authorization_scope="team",
+                )
             self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), digest)
 
     def test_wandb_acceptance_promotion_rejects_nonpassing_or_wrong_account(self):
@@ -967,11 +989,14 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             source.write_text(
                 json.dumps(
                     {
-                        "schema": "fast_roborender.wandb_online_smoke.v1",
+                        "schema": "fast_roborender.wandb_online_smoke.v2",
                         "status": "FAIL",
                         "account_email": "other@example.com",
-                        "personal": True,
-                        "entity": "other",
+                        "entity": "nvidia",
+                        "authorization_scope": "team",
+                        "team_member": True,
+                        "entity_is_team": True,
+                        "personal": False,
                         "observed_keys": [],
                     }
                 ),
@@ -981,7 +1006,11 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 wandb_promotion.PromotionError, "status mismatch"
             ):
                 wandb_promotion.promote(
-                    source, root / "acceptance.json", "ldu@nvidia.com"
+                    source,
+                    root / "acceptance.json",
+                    expected_email="ldu@nvidia.com",
+                    expected_entity="nvidia",
+                    authorization_scope="team",
                 )
 
     def test_hsg_runbook_uses_sealed_tools_and_documents_wandb_promotion(self):
@@ -989,7 +1018,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         self.assertIn(
             'WANDB_ACCEPTANCE="$STAGE_ROOT/runtime/validation/'
-            'wandb_online_smoke_acceptance.json"',
+            'wandb_online_smoke_nvidia_acceptance.json"',
             runbook,
         )
         self.assertIn("A PASS atomically creates $WANDB_ACCEPTANCE", runbook)

@@ -23,11 +23,48 @@ class PromotionError(RuntimeError):
     pass
 
 
+REPORT_SCHEMA = "fast_roborender.wandb_online_smoke.v2"
+AUTHORIZED_EMAIL = "ldu@nvidia.com"
+AUTHORIZED_ENTITY = "nvidia"
+AUTHORIZED_SCOPE = "team"
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise PromotionError(f"source contains duplicate JSON key {key!r}")
+        document[key] = value
+    return document
+
+
 def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def load_and_validate(source: Path, expected_email: str) -> bytes:
+def validate_authorized_request(
+    *, expected_email: str, expected_entity: str, authorization_scope: str
+) -> None:
+    if expected_email != AUTHORIZED_EMAIL:
+        raise PromotionError("expected W&B account is outside the authorized scope")
+    if expected_entity != AUTHORIZED_ENTITY:
+        raise PromotionError("expected W&B entity is outside the authorized scope")
+    if authorization_scope != AUTHORIZED_SCOPE:
+        raise PromotionError("unsupported W&B authorization scope")
+
+
+def load_and_validate(
+    source: Path,
+    *,
+    expected_email: str,
+    expected_entity: str,
+    authorization_scope: str,
+) -> bytes:
+    validate_authorized_request(
+        expected_email=expected_email,
+        expected_entity=expected_entity,
+        authorization_scope=authorization_scope,
+    )
     if source.is_symlink():
         raise PromotionError(f"source must not be a symbolic link: {source}")
     source = source.resolve(strict=True)
@@ -35,32 +72,55 @@ def load_and_validate(source: Path, expected_email: str) -> bytes:
         raise PromotionError(f"source is not a non-empty regular file: {source}")
     payload = source.read_bytes()
     try:
-        document: Any = json.loads(payload)
+        document: Any = json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
+    except PromotionError:
+        raise
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PromotionError("source is not valid JSON") from exc
     if not isinstance(document, dict):
         raise PromotionError("source must contain one JSON object")
     expected = {
-        "schema": "fast_roborender.wandb_online_smoke.v1",
+        "schema": REPORT_SCHEMA,
         "status": "PASS",
         "account_email": expected_email,
-        "personal": True,
+        "entity": expected_entity,
+        "authorization_scope": authorization_scope,
+        "team_member": True,
+        "entity_is_team": True,
+        "personal": False,
     }
     for key, value in expected.items():
         if document.get(key) != value or type(document.get(key)) is not type(value):
             raise PromotionError(f"W&B smoke record {key} mismatch")
     entity = document.get("entity")
-    if not isinstance(entity, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", entity) is None:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", entity) is None:
         raise PromotionError("W&B smoke record entity is malformed")
     observed = document.get("observed_keys")
     required = {"validation/scalar", "validation/image", "validation/video"}
-    if not isinstance(observed, list) or not required.issubset(observed):
+    if (
+        not isinstance(observed, list)
+        or not all(isinstance(key, str) for key in observed)
+        or len(observed) != len(set(observed))
+        or not required.issubset(observed)
+    ):
         raise PromotionError("W&B smoke record lacks scalar/image/video readback")
     return payload
 
 
-def promote(source: Path, destination: Path, expected_email: str) -> str:
-    payload = load_and_validate(source, expected_email)
+def promote(
+    source: Path,
+    destination: Path,
+    *,
+    expected_email: str,
+    expected_entity: str,
+    authorization_scope: str,
+) -> str:
+    payload = load_and_validate(
+        source,
+        expected_email=expected_email,
+        expected_entity=expected_entity,
+        authorization_scope=authorization_scope,
+    )
     if destination.is_symlink():
         raise PromotionError(f"destination must not be a symbolic link: {destination}")
     parent = destination.parent.resolve(strict=True)
@@ -111,9 +171,19 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--expected-email", required=True)
+    parser.add_argument("--expected-entity", required=True)
+    parser.add_argument(
+        "--authorization-scope", required=True, choices=(AUTHORIZED_SCOPE,)
+    )
     args = parser.parse_args()
     try:
-        digest = promote(args.source, args.destination, args.expected_email)
+        digest = promote(
+            args.source,
+            args.destination,
+            expected_email=args.expected_email,
+            expected_entity=args.expected_entity,
+            authorization_scope=args.authorization_scope,
+        )
     except (OSError, PromotionError) as exc:
         raise SystemExit(f"FATAL: {exc}") from exc
     print(f"WANDB_ACCEPTANCE={args.destination}")

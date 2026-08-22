@@ -55,6 +55,30 @@ class FakeWandb:
 
 
 class WandbRunWatcherTest(unittest.TestCase):
+    def test_authorization_scope_is_required_and_team_only(self):
+        required = [
+            "--run-dir",
+            "/tmp/run",
+            "--project",
+            "project",
+            "--expected-email",
+            "ldu@nvidia.com",
+            "--entity",
+            "nvidia",
+        ]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                watcher._parser().parse_args(required)
+            with self.assertRaises(SystemExit):
+                watcher._parser().parse_args(
+                    required + ["--authorization-scope", "personal"]
+                )
+        arguments = watcher._parser().parse_args(
+            required + ["--authorization-scope", "team"]
+        )
+        self.assertEqual(arguments.authorization_scope, "team")
+
     def test_rank_resolution_and_invalid_rank(self):
         self.assertEqual(watcher.process_rank({}), 0)
         self.assertEqual(watcher.process_rank({"SLURM_PROCID": "7"}), 7)
@@ -250,11 +274,24 @@ class WandbRunWatcherTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / "telemetry" / "READY.json"
             watcher.write_ready_marker(
-                marker, entity="ldu", project="dagger", run_id="stable_run_1"
+                marker,
+                account_email="ldu@nvidia.com",
+                entity="nvidia",
+                project="dagger",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+                run_id="stable_run_1",
             )
             payload = json.loads(marker.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "ready")
-            self.assertEqual(payload["entity"], "ldu")
+            self.assertEqual(payload["account_email"], "ldu@nvidia.com")
+            self.assertEqual(payload["entity"], "nvidia")
+            self.assertEqual(payload["authorization_scope"], "team")
+            self.assertTrue(payload["team_member"])
+            self.assertTrue(payload["entity_is_team"])
+            self.assertFalse(payload["personal"])
             self.assertEqual(payload["project"], "dagger")
             self.assertEqual(payload["wandb_run_id"], "stable_run_1")
             self.assertNotIn("key", json.dumps(payload).lower())
@@ -306,7 +343,14 @@ class WandbRunWatcherTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fake_wandb = FakeWandb()
-            identity = SimpleNamespace(entity="ldu", email="ldu@nvidia.com")
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
             arguments = [
                 "--run-dir",
                 str(root),
@@ -314,17 +358,32 @@ class WandbRunWatcherTest(unittest.TestCase):
                 "dagger",
                 "--expected-email",
                 "ldu@nvidia.com",
+                "--entity",
+                "nvidia",
+                "--authorization-scope",
+                "team",
                 "--min-age-s",
                 "0",
                 "--once",
             ]
             with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), \
                  mock.patch.object(watcher, "_load_wandb", return_value=fake_wandb), \
-                 mock.patch.object(watcher, "query_identity", return_value=identity):
+                 mock.patch.object(
+                     watcher, "query_identity", return_value=identity
+                 ) as query_identity:
                 self.assertEqual(watcher.main(arguments), 0)
                 self.assertEqual(watcher.main(arguments), 0)
 
             first, second = fake_wandb.init_calls
+            self.assertEqual(query_identity.call_count, 2)
+            self.assertEqual(
+                query_identity.call_args.kwargs,
+                {
+                    "expected_email": "ldu@nvidia.com",
+                    "requested_entity": "nvidia",
+                    "authorization_scope": "team",
+                },
+            )
             self.assertEqual(first["id"], second["id"])
             self.assertEqual(first["resume"], "allow")
             self.assertEqual(second["resume"], "must")
@@ -334,6 +393,13 @@ class WandbRunWatcherTest(unittest.TestCase):
                 .strip(),
                 first["id"],
             )
+            for call in (first, second):
+                self.assertEqual(call["config"]["account_email"], "ldu@nvidia.com")
+                self.assertEqual(call["config"]["entity"], "nvidia")
+                self.assertEqual(call["config"]["authorization_scope"], "team")
+                self.assertTrue(call["config"]["team_member"])
+                self.assertTrue(call["config"]["entity_is_team"])
+                self.assertFalse(call["config"]["personal"])
 
     def test_final_drain_waits_a_full_stability_window(self):
         deadline, complete = watcher.update_final_drain(
@@ -381,6 +447,10 @@ class WandbRunWatcherTest(unittest.TestCase):
                     "unused",
                     "--expected-email",
                     "ldu@nvidia.com",
+                    "--entity",
+                    "nvidia",
+                    "--authorization-scope",
+                    "team",
                     "--once",
                 ]
             )

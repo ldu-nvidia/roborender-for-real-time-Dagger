@@ -29,8 +29,8 @@ EXPECTED_IMAGE3F_ADAPTER_SHA256=${EXPECTED_IMAGE3F_ADAPTER_SHA256:-c68de259ce5ee
 EXPECTED_FAST_ROBORENDER_REVISION=${EXPECTED_FAST_ROBORENDER_REVISION:-}
 EXPECTED_GR00T_REVISION=${EXPECTED_GR00T_REVISION:-}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
-WANDB_ENTITY=${WANDB_ENTITY:-}
-WANDB_ONLINE_VALIDATION=${WANDB_ONLINE_VALIDATION:-$STAGE_ROOT/runtime/validation/wandb_online_smoke_acceptance.json}
+WANDB_ENTITY=${WANDB_ENTITY:-nvidia}
+WANDB_ONLINE_VALIDATION=${WANDB_ONLINE_VALIDATION:-$STAGE_ROOT/runtime/validation/wandb_online_smoke_nvidia_acceptance.json}
 WANDB_WATCHER_POLL_S=${WANDB_WATCHER_POLL_S:-15}
 WANDB_WATCHER_READY_TIMEOUT_S=${WANDB_WATCHER_READY_TIMEOUT_S:-120}
 WANDB_WATCHER_DRAIN_TIMEOUT_S=${WANDB_WATCHER_DRAIN_TIMEOUT_S:-240}
@@ -224,13 +224,14 @@ fi
 
 if [ "$USE_WANDB" -eq 1 ]; then
     [ "$WANDB_EXPECTED_EMAIL" = ldu@nvidia.com ] || fatal "HSG smoke telemetry is pinned to ldu@nvidia.com"
+    [ "$WANDB_ENTITY" = nvidia ] || fatal "HSG smoke telemetry is pinned to authorized team entity nvidia"
     NETRC=$STAGE_ROOT/runtime/home/.netrc
     [ -s "$NETRC" ] || fatal "W&B credential missing: $NETRC"
     [ "$(stat -c %u "$NETRC")" -eq "$(id -u)" ] || fatal "W&B netrc owner mismatch"
     case "$(stat -c %a "$NETRC")" in 400|600) ;; *) fatal "W&B netrc must be 0400 or 0600" ;; esac
     [ -s "$WANDB_ONLINE_VALIDATION" ] || \
-        fatal "successful personal-workspace W&B scalar/image/video validation is missing: $WANDB_ONLINE_VALIDATION"
-    WANDB_ENTITY=$(python3 - "$WANDB_ONLINE_VALIDATION" "$WANDB_EXPECTED_EMAIL" <<'PY'
+        fatal "successful authorized-team W&B scalar/image/video validation is missing: $WANDB_ONLINE_VALIDATION"
+    WANDB_ENTITY=$(python3 - "$WANDB_ONLINE_VALIDATION" "$WANDB_EXPECTED_EMAIL" "$WANDB_ENTITY" <<'PY'
 import json
 import re
 import sys
@@ -238,15 +239,19 @@ from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 expected = {
-    "schema": "fast_roborender.wandb_online_smoke.v1",
+    "schema": "fast_roborender.wandb_online_smoke.v2",
     "status": "PASS",
     "account_email": sys.argv[2],
-    "personal": True,
+    "entity": sys.argv[3],
+    "authorization_scope": "team",
+    "team_member": True,
+    "entity_is_team": True,
+    "personal": False,
 }
 for key, value in expected.items():
     if payload.get(key) != value:
         raise SystemExit(f"W&B acceptance {key} mismatch")
-entity = payload.get("entity")
+entity = payload["entity"]
 if not isinstance(entity, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", entity) is None:
     raise SystemExit("W&B acceptance entity is malformed")
 required = {"validation/scalar", "validation/image", "validation/video"}
@@ -491,7 +496,7 @@ fi
 # Bind every immutable input that could change the student trajectory to the
 # logical production run.  A later allocation may resume the same RUN_ID, but
 # it must use byte-identical source trees, containers, model assets, scheduler
-# topology, validation evidence, and personal W&B destination.
+# topology, validation evidence, and explicitly authorized W&B team destination.
 if [ "$RUN_PROFILE" = production_256x300 ]; then
     RUN_IDENTITY=$RUN_ROOT/run_identity.txt
     RUN_IDENTITY_MODE=create

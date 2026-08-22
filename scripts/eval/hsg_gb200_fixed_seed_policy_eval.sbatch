@@ -20,6 +20,7 @@ required=(STAGE_ROOT ROOT GR00T_ROOT TRAIN_RUN_DIR EVAL_DIR EVAL_MANIFEST EXPECT
           EXPECTED_FAST_SOURCE_TREE_SHA256 EXPECTED_GR00T_SOURCE_TREE_SHA256
           RESNET18_WEIGHTS EXPECTED_RESNET18_SHA256 MIN_SUCCESS_DELTA
           FIXED_EVAL_SEEDS FIXED_EVAL_NUM_ENVS WANDB_EXPECTED_EMAIL WANDB_ENTITY
+          WANDB_AUTHORIZATION_SCOPE
           WANDB_ONLINE_VALIDATION WANDB_ONLINE_VALIDATION_SHA256 PROJ EXP SLURM_BIN_DIR)
 for name in "${required[@]}"; do
     [ -n "${!name:-}" ] || { echo "FATAL: missing sanitized launch variable $name" >&2; exit 2; }
@@ -34,6 +35,9 @@ ACTUAL_QOS=${SLURM_JOB_QOS:-}
 ACTUAL_ACCOUNT=${SLURM_JOB_ACCOUNT:-}
 [ -n "$ACTUAL_ACCOUNT" ] || ACTUAL_ACCOUNT=$(scontrol show job "$SLURM_JOB_ID" -o | sed -n 's/.* Account=\([^ ]*\).*/\1/p')
 [ "$ACTUAL_ACCOUNT" = llmservice_nemotron_ultra ] || fatal "fixed evaluation account changed"
+[ "$WANDB_EXPECTED_EMAIL" = ldu@nvidia.com ] || fatal "W&B account binding changed"
+[ "$WANDB_ENTITY" = nvidia ] || fatal "W&B team entity binding changed"
+[ "$WANDB_AUTHORIZATION_SCOPE" = team ] || fatal "W&B authorization scope changed"
 [ "$(sha256sum "$TRAINER_CONTAINER" | awk '{print $1}')" = "$EXPECTED_TRAINER_CONTAINER_SHA256" ] || \
     fatal "SM100 trainer container changed"
 [ "$(sha256sum "$EVAL_MANIFEST" | awk '{print $1}')" = "$EXPECTED_EVAL_MANIFEST_SHA256" ] || \
@@ -41,7 +45,13 @@ ACTUAL_ACCOUNT=${SLURM_JOB_ACCOUNT:-}
 [ "$(sha256sum "$PREFLIGHT" | awk '{print $1}')" = "$EXPECTED_PREFLIGHT_SHA256" ] || \
     fatal "fixed-seed preflight changed"
 [ "$(sha256sum "$WANDB_ONLINE_VALIDATION" | awk '{print $1}')" = \
-  "$WANDB_ONLINE_VALIDATION_SHA256" ] || fatal "personal W&B acceptance changed"
+  "$WANDB_ONLINE_VALIDATION_SHA256" ] || fatal "authorized-team W&B acceptance changed"
+VALIDATED_WANDB_ENTITY=$(python3 "$ROOT/scripts/eval/wandb_team_contract.py" \
+    --acceptance "$WANDB_ONLINE_VALIDATION" \
+    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
+    --authorization-scope "$WANDB_AUTHORIZATION_SCOPE") || \
+    fatal "authorized-team W&B acceptance is invalid"
+[ "$VALIDATED_WANDB_ENTITY" = "$WANDB_ENTITY" ] || fatal "W&B acceptance entity changed"
 [ "$(tr -d '\r\n' < "$ROOT/.source_revision")" = "$EXPECTED_FAST_ROBORENDER_REVISION" ] || \
     fatal "fast_roborender revision changed"
 [ "$(tr -d '\r\n' < "$GR00T_ROOT/.source_revision")" = "$EXPECTED_GR00T_REVISION" ] || \
@@ -57,7 +67,9 @@ python3 "$ROOT/scripts/eval/hsg_gb200_fixed_seed_eval_gate.py" preflight \
     --fixed-seed-manifest "$EVAL_MANIFEST" \
     --fixed-seed-manifest-sha256 "$EXPECTED_EVAL_MANIFEST_SHA256" \
     --train-run-dir "$TRAIN_RUN_DIR" --expected-seeds "$FIXED_EVAL_SEEDS" \
-    --expected-num-envs "$FIXED_EVAL_NUM_ENVS" > "$CURRENT_PREFLIGHT"
+    --expected-num-envs "$FIXED_EVAL_NUM_ENVS" \
+    --wandb-acceptance "$WANDB_ONLINE_VALIDATION" \
+    --wandb-acceptance-sha256 "$WANDB_ONLINE_VALIDATION_SHA256" > "$CURRENT_PREFLIGHT"
 cmp -s "$PREFLIGHT" "$CURRENT_PREFLIGHT" || fatal "HSG preflight changed after submission"
 grep -F '"fast_roborender_source_tree_sha256": '"\"$EXPECTED_FAST_SOURCE_TREE_SHA256\"" \
     "$CURRENT_PREFLIGHT" >/dev/null || fatal "fast_roborender source-tree digest changed"
@@ -74,9 +86,10 @@ WANDB_PREFLIGHT_OUTPUT=$(srun --nodes=1 --ntasks=1 --nodelist="$MASTER_NODE" \
     env HOME="$STAGE_ROOT/runtime/home" WANDB_MODE=online \
     /usr/local/bin/roborender-trainer-sm100 python \
     "$ROOT/scripts/scaling/wandb_preflight.py" \
-    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" --format shell)
+    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
+    --authorization-scope "$WANDB_AUTHORIZATION_SCOPE" --format shell)
 [ "$(printf '%s\n' "$WANDB_PREFLIGHT_OUTPUT" | grep -c "^WANDB_ENTITY=$WANDB_ENTITY$")" -eq 1 ] || \
-    fatal "containerized personal W&B preflight failed"
+    fatal "containerized authorized-team W&B preflight failed"
 
 RUN_DONE="$EVAL_DIR/RUN_DONE"
 RUN_FAILED="$EVAL_DIR/RUN_FAILED"
@@ -120,7 +133,9 @@ srun --nodes=1 --ntasks=1 --nodelist="$MASTER_NODE" \
     --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY" \
     --project "$PROJ" --run-id "hsgfixedeval${SLURM_JOB_ID}" \
     --run-name "${EXP}-fixed-seed-gate" --manifest "$EVAL_MANIFEST" \
-    --summary "$SUMMARY" --output "$EVAL_DIR/wandb_upload.json"
+    --summary "$SUMMARY" --wandb-acceptance "$WANDB_ONLINE_VALIDATION" \
+    --wandb-acceptance-sha256 "$WANDB_ONLINE_VALIDATION_SHA256" \
+    --output "$EVAL_DIR/wandb_upload.json"
 
 WANDB_UPLOAD="$EVAL_DIR/wandb_upload.json"
 

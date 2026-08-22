@@ -26,13 +26,14 @@ sys.path.insert(0, str(HERE.parent / "scaling"))
 import fixed_seed_gate  # noqa: E402
 import camera_calibration_gate as camera_gate  # noqa: E402
 import hsg_gb200_smoke_gate as smoke_gate  # noqa: E402
+import wandb_team_contract as team_contract  # noqa: E402
 
 
 MANIFEST_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_manifest.v1"
-PREFLIGHT_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_preflight.v1"
+PREFLIGHT_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_preflight.v2"
 ATTESTATION_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_runtime.v1"
-ACCEPTANCE_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_acceptance.v1"
-WANDB_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_wandb_upload.v1"
+ACCEPTANCE_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_acceptance.v2"
+WANDB_SCHEMA = "fast_roborender.hsg_image3f_fixed_seed_wandb_upload.v2"
 OBSERVATION_MODE = "image3f_generated_rgb_3view"
 ROLE_ORDER = ("baseline", "early", "mid", "final")
 VIEWS = ("head_color", "hand_left", "hand_right")
@@ -369,6 +370,12 @@ def verify_camera_acceptance_binding(
             "fast_roborender_source_tree_sha256"
         ],
         expected_gr00t_source_tree_sha256=base["gr00t_source_tree_sha256"],
+        expected_source_snapshot_attestation_sha256=base[
+            "source_snapshot_attestation_sha256"
+        ],
+        expected_source_snapshot_inventory_sha256=base[
+            "source_snapshot_inventory_sha256"
+        ],
         expected_asset_contract_sha256=base["asset_contract_sha256"],
     )
     expected = {
@@ -381,6 +388,12 @@ def verify_camera_acceptance_binding(
             "fast_roborender_source_tree_sha256"
         ],
         "gr00t_source_tree_sha256": base["gr00t_source_tree_sha256"],
+        "source_snapshot_attestation_sha256": base[
+            "source_snapshot_attestation_sha256"
+        ],
+        "source_snapshot_inventory_sha256": base[
+            "source_snapshot_inventory_sha256"
+        ],
         "immutable_asset_contract_sha256": base["asset_contract_sha256"],
         "policy_views": list(VIEWS),
         "panels_verified": 2,
@@ -431,9 +444,18 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     camera_verification = verify_camera_acceptance_binding(args, base)
     camera_hash = camera_verification["acceptance_sha256"]
     resnet_hash = require_hash(args.resnet18, args.resnet18_sha256, "ResNet18 weights")
+    wandb_path = require_file(args.wandb_acceptance, "authorized-team W&B acceptance")
     wandb_hash = require_hash(
-        args.wandb_acceptance, args.wandb_acceptance_sha256, "personal W&B acceptance"
+        wandb_path,
+        args.wandb_acceptance_sha256,
+        "authorized-team W&B acceptance",
     )
+    try:
+        wandb_acceptance = team_contract.validate_online_acceptance(
+            team_contract.load_json(wandb_path)
+        )
+    except team_contract.TeamContractError as exc:
+        raise GateError(str(exc)) from None
     explicit_sources = {}
     for relative in (
         "scripts/eval/eval_agent_metrics_adapter.py",
@@ -442,6 +464,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "scripts/eval/hsg_gb200_image3f_fixed_seed_policy_eval.sbatch",
         "scripts/eval/hsg_gb200_image3f_fixed_seed_task.sh",
         "scripts/eval/hsg_gb200_image3f_fixed_seed_wandb.py",
+        "scripts/eval/wandb_team_contract.py",
         "scripts/scaling/camera_calibration_gate.py",
         "scripts/scaling/image3f_probe.py",
         "scripts/server/image3f_server.py",
@@ -492,7 +515,11 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             camera_verification
         ),
         "resnet18_sha256": resnet_hash,
-        "wandb_personal_acceptance_sha256": wandb_hash,
+        "wandb_online_acceptance": {
+            "path": str(wandb_path),
+            "sha256": wandb_hash,
+            **wandb_acceptance,
+        },
         "explicit_source_sha256": explicit_sources,
     }
 
@@ -735,6 +762,22 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
     for key, value in expected_preflight.items():
         if preflight_payload.get(key) != value:
             raise GateError(f"preflight {key} contract changed")
+    preflight_wandb = preflight_payload.get("wandb_online_acceptance")
+    if not isinstance(preflight_wandb, dict):
+        raise GateError("Image3F preflight lacks its authorized-team W&B binding")
+    try:
+        team_contract.validate_online_acceptance(preflight_wandb)
+        team_contract.validate_authorized_request(
+            expected_email=args.expected_wandb_email,
+            entity=args.expected_wandb_entity,
+            authorization_scope=team_contract.AUTHORIZED_SCOPE,
+        )
+    except team_contract.TeamContractError as exc:
+        raise GateError(str(exc)) from None
+    preflight_wandb_hash = require_sha256(
+        preflight_wandb.get("sha256"),
+        "preflight W&B online acceptance SHA-256",
+    )
     manifest_path = require_file(args.fixed_seed_manifest, "fixed-seed manifest")
     manifest_hash = require_hash(
         manifest_path, args.fixed_seed_manifest_sha256, "fixed-seed manifest"
@@ -876,16 +919,18 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
             )
             paired_outcome_transitions[transition] += 1
 
-    wandb_path = require_file(args.wandb_upload, "personal W&B upload marker")
+    wandb_path = require_file(args.wandb_upload, "authorized-team W&B upload marker")
     wandb = load_json(wandb_path)
     expected_wandb = {
         "schema": WANDB_SCHEMA,
         "status": "PASS",
-        "account_email": args.expected_wandb_email,
-        "entity": args.expected_wandb_entity,
-        "personal": True,
+        **team_contract.team_binding(),
         "manifest_sha256": manifest_hash,
         "summary_sha256": sha256_file(summary_path),
+        "wandb_online_acceptance_sha256": preflight_wandb_hash,
+        "wandb_online_acceptance_observed_keys": sorted(
+            team_contract.REQUIRED_OBSERVED_KEYS
+        ),
     }
     for key, value in expected_wandb.items():
         if wandb.get(key) != value:
@@ -930,6 +975,11 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
         "summary_sha256": sha256_file(summary_path),
         "wandb_upload": str(wandb_path),
         "wandb_upload_sha256": sha256_file(wandb_path),
+        "wandb_account_email": team_contract.AUTHORIZED_EMAIL,
+        "wandb_entity": team_contract.AUTHORIZED_ENTITY,
+        "wandb_authorization_scope": team_contract.AUTHORIZED_SCOPE,
+        "wandb_authorization": team_contract.team_binding(),
+        "wandb_online_acceptance_sha256": preflight_wandb_hash,
         "renderer_runtime_identity_sha256": next(iter(identity_hashes)),
         "endpoint_manifest_sha256": next(iter(endpoint_manifest_hashes)),
         "total_served_requests": total_requests,

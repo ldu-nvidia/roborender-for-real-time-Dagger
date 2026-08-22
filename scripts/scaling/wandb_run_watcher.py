@@ -486,13 +486,27 @@ class WandbArtifactWatcher:
 
 
 def write_ready_marker(
-    path: Path, *, entity: str, project: str, run_id: str | None = None
+    path: Path,
+    *,
+    account_email: str,
+    entity: str,
+    project: str,
+    authorization_scope: str,
+    team_member: bool,
+    entity_is_team: bool,
+    personal: bool,
+    run_id: str | None = None,
 ) -> None:
     """Publish watcher readiness atomically after W&B initialization succeeds."""
 
     payload = {
         "status": "ready",
+        "account_email": account_email,
         "entity": entity,
+        "authorization_scope": authorization_scope,
+        "team_member": team_member,
+        "entity_is_team": entity_is_team,
+        "personal": personal,
         "project": project,
         "pid": os.getpid(),
         "ready_unix_s": time.time(),
@@ -521,6 +535,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--group", default=None)
     parser.add_argument("--expected-email", default=os.environ.get("WANDB_EXPECTED_EMAIL"))
     parser.add_argument("--entity", default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument(
+        "--authorization-scope", required=True, choices=("team",)
+    )
     parser.add_argument("--poll-interval-s", type=float, default=30.0)
     parser.add_argument("--max-runtime-s", type=float, default=0.0)
     parser.add_argument("--min-age-s", type=float, default=5.0)
@@ -542,6 +559,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.expected_email:
         print("W&B artifact watcher: expected email is required", file=sys.stderr)
+        return 2
+    if not args.entity:
+        print("W&B artifact watcher: entity is required", file=sys.stderr)
         return 2
     if (
         args.poll_interval_s <= 0
@@ -568,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
             wandb,
             expected_email=args.expected_email,
             requested_entity=args.entity,
+            authorization_scope=args.authorization_scope,
         )
     except WandbPreflightError as exc:
         print(f"W&B artifact watcher: {exc}", file=sys.stderr)
@@ -599,6 +620,12 @@ def main(argv: list[str] | None = None) -> int:
             "source_run_dir": str(run_dir),
             "artifact_schema": STATE_SCHEMA_VERSION,
             "expected_account": identity.email,
+            "account_email": identity.email,
+            "entity": identity.entity,
+            "authorization_scope": identity.authorization_scope,
+            "team_member": identity.team_member,
+            "entity_is_team": identity.entity_is_team,
+            "personal": identity.personal,
         },
     )
     run.define_metric("trainer_step")
@@ -612,7 +639,15 @@ def main(argv: list[str] | None = None) -> int:
         run.finish(exit_code=2)
         return 2
     write_ready_marker(
-        ready_marker, entity=identity.entity, project=args.project, run_id=run_id
+        ready_marker,
+        account_email=identity.email,
+        entity=identity.entity,
+        project=args.project,
+        authorization_scope=identity.authorization_scope,
+        team_member=identity.team_member,
+        entity_is_team=identity.entity_is_team,
+        personal=identity.personal,
+        run_id=run_id,
     )
     watcher = WandbArtifactWatcher(
         run_dir=run_dir,

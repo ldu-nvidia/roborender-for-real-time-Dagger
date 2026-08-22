@@ -1,6 +1,6 @@
 #!/bin/bash
-# Aggregate all fixed-seed blocks, upload comparable metrics to the same personal
-# W&B project, and make the Slurm job red unless the policy-improvement gate passes.
+# Aggregate all fixed-seed blocks, upload comparable metrics to the authorized
+# W&B team project, and make the job red unless the policy-improvement gate passes.
 #SBATCH --partition=cpu_short
 #SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_eval_report
@@ -19,10 +19,15 @@ EXP=${EXP:-dagger_fixed_seed_gate}
 MIN_SUCCESS_DELTA=${MIN_SUCCESS_DELTA:-0.02}
 WANDB_EXPECTED_EMAIL=${WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 WANDB_MODE=${WANDB_MODE:-online}
-WANDB_ENTITY=${WANDB_ENTITY:-}
+WANDB_ENTITY=${WANDB_ENTITY:-nvidia}
+WANDB_AUTHORIZATION_SCOPE=${WANDB_AUTHORIZATION_SCOPE:-team}
 WANDB_PYTHON=${WANDB_PYTHON:-$STAGE_ROOT/runtime/envs/wandb-host/bin/python}
 export HOME=${HOME_OVERRIDE:-$STAGE_ROOT/runtime/home}
 SUMMARY="$EVAL_DIR/fixed_seed_improvement_report.json"
+
+[ "$WANDB_EXPECTED_EMAIL" = ldu@nvidia.com ] || { echo "FATAL: W&B account binding changed"; exit 2; }
+[ "$WANDB_ENTITY" = nvidia ] || { echo "FATAL: W&B team entity binding changed"; exit 2; }
+[ "$WANDB_AUTHORIZATION_SCOPE" = team ] || { echo "FATAL: W&B authorization scope changed"; exit 2; }
 
 set +e
 "$WANDB_PYTHON" "$ROOT/scripts/eval/fixed_seed_gate.py" summarize \
@@ -40,14 +45,12 @@ if [ "$GATE_RC" -eq 2 ]; then
 fi
 
 WANDB_PREFLIGHT=("$WANDB_PYTHON" "$ROOT/scripts/scaling/wandb_preflight.py"
-    --expected-email "$WANDB_EXPECTED_EMAIL" --format shell)
-if [ -n "$WANDB_ENTITY" ]; then
-    WANDB_PREFLIGHT+=(--entity "$WANDB_ENTITY")
-fi
+    --expected-email "$WANDB_EXPECTED_EMAIL" --entity "$WANDB_ENTITY"
+    --authorization-scope "$WANDB_AUTHORIZATION_SCOPE" --format shell)
 WANDB_IDENTITY=$(WANDB_MODE="$WANDB_MODE" "${WANDB_PREFLIGHT[@]}")
 case "$WANDB_IDENTITY" in
     WANDB_ENTITY=?*) WANDB_ENTITY=${WANDB_IDENTITY#WANDB_ENTITY=} ;;
-    *) echo "FATAL: W&B identity preflight did not return a personal entity"; exit 2 ;;
+    *) echo "FATAL: W&B identity preflight did not return the authorized team"; exit 2 ;;
 esac
 
 WANDB_MODE="$WANDB_MODE" "$WANDB_PYTHON" "$ROOT/scripts/eval/fixed_seed_gate.py" upload \

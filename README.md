@@ -17,7 +17,7 @@ SM100 Image3F/TensorRT renderer and one for Isaac Sim 5.1, Isaac Lab, GR00T, and
 The source checkout is staged separately as an immutable, content-addressed snapshot and mounted
 read-only into both containers.  The HSG launchers live under `scripts/scaling/hsg_gb200_*` and
 fail closed on source, container, model, engine, anchor-pool, teacher, camera, predecessor-smoke,
-and personal-W&B identities.
+and the explicitly authorized `ldu@nvidia.com` + `nvidia` W&B team identity.
 
 Always point `ROOT` at the exact read-only snapshot created for the campaign, never the mutable
 `$STAGE_ROOT/src/fast_roborender` compatibility path:
@@ -461,13 +461,38 @@ content-addressed acceptance record (the confirmation text is intentionally exac
 ```bash
 RUN_PROFILE=calibration_3view bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
 
+export CALIBRATION_MANIFEST=/absolute/run/path/validation/camera_calibration_manifest.json
+export FAST_TREE_SHA256=$(PYTHONDONTWRITEBYTECODE=1 python \
+  "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" tree-hash --root "$ROOT")
+export GR00T_TREE_SHA256=$(PYTHONDONTWRITEBYTECODE=1 python \
+  "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" tree-hash --root "$GR00T_ROOT")
+export ASSET_CONTRACT_SHA256=$(python - "$CALIBRATION_MANIFEST" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["immutable_asset_contract_sha256"])
+PY
+)
+export SOURCE_SNAPSHOT_ATTESTATION_SHA256=$(python - "$CALIBRATION_MANIFEST" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["source_snapshot_attestation_sha256"])
+PY
+)
+export SOURCE_SNAPSHOT_INVENTORY_SHA256=$(python - "$CALIBRATION_MANIFEST" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["source_snapshot_inventory_sha256"])
+PY
+)
 python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
-  --manifest /absolute/run/path/validation/camera_calibration_manifest.json \
+  --manifest "$CALIBRATION_MANIFEST" \
   --output "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json" \
   --reviewer ldu@nvidia.com \
   --confirm 'I reviewed both three-view calibration panels and accept the camera mapping.' \
   --expected-fast-roborender-revision "$(cat "$ROOT/.source_revision")" \
-  --expected-gr00t-revision "$(cat "$GR00T_ROOT/.source_revision")"
+  --expected-gr00t-revision "$(cat "$GR00T_ROOT/.source_revision")" \
+  --expected-fast-source-tree-sha256 "$FAST_TREE_SHA256" \
+  --expected-gr00t-source-tree-sha256 "$GR00T_TREE_SHA256" \
+  --expected-source-snapshot-attestation-sha256 "$SOURCE_SNAPSHOT_ATTESTATION_SHA256" \
+  --expected-source-snapshot-inventory-sha256 "$SOURCE_SNAPSHOT_INVENTORY_SHA256" \
+  --expected-asset-contract-sha256 "$ASSET_CONTRACT_SHA256"
 ```
 
 The acceptance binds both panel hashes, their PNG dimensions, ordered camera semantics, and both
@@ -497,7 +522,7 @@ remains blocked until every predecessor artifact validates against the same sour
 | Camera semantics | Human-accepted, content-addressed calibration for exact head/left-wrist/right-wrist order, orientations, tile shapes, panels, and source revisions |
 | Renderer provenance | All 52 live endpoints report exact three-view order/layout/shape, fine-tuned release/adapter SHA, five-step sampler, TeaCache 0.3, CFG 1.0, CUDA graph setting, and a load-verified TensorRT engine compatible with the serving GPU/software stack |
 | Training integrity | Two-node smoke-32 predecessor passes (seven renderers plus one trainer); full 8-rank smoke-256 proves synchronized post-update policy SHA; every update has finite/nonnegative cross-rank BC loss; initial and exact terminal checkpoints exist |
-| W&B observability | Online personal workspace authenticated as `ldu@nvidia.com`; stable resumable sidecar run; scalar, condition/generated image, and MP4 producers ready; repeated upload/encoding errors terminate training |
+| W&B observability | Online account `ldu@nvidia.com` with explicitly authorized team entity `nvidia`; stable resumable sidecar run; scalar, condition/generated image, and MP4 producers ready; repeated upload/encoding errors terminate training |
 | Runtime semantics | The composed trainer agrees with every behavior, primary-view, epoch, and loss-coefficient assertion before its first rollout |
 | Scientific result | Baseline/early/mid/final fixed-seed evaluation is complete; the final policy improves success by at least 2 absolute points and the paired 95% bootstrap interval has a lower bound above zero |
 
@@ -509,7 +534,7 @@ be present. A failed gate never becomes a nominal production run.
 ### W&B production telemetry
 
 Production submission fails closed unless W&B is online, the authenticated account email is
-`ldu@nvidia.com`, and the resolved entity is that account's personal entity rather than a team.
+`ldu@nvidia.com`, and exact team entity `nvidia` membership and entity type are verified.
 The trainer's rank-zero process logs optimization and environment scalars, including DAgger BC
 loss, learning rate, rewards, episode lengths, FPS, collection time, and learning time. A separate
 rank-zero sidecar uploads stable telemetry files from `telemetry/scalars`, `telemetry/images`, and
@@ -550,7 +575,7 @@ its paired seed-block bootstrap 95% interval is above zero. Reward and its paire
 reported as a diagnostic but are not silently mixed into the success criterion. Training loss
 is explicitly excluded as evidence of closed-loop improvement. Baseline/early/mid/final success,
 Wilson intervals, reward intervals, and the gate result are logged to a separate evaluation run
-in the same personal W&B project. This post-run scientific gate does not change the lifecycle or
+in the same authorized `nvidia` W&B team project. This post-run scientific gate does not change the lifecycle or
 ownership of the completed packed production job.
 
 Before the full job, validate environment imports, the GB200 renderer smoke test, endpoint
