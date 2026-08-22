@@ -18,7 +18,13 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
 VIEWS = ("head_color", "hand_left", "hand_right")
 SEALED_SOURCE_PROFILES = frozenset(
-    {"calibration_3view", "smoke_32x300", "smoke_256x300", "production_256x300"}
+    {
+        "calibration_3view",
+        "smoke_32x300",
+        "smoke_256x300",
+        "production_256x300",
+        "image3f_fixed_seed_production_eval",
+    }
 )
 
 

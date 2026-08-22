@@ -88,6 +88,12 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_image3f_production_eval_requires_a_sealed_source_snapshot(self):
+        self.assertIn(
+            "image3f_fixed_seed_production_eval",
+            gate.smoke_gate.SEALED_SOURCE_PROFILES,
+        )
+
     def test_prepare_pins_image3f_three_view_sequential_topology(self):
         payload = gate.prepare(
             argparse.Namespace(
