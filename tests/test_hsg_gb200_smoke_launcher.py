@@ -901,6 +901,37 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             packed,
         )
 
+    def test_hsg_profile_validation_calls_bind_complete_sealed_provenance(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        ordered_submit_contract = (
+            '--expected-fast-source-tree-sha256 "$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256" \\\n'
+            '        --expected-gr00t-source-tree-sha256 "$EXPECTED_GR00T_SOURCE_TREE_SHA256" \\\n'
+            "        --expected-source-snapshot-attestation-sha256 \\\n"
+            '          "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \\\n'
+            "        --expected-source-snapshot-inventory-sha256 \\\n"
+            '          "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \\\n'
+            '        --expected-asset-contract-sha256 "$EXPECTED_ASSET_CONTRACT_SHA256" \\'
+        )
+        ordered_packed_contract = (
+            '--expected-fast-source-tree-sha256 "$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256" \\\n'
+            '            --expected-gr00t-source-tree-sha256 "$EXPECTED_GR00T_SOURCE_TREE_SHA256" \\\n'
+            "            --expected-source-snapshot-attestation-sha256 \\\n"
+            '              "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \\\n'
+            "            --expected-source-snapshot-inventory-sha256 \\\n"
+            '              "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \\\n'
+            '            --expected-asset-contract-sha256 "$EXPECTED_ASSET_CONTRACT_SHA256" \\'
+        )
+
+        submit_predecessor_gate = submit.split(
+            'python3 "$ROOT/scripts/scaling/profile_validation_gate.py"', 1
+        )[1].split("\nfi", 1)[0]
+        packed_postrun_gate = packed.split(
+            "    smoke_32x300|smoke_256x300)\n", 1
+        )[1].split("\n        ;;", 1)[0]
+        self.assertIn(ordered_submit_contract, submit_predecessor_gate)
+        self.assertIn(ordered_packed_contract, packed_postrun_gate)
+
     def test_hsg_production_rejects_source_bytecode_before_and_after_queueing(self):
         submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
         packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()

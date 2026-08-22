@@ -486,6 +486,10 @@ if [ "$PREREQUISITE_PROFILE_EXPECTED" != NONE ]; then
         --expected-gr00t-revision "$GR00T_REVISION" \
         --expected-fast-source-tree-sha256 "$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256" \
         --expected-gr00t-source-tree-sha256 "$EXPECTED_GR00T_SOURCE_TREE_SHA256" \
+        --expected-source-snapshot-attestation-sha256 \
+          "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \
+        --expected-source-snapshot-inventory-sha256 \
+          "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \
         --expected-asset-contract-sha256 "$EXPECTED_ASSET_CONTRACT_SHA256" \
         --expected-wandb-email "$WANDB_EXPECTED_EMAIL" \
         --expected-wandb-entity "$WANDB_ENTITY" \
