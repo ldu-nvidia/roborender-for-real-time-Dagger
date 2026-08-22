@@ -27,32 +27,15 @@ def valid_viewer(**overrides):
     return SimpleNamespace(**values)
 
 
-def valid_team(**overrides):
-    values = {"name": "nvidia", "is_team": True}
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
 class FakeApi:
-    def __init__(self, viewer, team_record, team_error=None):
+    def __init__(self, viewer):
         self.viewer = viewer
-        self.team_record = team_record
-        self.team_error = team_error
-        self.team_requests = []
-
-    def team(self, name):
-        self.team_requests.append(name)
-        if self.team_error is not None:
-            raise self.team_error
-        return self.team_record
 
 
 class FakeWandb:
-    def __init__(self, viewer=None, team_record=None, api_error=None, team_error=None):
+    def __init__(self, viewer=None, api_error=None):
         self.viewer = viewer
-        self.team_record = team_record
         self.api_error = api_error
-        self.team_error = team_error
         self.timeouts = []
         self.apis = []
 
@@ -60,7 +43,7 @@ class FakeWandb:
         self.timeouts.append(timeout)
         if self.api_error is not None:
             raise self.api_error
-        api = FakeApi(self.viewer, self.team_record, self.team_error)
+        api = FakeApi(self.viewer)
         self.apis.append(api)
         return api
 
@@ -69,7 +52,6 @@ class WandbPreflightTest(unittest.TestCase):
     def test_accepts_only_verified_nvidia_team_membership(self):
         fake = FakeWandb(
             valid_viewer(email="LDU@NVIDIA.COM"),
-            valid_team(),
         )
         identity = wandb_preflight.query_identity(
             fake,
@@ -87,9 +69,9 @@ class WandbPreflightTest(unittest.TestCase):
         self.assertFalse(identity.personal)
         self.assertEqual(identity.mode, "online")
         self.assertEqual(fake.timeouts, [7.5])
-        self.assertEqual(fake.apis[0].team_requests, ["nvidia"])
+        self.assertEqual(len(fake.apis), 1)
 
-    def test_accepts_raw_graphql_viewer_membership_and_camelcase_is_team(self):
+    def test_accepts_raw_graphql_viewer_team_membership(self):
         viewer = {
             "email": "ldu@nvidia.com",
             "username": "ldu",
@@ -97,7 +79,6 @@ class WandbPreflightTest(unittest.TestCase):
         }
         identity = wandb_preflight.validate_identity(
             viewer,
-            {"name": "nvidia", "isTeam": True},
             **EXPECTED,
         )
         self.assertTrue(identity.team_member)
@@ -109,7 +90,6 @@ class WandbPreflightTest(unittest.TestCase):
         ):
             wandb_preflight.validate_identity(
                 valid_viewer(username="nvidia", teams=[]),
-                valid_team(),
                 **EXPECTED,
             )
 
@@ -119,28 +99,7 @@ class WandbPreflightTest(unittest.TestCase):
         ):
             wandb_preflight.validate_identity(
                 valid_viewer(entity="nvidia", teams=["another-team"]),
-                valid_team(),
                 **EXPECTED,
-            )
-
-    def test_requires_entity_to_report_exact_boolean_is_team_true(self):
-        for value in (False, 1, "true", None):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    wandb_preflight.WandbPreflightError, "isTeam=true"
-                ):
-                    wandb_preflight.validate_identity(
-                        valid_viewer(),
-                        {"name": "nvidia", "isTeam": value},
-                        **EXPECTED,
-                    )
-
-    def test_rejects_entity_lookup_name_mismatch(self):
-        with self.assertRaisesRegex(
-            wandb_preflight.WandbPreflightError, "authorized team"
-        ):
-            wandb_preflight.validate_identity(
-                valid_viewer(), valid_team(name="other"), **EXPECTED
             )
 
     def test_rejects_every_request_outside_pinned_authorization(self):
@@ -154,13 +113,13 @@ class WandbPreflightTest(unittest.TestCase):
             with self.subTest(request=request):
                 with self.assertRaises(wandb_preflight.WandbPreflightError):
                     wandb_preflight.validate_identity(
-                        valid_viewer(), valid_team(), **request
+                        valid_viewer(), **request
                     )
 
     def test_rejects_wrong_authenticated_account_without_echoing_addresses(self):
         viewer = valid_viewer(email="someone@example.com")
         with self.assertRaises(wandb_preflight.WandbPreflightError) as caught:
-            wandb_preflight.validate_identity(viewer, valid_team(), **EXPECTED)
+            wandb_preflight.validate_identity(viewer, **EXPECTED)
         message = str(caught.exception)
         self.assertNotIn("someone@example.com", message)
         self.assertNotIn("ldu@nvidia.com", message)
@@ -170,7 +129,7 @@ class WandbPreflightTest(unittest.TestCase):
             with self.subTest(teams=teams):
                 with self.assertRaises(wandb_preflight.WandbPreflightError):
                     wandb_preflight.validate_identity(
-                        valid_viewer(teams=teams), valid_team(), **EXPECTED
+                        valid_viewer(teams=teams), **EXPECTED
                     )
 
     def test_rejects_non_online_modes(self):
@@ -181,14 +140,7 @@ class WandbPreflightTest(unittest.TestCase):
 
     def test_auth_or_team_failure_does_not_expose_exception_text_or_api_key(self):
         secret = "not-a-real-secret-key"
-        failures = (
-            FakeWandb(api_error=RuntimeError(f"request failed with key {secret}")),
-            FakeWandb(
-                valid_viewer(),
-                valid_team(),
-                team_error=RuntimeError(f"team failed with key {secret}"),
-            ),
-        )
+        failures = (FakeWandb(api_error=RuntimeError(f"request failed with key {secret}")),)
         for fake in failures:
             with self.subTest(fake=fake):
                 with self.assertRaises(wandb_preflight.WandbPreflightError) as caught:
@@ -205,7 +157,7 @@ class WandbPreflightTest(unittest.TestCase):
 
     def test_main_json_reports_team_attestation_and_never_api_key(self):
         secret = "not-a-real-secret-key"
-        fake = FakeWandb(valid_viewer(), valid_team())
+        fake = FakeWandb(valid_viewer())
         stdout = io.StringIO()
         stderr = io.StringIO()
         with mock.patch.object(

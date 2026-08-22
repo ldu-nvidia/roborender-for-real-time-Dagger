@@ -6,10 +6,13 @@ existing ``~/.netrc`` can silently select the wrong W&B user.  This preflight
 performs read-only viewer and entity queries and accepts exactly the authorized
 ``ldu@nvidia.com`` account writing to the ``nvidia`` team.
 
-Team authorization requires two independent facts: ``nvidia`` must occur in
-the viewer's team memberships, and the resolved entity must report
-``isTeam=true``.  A matching viewer username or default entity is not evidence
-of team membership and is never used as a fallback.
+Team authorization requires ``nvidia`` to occur in the authenticated viewer's
+explicit ``teams`` collection.  That collection is the supported non-admin
+SDK surface for both membership and team type; ``api.team()`` is intentionally
+not used because it can require team-admin privileges even for a member.  A
+matching viewer username or default entity is not evidence of team membership
+and is never used as a fallback.  The separate online smoke then proves actual
+write access by reading scalar, image, and video data back from the team run.
 
 No API key, netrc contents, or W&B settings are included in either successful
 or failed output.
@@ -121,16 +124,8 @@ def _team_names(viewer: object) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _entity_is_team(entity_record: object) -> bool:
-    value = _field(entity_record, "isTeam")
-    if value is None:
-        value = _field(entity_record, "is_team")
-    return value is True
-
-
 def validate_identity(
     viewer: object,
-    entity_record: object,
     *,
     expected_email: str,
     requested_entity: str,
@@ -156,16 +151,11 @@ def validate_identity(
     if username is None:
         raise WandbPreflightError("W&B viewer response did not include a username")
 
-    if requested_entity not in _team_names(viewer):
+    team_names = _team_names(viewer)
+    if requested_entity not in team_names:
         raise WandbPreflightError(
             "authorized W&B entity is not in the viewer's team memberships"
         )
-
-    entity_name = _nonempty(_field(entity_record, "name"))
-    if entity_name != requested_entity:
-        raise WandbPreflightError("resolved W&B entity does not match the authorized team")
-    if not _entity_is_team(entity_record):
-        raise WandbPreflightError("authorized W&B entity did not report isTeam=true")
 
     return WandbIdentity(
         # Emit the pinned canonical identity rather than server casing so the
@@ -199,16 +189,13 @@ def query_identity(
     )
     mode = validate_mode(environment)
     try:
-        api = wandb_module.Api(timeout=timeout_s)
-        viewer = api.viewer
-        entity_record = api.team(requested_entity)
+        viewer = wandb_module.Api(timeout=timeout_s).viewer
     except Exception as exc:  # Keep third-party errors from leaking credentials/settings.
         raise WandbPreflightError(
             f"W&B authentication/team query failed ({type(exc).__name__})"
         ) from None
     return validate_identity(
         viewer,
-        entity_record,
         expected_email=expected_email,
         requested_entity=requested_entity,
         authorization_scope=authorization_scope,
