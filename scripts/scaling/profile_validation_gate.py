@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -78,6 +79,10 @@ HSG_EXPECTED_FIELDS = frozenset(
         "ddp_sync_marker_sha256",
         "renderer_placement",
         "renderer_placement_sha256",
+        "renderer_clean_stop_evidence",
+        "renderer_clean_stop_evidence_sha256",
+        "renderer_stop_ack_count",
+        "renderer_stop_ack_set_sha256",
         "wandb_media_drain",
         "wandb_media_drain_sha256",
         "wandb_remote_readback",
@@ -135,6 +140,13 @@ def sha256_file(path: Path) -> str:
     except OSError as exc:
         raise GateError(f"cannot hash {path}: {exc}") from exc
     return digest.hexdigest()
+
+
+def canonical_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _require_revision(value: str, label: str) -> str:
@@ -357,6 +369,129 @@ def _validate_ddp_marker(path: Path, expected_world_size: int) -> str:
     )
 
 
+def _validate_renderer_clean_stop(
+    path: Path,
+    expected_profile: str,
+    expected_renderers: int,
+    expected_ack_set_sha256: str,
+) -> tuple[int, str]:
+    evidence = load_json(path)
+    expected = {
+        "schema": "fast_roborender.renderer_clean_stop.v1",
+        "status": "PASS",
+        "run_profile": expected_profile,
+        "expected_renderers": expected_renderers,
+        "srun_was_live_before_stop": True,
+        "renderer_srun_exit_code": 0,
+        "forced_termination_used": False,
+        "endpoint_entry_count": 0,
+        "ready_entry_count": 0,
+        "stop_ack_count": expected_renderers,
+    }
+    for key, value in expected.items():
+        if evidence.get(key) != value or type(evidence.get(key)) is not type(value):
+            raise GateError(f"renderer clean-stop evidence {key} mismatch")
+    run_id = evidence.get("run_id")
+    if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+        raise GateError("renderer clean-stop run ID is malformed")
+    attempt_id = evidence.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise GateError("renderer clean-stop attempt ID is malformed")
+    job_id = evidence.get("job_id")
+    if not isinstance(job_id, str) or re.fullmatch(r"[0-9]+", job_id) is None:
+        raise GateError("renderer clean-stop job ID is malformed")
+    run_root = path.parent
+    fleet_dir = run_root / "fleet"
+    if fleet_dir.is_symlink() or not fleet_dir.is_dir():
+        raise GateError("renderer fleet directory is missing or unsafe")
+    if evidence.get("fleet_dir") != str(fleet_dir.resolve(strict=True)):
+        raise GateError("renderer clean-stop fleet path is not run-scoped")
+    stop_path = fleet_dir / "STOP"
+    if stop_path.is_symlink() or not stop_path.is_file():
+        raise GateError("renderer STOP sentinel is missing or unsafe")
+    stop_path = stop_path.resolve(strict=True)
+    stop_hash = sha256_file(stop_path)
+    if (
+        evidence.get("stop_sentinel_path") != str(stop_path)
+        or evidence.get("stop_sentinel_sha256") != stop_hash
+    ):
+        raise GateError("renderer STOP sentinel evidence changed")
+    stop_request = load_json(stop_path)
+    stop_expected = {
+        "schema": "fast_roborender.renderer_stop_request.v1",
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "job_id": job_id,
+    }
+    for key, value in stop_expected.items():
+        if stop_request.get(key) != value:
+            raise GateError(f"renderer STOP request {key} mismatch")
+    endpoint_dir = fleet_dir / "endpoints"
+    if endpoint_dir.is_symlink() or not endpoint_dir.is_dir() or any(
+        endpoint_dir.iterdir()
+    ):
+        raise GateError("renderer endpoint directory is not clean")
+    queue_dir = fleet_dir / "queues"
+    if queue_dir.is_symlink() or not queue_dir.is_dir():
+        raise GateError("renderer queue directory is missing or unsafe")
+    for directory, directory_names, file_names in os.walk(
+        queue_dir, followlinks=False
+    ):
+        base = Path(directory)
+        for name in directory_names + file_names:
+            entry = base / name
+            if entry.is_symlink():
+                raise GateError(f"renderer queue contains an unsafe symlink: {entry}")
+            if name == "READY":
+                raise GateError("renderer queue contains a residual READY marker")
+    records = evidence.get("stop_ack_records")
+    if not isinstance(records, list) or len(records) != expected_renderers:
+        raise GateError("renderer STOP ACK records are incomplete")
+    expected_names = [
+        f"renderer_{index:03d}.json" for index in range(expected_renderers)
+    ]
+    if [record.get("name") for record in records if isinstance(record, dict)] != expected_names:
+        raise GateError("renderer STOP ACK records are not ordered and complete")
+    ack_dir = fleet_dir / "stop_acks"
+    if (
+        ack_dir.is_symlink()
+        or not ack_dir.is_dir()
+        or {path.name for path in ack_dir.iterdir()} != set(expected_names)
+    ):
+        raise GateError("renderer STOP ACK directory contents changed")
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or set(record) != {"name", "sha256"}:
+            raise GateError("renderer STOP ACK record schema changed")
+        ack_path = ack_dir / record["name"]
+        if ack_path.is_symlink() or not ack_path.is_file():
+            raise GateError(f"renderer {index} STOP ACK is missing or unsafe")
+        if sha256_file(ack_path) != _require_sha256(
+            record["sha256"], f"renderer {index} STOP ACK SHA-256"
+        ):
+            raise GateError(f"renderer {index} STOP ACK changed")
+        ack = load_json(ack_path)
+        if (
+            ack.get("schema") != "fast_roborender.image3f_stop_ack.v1"
+            or ack.get("status") != "STOP_observed"
+            or ack.get("server_id") != f"{run_id}:{index:03d}"
+            or ack.get("stop_sentinel_path") != str(stop_path)
+            or ack.get("stop_sentinel_sha256") != stop_hash
+            or type(ack.get("pid")) is not int
+            or ack["pid"] <= 0
+        ):
+            raise GateError(f"renderer {index} STOP ACK is inconsistent")
+    ack_set_sha256 = canonical_sha256(records)
+    declared_set_hash = _require_sha256(
+        expected_ack_set_sha256, "renderer STOP ACK-set SHA-256"
+    )
+    if (
+        evidence.get("stop_ack_set_sha256") != ack_set_sha256
+        or ack_set_sha256 != declared_set_hash
+    ):
+        raise GateError("renderer STOP ACK-set SHA-256 mismatch")
+    return expected_renderers, ack_set_sha256
+
+
 def validate_profile(
     manifest: Path,
     expected_profile: str,
@@ -394,7 +529,7 @@ def validate_profile(
     _require_exact(fields, "run_profile", expected_profile)
     _require_exact(fields, "fast_roborender_revision", fast_revision)
     _require_exact(fields, "gr00t_revision", gr00t_revision)
-    is_hsg = fields.get("manifest_schema") == "fast_roborender.hsg_profile_validation.v2"
+    is_hsg = fields.get("manifest_schema") == "fast_roborender.hsg_profile_validation.v3"
     requires_hsg = any(
         value is not None
         for value in (
@@ -462,6 +597,9 @@ def validate_profile(
     initial_policy_state_hash = ""
     final_policy_state_hash = ""
     placement_hash = ""
+    clean_stop_hash = ""
+    clean_stop_ack_count = 0
+    clean_stop_ack_set_hash = ""
     wandb_drain_hash = ""
     wandb_readback_hash = ""
     if is_hsg:
@@ -524,6 +662,24 @@ def validate_profile(
             or sum(expected_counts.values()) != renderer_count
         ):
             raise GateError("HSG predecessor renderer placement is invalid")
+        clean_stop_path, clean_stop_hash = _artifact(
+            fields,
+            manifest_path,
+            "renderer_clean_stop_evidence",
+            "renderer_clean_stop_evidence_sha256",
+            Path("../renderer_clean_stop.json"),
+        )
+        _require_int(
+            fields, "renderer_stop_ack_count", contract["renderer_count"]
+        )
+        clean_stop_ack_count, clean_stop_ack_set_hash = (
+            _validate_renderer_clean_stop(
+                clean_stop_path,
+                expected_profile,
+                contract["renderer_count"],
+                fields["renderer_stop_ack_set_sha256"],
+            )
+        )
         drain_path, wandb_drain_hash = _artifact(
             fields,
             manifest_path,
@@ -647,6 +803,9 @@ def validate_profile(
         "ddp_sync_marker_sha256": ddp_hash,
         "ddp_policy_parameters_sha256": parameter_hash,
         "renderer_placement_sha256": placement_hash,
+        "renderer_clean_stop_evidence_sha256": clean_stop_hash,
+        "renderer_stop_ack_count": clean_stop_ack_count,
+        "renderer_stop_ack_set_sha256": clean_stop_ack_set_hash,
         "wandb_media_drain_sha256": wandb_drain_hash,
         "wandb_remote_readback_sha256": wandb_readback_hash,
     }

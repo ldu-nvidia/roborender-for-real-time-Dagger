@@ -364,6 +364,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         renderer_count: int = 1,
         renderer_hosts: int = 1,
         wandb: bool = False,
+        profile: str = "minimal_e2e",
     ) -> None:
         initial = run_dir / "initial_policy.pt"
         final = run_dir / f"model_step_{final_step:06d}.pt"
@@ -438,6 +439,58 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             run_dir / "validation/renderer_placement.json",
             (json.dumps(placement) + "\n").encode(),
         )
+        fleet = run_dir.parent / "fleet"
+        (fleet / "endpoints").mkdir(parents=True)
+        (fleet / "queues").mkdir()
+        ack_dir = fleet / "stop_acks"
+        ack_dir.mkdir()
+        stop_path = fleet / "STOP"
+        run_id = "fixture-run"
+        attempt_id = "NONE"
+        job_id = "1234"
+        stop_hash = write(
+            stop_path,
+            (
+                json.dumps(
+                    {
+                        "schema": "fast_roborender.renderer_stop_request.v1",
+                        "run_id": run_id,
+                        "attempt_id": attempt_id,
+                        "job_id": job_id,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode(),
+        )
+        for index in range(renderer_count):
+            ack = {
+                "schema": "fast_roborender.image3f_stop_ack.v1",
+                "status": "STOP_observed",
+                "server_id": f"{run_id}:{index:03d}",
+                "pid": 1000 + index,
+                "stop_sentinel_path": str(stop_path.resolve()),
+                "stop_sentinel_sha256": stop_hash,
+                "observed_at": "2026-08-22T00:00:00+00:00",
+            }
+            write(
+                ack_dir / f"renderer_{index:03d}.json",
+                (json.dumps(ack, indent=2, sort_keys=True) + "\n").encode(),
+            )
+        gate.renderer_clean_stop(
+            argparse.Namespace(
+                profile=profile,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                job_id=job_id,
+                fleet_dir=fleet,
+                evidence=run_dir.parent / "renderer_clean_stop.json",
+                expected_renderers=renderer_count,
+                renderer_srun_exit_code=0,
+                srun_was_live_before_stop=True,
+            )
+        )
         if wandb:
             drain = {
                 "schema": "fast_roborender.wandb_media_drain.v1",
@@ -477,7 +530,9 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
     def test_resume_profile_reports_the_post_restart_checkpoint_as_final(self):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "train"
-            self.make_postrun(run_dir, 1, final_step=2)
+            self.make_postrun(
+                run_dir, 1, final_step=2, profile="resume_minimal"
+            )
             args = argparse.Namespace(
                 profile="resume_minimal",
                 run_dir=run_dir,
@@ -491,6 +546,8 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 source_snapshot_attestation_sha256="NONE",
                 source_snapshot_inventory_sha256="NONE",
                 asset_contract_sha256="c" * 64,
+                renderer_clean_stop_evidence=run_dir.parent
+                / "renderer_clean_stop.json",
                 wandb_expected_email="",
                 wandb_entity="",
             )
@@ -505,7 +562,12 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "train"
             self.make_postrun(
-                run_dir, 1, renderer_count=7, renderer_hosts=2, wandb=True
+                run_dir,
+                1,
+                renderer_count=7,
+                renderer_hosts=2,
+                wandb=True,
+                profile="smoke_32x300",
             )
             fast_revision = "4" * 40
             gr00t_revision = "5" * 40
@@ -522,6 +584,8 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 source_snapshot_attestation_sha256="d" * 64,
                 source_snapshot_inventory_sha256="e" * 64,
                 asset_contract_sha256="c" * 64,
+                renderer_clean_stop_evidence=run_dir.parent
+                / "renderer_clean_stop.json",
                 wandb_expected_email="ldu@nvidia.com",
                 wandb_entity="nvidia",
             )
@@ -540,12 +604,37 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 expected_wandb_entity="nvidia",
             )
             self.assertEqual(validated["status"], "verified")
+            self.assertEqual(validated["renderer_stop_ack_count"], 7)
+            self.assertTrue(validated["renderer_stop_ack_set_sha256"])
+            ack = run_dir.parent / "fleet/stop_acks/renderer_000.json"
+            ack.write_text(ack.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                profile_gate.GateError, "renderer 0 STOP ACK changed"
+            ):
+                profile_gate.validate_profile(
+                    Path(report["profile_validation_manifest"]),
+                    "smoke_32x300",
+                    fast_revision,
+                    gr00t_revision,
+                    expected_fast_source_tree_sha256="a" * 64,
+                    expected_gr00t_source_tree_sha256="b" * 64,
+                    expected_source_snapshot_attestation_sha256="d" * 64,
+                    expected_source_snapshot_inventory_sha256="e" * 64,
+                    expected_asset_contract_sha256="c" * 64,
+                    expected_wandb_email="ldu@nvidia.com",
+                    expected_wandb_entity="nvidia",
+                )
 
     def test_256_profile_postrun_requires_and_attests_eight_rank_ddp(self):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "train"
             self.make_postrun(
-                run_dir, 8, renderer_count=52, renderer_hosts=15, wandb=True
+                run_dir,
+                8,
+                renderer_count=52,
+                renderer_hosts=15,
+                wandb=True,
+                profile="smoke_256x300",
             )
             fast_revision = "6" * 40
             gr00t_revision = "7" * 40
@@ -562,6 +651,8 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 source_snapshot_attestation_sha256="d" * 64,
                 source_snapshot_inventory_sha256="e" * 64,
                 asset_contract_sha256="c" * 64,
+                renderer_clean_stop_evidence=run_dir.parent
+                / "renderer_clean_stop.json",
                 wandb_expected_email="ldu@nvidia.com",
                 wandb_entity="nvidia",
             )
@@ -593,6 +684,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 renderer_count=52,
                 renderer_hosts=15,
                 wandb=True,
+                profile="production_256x300",
             )
             args = argparse.Namespace(
                 profile="production_256x300",
@@ -608,6 +700,8 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 source_snapshot_attestation_sha256="d" * 64,
                 source_snapshot_inventory_sha256="e" * 64,
                 asset_contract_sha256="c" * 64,
+                renderer_clean_stop_evidence=run_dir.parent
+                / "renderer_clean_stop.json",
                 wandb_expected_email="ldu@nvidia.com",
                 wandb_entity="nvidia",
             )
@@ -1148,6 +1242,67 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         self.assertIn("trap 'terminate_with_status 143' TERM", packed)
         self.assertIn("trap 'terminate_with_status 130' INT", packed)
         self.assertNotIn("trap cleanup EXIT TERM INT", packed)
+
+    def test_hsg_renderer_shutdown_is_cooperative_attested_and_fail_closed(self):
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        array = (ROOT / "scripts/server/image3f_server_array.sbatch").read_text()
+        server = (ROOT / "scripts/server/image3f_server.py").read_text()
+        for contract in (
+            "FLEET_STOP_FILE=$FLEET_CANONICAL/STOP",
+            "RENDERER_CLEAN_STOP_EVIDENCE=$RUN_ATTEMPT_CANONICAL/renderer_clean_stop.json",
+            "stop_renderer_fleet_cleanly",
+            'renderer srun exited before STOP request',
+            'if wait "$pid"; then renderer_rc=0; else renderer_rc=$?; fi',
+            'endpoint_count=$(find "$FLEET_DIR/endpoints" -mindepth 1 -maxdepth 1',
+            'ready_count=$(find "$FLEET_DIR/queues" -name READY',
+            'ack_count=$(find "$FLEET_DIR/stop_acks"',
+            "renderer-clean-stop",
+            "--srun-was-live-before-stop",
+            '--renderer-clean-stop-evidence "$RENDERER_CLEAN_STOP_EVIDENCE"',
+            'forced_termination=1',
+            '[ "$forced_termination" -eq 0 ] || return 74',
+        ):
+            self.assertIn(contract, packed)
+        self.assertLess(
+            packed.index('stop_renderer_fleet_cleanly "$RENDER_STEP_PID"'),
+            packed.index('hsg_gb200_smoke_gate.py" postrun'),
+        )
+        self.assertIn('export IMAGE3F_STOP_FILE="$RUN_DIR/STOP"', array)
+        self.assertIn(
+            'export IMAGE3F_STOP_ACK_FILE="$RUN_DIR/stop_acks/renderer_${INDEX}.json"',
+            array,
+        )
+        self.assertIn("export IMAGE3F_STOP_POLL_S=1", array)
+        self.assertIn("trap cleanup EXIT", array)
+        self.assertIn("trap 'exit 143' TERM", array)
+        self.assertNotIn("trap cleanup EXIT INT TERM", array)
+        self.assertIn(
+            "Image3F server exited zero without the exact STOP sentinel", array
+        )
+        self.assertIn(
+            "Image3F server exited zero without its exact nonempty STOP ACK", array
+        )
+        self.assertLess(
+            server.index("if stop_controller.requested():"),
+            server.index("Image3FSession(memory_mode"),
+        )
+        for contract in (
+            "connections.start_handler(sock, handler)",
+            "connections.close_clients()",
+            "with session_lock:",
+            "connections.drain(timeout_seconds=10.0)",
+            "acknowledge_stop(stop_controller)",
+        ):
+            self.assertIn(contract, server)
+        self.assertNotIn(
+            'RENDERER_CLEAN_STOP_EVIDENCE=$(dirname "$RESUME_CANDIDATE")',
+            packed,
+        )
+        self.assertNotIn('if [ "$PRODUCTION_ACTION" != validate ]; then', packed)
+        self.assertIn(
+            "Finalize the already durable step-500 checkpoint without retraining",
+            packed,
+        )
 
     def test_hsg_sanitized_path_preserves_slurm_commands(self):
         submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()

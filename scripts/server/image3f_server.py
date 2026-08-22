@@ -20,6 +20,7 @@ import numpy as np
 from PIL import Image
 from reference_history import LaggedReferenceStore
 from runtime_identity import describe_runtime_identity
+from shutdown_control import StopController
 
 BUNDLE = Path(os.environ["IMAGE3F_ROOT"])
 sys.path.insert(0, str(BUNDLE))
@@ -158,7 +159,14 @@ def _recv_msg(sock):
 
 
 def handle_conn(
-    sock, addr, session, session_lock, references, metrics, runtime_identity
+    sock,
+    addr,
+    session,
+    session_lock,
+    references,
+    metrics,
+    runtime_identity,
+    connections,
 ):
     print(f"tcp client {addr}", flush=True)
     try:
@@ -299,6 +307,7 @@ def handle_conn(
         pass
     finally:
         sock.close()
+        connections.remove(sock, threading.current_thread())
         print(f"tcp client {addr} gone", flush=True)
 
 
@@ -340,6 +349,61 @@ class ServerMetrics:
             }
 
 
+class ConnectionRegistry:
+    """Track live TCP handlers so STOP cannot race an in-flight request."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sockets = set()
+        self._threads = set()
+
+    def start_handler(self, sock, thread):
+        with self._lock:
+            self._sockets.add(sock)
+            self._threads.add(thread)
+            try:
+                thread.start()
+            except BaseException:
+                self._sockets.discard(sock)
+                self._threads.discard(thread)
+                raise
+
+    def remove(self, sock, thread):
+        with self._lock:
+            self._sockets.discard(sock)
+            self._threads.discard(thread)
+
+    def close_clients(self):
+        with self._lock:
+            sockets = list(self._sockets)
+        for client in sockets:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def drain(self, timeout_seconds):
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            with self._lock:
+                threads = list(self._threads)
+            if not threads:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            for thread in threads:
+                thread.join(timeout=min(0.25, remaining))
+
+    def count(self):
+        with self._lock:
+            return len(self._threads)
+
+
 def create_tcp_server(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -348,12 +412,29 @@ def create_tcp_server(port):
     return srv, int(srv.getsockname()[1])
 
 
-def tcp_listener(srv, session, session_lock, references, metrics, runtime_identity):
+def tcp_listener(
+    srv,
+    session,
+    session_lock,
+    references,
+    metrics,
+    runtime_identity,
+    stopped,
+    connections,
+):
     print(f"tcp listening on {srv.getsockname()[1]}", flush=True)
-    while True:
-        sock, addr = srv.accept()
+    srv.settimeout(1.0)
+    while not stopped.is_set():
+        try:
+            sock, addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            if stopped.is_set():
+                return
+            raise
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        threading.Thread(
+        handler = threading.Thread(
             target=handle_conn,
             args=(
                 sock,
@@ -363,12 +444,37 @@ def tcp_listener(srv, session, session_lock, references, metrics, runtime_identi
                 references,
                 metrics,
                 runtime_identity,
+                connections,
             ),
             daemon=True,
-        ).start()
+        )
+        connections.start_handler(sock, handler)
+
+
+def acknowledge_stop(stop_controller):
+    if stop_controller.error is not None:
+        raise RuntimeError("Image3F STOP watcher failed") from stop_controller.error
+    acknowledgement = stop_controller.acknowledge(
+        os.environ.get("IMAGE3F_SERVER_ID", "legacy")
+    )
+    print(
+        f"STOP_REQUESTED ack={stop_controller.ack_path} "
+        f"server_id={acknowledgement['server_id']}",
+        flush=True,
+    )
+    print("SERVER_STOPPED_CLEANLY", flush=True)
 
 
 def main():
+    stop_controller = StopController.from_environment()
+    if stop_controller.requested():
+        acknowledge_stop(stop_controller)
+        return
+    stopped = threading.Event()
+    stop_watcher = threading.Thread(
+        target=stop_controller.watch, args=(stopped,), daemon=True
+    )
+    stop_watcher.start()
     inbox = QUEUE / "inbox"; done = QUEUE / "done"
     inbox.mkdir(parents=True, exist_ok=True); done.mkdir(parents=True, exist_ok=True)
     print("loading Image3FSession ...", flush=True)
@@ -382,15 +488,29 @@ def main():
     )
     metrics = ServerMetrics()
     print(f"SESSION_READY in {time.time()-t0:.0f}s", flush=True)
+    if stopped.is_set():
+        acknowledge_stop(stop_controller)
+        return
     job_digits = "".join(c for c in os.environ.get("SLURM_JOB_ID", "0") if c.isdigit())
     default_port = 18500 + int(job_digits or "0") % 1000
     requested_port = int(os.environ.get("IMAGE3F_PORT", str(default_port)))
     srv, port = create_tcp_server(requested_port)
-    threading.Thread(
+    connections = ConnectionRegistry()
+    listener = threading.Thread(
         target=tcp_listener,
-        args=(srv, session, session_lock, references, metrics, runtime_identity),
+        args=(
+            srv,
+            session,
+            session_lock,
+            references,
+            metrics,
+            runtime_identity,
+            stopped,
+            connections,
+        ),
         daemon=True,
-    ).start()
+    )
+    listener.start()
     import subprocess
     host = os.environ.get("IMAGE3F_ADVERTISE_HOST", "").strip()
     if not host:
@@ -407,13 +527,13 @@ def main():
     endpoint_tmp.write_text(f"{host} {port}\n")
     os.replace(endpoint_tmp, endpoint)
     (QUEUE / "READY").write_text(str(time.time()))
-    while True:
+    while not stopped.is_set():
         reqs = list(inbox.glob("*.json"))
         if os.environ.get("IMAGE3F_ALLOW_PY_QUEUE", "1") == "1":
             reqs += list(inbox.glob("*.py"))
         reqs = sorted(reqs)
         if not reqs:
-            time.sleep(2)
+            stopped.wait(stop_controller.poll_seconds)
             continue
         rp = reqs[0]
         print(f"processing {rp.name}", flush=True)
@@ -440,6 +560,22 @@ def main():
         (done / (rp.stem + ".result.json")).write_text(json.dumps(result, indent=1))
         shutil.move(str(rp), done / rp.name)
         print(f"done {rp.name}: {result['status']}", flush=True)
+    srv.close()
+    listener.join(timeout=2.0)
+    if listener.is_alive():
+        raise RuntimeError("Image3F STOP timed out closing the TCP listener")
+    connections.close_clients()
+    # A handler may have passed socket receive and entered GPU inference just
+    # before STOP.  Closing clients prevents new requests; taking the session
+    # lock proves any in-flight generation has left the critical section.
+    with session_lock:
+        pass
+    connections.close_clients()
+    if not connections.drain(timeout_seconds=10.0):
+        raise RuntimeError(
+            f"Image3F STOP timed out draining {connections.count()} TCP handlers"
+        )
+    acknowledge_stop(stop_controller)
 
 
 if __name__ == "__main__":

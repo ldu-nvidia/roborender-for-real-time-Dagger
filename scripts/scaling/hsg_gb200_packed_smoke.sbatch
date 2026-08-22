@@ -551,9 +551,8 @@ MASTER_ADDR=${TRAINER_NODES[0]}
 MASTER_PORT=$((15000 + SLURM_JOB_ID % 20000))
 LOCAL_NUM_ENVS=$((GLOBAL_NUM_ENVS / TRAINER_RANKS))
 RENDERER_PLACEMENT_PLAN=$RUN_ATTEMPT_DIR/renderer_placement_plan.json
-if [ "$PRODUCTION_ACTION" != validate ]; then
-    python3 - "$RENDERER_PLACEMENT_PLAN" "$EXPECTED_RENDERERS" \
-        "${ALLOCATED_NODES[@]}" <<'PY'
+python3 - "$RENDERER_PLACEMENT_PLAN" "$EXPECTED_RENDERERS" \
+    "${ALLOCATED_NODES[@]}" <<'PY'
 import json
 import os
 import sys
@@ -587,7 +586,6 @@ finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
 PY
-fi
 PREFLIGHT_ARTIFACT_DIR=$RUN_ROOT
 TRAIN_LOG_DIR=$TRAIN_RUN_DIR/slurm
 TRAIN_HYDRA_DIR=$TRAIN_RUN_DIR/.hydra
@@ -625,6 +623,22 @@ mkdir -p "$FLEET_DIR/endpoints" "$FLEET_DIR/queues" "$FLEET_DIR/logs" \
          "$TRAIN_RUN_DIR/slurm" "$TRAIN_RUN_DIR/output" "$TRAIN_RUN_DIR/telemetry" \
          "$TRAIN_LOG_DIR" "$TRAIN_HYDRA_DIR" "$TRAIN_OUTPUT_DIR" \
          "$STAGE_ROOT/runtime/home" "$STAGE_ROOT/runtime/cache" "$STAGE_ROOT/runtime/tmp"
+
+[ -d "$RUN_ATTEMPT_DIR" ] && [ ! -L "$RUN_ATTEMPT_DIR" ] || \
+    fatal "run attempt directory is missing or unsafe"
+[ -d "$FLEET_DIR" ] && [ ! -L "$FLEET_DIR" ] || \
+    fatal "renderer fleet directory is missing or unsafe"
+RUN_ATTEMPT_CANONICAL=$(realpath -e "$RUN_ATTEMPT_DIR")
+FLEET_CANONICAL=$(realpath -e "$FLEET_DIR")
+[ "$FLEET_CANONICAL" = "$RUN_ATTEMPT_CANONICAL/fleet" ] || \
+    fatal "renderer fleet directory is not attempt-scoped"
+FLEET_STOP_FILE=$FLEET_CANONICAL/STOP
+RENDERER_CLEAN_STOP_EVIDENCE=$RUN_ATTEMPT_CANONICAL/renderer_clean_stop.json
+[ ! -e "$FLEET_STOP_FILE" ] && [ ! -L "$FLEET_STOP_FILE" ] || \
+    fatal "attempt-scoped renderer STOP sentinel already exists or is unsafe"
+[ ! -e "$RENDERER_CLEAN_STOP_EVIDENCE" ] && \
+[ ! -L "$RENDERER_CLEAN_STOP_EVIDENCE" ] || \
+    fatal "attempt-scoped renderer clean-stop evidence already exists or is unsafe"
 
 if [ "$USE_WANDB" -eq 1 ]; then
     [ -s "$WANDB_ONLINE_VALIDATION" ] || fatal "W&B online validation disappeared after submission"
@@ -690,10 +704,11 @@ WANDB_WATCHER_PID=""
 CLEANUP_DEADLINE=0
 IN_CLEANUP=0
 TERMINATION_GRACE_S=20
+COOPERATIVE_STOP_GRACE_S=90
 CLEANUP_TOTAL_BUDGET_S=240
 
 terminate_pid_bounded() {
-    local pid=$1 label=$2 deadline now
+    local pid=$1 label=$2 deadline now forced_termination=0
     [ -n "$pid" ] || return 0
     kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
     kill -TERM "$pid" 2>/dev/null || true
@@ -706,6 +721,7 @@ terminate_pid_bounded() {
     done
     if kill -0 "$pid" 2>/dev/null; then
         echo "ERROR: $label ignored TERM; sending KILL after ${TERMINATION_GRACE_S}s" >&2
+        forced_termination=1
         kill -KILL "$pid" 2>/dev/null || true
         now=$((SECONDS + 5))
         if [ "$CLEANUP_DEADLINE" -gt 0 ] && [ "$now" -gt "$CLEANUP_DEADLINE" ]; then
@@ -720,6 +736,96 @@ terminate_pid_bounded() {
         return 73
     fi
     wait "$pid" 2>/dev/null || true
+    [ "$forced_termination" -eq 0 ] || return 74
+}
+
+stop_renderer_fleet_cleanly() {
+    local pid=$1 deadline renderer_rc endpoint_count ready_count ack_count
+    [ -n "$pid" ] || {
+        echo "ERROR: renderer fleet PID is missing before STOP" >&2
+        return 74
+    }
+    if ! kill -0 "$pid" 2>/dev/null; then
+        if wait "$pid" 2>/dev/null; then renderer_rc=0; else renderer_rc=$?; fi
+        echo "ERROR: renderer srun exited before STOP request (rc=$renderer_rc)" >&2
+        return 74
+    fi
+    [ -n "$FLEET_STOP_FILE" ] && [ -n "$RENDERER_CLEAN_STOP_EVIDENCE" ] || {
+        echo "ERROR: renderer clean-stop paths are unset" >&2
+        return 74
+    }
+    [ ! -e "$FLEET_STOP_FILE" ] && [ ! -L "$FLEET_STOP_FILE" ] || {
+        echo "ERROR: renderer STOP sentinel already exists or is unsafe" >&2
+        return 74
+    }
+    [ ! -e "$RENDERER_CLEAN_STOP_EVIDENCE" ] && \
+    [ ! -L "$RENDERER_CLEAN_STOP_EVIDENCE" ] || {
+        echo "ERROR: renderer clean-stop evidence already exists or is unsafe" >&2
+        return 74
+    }
+    python3 - "$FLEET_STOP_FILE" "$RUN_ID" "$ATTEMPT_ID" "$SLURM_JOB_ID" <<'PY' || return 74
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+if destination.exists() or destination.is_symlink():
+    raise SystemExit("renderer STOP sentinel already exists or is unsafe")
+payload = {
+    "schema": "fast_roborender.renderer_stop_request.v1",
+    "run_id": sys.argv[2],
+    "attempt_id": sys.argv[3],
+    "job_id": sys.argv[4],
+}
+descriptor, temporary = tempfile.mkstemp(
+    prefix=f".{destination.name}.", dir=destination.parent
+)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+    deadline=$((SECONDS + COOPERATIVE_STOP_GRACE_S))
+    while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "ERROR: renderer srun did not honor cooperative STOP within ${COOPERATIVE_STOP_GRACE_S}s" >&2
+        return 74
+    fi
+    if wait "$pid"; then renderer_rc=0; else renderer_rc=$?; fi
+    [ "$renderer_rc" -eq 0 ] || {
+        echo "ERROR: renderer srun exited nonzero after STOP (rc=$renderer_rc)" >&2
+        return 74
+    }
+    endpoint_count=$(find "$FLEET_DIR/endpoints" -mindepth 1 -maxdepth 1 -printf . | wc -c)
+    ready_count=$(find "$FLEET_DIR/queues" -name READY -printf . | wc -c)
+    ack_count=$(find "$FLEET_DIR/stop_acks" -mindepth 1 -maxdepth 1 -printf . | wc -c)
+    [ "$endpoint_count" -eq 0 ] && [ "$ready_count" -eq 0 ] || {
+        echo "ERROR: renderer STOP left endpoint=$endpoint_count READY=$ready_count markers" >&2
+        return 74
+    }
+    [ "$ack_count" -eq "$EXPECTED_RENDERERS" ] || {
+        echo "ERROR: renderer STOP ACK count $ack_count != $EXPECTED_RENDERERS" >&2
+        return 74
+    }
+    python3 "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" renderer-clean-stop \
+        --profile "$RUN_PROFILE" --run-id "$RUN_ID" --attempt-id "$ATTEMPT_ID" \
+        --job-id "$SLURM_JOB_ID" --fleet-dir "$FLEET_DIR" \
+        --evidence "$RENDERER_CLEAN_STOP_EVIDENCE" \
+        --expected-renderers "$EXPECTED_RENDERERS" \
+        --renderer-srun-exit-code "$renderer_rc" \
+        --srun-was-live-before-stop >/dev/null || return 74
+    [ -s "$RENDERER_CLEAN_STOP_EVIDENCE" ] && \
+    [ ! -L "$RENDERER_CLEAN_STOP_EVIDENCE" ] || return 74
 }
 
 drain_wandb_watcher() {
@@ -1010,7 +1116,6 @@ PY
 fi
 
 EP_LIST="[]"
-if [ "$PRODUCTION_ACTION" != validate ]; then
 srun --nodes="$PACKED_NODES" --ntasks="$EXPECTED_RENDERERS" --ntasks-per-node=4 \
     --distribution=cyclic --gpus="$EXPECTED_RENDERERS" --gpus-per-task=1 \
     --cpus-per-task=8 --mem=512G \
@@ -1059,7 +1164,6 @@ EP_LIST=$(python3 "$ROOT/scripts/scaling/image3f_probe.py" \
     --write-placement-report "$TRAIN_RUN_DIR/validation/renderer_placement.json" \
     --write-manifest "$FLEET_DIR/selected_endpoints.txt" \
     --write-report "$FLEET_DIR/renderer_capabilities.json" --hydra-list)
-fi
 
 TRAIN_ABSOLUTE_TARGET=$NUM_ROLLOUT_ITERATIONS
 PLAN=(--global-envs "$GLOBAL_NUM_ENVS" --rollout-steps "$ROLLOUT_STEPS"
@@ -1352,8 +1456,8 @@ else
 fi
 
 if [ -n "$RENDER_STEP_PID" ]; then
-    terminate_pid_bounded "$RENDER_STEP_PID" "renderer fleet" || \
-        fatal "renderer fleet did not stop cleanly"
+    stop_renderer_fleet_cleanly "$RENDER_STEP_PID" || \
+        fatal "renderer fleet did not complete the cooperative clean-stop contract"
 fi
 RENDER_STEP_PID=""
 
@@ -1587,6 +1691,7 @@ python3 "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" postrun \
     --source-snapshot-inventory-sha256 \
       "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \
     --asset-contract-sha256 "$EXPECTED_ASSET_CONTRACT_SHA256" \
+    --renderer-clean-stop-evidence "$RENDERER_CLEAN_STOP_EVIDENCE" \
     --wandb-expected-email "$WANDB_EXPECTED_EMAIL" --wandb-entity "$WANDB_ENTITY" \
     > "$POSTRUN_GATE_PATH"
 

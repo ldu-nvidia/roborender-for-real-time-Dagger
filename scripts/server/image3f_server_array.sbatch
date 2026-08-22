@@ -32,13 +32,17 @@ export ROBORENDER_MODEL_BASE=${ROBORENDER_MODEL_BASE:-$STAGE_ROOT/assets/models}
 export ENDPOINT_FILE="$RUN_DIR/endpoints/renderer_${INDEX}.txt"
 export IMAGE3F_QUEUE="$RUN_DIR/queues/renderer_${INDEX}"
 export IMAGE3F_SERVER_ID="${IMAGE3F_RUN_ID:-${SLURM_ARRAY_JOB_ID}}:${INDEX}"
+export IMAGE3F_STOP_FILE="$RUN_DIR/STOP"
+export IMAGE3F_STOP_ACK_FILE="$RUN_DIR/stop_acks/renderer_${INDEX}.json"
+export IMAGE3F_STOP_POLL_S=1
 # Let the kernel choose a collision-free port. The server publishes the bound port atomically.
 export IMAGE3F_PORT=0
 export IMAGE3F_MAX_STREAMS=${IMAGE3F_MAX_STREAMS:-16}
 export IMAGE3F_ALLOW_PY_QUEUE=0
 
-mkdir -p "$RUN_DIR/endpoints" "$IMAGE3F_QUEUE/inbox" "$IMAGE3F_QUEUE/done"
-rm -f "$ENDPOINT_FILE" "$IMAGE3F_QUEUE/READY"
+mkdir -p "$RUN_DIR/endpoints" "$RUN_DIR/stop_acks" \
+         "$IMAGE3F_QUEUE/inbox" "$IMAGE3F_QUEUE/done"
+rm -f "$ENDPOINT_FILE" "$IMAGE3F_QUEUE/READY" "$IMAGE3F_STOP_ACK_FILE"
 
 # Avoid 26+ cold model loads hitting shared storage in the same second.
 STARTUP_STAGGER_S=${STARTUP_STAGGER_S:-5}
@@ -53,6 +57,18 @@ fi
 cleanup() {
     rm -f "$ENDPOINT_FILE" "$IMAGE3F_QUEUE/READY"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 "$IMAGE3F_PYTHON" "$ROOT/scripts/server/image3f_server.py"
+[ -f "$IMAGE3F_STOP_FILE" ] && [ ! -L "$IMAGE3F_STOP_FILE" ] && \
+[ -s "$IMAGE3F_STOP_FILE" ] || {
+    echo "FATAL: Image3F server exited zero without the exact STOP sentinel" >&2
+    exit 74
+}
+[ -f "$IMAGE3F_STOP_ACK_FILE" ] && [ ! -L "$IMAGE3F_STOP_ACK_FILE" ] && \
+[ -s "$IMAGE3F_STOP_ACK_FILE" ] || {
+    echo "FATAL: Image3F server exited zero without its exact nonempty STOP ACK" >&2
+    exit 74
+}

@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -168,6 +169,23 @@ def require_revision_marker(repo: Path, expected: str, label: str) -> str:
     if actual != expected:
         raise GateError(f"{label} revision mismatch: {actual!r} != {expected!r}")
     return actual
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink():
+        raise GateError(f"refusing to replace existing evidence: {path}")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _require_exact_keys(document: dict[str, Any], expected: set[str], label: str) -> None:
@@ -712,6 +730,195 @@ def validate_wandb_evidence(
     }
 
 
+def _renderer_stop_artifacts(
+    fleet_dir: Path,
+    expected_renderers: int,
+    run_id: str,
+    attempt_id: str,
+    job_id: str,
+) -> dict[str, Any]:
+    fleet_dir = require_dir(fleet_dir, "renderer fleet directory")
+    stop_path = require_file(fleet_dir / "STOP", "renderer STOP sentinel")
+    stop_sha256 = sha256_file(stop_path)
+    stop_request = load_json(stop_path)
+    stop_expected = {
+        "schema": "fast_roborender.renderer_stop_request.v1",
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "job_id": job_id,
+    }
+    for key, value in stop_expected.items():
+        if stop_request.get(key) != value:
+            raise GateError(f"renderer STOP request {key} mismatch")
+
+    endpoints = require_dir(fleet_dir / "endpoints", "renderer endpoint directory")
+    endpoint_residue = sorted(path.name for path in endpoints.iterdir())
+    if endpoint_residue:
+        raise GateError(
+            f"renderer endpoint cleanup left {len(endpoint_residue)} entries: "
+            f"{endpoint_residue[:4]}"
+        )
+
+    queues = require_dir(fleet_dir / "queues", "renderer queue directory")
+    ready_residue: list[str] = []
+    for directory, directory_names, file_names in os.walk(queues, followlinks=False):
+        base = Path(directory)
+        for name in directory_names + file_names:
+            entry = base / name
+            if entry.is_symlink():
+                raise GateError(f"renderer queue contains an unsafe symlink: {entry}")
+            if name == "READY":
+                ready_residue.append(str(entry))
+    if ready_residue:
+        raise GateError(
+            f"renderer queue cleanup left {len(ready_residue)} READY entries"
+        )
+
+    ack_dir = require_dir(fleet_dir / "stop_acks", "renderer STOP ACK directory")
+    expected_names = {
+        f"renderer_{index:03d}.json" for index in range(expected_renderers)
+    }
+    actual_entries = list(ack_dir.iterdir())
+    actual_names = {path.name for path in actual_entries}
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        raise GateError(
+            "renderer STOP ACK set mismatch: "
+            f"missing={missing[:4]} extra={extra[:4]}"
+        )
+    ack_records: list[dict[str, str]] = []
+    for index in range(expected_renderers):
+        ack_path = require_file(
+            ack_dir / f"renderer_{index:03d}.json",
+            f"renderer {index} STOP ACK",
+        )
+        ack = load_json(ack_path)
+        expected = {
+            "schema": "fast_roborender.image3f_stop_ack.v1",
+            "status": "STOP_observed",
+            "server_id": f"{run_id}:{index:03d}",
+            "stop_sentinel_path": str(stop_path),
+            "stop_sentinel_sha256": stop_sha256,
+        }
+        for key, value in expected.items():
+            if ack.get(key) != value:
+                raise GateError(f"renderer {index} STOP ACK {key} mismatch")
+        if type(ack.get("pid")) is not int or ack["pid"] <= 0:
+            raise GateError(f"renderer {index} STOP ACK pid is invalid")
+        if not isinstance(ack.get("observed_at"), str) or not ack["observed_at"]:
+            raise GateError(f"renderer {index} STOP ACK timestamp is invalid")
+        ack_records.append(
+            {
+                "name": ack_path.name,
+                "sha256": sha256_file(ack_path),
+            }
+        )
+    return {
+        "fleet_dir": str(fleet_dir),
+        "stop_sentinel_path": str(stop_path),
+        "stop_sentinel_sha256": stop_sha256,
+        "stop_ack_count": len(ack_records),
+        "stop_ack_records": ack_records,
+        "stop_ack_set_sha256": canonical_sha256(ack_records),
+        "endpoint_entry_count": 0,
+        "ready_entry_count": 0,
+    }
+
+
+def renderer_clean_stop(args: argparse.Namespace) -> dict[str, Any]:
+    if args.expected_renderers <= 0:
+        raise GateError("expected renderer count must be positive")
+    if args.renderer_srun_exit_code != 0:
+        raise GateError("renderer srun did not exit zero")
+    if not args.srun_was_live_before_stop:
+        raise GateError("renderer srun was not live when STOP was requested")
+    if not re.fullmatch(r"[0-9]+", args.job_id):
+        raise GateError("renderer job ID is malformed")
+    fleet_dir = require_dir(args.fleet_dir, "renderer fleet directory")
+    if args.evidence.parent.is_symlink():
+        raise GateError("renderer clean-stop evidence parent is unsafe")
+    evidence_parent = args.evidence.parent.resolve(strict=True)
+    if evidence_parent != fleet_dir.parent:
+        raise GateError("renderer clean-stop evidence is not attempt-scoped")
+    artifacts = _renderer_stop_artifacts(
+        fleet_dir,
+        args.expected_renderers,
+        args.run_id,
+        args.attempt_id,
+        args.job_id,
+    )
+    payload = {
+        "schema": "fast_roborender.renderer_clean_stop.v1",
+        "status": "PASS",
+        "run_profile": args.profile,
+        "run_id": args.run_id,
+        "attempt_id": args.attempt_id,
+        "job_id": args.job_id,
+        "expected_renderers": args.expected_renderers,
+        "srun_was_live_before_stop": True,
+        "renderer_srun_exit_code": 0,
+        "forced_termination_used": False,
+        **artifacts,
+    }
+    atomic_write_json(args.evidence, payload)
+    return payload
+
+
+def validate_renderer_clean_stop(
+    evidence_path: Path, expected_renderers: int, profile: str
+) -> dict[str, Any]:
+    evidence_path = require_file(evidence_path, "renderer clean-stop evidence")
+    evidence = load_json(evidence_path)
+    expected = {
+        "schema": "fast_roborender.renderer_clean_stop.v1",
+        "status": "PASS",
+        "run_profile": profile,
+        "expected_renderers": expected_renderers,
+        "srun_was_live_before_stop": True,
+        "renderer_srun_exit_code": 0,
+        "forced_termination_used": False,
+        "endpoint_entry_count": 0,
+        "ready_entry_count": 0,
+        "stop_ack_count": expected_renderers,
+    }
+    for key, value in expected.items():
+        if evidence.get(key) != value:
+            raise GateError(f"renderer clean-stop evidence {key} mismatch")
+    run_id = evidence.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise GateError("renderer clean-stop run ID is invalid")
+    fleet_dir = evidence_path.parent / "fleet"
+    if evidence.get("fleet_dir") != str(fleet_dir.resolve(strict=True)):
+        raise GateError("renderer clean-stop fleet path is not attempt-scoped")
+    attempt_id = evidence.get("attempt_id")
+    job_id = evidence.get("job_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise GateError("renderer clean-stop attempt ID is invalid")
+    if not isinstance(job_id, str) or re.fullmatch(r"[0-9]+", job_id) is None:
+        raise GateError("renderer clean-stop job ID is invalid")
+    artifacts = _renderer_stop_artifacts(
+        fleet_dir, expected_renderers, run_id, attempt_id, job_id
+    )
+    for key in (
+        "stop_sentinel_path",
+        "stop_sentinel_sha256",
+        "stop_ack_count",
+        "stop_ack_records",
+        "stop_ack_set_sha256",
+        "endpoint_entry_count",
+        "ready_entry_count",
+    ):
+        if evidence.get(key) != artifacts[key]:
+            raise GateError(f"renderer clean-stop evidence {key} changed")
+    return {
+        "path": str(evidence_path),
+        "sha256": sha256_file(evidence_path),
+        "stop_ack_count": expected_renderers,
+        "stop_ack_set_sha256": artifacts["stop_ack_set_sha256"],
+    }
+
+
 def postrun(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = require_dir(args.run_dir, "training run directory")
     initial = require_file(run_dir / "initial_policy.pt", "initial policy")
@@ -776,6 +983,9 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
             raise GateError(f"non-sealed profile unexpectedly received {label}")
     placement_path = run_dir / "validation/renderer_placement.json"
     validate_renderer_placement(placement_path, expected_renderers)
+    renderer_stop = validate_renderer_clean_stop(
+        args.renderer_clean_stop_evidence, expected_renderers, args.profile
+    )
     wandb = None
     if args.profile in {"smoke_32x300", "smoke_256x300", "production_256x300"}:
         if not args.wandb_expected_email or not args.wandb_entity:
@@ -816,6 +1026,7 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
         "source_snapshot_inventory_sha256": args.source_snapshot_inventory_sha256,
         "immutable_asset_contract_sha256": args.asset_contract_sha256,
         "renderer_placement_sha256": sha256_file(placement_path),
+        "renderer_clean_stop": renderer_stop,
         "initial_checkpoint_sha256": initial_checkpoint_hash,
         "initial_policy_sha256": initial_policy_hash,
         "final_checkpoint_step": final_step,
@@ -864,7 +1075,7 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
     if args.profile in {"smoke_32x300", "smoke_256x300"}:
         manifest = run_dir / "profile_validation_manifest.txt"
         fields = {
-            "manifest_schema": "fast_roborender.hsg_profile_validation.v2",
+            "manifest_schema": "fast_roborender.hsg_profile_validation.v3",
             "run_profile": args.profile,
             "fast_roborender_revision": args.fast_revision,
             "fast_roborender_source_tree_sha256": args.fast_source_tree_sha256,
@@ -894,6 +1105,12 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
             "policy_change_marker_sha256": report["policy_change_marker_sha256"],
             "renderer_placement": str(placement_path.resolve()),
             "renderer_placement_sha256": report["renderer_placement_sha256"],
+            "renderer_clean_stop_evidence": renderer_stop["path"],
+            "renderer_clean_stop_evidence_sha256": renderer_stop["sha256"],
+            "renderer_stop_ack_count": str(renderer_stop["stop_ack_count"]),
+            "renderer_stop_ack_set_sha256": renderer_stop[
+                "stop_ack_set_sha256"
+            ],
             "wandb_media_drain": wandb["drain_path"],
             "wandb_media_drain_sha256": wandb["drain_sha256"],
             "wandb_remote_readback": wandb["readback_path"],
@@ -953,8 +1170,19 @@ def parser() -> argparse.ArgumentParser:
     post.add_argument("--source-snapshot-attestation-sha256", required=True)
     post.add_argument("--source-snapshot-inventory-sha256", required=True)
     post.add_argument("--asset-contract-sha256", required=True)
+    post.add_argument("--renderer-clean-stop-evidence", type=Path, required=True)
     post.add_argument("--wandb-expected-email")
     post.add_argument("--wandb-entity")
+    clean_stop = sub.add_parser("renderer-clean-stop")
+    clean_stop.add_argument("--profile", required=True)
+    clean_stop.add_argument("--run-id", required=True)
+    clean_stop.add_argument("--attempt-id", required=True)
+    clean_stop.add_argument("--job-id", required=True)
+    clean_stop.add_argument("--fleet-dir", type=Path, required=True)
+    clean_stop.add_argument("--evidence", type=Path, required=True)
+    clean_stop.add_argument("--expected-renderers", type=int, required=True)
+    clean_stop.add_argument("--renderer-srun-exit-code", type=int, required=True)
+    clean_stop.add_argument("--srun-was-live-before-stop", action="store_true")
     tree = sub.add_parser("tree-hash")
     tree.add_argument("--root", type=Path, required=True)
     return result
@@ -965,6 +1193,8 @@ def main() -> None:
     try:
         if args.command == "preflight":
             report = preflight(args)
+        elif args.command == "renderer-clean-stop":
+            report = renderer_clean_stop(args)
         elif args.command == "postrun":
             report = postrun(args)
         else:
