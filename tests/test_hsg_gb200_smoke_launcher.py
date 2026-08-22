@@ -886,6 +886,21 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             2,
         )
 
+    def test_hsg_calibration_postrun_binds_complete_sealed_provenance(self):
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        self.assertIn(
+            '"$EXPECTED_GR00T_SOURCE_TREE_SHA256" \\\n'
+            '            "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \\\n'
+            '            "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \\\n'
+            '            "$EXPECTED_ASSET_CONTRACT_SHA256" <<\'PY\'',
+            packed,
+        )
+        self.assertIn(
+            "Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],\n"
+            "    sys.argv[6], sys.argv[7], sys.argv[8]",
+            packed,
+        )
+
     def test_hsg_production_rejects_source_bytecode_before_and_after_queueing(self):
         submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
         packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()

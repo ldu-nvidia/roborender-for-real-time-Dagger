@@ -1620,13 +1620,16 @@ case "$RUN_PROFILE" in
             "$EXPECTED_FAST_ROBORENDER_REVISION" "$EXPECTED_GR00T_REVISION" \
             "$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256" \
             "$EXPECTED_GR00T_SOURCE_TREE_SHA256" \
+            "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \
+            "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \
             "$EXPECTED_ASSET_CONTRACT_SHA256" <<'PY'
 import json
 import sys
 from pathlib import Path
 from camera_calibration_gate import validate_technical_manifest
 print(json.dumps(validate_technical_manifest(
-    Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+    Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+    sys.argv[6], sys.argv[7], sys.argv[8]
 ), indent=2))
 PY
         publish_once "$TECHNICAL" "$STAGE_ROOT/runtime/validation/camera_calibration_manifest.json"
