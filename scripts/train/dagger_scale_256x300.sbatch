@@ -26,6 +26,11 @@ ANCHORS=${ANCHORS:-$STAGE_ROOT/assets/anchor_pool_2048}
 TEACHER_CKPT=${TEACHER_CKPT:-$STAGE_ROOT/assets/policies/expert_labeler/model_step_044500.pt}
 EXPECTED_TEACHER_CKPT_SHA256=${EXPECTED_TEACHER_CKPT_SHA256:-943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38}
 FLEET_DIR=${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_production.sh}
+RUN_ID=${RUN_ID:?RUN_ID is required; use a sanitized launcher}
+[[ "$RUN_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || {
+    echo "FATAL: RUN_ID must match [A-Za-z0-9_-]{1,128}" >&2
+    exit 2
+}
 GLOBAL_NUM_ENVS=${GLOBAL_NUM_ENVS:-256}
 ROLLOUT_STEPS=${ROLLOUT_STEPS:-300}
 MIX=${MIX:-0.0}
@@ -633,6 +638,7 @@ initial_policy_checkpoint=$TRAIN_RUN_DIR/initial_policy.pt
 expected_final_checkpoint=$EXPECTED_FINAL_CHECKPOINT
 camera_calibration_acceptance=${CAMERA_CALIBRATION_ACCEPTANCE:-NONE}
 camera_calibration_acceptance_sha256=${EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256:-NONE}
+camera_calibration_run_id=${CAMERA_CALIBRATION_RUN_ID:-NONE}
 prerequisite_profile=${PREREQUISITE_PROFILE_EXPECTED:-NONE}
 prerequisite_profile_validation=${PREREQUISITE_PROFILE_VALIDATION:-NONE}
 prerequisite_profile_validation_sha256=${EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256:-NONE}
@@ -960,8 +966,9 @@ PY
                     CAMERA_TMP="$CAMERA_CALIBRATION_MANIFEST.tmp.$$"
                     cat > "$CAMERA_TMP" <<EOF
 {
-  "schema": "fast_roborender.camera_calibration.v1",
+  "schema": "fast_roborender.camera_calibration.v2",
   "status": "awaiting_visual_acceptance",
+  "run_id": "$RUN_ID",
   "fast_roborender_revision": "$FAST_REVISION",
   "gr00t_revision": "$EXPECTED_GR00T_REVISION",
   "policy_views": ["head_color", "hand_left", "hand_right"],

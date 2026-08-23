@@ -74,9 +74,12 @@ sbatch "$ROOT/scripts/scaling/hsg_gb200_wandb_validate.sbatch"
 # A PASS atomically creates $WANDB_ACCEPTANCE from the job-specific JSON. A
 # different existing acceptance is never overwritten.
 
-RUN_PROFILE=calibration_3view bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+RUN_ID=calibration_3view_$(date -u +%Y%m%dT%H%M%SZ)
+RUN_PROFILE=calibration_3view RUN_ID="$RUN_ID" \
+  bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
 # Review both generated panels, then create the source/asset-bound acceptance:
-export CALIBRATION_MANIFEST=/absolute/run/path/validation/camera_calibration_manifest.json
+export CALIBRATION_MANIFEST="$STAGE_ROOT/runtime/validation/camera_calibration_manifest_${RUN_ID}.json"
+export CALIBRATION_ACCEPTANCE="$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${RUN_ID}.json"
 export FAST_TREE_SHA256=$(PYTHONDONTWRITEBYTECODE=1 python \
   "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" tree-hash --root "$ROOT")
 export GR00T_TREE_SHA256=$(PYTHONDONTWRITEBYTECODE=1 python \
@@ -98,9 +101,10 @@ PY
 )
 python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
   --manifest "$CALIBRATION_MANIFEST" \
-  --output "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json" \
+  --output "$CALIBRATION_ACCEPTANCE" \
   --reviewer ldu@nvidia.com \
   --confirm 'I reviewed both three-view calibration panels and accept the camera mapping.' \
+  --expected-run-id "$RUN_ID" \
   --expected-fast-roborender-revision "$(cat "$ROOT/.source_revision")" \
   --expected-gr00t-revision "$(cat "$GR00T_ROOT/.source_revision")" \
   --expected-fast-source-tree-sha256 "$FAST_TREE_SHA256" \
@@ -109,9 +113,16 @@ python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
   --expected-source-snapshot-inventory-sha256 "$SOURCE_SNAPSHOT_INVENTORY_SHA256" \
   --expected-asset-contract-sha256 "$ASSET_CONTRACT_SHA256"
 
-RUN_PROFILE=smoke_32x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
-RUN_PROFILE=smoke_256x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+export CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE"
+
+CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE" \
+  RUN_PROFILE=smoke_32x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE" \
+  RUN_PROFILE=smoke_256x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
 ```
+
+Calibration `RUN_ID`/`RUN_ROOT` reservations are fresh-only. If submission fails,
+use a new `RUN_ID`; an existing calibration run root is never reused.
 
 The camera acceptance and smoke manifests are immutable evidence. A changed
 source file, foundation shard, adapter, TensorRT engine, teacher checkpoint, or
@@ -128,6 +139,8 @@ request construction under a clearly disposable run root. It never consumes
 the intended logical `RUN_ID`.
 
 ```bash
+export CAMERA_CALIBRATION_RUN_ID=<accepted-calibration-run-id>
+export CAMERA_CALIBRATION_ACCEPTANCE="$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json"
 DRY_RUN=1 bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
 ```
 
@@ -137,6 +150,8 @@ Choose a stable run ID. Fresh production must use `CKPT=none`; the student is
 initialized from the base model, not Raven's example `last.pt`.
 
 ```bash
+export CAMERA_CALIBRATION_RUN_ID=<accepted-calibration-run-id>
+export CAMERA_CALIBRATION_ACCEPTANCE="$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json"
 export RUN_ID=roborender_dagger_256x300_$(date -u +%Y%m%dT%H%M%SZ)
 export RUN_ROOT="$STAGE_ROOT/runtime/$RUN_ID"
 bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
@@ -156,6 +171,8 @@ the newest periodic checkpoint, so the candidate is always latest. Use the
 candidate from the failed attempt verbatim:
 
 ```bash
+export CAMERA_CALIBRATION_RUN_ID=<accepted-calibration-run-id>
+export CAMERA_CALIBRATION_ACCEPTANCE="$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json"
 export RUN_ID=<original-run-id>
 export RUN_ROOT="$STAGE_ROOT/runtime/$RUN_ID"
 export RESUME_TRAINING=1
@@ -176,6 +193,8 @@ If training produced the exact step-500 checkpoint but telemetry drain or a
 postrun gate failed, do not retrain. Use the dedicated validation entrypoint:
 
 ```bash
+export CAMERA_CALIBRATION_RUN_ID=<accepted-calibration-run-id>
+export CAMERA_CALIBRATION_ACCEPTANCE="$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json"
 export RUN_ID=<original-run-id>
 export RUN_ROOT="$STAGE_ROOT/runtime/$RUN_ID"
 export CKPT="$RUN_ROOT/train/model_step_000500.pt"
@@ -189,7 +208,26 @@ finishes W&B drain/remote readback, checkpoint/policy validation, continuity
 evidence, and postrun publication. `RUN_DONE` is created only after all gates
 pass; otherwise the attempt remains failed and auditable.
 
-## 7. Expected durable evidence
+## 7. Run the primary fixed-seed policy-improvement gate
+
+The production launcher does not submit evaluation automatically. In a fresh
+shell, select the same reviewed, versioned camera acceptance and the completed
+training run explicitly before launching the Image3F-in-loop evaluation:
+
+```bash
+export CAMERA_CALIBRATION_RUN_ID=<accepted-calibration-run-id>
+export CAMERA_CALIBRATION_ACCEPTANCE="$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json"
+export TRAIN_RUN_DIR="$STAGE_ROOT/runtime/<completed-production-run-id>/train"
+export BASELINE_CKPT="$TRAIN_RUN_DIR/initial_policy.pt"
+export REFERENCE_CONFIG="$TRAIN_RUN_DIR/config.yaml"
+bash "$ROOT/scripts/eval/submit_hsg_gb200_image3f_fixed_seed_gate.sh"
+```
+
+The launcher rejects an omitted or unversioned camera acceptance, derives the
+calibration run ID from its filename, and binds that ID during both submission
+and allocation-time verification.
+
+## 8. Expected durable evidence
 
 Inspect the attempt and training directories for the submission/run identity,
 runtime preflight, renderer-placement attestation, endpoint capability report,

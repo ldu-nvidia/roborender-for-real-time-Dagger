@@ -154,6 +154,7 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
                 {
                     "schema": gate.camera_gate.TECHNICAL_SCHEMA,
                     "status": gate.camera_gate.TECHNICAL_STATUS,
+                    "run_id": "calibration_3view_fixture",
                     "fast_roborender_revision": fast_revision,
                     "gr00t_revision": gr00t_revision,
                     "fast_roborender_source_tree_sha256": base[
@@ -191,7 +192,11 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
             )
             + "\n"
         )
-        acceptance = self.base / "camera_calibration_acceptance.json"
+        calibration_run_id = "calibration_3view_fixture"
+        acceptance = (
+            self.base
+            / f"camera_calibration_acceptance_{calibration_run_id}.json"
+        )
         gate.camera_gate.accept_manifest(
             technical,
             acceptance,
@@ -210,11 +215,18 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
             camera_acceptance_sha256=hashlib.sha256(
                 acceptance.read_bytes()
             ).hexdigest(),
+            camera_calibration_run_id=calibration_run_id,
             fast_revision=fast_revision,
             gr00t_revision=gr00t_revision,
         )
         verified = gate.verify_camera_acceptance_binding(args, base)
         self.assertEqual(verified["status"], "verified")
+        self.assertEqual(verified["run_id"], calibration_run_id)
+
+        args.camera_calibration_run_id = "different_calibration"
+        with self.assertRaisesRegex(gate.camera_gate.GateError, "run_id mismatch"):
+            gate.verify_camera_acceptance_binding(args, base)
+        args.camera_calibration_run_id = calibration_run_id
 
         mutated = dict(base)
         mutated["fast_roborender_source_tree_sha256"] = "d" * 64
@@ -362,7 +374,31 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
         self.assertIn("--nodes=2", submit)
         self.assertIn("--gpus-per-node=4", submit)
         self.assertIn("--time=48:00:00", submit)
+        self.assertNotIn("camera_calibration_acceptance.json", submit)
+        self.assertIn(
+            "CAMERA_CALIBRATION_ACCEPTANCE must explicitly select a versioned",
+            submit,
+        )
+        self.assertIn(
+            'camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json',
+            submit,
+        )
+        self.assertIn('--expected-run-id "$CAMERA_CALIBRATION_RUN_ID"', submit)
+        self.assertIn(
+            "CAMERA_CALIBRATION_RUN_ID=$CAMERA_CALIBRATION_RUN_ID,",
+            submit,
+        )
         self.assertIn("#SBATCH --partition=batch_long", packed)
+        self.assertIn("CAMERA_CALIBRATION_RUN_ID", packed)
+        self.assertIn('--expected-run-id "$CAMERA_CALIBRATION_RUN_ID"', packed)
+        self.assertIn(
+            '--camera-calibration-run-id "$CAMERA_CALIBRATION_RUN_ID"',
+            submit,
+        )
+        self.assertIn(
+            '--camera-calibration-run-id "$CAMERA_CALIBRATION_RUN_ID"',
+            packed,
+        )
         self.assertIn("--ntasks=7", packed)
         self.assertIn("--nodelist=\"$EVAL_NODE\" --gpus=1", packed)
         self.assertIn("RENDER_SHUTDOWN_TIMEOUT_S=180", packed)
@@ -378,6 +414,126 @@ class HsgGb200Image3fFixedSeedTests(unittest.TestCase):
         self.assertIn('IMAGE3F_RUN_ID="${EVAL_RUN_ID}_${LABEL}_seed${SEED}"', task)
         self.assertIn('--endpoint-manifest "$ENDPOINT_MANIFEST"', task)
         self.assertNotIn("WANDB_API_KEY", submit + packed + task)
+
+    def test_fixed_seed_submit_rejects_missing_or_nonversioned_acceptance_early(self):
+        launcher = ROOT / "scripts/eval/submit_hsg_gb200_image3f_fixed_seed_gate.sh"
+        stage_root = self.base / "stage"
+        base_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "STAGE_ROOT": str(stage_root),
+            "TRAIN_RUN_DIR": str(self.run_dir),
+            "SLURM_BIN_DIR": str(self.base / "missing-slurm"),
+        }
+
+        cases = (
+            ({}, "must explicitly select a versioned"),
+            (
+                {
+                    "CAMERA_CALIBRATION_ACCEPTANCE": str(
+                        stage_root
+                        / "runtime/validation/camera_calibration_acceptance.json"
+                    )
+                },
+                "must name camera_calibration_acceptance_<run-id>.json",
+            ),
+            (
+                {
+                    "CAMERA_CALIBRATION_ACCEPTANCE": str(
+                        stage_root
+                        / "runtime/validation/"
+                        "camera_calibration_acceptance_bad.run.json"
+                    )
+                },
+                "malformed run ID",
+            ),
+            (
+                {
+                    "CAMERA_CALIBRATION_ACCEPTANCE": str(
+                        stage_root
+                        / "runtime/validation/"
+                        "camera_calibration_acceptance_calibration_good.json"
+                    ),
+                    "CAMERA_CALIBRATION_RUN_ID": "different_calibration",
+                },
+                "does not match the selected acceptance filename",
+            ),
+            (
+                {
+                    "CAMERA_CALIBRATION_ACCEPTANCE": str(
+                        self.base
+                        / "other/camera_calibration_acceptance_calibration_good.json"
+                    )
+                },
+                "must be the exact versioned validation artifact",
+            ),
+        )
+        for extra_env, message in cases:
+            with self.subTest(message=message):
+                result = subprocess.run(
+                    ["bash", str(launcher)],
+                    env={**base_env, **extra_env},
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+
+        accepted = subprocess.run(
+            ["bash", str(launcher)],
+            env={
+                **base_env,
+                "CAMERA_CALIBRATION_ACCEPTANCE": str(
+                    stage_root
+                    / "runtime/validation/"
+                    "camera_calibration_acceptance_calibration_good.json"
+                ),
+            },
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(accepted.returncode, 2, accepted.stderr)
+        self.assertIn("missing HSG Slurm command", accepted.stderr)
+        self.assertNotIn("camera calibration acceptance", accepted.stderr.lower())
+
+    def test_runbook_standalone_workflows_select_versioned_acceptance(self):
+        runbook = (ROOT / "docs/HSG_GB200_PRODUCTION_RUNBOOK.md").read_text(
+            encoding="utf-8"
+        )
+        headings = (
+            "## 3. Validate submission without consuming the logical run ID",
+            "## 4. Submit a fresh production run",
+            "## 5. Resume after an interrupted allocation",
+            "## 6. Validation-only recovery at step 500",
+            "## 7. Run the primary fixed-seed policy-improvement gate",
+        )
+        for index, heading in enumerate(headings):
+            start = runbook.index(heading)
+            end = (
+                runbook.index(headings[index + 1], start)
+                if index + 1 < len(headings)
+                else runbook.index("## 8. Expected durable evidence", start)
+            )
+            section = runbook[start:end]
+            with self.subTest(heading=heading):
+                self.assertIn(
+                    "export CAMERA_CALIBRATION_RUN_ID=<accepted-calibration-run-id>",
+                    section,
+                )
+                self.assertIn(
+                    "camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json",
+                    section,
+                )
+        fixed_seed_section = runbook[
+            runbook.index(headings[-1]) : runbook.index(
+                "## 8. Expected durable evidence"
+            )
+        ]
+        self.assertIn(
+            'bash "$ROOT/scripts/eval/submit_hsg_gb200_image3f_fixed_seed_gate.sh"',
+            fixed_seed_section,
+        )
 
     def test_wandb_readback_requires_image3f_and_policy_evidence(self):
         rows = [

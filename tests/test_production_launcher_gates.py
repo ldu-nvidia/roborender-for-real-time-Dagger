@@ -1,4 +1,5 @@
 import math
+import os
 import re
 import subprocess
 import sys
@@ -184,6 +185,21 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         )
         self.assertIn('"panel_shape_hwc": [720, 1248, 3]', self.trainer)
         self.assertIn("calibration panel contract mismatch", self.trainer)
+        for contract in (
+            "reserve-run-root",
+            'OCI_RUN_ROOT=$STAGE_ROOT/runtime/$RUN_ID',
+            '[ "$FLEET_DIR" = "$OCI_RUN_ROOT/fleet" ]',
+            '[ "$TRAIN_RUN_DIR" = "$OCI_RUN_ROOT/train" ]',
+        ):
+            self.assertIn(contract, self.submit)
+        for contract in (
+            'OCI_RUN_ROOT=$STAGE_ROOT/runtime/$RUN_ID',
+            '[ "$FLEET_DIR" = "$OCI_RUN_ROOT/fleet" ]',
+            '[ "$TRAIN_RUN_DIR" = "$OCI_RUN_ROOT/train" ]',
+            '[ ! -L "$OCI_RUN_ROOT" ]',
+            '"$(realpath -e "$OCI_RUN_ROOT")"',
+        ):
+            self.assertIn(contract, self.packed)
 
     def test_human_accepted_camera_calibration_is_a_release_prerequisite(self):
         for text in (self.submit, self.packed):
@@ -192,15 +208,92 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             self.assertIn("camera_calibration_gate.py", text)
             self.assertIn("camera calibration acceptance validation failed", text)
         self.assertIn(
-            "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json",
+            "camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json",
             self.submit,
         )
+        for text in (self.submit, self.packed):
+            self.assertIn('--expected-run-id "$CAMERA_CALIBRATION_RUN_ID"', text)
+            self.assertIn("camera_calibration_run_id=", text)
         self.assertIn("camera_calibration_acceptance=", self.submit)
         self.assertIn("camera_calibration_acceptance=", self.packed)
         self.assertIn("camera_calibration_acceptance=", self.trainer)
         self.assertIn(
             '"status": "awaiting_visual_acceptance"', self.trainer
         )
+        self.assertIn("camera_calibration_run_id=", self.trainer)
+
+    def test_run_id_is_rejected_at_every_oci_json_boundary(self):
+        invalid_ids = ("dotted.run", 'quoted"run', "line\nbreak")
+        launchers = (
+            "scripts/scaling/submit_oci_packed.sh",
+            "scripts/scaling/oci_packed_256x300.sbatch",
+        )
+        for launcher in launchers:
+            for run_id in invalid_ids:
+                completed = subprocess.run(
+                    ["bash", str(ROOT / launcher)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env={
+                        **os.environ,
+                        "RUN_ID": run_id,
+                        "RUN_PROFILE": "invalid_profile_for_run_id_probe",
+                    },
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertIn("RUN_ID must match", completed.stderr)
+
+            completed = subprocess.run(
+                ["bash", str(ROOT / launcher)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "RUN_ID": "valid_RUN-1",
+                    "RUN_PROFILE": "invalid_profile_for_run_id_probe",
+                },
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("unknown RUN_PROFILE", completed.stderr)
+            self.assertNotIn("RUN_ID must match", completed.stderr)
+
+        calibration = subprocess.run(
+            ["bash", str(ROOT / "scripts/scaling/submit_oci_calibration_3view.sh")],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ, "RUN_ID": "dotted.calibration"},
+        )
+        self.assertEqual(calibration.returncode, 2, calibration.stderr)
+        self.assertIn("RUN_ID must match", calibration.stderr)
+
+        trainer = ROOT / "scripts/train/dagger_scale_256x300.sbatch"
+        for run_id in invalid_ids:
+            completed = subprocess.run(
+                ["bash", str(trainer)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "FLEET_DIR": "/tmp/run-id-probe", "RUN_ID": run_id},
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("RUN_ID must match", completed.stderr)
+        completed = subprocess.run(
+            ["bash", str(trainer)],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={
+                **os.environ,
+                "FLEET_DIR": "/tmp/run-id-probe",
+                "RUN_ID": "valid_RUN-1",
+            },
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("must run under Slurm", completed.stderr)
+        self.assertNotIn("RUN_ID must match", completed.stderr)
 
     def test_distributed_smoke_enables_sync_gate_and_one_update(self):
         for contract in (

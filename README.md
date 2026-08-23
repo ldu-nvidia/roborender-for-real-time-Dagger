@@ -459,9 +459,12 @@ columns are the head, left-wrist, and right-wrist cameras with correct orientati
 content-addressed acceptance record (the confirmation text is intentionally exact):
 
 ```bash
-RUN_PROFILE=calibration_3view bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+RUN_ID=calibration_3view_$(date -u +%Y%m%dT%H%M%SZ)
+RUN_PROFILE=calibration_3view RUN_ID="$RUN_ID" \
+  bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
 
-export CALIBRATION_MANIFEST=/absolute/run/path/validation/camera_calibration_manifest.json
+export CALIBRATION_MANIFEST="$STAGE_ROOT/runtime/validation/camera_calibration_manifest_${RUN_ID}.json"
+export CALIBRATION_ACCEPTANCE="$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${RUN_ID}.json"
 export FAST_TREE_SHA256=$(PYTHONDONTWRITEBYTECODE=1 python \
   "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" tree-hash --root "$ROOT")
 export GR00T_TREE_SHA256=$(PYTHONDONTWRITEBYTECODE=1 python \
@@ -483,9 +486,10 @@ PY
 )
 python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
   --manifest "$CALIBRATION_MANIFEST" \
-  --output "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance.json" \
+  --output "$CALIBRATION_ACCEPTANCE" \
   --reviewer ldu@nvidia.com \
   --confirm 'I reviewed both three-view calibration panels and accept the camera mapping.' \
+  --expected-run-id "$RUN_ID" \
   --expected-fast-roborender-revision "$(cat "$ROOT/.source_revision")" \
   --expected-gr00t-revision "$(cat "$GR00T_ROOT/.source_revision")" \
   --expected-fast-source-tree-sha256 "$FAST_TREE_SHA256" \
@@ -493,7 +497,12 @@ python "$ROOT/scripts/scaling/camera_calibration_gate.py" accept \
   --expected-source-snapshot-attestation-sha256 "$SOURCE_SNAPSHOT_ATTESTATION_SHA256" \
   --expected-source-snapshot-inventory-sha256 "$SOURCE_SNAPSHOT_INVENTORY_SHA256" \
   --expected-asset-contract-sha256 "$ASSET_CONTRACT_SHA256"
+
+export CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE"
 ```
+
+Calibration `RUN_ID`/`RUN_ROOT` reservations are fresh-only. If submission fails,
+use a new `RUN_ID`; an existing calibration run root is never reused.
 
 The acceptance binds both panel hashes, their PNG dimensions, ordered camera semantics, and both
 repository revisions. Any source, panel, or revision change invalidates it. The bounded validation
@@ -502,13 +511,16 @@ one synchronized optimizer update across all eight trainer ranks. Publish each s
 without copying or editing its manifest, then advance to the next gate:
 
 ```bash
-RUN_PROFILE=smoke_32x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE" \
+  RUN_PROFILE=smoke_32x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
 
 # After publishing the validated smoke-32 manifest at the path printed by the job:
-RUN_PROFILE=smoke_256x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
+CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE" \
+  RUN_PROFILE=smoke_256x300 bash "$ROOT/scripts/scaling/submit_hsg_gb200_smoke.sh"
 
 # After publishing the validated smoke-256 manifest:
-bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
+CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE" \
+  bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
 ```
 
 The submitter and packed allocation independently rehash the predecessor manifest, checkpoints,

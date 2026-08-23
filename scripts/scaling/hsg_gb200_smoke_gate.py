@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -11,7 +13,7 @@ import os
 import re
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -31,6 +33,357 @@ SEALED_SOURCE_PROFILES = frozenset(
 
 class GateError(RuntimeError):
     pass
+
+
+WANDB_READBACK_SCHEMA = "fast_roborender.wandb_training_readback.v3"
+WANDB_RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+ERROR_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+WANDB_PROJECT_BY_PROFILE = {
+    "smoke_32x300": "roborender_dagger_hsg_gb200_smoke",
+    "smoke_256x300": "roborender_dagger_hsg_gb200_smoke",
+    "production_256x300": "roborender_dagger_hsg_gb200_production",
+}
+
+
+class ReadbackContractError(ValueError):
+    pass
+
+
+def _readback_string_set(
+    value: object, label: str, *, nonempty: bool = True
+) -> set[str]:
+    if (
+        not isinstance(value, list)
+        or (nonempty and not value)
+        or any(not isinstance(item, str) or not item for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise ReadbackContractError(f"{label} is malformed")
+    return set(value)
+
+
+def _readback_sha(value: object, label: str) -> str:
+    if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+        raise ReadbackContractError(f"{label} is malformed")
+    return value
+
+
+def _readback_md5(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise ReadbackContractError(f"{label} is malformed")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        raise ReadbackContractError(f"{label} is malformed") from None
+    if len(decoded) != 16:
+        raise ReadbackContractError(f"{label} is malformed")
+    return value
+
+
+def _readback_media_path(value: object, kind: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ReadbackContractError("verified remote media path is malformed")
+    path = PurePosixPath(value)
+    prefix = ("media", "images" if kind == "image" else "videos")
+    if path.is_absolute() or ".." in path.parts or path.parts[:2] != prefix:
+        raise ReadbackContractError("verified remote media path is unsafe")
+    return value
+
+
+def _validate_scalar_readback(value: object, *, axis: str) -> None:
+    if not isinstance(value, dict) or value.get("axis") != axis:
+        raise ReadbackContractError(f"{axis} scalar evidence is malformed")
+    required = value.get("required_point_count")
+    verified = value.get("verified_point_count")
+    step_count = value.get("required_step_count")
+    minimum = value.get("min_step")
+    maximum = value.get("max_step")
+    if (
+        isinstance(required, bool)
+        or not isinstance(required, int)
+        or required < 1
+        or verified != required
+        or isinstance(step_count, bool)
+        or not isinstance(step_count, int)
+        or not 1 <= step_count <= required
+        or isinstance(minimum, bool)
+        or not isinstance(minimum, int)
+        or minimum < 0
+        or isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum < minimum
+        or value.get("all_points_verified") is not True
+    ):
+        raise ReadbackContractError(f"{axis} scalar point evidence is incomplete")
+    required_hash = _readback_sha(
+        value.get("required_points_sha256"), "required points"
+    )
+    verified_hash = _readback_sha(
+        value.get("verified_points_sha256"), "verified points"
+    )
+    if required_hash != verified_hash:
+        raise ReadbackContractError(f"{axis} scalar point digests differ")
+    _readback_sha(value.get("required_steps_sha256"), "required steps")
+    resume = value.get("resume_training")
+    checkpoint = value.get("resume_checkpoint_step")
+    rollout_steps = value.get("rollout_steps")
+    if (
+        not isinstance(resume, bool)
+        or isinstance(checkpoint, bool)
+        or not isinstance(checkpoint, int)
+        or checkpoint < 0
+        or isinstance(rollout_steps, bool)
+        or not isinstance(rollout_steps, int)
+        or rollout_steps < 1
+    ):
+        raise ReadbackContractError(f"{axis} scalar restart contract is malformed")
+    if resume:
+        pre = value.get("boundary_pre_step")
+        post = value.get("boundary_post_step")
+        if (
+            checkpoint < 1
+            or isinstance(pre, bool)
+            or not isinstance(pre, int)
+            or isinstance(post, bool)
+            or not isinstance(post, int)
+            or not minimum <= pre <= maximum
+            or not minimum <= post <= maximum
+            or value.get("boundary_pre_verified") is not True
+            or value.get("boundary_post_verified") is not True
+        ):
+            raise ReadbackContractError(
+                f"{axis} scalar restart boundary is not verified"
+            )
+        if axis == "_step":
+            if pre != checkpoint - 1 or post != checkpoint:
+                raise ReadbackContractError(
+                    f"{axis} scalar restart boundary is unrelated to checkpoint"
+                )
+        else:
+            boundary = checkpoint * rollout_steps
+            if not pre < boundary <= post:
+                raise ReadbackContractError(
+                    f"{axis} scalar restart boundary is unrelated to checkpoint"
+                )
+    elif (
+        checkpoint != 0
+        or value.get("boundary_pre_step") is not None
+        or value.get("boundary_post_step") is not None
+        or value.get("boundary_pre_verified") is not True
+        or value.get("boundary_post_verified") is not True
+    ):
+        raise ReadbackContractError(f"{axis} non-resume boundary is malformed")
+
+
+def validate_readback_report(
+    payload: object,
+    *,
+    expected_email: str,
+    expected_entity: str,
+    expected_project: str,
+    expected_sidecar_run_id: str,
+    expected_local_counts: dict[str, int],
+    expected_trainer_run_id: str | None = None,
+) -> dict[str, str]:
+    """Reject incomplete, legacy, or internally inconsistent W&B evidence."""
+
+    if not isinstance(payload, dict):
+        raise ReadbackContractError("W&B readback report is not an object")
+    expected = {
+        "schema": WANDB_READBACK_SCHEMA,
+        "status": "PASS",
+        "account_email": expected_email,
+        "entity": expected_entity,
+        "project": expected_project,
+        "authorization_scope": "team",
+        "team_member": True,
+        "entity_is_team": True,
+        "personal": False,
+        "sidecar_run_id": expected_sidecar_run_id,
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise ReadbackContractError(f"W&B readback {key} mismatch")
+    trainer_run_id = payload.get("trainer_run_id")
+    if (
+        not isinstance(trainer_run_id, str)
+        or WANDB_RUN_ID_RE.fullmatch(trainer_run_id) is None
+        or (
+            expected_trainer_run_id is not None
+            and trainer_run_id != expected_trainer_run_id
+        )
+    ):
+        raise ReadbackContractError("W&B trainer run ID mismatch")
+
+    local_counts = payload.get("local_artifact_counts")
+    if not isinstance(local_counts, dict) or any(
+        isinstance(local_counts.get(kind), bool)
+        or not isinstance(local_counts.get(kind), int)
+        or local_counts[kind] < 1
+        or local_counts[kind] != expected_local_counts.get(kind)
+        for kind in ("scalar", "image", "video")
+    ):
+        raise ReadbackContractError("W&B local artifact counts mismatch")
+
+    required_trainer = _readback_string_set(
+        payload.get("required_trainer_keys"), "required trainer keys"
+    )
+    observed_trainer = _readback_string_set(
+        payload.get("observed_trainer_keys"), "observed trainer keys"
+    )
+    if (
+        required_trainer != {"production/dagger_bc_loss"}
+        or not required_trainer <= observed_trainer
+    ):
+        raise ReadbackContractError("W&B trainer scalar keys are incomplete")
+    trainer_scalar = payload.get("trainer_scalar_evidence")
+    _validate_scalar_readback(trainer_scalar, axis="_step")
+
+    required_scalars = _readback_string_set(
+        payload.get("required_sidecar_scalar_keys"), "required sidecar scalar keys"
+    )
+    observed_scalars = _readback_string_set(
+        payload.get("observed_sidecar_scalar_keys"), "observed sidecar scalar keys"
+    )
+    required_media = _readback_string_set(
+        payload.get("required_sidecar_media_keys"), "required sidecar media keys"
+    )
+    observed_media = _readback_string_set(
+        payload.get("observed_sidecar_media_keys"), "observed sidecar media keys"
+    )
+    required_all = _readback_string_set(
+        payload.get("required_sidecar_keys"), "required sidecar keys"
+    )
+    observed_all = _readback_string_set(
+        payload.get("observed_sidecar_keys"), "observed sidecar keys"
+    )
+    if (
+        "trainer_step" not in required_scalars
+        or not required_scalars <= observed_scalars
+        or not required_media <= observed_media
+        or required_all != required_scalars | required_media
+        or observed_all != observed_scalars | observed_media
+        or not required_all <= observed_all
+    ):
+        raise ReadbackContractError("W&B split sidecar evidence is inconsistent")
+    sidecar_scalar = payload.get("sidecar_scalar_evidence")
+    _validate_scalar_readback(sidecar_scalar, axis="trainer_step")
+    if any(
+        trainer_scalar.get(key) != sidecar_scalar.get(key)  # type: ignore[union-attr]
+        for key in ("resume_training", "resume_checkpoint_step", "rollout_steps")
+    ):
+        raise ReadbackContractError("trainer/sidecar restart contracts differ")
+
+    required_event_count = payload.get("required_remote_media_event_count")
+    verified_event_count = payload.get("verified_remote_media_event_count")
+    downloaded_file_count = payload.get("downloaded_remote_media_file_count")
+    events = payload.get("verified_remote_media_events")
+    expected_event_count = local_counts["image"] + local_counts["video"]
+    if (
+        required_event_count != expected_event_count
+        or verified_event_count != expected_event_count
+        or not isinstance(events, list)
+        or len(events) != expected_event_count
+        or isinstance(downloaded_file_count, bool)
+        or not isinstance(downloaded_file_count, int)
+        or not 1 <= downloaded_file_count <= expected_event_count
+        or payload.get("remote_media_history_steps_unique") is not True
+        or not isinstance(payload.get("remote_media_paths_unique"), bool)
+    ):
+        raise ReadbackContractError("W&B remote media event count is incomplete")
+    remote_paths: set[str] = set()
+    local_paths: set[str] = set()
+    history_steps: set[int] = set()
+    remote_fingerprints: dict[str, tuple[str, int, str, str]] = {}
+    summary_counts = {key: 0 for key in required_media}
+    events_by_key: dict[str, list[dict[str, object]]] = {
+        key: [] for key in required_media
+    }
+    kind_counts = {"image": 0, "video": 0}
+    for record in events:
+        if not isinstance(record, dict):
+            raise ReadbackContractError("verified remote media record is malformed")
+        key = record.get("key")
+        kind = record.get("kind")
+        local_path = record.get("local_relative_path")
+        size = record.get("size")
+        trainer_step = record.get("trainer_step")
+        history_step = record.get("remote_history_step")
+        if (
+            key not in required_media
+            or kind not in kind_counts
+            or not isinstance(local_path, str)
+            or not local_path.startswith(f"telemetry/{kind}s/")
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 1
+            or isinstance(trainer_step, bool)
+            or not isinstance(trainer_step, int)
+            or trainer_step < 0
+            or isinstance(history_step, bool)
+            or not isinstance(history_step, int)
+            or history_step < 0
+        ):
+            raise ReadbackContractError("verified remote media record is malformed")
+        remote_path = _readback_media_path(record.get("remote_path"), kind)
+        if local_path in local_paths or history_step in history_steps:
+            raise ReadbackContractError("verified media history is not injective")
+        remote_paths.add(remote_path)
+        local_paths.add(local_path)
+        history_steps.add(history_step)
+        local_md5 = _readback_md5(record.get("local_md5"), "local media MD5")
+        remote_md5 = _readback_md5(record.get("remote_md5"), "remote media MD5")
+        local_sha = _readback_sha(record.get("local_sha256"), "local media SHA256")
+        remote_sha = _readback_sha(
+            record.get("remote_sha256"), "remote media SHA256"
+        )
+        if local_md5 != remote_md5 or local_sha != remote_sha:
+            raise ReadbackContractError("verified media fingerprints differ")
+        fingerprint = (kind, size, remote_md5, remote_sha)
+        previous_fingerprint = remote_fingerprints.setdefault(
+            remote_path, fingerprint
+        )
+        if previous_fingerprint != fingerprint:
+            raise ReadbackContractError(
+                "deduplicated remote media path has conflicting fingerprints"
+            )
+        if not isinstance(record.get("summary_current"), bool):
+            raise ReadbackContractError("verified media summary flag is malformed")
+        if record["summary_current"]:
+            summary_counts[key] += 1
+        events_by_key[key].append(record)
+        kind_counts[kind] += 1
+    if (
+        kind_counts
+        != {"image": local_counts["image"], "video": local_counts["video"]}
+        or any(count != 1 for count in summary_counts.values())
+        or len(remote_paths) != downloaded_file_count
+        or payload["remote_media_paths_unique"]
+        is not (len(remote_paths) == expected_event_count)
+    ):
+        raise ReadbackContractError("verified media kind/summary counts mismatch")
+    for key, key_events in events_by_key.items():
+        newest_history = max(
+            key_events, key=lambda item: int(item["remote_history_step"])
+        )
+        newest_local = max(
+            key_events,
+            key=lambda item: (
+                int(item["trainer_step"]),
+                str(item["local_relative_path"]),
+            ),
+        )
+        if newest_history is not newest_local or newest_history["summary_current"] is not True:
+            raise ReadbackContractError("verified media summary event is stale")
+    last_error = payload.get("last_api_error_type")
+    if not isinstance(last_error, str) or (
+        last_error and ERROR_TYPE_RE.fullmatch(last_error) is None
+    ):
+        raise ReadbackContractError("W&B API error evidence is unsafe")
+    return {
+        "trainer_run_id": trainer_run_id,
+        "sidecar_run_id": expected_sidecar_run_id,
+    }
 
 
 def sha256_file(path: Path) -> str:
@@ -680,7 +1033,10 @@ def validate_renderer_placement(path: Path, expected_renderers: int) -> dict[str
 
 
 def validate_wandb_evidence(
-    run_dir: Path, expected_email: str, expected_entity: str
+    run_dir: Path,
+    expected_email: str,
+    expected_entity: str,
+    expected_project: str,
 ) -> dict[str, Any]:
     drain_path = run_dir / "validation/wandb_media_drain.json"
     readback_path = run_dir / "validation/wandb_training_readback.json"
@@ -698,35 +1054,24 @@ def validate_wandb_evidence(
     ):
         raise GateError("W&B media drain lacks scalar/image/video evidence")
     readback = load_json(require_file(readback_path, "W&B remote readback marker"))
-    expected = {
-        "schema": "fast_roborender.wandb_training_readback.v2",
-        "status": "PASS",
-        "account_email": expected_email,
-        "entity": expected_entity,
-        "authorization_scope": "team",
-        "team_member": True,
-        "entity_is_team": True,
-        "personal": False,
-        "sidecar_run_id": drain.get("wandb_run_id"),
-    }
-    for key, value in expected.items():
-        if readback.get(key) != value:
-            raise GateError(f"W&B remote readback {key} mismatch")
-    required_trainer = set(readback.get("required_trainer_keys", []))
-    observed_trainer = set(readback.get("observed_trainer_keys", []))
-    required_sidecar = set(readback.get("required_sidecar_keys", []))
-    observed_sidecar = set(readback.get("observed_sidecar_keys", []))
-    if "production/dagger_bc_loss" not in required_trainer or not required_trainer <= observed_trainer:
-        raise GateError("W&B trainer scalar readback is incomplete")
-    if not required_sidecar or not required_sidecar <= observed_sidecar:
-        raise GateError("W&B sidecar scalar/image/video readback is incomplete")
+    try:
+        run_ids = validate_readback_report(
+            readback,
+            expected_email=expected_email,
+            expected_entity=expected_entity,
+            expected_project=expected_project,
+            expected_sidecar_run_id=str(drain.get("wandb_run_id", "")),
+            expected_local_counts=kinds,
+        )
+    except ReadbackContractError as exc:
+        raise GateError(str(exc)) from None
     return {
         "drain_path": str(drain_path.resolve()),
         "drain_sha256": sha256_file(drain_path),
         "readback_path": str(readback_path.resolve()),
         "readback_sha256": sha256_file(readback_path),
-        "trainer_run_id": readback.get("trainer_run_id"),
-        "sidecar_run_id": readback.get("sidecar_run_id"),
+        "trainer_run_id": run_ids["trainer_run_id"],
+        "sidecar_run_id": run_ids["sidecar_run_id"],
     }
 
 
@@ -991,7 +1336,10 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
         if not args.wandb_expected_email or not args.wandb_entity:
             raise GateError("W&B identity is required for this profile")
         wandb = validate_wandb_evidence(
-            run_dir, args.wandb_expected_email, args.wandb_entity
+            run_dir,
+            args.wandb_expected_email,
+            args.wandb_entity,
+            WANDB_PROJECT_BY_PROFILE[args.profile],
         )
     policy_change_path = run_dir / "validation/checkpoint_policy_change.json"
     policy_change = validate_policy_change(policy_change_path, initial, final, final_step)
@@ -1041,13 +1389,17 @@ def postrun(args: argparse.Namespace) -> dict[str, Any]:
     if wandb is not None:
         report["wandb"] = wandb
     if args.profile == "calibration_3view":
+        run_id = getattr(args, "run_id", None)
+        if not isinstance(run_id, str) or WANDB_RUN_ID_RE.fullmatch(run_id) is None:
+            raise GateError("calibration postrun RUN_ID is malformed")
         panels = [
             require_file(run_dir / "render_dumps/step000_env0.png", "calibration panel 0"),
             require_file(run_dir / "render_dumps/step001_env0.png", "calibration panel 1"),
         ]
         technical = {
-            "schema": "fast_roborender.camera_calibration.v1",
+            "schema": "fast_roborender.camera_calibration.v2",
             "status": "awaiting_visual_acceptance",
+            "run_id": run_id,
             "fast_roborender_revision": args.fast_revision,
             "fast_roborender_source_tree_sha256": args.fast_source_tree_sha256,
             "gr00t_revision": args.gr00t_revision,
@@ -1158,6 +1510,7 @@ def parser() -> argparse.ArgumentParser:
 
     post = sub.add_parser("postrun")
     post.add_argument("--profile", required=True)
+    post.add_argument("--run-id", required=True)
     post.add_argument("--run-dir", type=Path, required=True)
     post.add_argument("--global-envs", type=int, required=True)
     post.add_argument("--rollout-steps", type=int, required=True)

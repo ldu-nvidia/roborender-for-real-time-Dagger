@@ -377,11 +377,13 @@ def verify_camera_acceptance_binding(
             "source_snapshot_inventory_sha256"
         ],
         expected_asset_contract_sha256=base["asset_contract_sha256"],
+        expected_run_id=args.camera_calibration_run_id,
     )
     expected = {
         "schema": camera_gate.VERIFICATION_SCHEMA,
         "status": "verified",
         "acceptance_sha256": acceptance_hash,
+        "run_id": args.camera_calibration_run_id,
         "fast_roborender_revision": args.fast_revision,
         "gr00t_revision": args.gr00t_revision,
         "fast_roborender_source_tree_sha256": base[
@@ -1036,6 +1038,7 @@ def parser() -> argparse.ArgumentParser:
     pre.add_argument("--adapter-sha256", required=True)
     pre.add_argument("--camera-acceptance", type=Path, required=True)
     pre.add_argument("--camera-acceptance-sha256", required=True)
+    pre.add_argument("--camera-calibration-run-id", required=True)
     pre.add_argument("--resnet18", type=Path, required=True)
     pre.add_argument("--resnet18-sha256", required=True)
     pre.add_argument("--wandb-acceptance", type=Path, required=True)

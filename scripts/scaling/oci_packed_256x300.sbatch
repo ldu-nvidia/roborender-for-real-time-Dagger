@@ -62,6 +62,7 @@ PACKED_CPUS_PER_GPU=${PACKED_CPUS_PER_GPU:-10}
 PACKED_MEM=${PACKED_MEM:-768G}
 EXPECTED_RENDERERS=${EXPECTED_RENDERERS:-52}
 CAMERA_CALIBRATION_ACCEPTANCE=${CAMERA_CALIBRATION_ACCEPTANCE:-NONE}
+CAMERA_CALIBRATION_RUN_ID=${CAMERA_CALIBRATION_RUN_ID:-NONE}
 EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256=${EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256:-NONE}
 PREREQUISITE_PROFILE_VALIDATION=${PREREQUISITE_PROFILE_VALIDATION:-NONE}
 EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256=${EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256:-NONE}
@@ -73,6 +74,9 @@ fatal() {
     echo "FATAL: $*" >&2
     exit 2
 }
+
+[[ "$RUN_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || \
+    fatal "RUN_ID must match [A-Za-z0-9_-]{1,128}"
 
 case "$RUN_PROFILE" in
     production_256x300)
@@ -119,6 +123,33 @@ case "$RUN_PROFILE" in
         ;;
     *) fatal "unknown RUN_PROFILE=$RUN_PROFILE" ;;
 esac
+if [ "$RUN_PROFILE" = calibration_3view ]; then
+    OCI_RUN_ROOT=$STAGE_ROOT/runtime/$RUN_ID
+    [ "$FLEET_DIR" = "$OCI_RUN_ROOT/fleet" ] || \
+        fatal "calibration FLEET_DIR must be bound to RUN_ID"
+    [ "$TRAIN_RUN_DIR" = "$OCI_RUN_ROOT/train" ] || \
+        fatal "calibration TRAIN_RUN_DIR must be bound to RUN_ID"
+    [ -d "$OCI_RUN_ROOT" ] && [ ! -L "$OCI_RUN_ROOT" ] || \
+        fatal "calibration RUN_ROOT is missing or unsafe"
+    [ "$(realpath -e "$OCI_RUN_ROOT")" = "$OCI_RUN_ROOT" ] || \
+        fatal "calibration RUN_ROOT must be canonical"
+    for run_child in "$FLEET_DIR" "$TRAIN_RUN_DIR"; do
+        [ -d "$run_child" ] && [ ! -L "$run_child" ] || \
+            fatal "calibration run directory is missing or unsafe: $run_child"
+        [ "$(realpath -e "$run_child")" = "$run_child" ] || \
+            fatal "calibration run directory must be canonical: $run_child"
+    done
+fi
+if [ "$RUN_PROFILE" = calibration_3view ]; then
+    [ "$CAMERA_CALIBRATION_ACCEPTANCE:$CAMERA_CALIBRATION_RUN_ID:$EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256" = \
+      NONE:NONE:NONE ] || fatal "calibration_3view cannot consume a prior camera acceptance"
+else
+    [[ "$CAMERA_CALIBRATION_RUN_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || \
+        fatal "CAMERA_CALIBRATION_RUN_ID is malformed"
+    [ "$CAMERA_CALIBRATION_ACCEPTANCE" = \
+      "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json" ] || \
+        fatal "camera calibration acceptance escaped its exact versioned path"
+fi
 [ "${SLURM_NNODES:-0}" -eq "$PACKED_NODES" ] || \
     fatal "$RUN_PROFILE requires exactly $PACKED_NODES allocated node(s)"
 [ "${SLURM_JOB_PARTITION:-}" = "$PACKED_PARTITION" ] || \
@@ -171,6 +202,7 @@ else
         fatal "camera calibration acceptance hash mismatch"
     "$HOST_PYTHON" "$ROOT/scripts/scaling/camera_calibration_gate.py" verify \
         --acceptance "$CAMERA_CALIBRATION_ACCEPTANCE" \
+        --expected-run-id "$CAMERA_CALIBRATION_RUN_ID" \
         --expected-fast-roborender-revision "$FAST_REVISION" \
         --expected-gr00t-revision "$GR00T_REVISION" \
         --expected-acceptance-sha256 "$EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256" \
@@ -262,6 +294,7 @@ initial_policy_checkpoint=$TRAIN_RUN_DIR/initial_policy.pt
 expected_final_checkpoint=$EXPECTED_FINAL_CHECKPOINT
 camera_calibration_acceptance=$CAMERA_CALIBRATION_ACCEPTANCE
 camera_calibration_acceptance_sha256=$EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256
+camera_calibration_run_id=$CAMERA_CALIBRATION_RUN_ID
 prerequisite_profile=$PREREQUISITE_PROFILE_EXPECTED
 prerequisite_profile_validation=$PREREQUISITE_PROFILE_VALIDATION
 prerequisite_profile_validation_sha256=$EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256
@@ -283,6 +316,7 @@ export IMAGE_DAGGER_DUMP_SIM_RGB IMAGE_DAGGER_DUMP_MAX_STEPS IMAGE_DAGGER_DUMP_M
 export IMAGE_DAGGER_VERIFY_DDP_SYNC
 export IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS
 export CAMERA_CALIBRATION_ACCEPTANCE EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256
+export CAMERA_CALIBRATION_RUN_ID
 export PREREQUISITE_PROFILE_VALIDATION EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256
 export PREREQUISITE_PROFILE_EXPECTED
 export VIRAL_PYTHON VIRAL_VENV_ACTIVATE WANDB_ENV WANDB_PYTHON WANDB_EXPECTED_EMAIL WANDB_MODE

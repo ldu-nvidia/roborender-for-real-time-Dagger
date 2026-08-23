@@ -20,6 +20,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts.scaling.hsg_gb200_smoke_gate import (
+        ReadbackContractError,
+        validate_readback_report,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/scaling.
+    from hsg_gb200_smoke_gate import (  # type: ignore[no-redef]
+        ReadbackContractError,
+        validate_readback_report,
+    )
+
 
 LEGACY_EXPECTED_FIELDS = frozenset(
     {
@@ -701,49 +712,33 @@ def validate_profile(
         if _RUN_ID.fullmatch(trainer_run_id) is None or _RUN_ID.fullmatch(sidecar_run_id) is None:
             raise GateError("HSG predecessor W&B run ID is malformed")
         kinds = drain.get("artifact_kinds")
-        local_counts = readback.get("local_artifact_counts")
-        required_trainer = readback.get("required_trainer_keys")
-        observed_trainer = readback.get("observed_trainer_keys")
-        required_sidecar = readback.get("required_sidecar_keys")
-        observed_sidecar = readback.get("observed_sidecar_keys")
         if (
             drain.get("schema") != "fast_roborender.wandb_media_drain.v1"
             or drain.get("status") != "PASS"
-            or readback.get("schema")
-            != "fast_roborender.wandb_training_readback.v2"
-            or readback.get("status") != "PASS"
-            or readback.get("account_email") != expected_wandb_email
-            or readback.get("entity") != expected_wandb_entity
-            or readback.get("authorization_scope") != "team"
-            or readback.get("team_member") is not True
-            or readback.get("entity_is_team") is not True
-            or readback.get("personal") is not False
-            or readback.get("trainer_run_id") != trainer_run_id
-            or readback.get("sidecar_run_id") != sidecar_run_id
             or drain.get("wandb_run_id") != sidecar_run_id
             or not isinstance(kinds, dict)
-            or not isinstance(local_counts, dict)
             or any(
                 isinstance(kinds.get(kind), bool)
                 or not isinstance(kinds.get(kind), int)
                 or kinds[kind] < 1
-                or local_counts.get(kind) != kinds[kind]
                 for kind in ("scalar", "image", "video")
             )
-            or not isinstance(required_trainer, list)
-            or not isinstance(observed_trainer, list)
-            or any(not isinstance(key, str) for key in required_trainer)
-            or any(not isinstance(key, str) for key in observed_trainer)
-            or "production/dagger_bc_loss" not in required_trainer
-            or not set(required_trainer).issubset(observed_trainer)
-            or not isinstance(required_sidecar, list)
-            or not required_sidecar
-            or not isinstance(observed_sidecar, list)
-            or any(not isinstance(key, str) for key in required_sidecar)
-            or any(not isinstance(key, str) for key in observed_sidecar)
-            or not set(required_sidecar).issubset(observed_sidecar)
         ):
             raise GateError("HSG predecessor W&B evidence is inconsistent")
+        try:
+            validate_readback_report(
+                readback,
+                expected_email=expected_wandb_email,
+                expected_entity=expected_wandb_entity,
+                expected_project="roborender_dagger_hsg_gb200_smoke",
+                expected_sidecar_run_id=sidecar_run_id,
+                expected_trainer_run_id=trainer_run_id,
+                expected_local_counts=kinds,
+            )
+        except ReadbackContractError as exc:
+            raise GateError(
+                f"HSG predecessor W&B evidence is inconsistent: {exc}"
+            ) from None
 
     ddp_path: Path | None = None
     ddp_hash = ""

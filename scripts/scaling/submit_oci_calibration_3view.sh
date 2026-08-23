@@ -30,6 +30,10 @@ export IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS=1
 export RUN_WALLTIME=${RUN_WALLTIME:-01:00:00}
 export PROJ=roborender_dagger_3view_calibration
 export RUN_ID=${RUN_ID:-dagger_3view_calibration_$(date +%Y%m%d_%H%M%S)}
+[[ "$RUN_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || {
+    echo "FATAL: RUN_ID must match [A-Za-z0-9_-]{1,128}" >&2
+    exit 2
+}
 export EXP=$RUN_ID
 export VG_PRIMARY_VIEW=head_color
 export VG_POLICY_VIEWS=head_color:hand_left:hand_right

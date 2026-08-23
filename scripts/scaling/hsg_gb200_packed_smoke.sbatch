@@ -41,7 +41,9 @@ required=(STAGE_ROOT ROOT GR00T_ROOT RUN_PROFILE PRODUCTION_ACTION RUN_ID RUN_RO
           EXPECTED_IMAGE3F_ADAPTER_SHA256 EXPECTED_ASSET_CONTRACT_SHA256
           EXPECTED_IMAGE3F_ENGINE_SHA256
           IMAGE_DAGGER_DUMP_SIM_RGB USE_WANDB
-          CAMERA_CALIBRATION_ACCEPTANCE EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256
+          CAMERA_CALIBRATION_ACCEPTANCE CAMERA_CALIBRATION_RUN_ID
+          EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256
+          CAMERA_CALIBRATION_MANIFEST_DESTINATION
           PREREQUISITE_PROFILE_EXPECTED PREREQUISITE_PROFILE_VALIDATION
           EXPECTED_PREREQUISITE_PROFILE_VALIDATION_SHA256)
 for name in "${required[@]}"; do
@@ -64,6 +66,82 @@ done
 export SLURM_EXPORT_ENV=ALL
 
 fatal() { echo "FATAL: $*" >&2; exit 2; }
+
+validate_calibration_run_directories() {
+    local runtime_dir expected_run_root run_directory canonical
+    [ "$RUN_PROFILE" = calibration_3view ] || return 0
+    runtime_dir=$STAGE_ROOT/runtime
+    expected_run_root=$runtime_dir/$RUN_ID
+    [ -d "$runtime_dir" ] && [ ! -L "$runtime_dir" ] || \
+        fatal "calibration runtime directory is missing or unsafe"
+    canonical=$(realpath -e "$runtime_dir") || \
+        fatal "cannot resolve calibration runtime directory"
+    [ "$canonical" = "$runtime_dir" ] || \
+        fatal "calibration runtime directory must be canonical"
+    [ "$RUN_ROOT" = "$expected_run_root" ] || \
+        fatal "calibration RUN_ROOT must be exactly $expected_run_root"
+    [ "$RUN_ATTEMPT_DIR" = "$RUN_ROOT" ] || \
+        fatal "calibration RUN_ATTEMPT_DIR must equal RUN_ROOT"
+    [ "$FLEET_DIR" = "$RUN_ROOT/fleet" ] || \
+        fatal "calibration FLEET_DIR must be an exact RUN_ROOT child"
+    [ "$TRAIN_RUN_DIR" = "$RUN_ROOT/train" ] || \
+        fatal "calibration TRAIN_RUN_DIR must be an exact RUN_ROOT child"
+    for run_directory in "$RUN_ROOT" "$FLEET_DIR" "$TRAIN_RUN_DIR"; do
+        [ -d "$run_directory" ] && [ ! -L "$run_directory" ] || \
+            fatal "calibration run directory is missing or unsafe: $run_directory"
+        canonical=$(realpath -e "$run_directory") || \
+            fatal "cannot resolve calibration run directory: $run_directory"
+        [ "$canonical" = "$run_directory" ] || \
+            fatal "calibration run directory must be canonical: $run_directory"
+    done
+}
+validate_calibration_run_directories
+
+case "$RUN_PROFILE" in
+    smoke_32x300|smoke_256x300|production_256x300)
+        [[ "$CAMERA_CALIBRATION_RUN_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || \
+            fatal "CAMERA_CALIBRATION_RUN_ID is malformed"
+        [ "$CAMERA_CALIBRATION_ACCEPTANCE" = \
+          "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json" ] || \
+            fatal "camera calibration acceptance escaped its exact versioned path"
+        ;;
+    *)
+        [ "$CAMERA_CALIBRATION_ACCEPTANCE:$CAMERA_CALIBRATION_RUN_ID:$EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256" = \
+          NONE:NONE:NONE ] || fatal "$RUN_PROFILE cannot consume a camera calibration acceptance"
+        ;;
+esac
+
+validate_camera_calibration_manifest_destination() {
+    local validation_dir expected_destination canonical_validation_dir
+    validation_dir=$STAGE_ROOT/runtime/validation
+    if [ "$RUN_PROFILE" = calibration_3view ]; then
+        expected_destination=$validation_dir/camera_calibration_manifest_${RUN_ID}.json
+        [ "$CAMERA_CALIBRATION_MANIFEST_DESTINATION" = "$expected_destination" ] || \
+            fatal "calibration manifest destination does not exactly bind RUN_ID=$RUN_ID"
+        [ -d "$validation_dir" ] && [ ! -L "$validation_dir" ] || \
+            fatal "calibration validation directory is missing or unsafe"
+        canonical_validation_dir=$(realpath -e "$validation_dir") || \
+            fatal "cannot resolve calibration validation directory"
+        [ "$canonical_validation_dir" = "$validation_dir" ] || \
+            fatal "calibration validation directory must be canonical"
+        [ "$(dirname -- "$CAMERA_CALIBRATION_MANIFEST_DESTINATION")" = \
+          "$validation_dir" ] || \
+            fatal "calibration manifest destination must be a direct validation child"
+        [ "$(basename -- "$CAMERA_CALIBRATION_MANIFEST_DESTINATION")" = \
+          "camera_calibration_manifest_${RUN_ID}.json" ] || \
+            fatal "calibration manifest destination filename changed"
+        [ ! -L "$CAMERA_CALIBRATION_MANIFEST_DESTINATION" ] || \
+            fatal "calibration manifest destination cannot be a symlink"
+        [ ! -e "$CAMERA_CALIBRATION_MANIFEST_DESTINATION" ] || \
+        [ -f "$CAMERA_CALIBRATION_MANIFEST_DESTINATION" ] || \
+            fatal "existing calibration manifest destination is not a regular file"
+    else
+        [ "$CAMERA_CALIBRATION_MANIFEST_DESTINATION" = NONE ] || \
+            fatal "$RUN_PROFILE must use CAMERA_CALIBRATION_MANIFEST_DESTINATION=NONE"
+    fi
+}
+validate_camera_calibration_manifest_destination
+
 [ "$PACKED_GPUS_PER_NODE" -eq 4 ] || fatal "HSG profile requires four GB200s per node"
 [ "${SLURM_NNODES:-0}" -eq "$PACKED_NODES" ] || fatal "allocated node count changed"
 [ "${SLURM_JOB_PARTITION:-}" = "$PACKED_PARTITION" ] || \
@@ -287,6 +365,7 @@ case "$RUN_PROFILE" in
             fatal "camera calibration acceptance changed after submission"
         python3 "$ROOT/scripts/scaling/camera_calibration_gate.py" verify \
             --acceptance "$CAMERA_CALIBRATION_ACCEPTANCE" \
+            --expected-run-id "$CAMERA_CALIBRATION_RUN_ID" \
             --expected-fast-roborender-revision "$EXPECTED_FAST_ROBORENDER_REVISION" \
             --expected-gr00t-revision "$EXPECTED_GR00T_REVISION" \
             --expected-fast-source-tree-sha256 "$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256" \
@@ -1554,6 +1633,10 @@ PY
         "$ROOT/scripts/scaling/wandb_training_readback.py" \
         --run-dir "$TRAIN_RUN_DIR" --project "$PROJ" --entity "$WANDB_ENTITY" \
         --expected-email "$WANDB_EXPECTED_EMAIL" --authorization-scope team \
+        --rollout-steps "$ROLLOUT_STEPS" \
+        --resume-training "$RESUME_TRAINING" \
+        --resume-checkpoint-step "$([ "$RESUME_TRAINING" -eq 1 ] && \
+            echo "$RESUME_CHECKPOINT_STEP" || echo 0)" \
         --timeout-s 180 \
         --output "$WANDB_TRAINING_READBACK"
 fi
@@ -1679,7 +1762,7 @@ PY
     fatal "pinned ResNet18 weights changed during the allocation"
 
 python3 "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" postrun \
-    --profile "$RUN_PROFILE" --run-dir "$TRAIN_RUN_DIR" \
+    --profile "$RUN_PROFILE" --run-id "$RUN_ID" --run-dir "$TRAIN_RUN_DIR" \
     --global-envs "$GLOBAL_NUM_ENVS" --rollout-steps "$ROLLOUT_STEPS" \
     --final-step "$TRAIN_ABSOLUTE_TARGET" \
     --world-size "$TRAINER_RANKS" --fast-revision "$EXPECTED_FAST_ROBORENDER_REVISION" \
@@ -1695,16 +1778,6 @@ python3 "$ROOT/scripts/scaling/hsg_gb200_smoke_gate.py" postrun \
     --wandb-expected-email "$WANDB_EXPECTED_EMAIL" --wandb-entity "$WANDB_ENTITY" \
     > "$POSTRUN_GATE_PATH"
 
-publish_once() {
-    local source=$1 destination=$2
-    mkdir -p "$(dirname "$destination")"
-    if [ -e "$destination" ]; then
-        [ "$(sha256sum "$source" | awk '{print $1}')" = "$(sha256sum "$destination" | awk '{print $1}')" ] || \
-            fatal "refusing to replace a different validation artifact: $destination"
-    else
-        cp "$source" "$destination"
-    fi
-}
 publish_symlink_once() {
     local source destination
     source=$(realpath -e "$1")
@@ -1721,23 +1794,27 @@ publish_symlink_once() {
 case "$RUN_PROFILE" in
     calibration_3view)
         TECHNICAL="$TRAIN_RUN_DIR/validation/camera_calibration_manifest.json"
-        PYTHONPATH="$ROOT/scripts/scaling" python3 - "$TECHNICAL" \
-            "$EXPECTED_FAST_ROBORENDER_REVISION" "$EXPECTED_GR00T_REVISION" \
-            "$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256" \
-            "$EXPECTED_GR00T_SOURCE_TREE_SHA256" \
-            "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \
-            "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \
-            "$EXPECTED_ASSET_CONTRACT_SHA256" <<'PY'
-import json
-import sys
-from pathlib import Path
-from camera_calibration_gate import validate_technical_manifest
-print(json.dumps(validate_technical_manifest(
-    Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
-    sys.argv[6], sys.argv[7], sys.argv[8]
-), indent=2))
-PY
-        publish_once "$TECHNICAL" "$STAGE_ROOT/runtime/validation/camera_calibration_manifest.json"
+        # Recheck immediately before publishing so a queued allocation cannot
+        # silently redirect the run-scoped evidence after submission.
+        validate_camera_calibration_manifest_destination
+        python3 "$ROOT/scripts/scaling/camera_calibration_gate.py" publish \
+            --manifest "$TECHNICAL" \
+            --destination "$CAMERA_CALIBRATION_MANIFEST_DESTINATION" \
+            --validation-directory "$STAGE_ROOT/runtime/validation" \
+            --expected-run-id "$RUN_ID" \
+            --expected-fast-roborender-revision \
+              "$EXPECTED_FAST_ROBORENDER_REVISION" \
+            --expected-gr00t-revision "$EXPECTED_GR00T_REVISION" \
+            --expected-fast-source-tree-sha256 \
+              "$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256" \
+            --expected-gr00t-source-tree-sha256 \
+              "$EXPECTED_GR00T_SOURCE_TREE_SHA256" \
+            --expected-source-snapshot-attestation-sha256 \
+              "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \
+            --expected-source-snapshot-inventory-sha256 \
+              "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \
+            --expected-asset-contract-sha256 \
+              "$EXPECTED_ASSET_CONTRACT_SHA256" >/dev/null
         echo "Calibration is technically valid; explicit visual acceptance is still required."
         ;;
     smoke_32x300|smoke_256x300)

@@ -22,6 +22,7 @@ required=(STAGE_ROOT ROOT GR00T_ROOT TRAIN_RUN_DIR EVAL_DIR EVAL_RUN_ID EVAL_MAN
           EXPECTED_GR00T_REVISION EXPECTED_FAST_SOURCE_TREE_SHA256
           EXPECTED_GR00T_SOURCE_TREE_SHA256 EXPECTED_IMAGE3F_RELEASE_ID
           EXPECTED_IMAGE3F_ADAPTER_SHA256 EXPECTED_IMAGE3F_ENGINE_SHA256 CAMERA_CALIBRATION_ACCEPTANCE
+          CAMERA_CALIBRATION_RUN_ID
           EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256 MIN_SUCCESS_DELTA
           FIXED_EVAL_SEEDS FIXED_EVAL_NUM_ENVS EXPECTED_RENDERERS WANDB_EXPECTED_EMAIL
           WANDB_ENTITY WANDB_AUTHORIZATION_SCOPE WANDB_ONLINE_VALIDATION
@@ -46,6 +47,11 @@ ACTUAL_ACCOUNT=${SLURM_JOB_ACCOUNT:-}
 [ "$WANDB_EXPECTED_EMAIL" = ldu@nvidia.com ] || fatal "W&B account binding changed"
 [ "$WANDB_ENTITY" = nvidia ] || fatal "W&B team entity binding changed"
 [ "$WANDB_AUTHORIZATION_SCOPE" = team ] || fatal "W&B authorization scope changed"
+[ "$CAMERA_CALIBRATION_ACCEPTANCE" = \
+  "$STAGE_ROOT/runtime/validation/camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json" ] || \
+    fatal "camera calibration acceptance path/run ID binding changed"
+[[ "$CAMERA_CALIBRATION_RUN_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || \
+    fatal "camera calibration run ID is malformed"
 [ "$RENDERER_CONTAINER" != "$TRAINER_CONTAINER" ] || fatal "renderer/trainer images must differ"
 [ "$(sha256sum "$RENDERER_CONTAINER" | awk '{print $1}')" = "$EXPECTED_RENDERER_CONTAINER_SHA256" ] || \
     fatal "renderer container changed"
@@ -70,6 +76,7 @@ VALIDATED_WANDB_ENTITY=$(python3 "$ROOT/scripts/eval/wandb_team_contract.py" \
 
 python3 "$ROOT/scripts/scaling/camera_calibration_gate.py" verify \
     --acceptance "$CAMERA_CALIBRATION_ACCEPTANCE" \
+    --expected-run-id "$CAMERA_CALIBRATION_RUN_ID" \
     --expected-fast-roborender-revision "$EXPECTED_FAST_ROBORENDER_REVISION" \
     --expected-gr00t-revision "$EXPECTED_GR00T_REVISION" \
     --expected-acceptance-sha256 "$EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256" >/dev/null
@@ -91,6 +98,7 @@ python3 "$ROOT/scripts/eval/hsg_gb200_image3f_fixed_seed_gate.py" preflight \
     --adapter-sha256 "$EXPECTED_IMAGE3F_ADAPTER_SHA256" \
     --camera-acceptance "$CAMERA_CALIBRATION_ACCEPTANCE" \
     --camera-acceptance-sha256 "$EXPECTED_CAMERA_CALIBRATION_ACCEPTANCE_SHA256" \
+    --camera-calibration-run-id "$CAMERA_CALIBRATION_RUN_ID" \
     --resnet18 "$RESNET18_WEIGHTS" --resnet18-sha256 "$EXPECTED_RESNET18_SHA256" \
     --wandb-acceptance "$WANDB_ONLINE_VALIDATION" \
     --wandb-acceptance-sha256 "$WANDB_ONLINE_VALIDATION_SHA256" \

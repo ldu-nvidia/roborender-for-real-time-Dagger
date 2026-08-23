@@ -499,8 +499,29 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 "artifact_count": 3,
                 "artifact_kinds": {"scalar": 1, "image": 1, "video": 1},
             }
+            scalar_evidence = {
+                "axis": "trainer_step",
+                "required_point_count": 1,
+                "verified_point_count": 1,
+                "required_points_sha256": "4" * 64,
+                "verified_points_sha256": "4" * 64,
+                "required_step_count": 1,
+                "required_steps_sha256": "5" * 64,
+                "min_step": 0,
+                "max_step": 0,
+                "all_points_verified": True,
+                "resume_training": False,
+                "resume_checkpoint_step": 0,
+                "rollout_steps": 300,
+                "boundary_pre_step": None,
+                "boundary_post_step": None,
+                "boundary_pre_verified": True,
+                "boundary_post_verified": True,
+            }
+            trainer_scalar_evidence = dict(scalar_evidence)
+            trainer_scalar_evidence["axis"] = "_step"
             readback = {
-                "schema": "fast_roborender.wandb_training_readback.v2",
+                "schema": "fast_roborender.wandb_training_readback.v3",
                 "status": "PASS",
                 "account_email": "ldu@nvidia.com",
                 "entity": "nvidia",
@@ -508,13 +529,58 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 "team_member": True,
                 "entity_is_team": True,
                 "personal": False,
-                "project": "roborender_dagger_3view_production",
+                "project": (
+                    "roborender_dagger_hsg_gb200_production"
+                    if profile == "production_256x300"
+                    else "roborender_dagger_hsg_gb200_smoke"
+                ),
                 "trainer_run_id": "trainer-run",
                 "sidecar_run_id": "sidecar-run",
                 "required_trainer_keys": ["production/dagger_bc_loss"],
                 "observed_trainer_keys": ["production/dagger_bc_loss"],
+                "trainer_scalar_evidence": trainer_scalar_evidence,
                 "required_sidecar_keys": ["trainer_step", "media/image/x", "media/video/x"],
                 "observed_sidecar_keys": ["trainer_step", "media/image/x", "media/video/x"],
+                "required_sidecar_scalar_keys": ["trainer_step"],
+                "observed_sidecar_scalar_keys": ["trainer_step"],
+                "sidecar_scalar_evidence": scalar_evidence,
+                "required_sidecar_media_keys": ["media/image/x", "media/video/x"],
+                "observed_sidecar_media_keys": ["media/image/x", "media/video/x"],
+                "required_remote_media_event_count": 2,
+                "verified_remote_media_event_count": 2,
+                "downloaded_remote_media_file_count": 2,
+                "remote_media_history_steps_unique": True,
+                "remote_media_paths_unique": True,
+                "verified_remote_media_events": [
+                    {
+                        "key": "media/image/x",
+                        "kind": "image",
+                        "trainer_step": 0,
+                        "remote_history_step": 1,
+                        "local_relative_path": "telemetry/images/step.png",
+                        "remote_path": "media/images/image.png",
+                        "size": 3,
+                        "local_md5": "RlLAPdQBNu3+TxhyUlxpaQ==",
+                        "remote_md5": "RlLAPdQBNu3+TxhyUlxpaQ==",
+                        "local_sha256": "6" * 64,
+                        "remote_sha256": "6" * 64,
+                        "summary_current": True,
+                    },
+                    {
+                        "key": "media/video/x",
+                        "kind": "video",
+                        "trainer_step": 1,
+                        "remote_history_step": 2,
+                        "local_relative_path": "telemetry/videos/step.mp4",
+                        "remote_path": "media/videos/video.mp4",
+                        "size": 3,
+                        "local_md5": "3xDDe4dm2RJU69/PVnPFIA==",
+                        "remote_md5": "3xDDe4dm2RJU69/PVnPFIA==",
+                        "local_sha256": "7" * 64,
+                        "remote_sha256": "7" * 64,
+                        "summary_current": True,
+                    },
+                ],
                 "local_artifact_counts": {"scalar": 1, "image": 1, "video": 1},
                 "last_api_error_type": "",
             }
@@ -557,6 +623,208 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
                 report["final_policy_sha256"],
                 "3" * 64,
             )
+
+    def test_wandb_readback_v2_and_noninjective_v3_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "train"
+            self.make_postrun(
+                run_dir,
+                1,
+                renderer_count=7,
+                renderer_hosts=2,
+                wandb=True,
+                profile="smoke_32x300",
+            )
+            path = run_dir / "validation/wandb_training_readback.json"
+            report = json.loads(path.read_text(encoding="utf-8"))
+            report["schema"] = "fast_roborender.wandb_training_readback.v2"
+            path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "schema mismatch"):
+                gate.validate_wandb_evidence(
+                    run_dir,
+                    "ldu@nvidia.com",
+                    "nvidia",
+                    "roborender_dagger_hsg_gb200_smoke",
+                )
+
+            report["schema"] = "fast_roborender.wandb_training_readback.v3"
+            passing = json.loads(json.dumps(report))
+            cases = []
+            noninjective = json.loads(json.dumps(passing))
+            noninjective["verified_remote_media_events"][1][
+                "remote_history_step"
+            ] = noninjective["verified_remote_media_events"][0][
+                "remote_history_step"
+            ]
+            cases.append(("history is not injective", noninjective))
+            split = json.loads(json.dumps(passing))
+            split["observed_sidecar_media_keys"] = []
+            cases.append(("observed sidecar media", split))
+            count = json.loads(json.dumps(passing))
+            count["verified_remote_media_event_count"] = 1
+            cases.append(("event count", count))
+            digest = json.loads(json.dumps(passing))
+            digest["verified_remote_media_events"][0]["remote_sha256"] = "8" * 64
+            cases.append(("fingerprints differ", digest))
+            scalar = json.loads(json.dumps(passing))
+            scalar["sidecar_scalar_evidence"]["verified_point_count"] = 0
+            cases.append(("scalar point evidence", scalar))
+            project = json.loads(json.dumps(passing))
+            project["project"] = "unrelated-project"
+            cases.append(("project mismatch", project))
+            persisted_float_size = json.loads(json.dumps(passing))
+            persisted_float_size["verified_remote_media_events"][0]["size"] = 3.0
+            cases.append(("remote media record is malformed", persisted_float_size))
+            for message, candidate in cases:
+                with self.subTest(message=message):
+                    path.write_text(
+                        json.dumps(candidate) + "\n", encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(gate.GateError, message):
+                        gate.validate_wandb_evidence(
+                            run_dir,
+                            "ldu@nvidia.com",
+                            "nvidia",
+                            "roborender_dagger_hsg_gb200_smoke",
+                        )
+
+            deduplicated = json.loads(json.dumps(passing))
+            duplicate_event = json.loads(
+                json.dumps(deduplicated["verified_remote_media_events"][0])
+            )
+            duplicate_event.update(
+                {
+                    "trainer_step": 10,
+                    "remote_history_step": 3,
+                    "local_relative_path": "telemetry/images/step2.png",
+                    "summary_current": True,
+                }
+            )
+            deduplicated["verified_remote_media_events"][0][
+                "summary_current"
+            ] = False
+            deduplicated["verified_remote_media_events"].append(duplicate_event)
+            deduplicated["required_remote_media_event_count"] = 3
+            deduplicated["verified_remote_media_event_count"] = 3
+            deduplicated["remote_media_paths_unique"] = False
+            deduplicated["local_artifact_counts"]["image"] = 2
+            path.write_text(json.dumps(deduplicated) + "\n", encoding="utf-8")
+            drain_path = run_dir / "validation/wandb_media_drain.json"
+            drain = json.loads(drain_path.read_text(encoding="utf-8"))
+            drain["artifact_count"] = 4
+            drain["artifact_kinds"]["image"] = 2
+            drain_path.write_text(json.dumps(drain) + "\n", encoding="utf-8")
+            evidence = gate.validate_wandb_evidence(
+                run_dir,
+                "ldu@nvidia.com",
+                "nvidia",
+                "roborender_dagger_hsg_gb200_smoke",
+            )
+            self.assertEqual(evidence["sidecar_run_id"], "sidecar-run")
+
+            stale_summary = json.loads(json.dumps(deduplicated))
+            stale_summary["verified_remote_media_events"][0][
+                "summary_current"
+            ] = True
+            stale_summary["verified_remote_media_events"][2][
+                "summary_current"
+            ] = False
+            reversed_local_order = json.loads(json.dumps(deduplicated))
+            reversed_local_order["verified_remote_media_events"][0][
+                "trainer_step"
+            ] = 20
+            for candidate in (stale_summary, reversed_local_order):
+                path.write_text(json.dumps(candidate) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    gate.GateError, "summary event is stale"
+                ):
+                    gate.validate_wandb_evidence(
+                        run_dir,
+                        "ldu@nvidia.com",
+                        "nvidia",
+                        "roborender_dagger_hsg_gb200_smoke",
+                    )
+
+    def test_wandb_readback_rejects_unrelated_resume_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "train"
+            self.make_postrun(
+                run_dir,
+                1,
+                renderer_count=7,
+                renderer_hosts=2,
+                wandb=True,
+                profile="smoke_32x300",
+            )
+            path = run_dir / "validation/wandb_training_readback.json"
+            passing = json.loads(path.read_text(encoding="utf-8"))
+            trainer = passing["trainer_scalar_evidence"]
+            trainer.update(
+                {
+                    "required_point_count": 2,
+                    "verified_point_count": 2,
+                    "min_step": 4,
+                    "max_step": 5,
+                    "required_step_count": 2,
+                    "resume_training": True,
+                    "resume_checkpoint_step": 5,
+                    "boundary_pre_step": 4,
+                    "boundary_post_step": 5,
+                }
+            )
+            sidecar = passing["sidecar_scalar_evidence"]
+            sidecar.update(
+                {
+                    "required_point_count": 2,
+                    "verified_point_count": 2,
+                    "min_step": 1490,
+                    "max_step": 1500,
+                    "required_step_count": 2,
+                    "resume_training": True,
+                    "resume_checkpoint_step": 5,
+                    "boundary_pre_step": 1490,
+                    "boundary_post_step": 1500,
+                }
+            )
+
+            path.write_text(json.dumps(passing) + "\n", encoding="utf-8")
+            gate.validate_wandb_evidence(
+                run_dir,
+                "ldu@nvidia.com",
+                "nvidia",
+                "roborender_dagger_hsg_gb200_smoke",
+            )
+
+            cases = []
+            wrong_trainer = json.loads(json.dumps(passing))
+            wrong_trainer["trainer_scalar_evidence"].update(
+                {"min_step": 3, "boundary_pre_step": 3}
+            )
+            cases.append(("_step scalar restart boundary", wrong_trainer))
+            split_sidecar = json.loads(json.dumps(passing))
+            split_sidecar["sidecar_scalar_evidence"].update(
+                {
+                    "max_step": 1501,
+                    "boundary_pre_step": 1500,
+                    "boundary_post_step": 1501,
+                }
+            )
+            cases.append(("trainer_step scalar restart boundary", split_sidecar))
+            outside_range = json.loads(json.dumps(passing))
+            outside_range["sidecar_scalar_evidence"].update(
+                {"boundary_pre_step": 1490, "boundary_post_step": 1501}
+            )
+            cases.append(("trainer_step scalar restart boundary", outside_range))
+            for message, candidate in cases:
+                with self.subTest(message=message):
+                    path.write_text(json.dumps(candidate) + "\n", encoding="utf-8")
+                    with self.assertRaisesRegex(gate.GateError, message):
+                        gate.validate_wandb_evidence(
+                            run_dir,
+                            "ldu@nvidia.com",
+                            "nvidia",
+                            "roborender_dagger_hsg_gb200_smoke",
+                        )
 
     def test_32_profile_postrun_is_accepted_by_existing_profile_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -982,18 +1250,169 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
 
     def test_hsg_calibration_postrun_binds_complete_sealed_provenance(self):
         packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
-        self.assertIn(
-            '"$EXPECTED_GR00T_SOURCE_TREE_SHA256" \\\n'
-            '            "$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256" \\\n'
-            '            "$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256" \\\n'
-            '            "$EXPECTED_ASSET_CONTRACT_SHA256" <<\'PY\'',
-            packed,
+        calibration_publish = packed.rsplit("    calibration_3view)\n", 1)[1].split(
+            "\n        ;;", 1
+        )[0]
+        for contract in (
+            '--expected-run-id "$RUN_ID"',
+            '"$EXPECTED_FAST_ROBORENDER_SOURCE_TREE_SHA256"',
+            '"$EXPECTED_GR00T_SOURCE_TREE_SHA256"',
+            '"$EXPECTED_SOURCE_SNAPSHOT_ATTESTATION_SHA256"',
+            '"$EXPECTED_SOURCE_SNAPSHOT_INVENTORY_SHA256"',
+            '"$EXPECTED_ASSET_CONTRACT_SHA256"',
+        ):
+            self.assertIn(contract, calibration_publish)
+
+    def test_hsg_calibration_manifest_destination_exactly_binds_run_id(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        exact_destination = (
+            "camera_calibration_manifest_${RUN_ID}.json"
         )
         self.assertIn(
-            "Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],\n"
-            "    sys.argv[6], sys.argv[7], sys.argv[8]",
+            "EXPECTED_CAMERA_CALIBRATION_MANIFEST_DESTINATION="
+            "$STAGE_ROOT/runtime/validation/" + exact_destination,
+            submit,
+        )
+        self.assertIn(
+            "expected_destination=$validation_dir/" + exact_destination,
             packed,
         )
+        for launcher in (submit, packed):
+            self.assertIn("must be a direct validation child", launcher)
+            self.assertIn("calibration validation directory must be canonical", launcher)
+            self.assertIn(exact_destination, launcher)
+
+    def test_hsg_calibration_uses_exclusive_fresh_run_root_reservation(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        self.assertIn("calibration RUN_ROOT must be exactly", submit)
+        self.assertIn('camera_calibration_gate.py" reserve-run-root', submit)
+        self.assertIn('--run-root "$RUN_ROOT" --run-id "$RUN_ID"', submit)
+
+    def test_queued_calibration_reasserts_exact_reserved_run_directories(self):
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        for contract in (
+            "validate_calibration_run_directories",
+            'expected_run_root=$runtime_dir/$RUN_ID',
+            '[ "$RUN_ROOT" = "$expected_run_root" ]',
+            '[ "$RUN_ATTEMPT_DIR" = "$RUN_ROOT" ]',
+            '[ "$FLEET_DIR" = "$RUN_ROOT/fleet" ]',
+            '[ "$TRAIN_RUN_DIR" = "$RUN_ROOT/train" ]',
+            '[ ! -L "$run_directory" ]',
+            'canonical=$(realpath -e "$run_directory")',
+            '[ "$canonical" = "$run_directory" ]',
+        ):
+            self.assertIn(contract, packed)
+
+    def test_hsg_calibration_manifest_destination_is_exported_and_bound(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        self.assertIn(
+            ",CAMERA_CALIBRATION_MANIFEST_DESTINATION="
+            "$CAMERA_CALIBRATION_MANIFEST_DESTINATION,",
+            submit,
+        )
+        self.assertIn(
+            "camera_calibration_manifest_destination="
+            "$CAMERA_CALIBRATION_MANIFEST_DESTINATION",
+            submit,
+        )
+        required = packed.split("required=(", 1)[1].split(")", 1)[0]
+        self.assertIn("CAMERA_CALIBRATION_MANIFEST_DESTINATION", required)
+        self.assertIn('camera_calibration_gate.py" publish', packed)
+        self.assertIn(
+            '--destination "$CAMERA_CALIBRATION_MANIFEST_DESTINATION"', packed
+        )
+        self.assertNotIn(
+            'publish_once "$TECHNICAL" '
+            '"$STAGE_ROOT/runtime/validation/camera_calibration_manifest.json"',
+            packed,
+        )
+        self.assertNotIn("publish_once()", packed)
+
+    def test_hsg_calibration_manifest_destination_rejects_symlinks_twice(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        for launcher in (submit, packed):
+            self.assertIn(
+                '[ ! -L "$CAMERA_CALIBRATION_MANIFEST_DESTINATION" ]',
+                launcher,
+            )
+            self.assertIn(
+                "calibration manifest destination cannot be a symlink",
+                launcher,
+            )
+        self.assertEqual(
+            packed.count("validate_camera_calibration_manifest_destination"),
+            3,
+        )
+        self.assertLess(
+            packed.rindex("validate_camera_calibration_manifest_destination"),
+            packed.index(
+                'python3 "$ROOT/scripts/scaling/camera_calibration_gate.py" publish'
+            ),
+        )
+
+    def test_hsg_noncalibration_profiles_force_destination_none(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        self.assertIn(
+            "CAMERA_CALIBRATION_MANIFEST_DESTINATION="
+            "${CAMERA_CALIBRATION_MANIFEST_DESTINATION:-NONE}",
+            submit,
+        )
+        for launcher in (submit, packed):
+            self.assertIn(
+                'must use CAMERA_CALIBRATION_MANIFEST_DESTINATION=NONE',
+                launcher,
+            )
+
+    def test_hsg_calibration_docs_use_the_versioned_destination(self):
+        readme = (ROOT / "README.md").read_text()
+        runbook = (ROOT / "docs/HSG_GB200_PRODUCTION_RUNBOOK.md").read_text()
+        for document in (readme, runbook):
+            self.assertIn(
+                'camera_calibration_manifest_${RUN_ID}.json', document
+            )
+            self.assertIn(
+                'camera_calibration_acceptance_${RUN_ID}.json', document
+            )
+            self.assertIn('--output "$CALIBRATION_ACCEPTANCE"', document)
+            self.assertIn(
+                'export CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE"',
+                document,
+            )
+            self.assertGreaterEqual(
+                document.count(
+                    'CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE"'
+                ),
+                3,
+            )
+            self.assertNotIn(
+                "export CALIBRATION_MANIFEST=/absolute/run/path/validation/"
+                "camera_calibration_manifest.json",
+                document,
+            )
+            self.assertNotIn(
+                '--output "$STAGE_ROOT/runtime/validation/'
+                'camera_calibration_acceptance.json"',
+                document,
+            )
+
+    def test_hsg_acceptance_verification_binds_versioned_calibration_run(self):
+        submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        for launcher in (submit, packed):
+            self.assertIn("CAMERA_CALIBRATION_RUN_ID", launcher)
+            self.assertIn(
+                "camera_calibration_acceptance_${CAMERA_CALIBRATION_RUN_ID}.json",
+                launcher,
+            )
+            self.assertIn('--expected-run-id "$CAMERA_CALIBRATION_RUN_ID"', launcher)
+        self.assertIn(
+            "CAMERA_CALIBRATION_RUN_ID=$CAMERA_CALIBRATION_RUN_ID,", submit
+        )
+        self.assertIn("camera_calibration_run_id=", submit)
 
     def test_hsg_profile_validation_calls_bind_complete_sealed_provenance(self):
         submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
