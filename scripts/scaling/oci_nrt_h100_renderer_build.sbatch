@@ -17,7 +17,7 @@ source "$ROOT/scripts/setup/oci_nrt_h100_env.sh"
 
 PACKAGE_ROOT=${PACKAGE_ROOT:-$STAGE_ROOT/assets/roborender_image_model_accelerated}
 CONTAINER_ROOT=${CONTAINER_ROOT:-$STAGE_ROOT/containers}
-CONTAINER_OUT=${CONTAINER_OUT:-$CONTAINER_ROOT/roborender-image3f-x86_64-sm90-cu128-trt10.13.3.9.sqsh}
+CONTAINER_OUT=${CONTAINER_OUT:-$CONTAINER_ROOT/roborender-image3f-x86_64-sm90-cu128-trt10.13.3.9-exportfix1.sqsh}
 PARTIAL="$CONTAINER_OUT.partial.${SLURM_JOB_ID:-$$}"
 REPORT=${REPORT:-$STAGE_ROOT/validation/h100_renderer_build_imports.json}
 export PACKAGE_ROOT REPORT
@@ -68,6 +68,8 @@ PIP=("$PY" -m pip)
     tensorrt-cu12==10.13.3.9
 
 cp -a "$PACKAGE_ROOT" /opt/roborender
+"$PY" "$ROOT/containers/h100/patch_image3f_exporter.py" /opt/roborender
+"$PY" /opt/roborender/bin/generate_manifests.py
 "${PIP[@]}" install --no-deps -e /opt/roborender/vendor/raven-image3f-joint
 install -m 0555 "$ROOT/containers/h100/renderer_exec.sh" /usr/local/bin/roborender-sm90
 install -m 0444 "$ROOT/containers/gb200/renderer_import_gate.py" /opt/renderer_import_gate.py

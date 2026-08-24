@@ -12,7 +12,7 @@ set -Eeuo pipefail
 
 STAGE_ROOT=${ROBORENDER_STAGE_ROOT:-/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build}
 ROOT=${ROOT:?submit with ROOT set to the immutable staged source snapshot}
-CONTAINER=${CONTAINER:-$STAGE_ROOT/containers/roborender-image3f-x86_64-sm90-cu128-trt10.13.3.9.sqsh}
+CONTAINER=${CONTAINER:-$STAGE_ROOT/containers/roborender-image3f-x86_64-sm90-cu128-trt10.13.3.9-exportfix1.sqsh}
 MODEL_ROOT=${MODEL_ROOT:-$STAGE_ROOT/assets/models}
 GENERATED_ROOT=${GENERATED_ROOT:-$STAGE_ROOT/runtime/image3f-generated}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$STAGE_ROOT/validation/h100_image3f_runtime}
