@@ -140,7 +140,8 @@ if not torch.__version__.startswith("2.7.0") or torch.version.cuda != "12.8":
 if not torchvision.__version__.startswith("0.22.0"):
     raise SystemExit("unexpected Isaac 5.1 torchvision base runtime")
 PY
-"$PY" -m pip install --index-url https://download.pytorch.org/whl/cu128 triton==3.3.0
+"$PY" -m pip install --no-deps \
+    --index-url https://download.pytorch.org/whl/cu128 triton==3.3.0
 "$PY" -m pip install "Cython==3.2.9" "toml==0.10.2"
 "$PY" -m pip install --no-build-isolation -e /opt/IsaacLab/source/isaaclab
 "$PY" -m pip install --no-build-isolation \
