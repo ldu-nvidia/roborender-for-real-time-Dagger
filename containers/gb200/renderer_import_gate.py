@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Fail closed unless the Image3F SM100 runtime imports on ARM64 CUDA."""
+"""Fail closed unless the Image3F runtime matches its declared CUDA target."""
 
 from __future__ import annotations
 
 import importlib
 import json
+import os
 import platform
 import sys
 from pathlib import Path
@@ -38,6 +39,13 @@ MODULES = (
 
 
 def main() -> None:
+    expected_machine = os.environ.get("ROBORENDER_EXPECTED_MACHINE", "aarch64")
+    expected_cc = [
+        int(value)
+        for value in os.environ.get("ROBORENDER_EXPECTED_CC", "10,0").split(",")
+    ]
+    expected_cuda = os.environ.get("ROBORENDER_EXPECTED_TORCH_CUDA")
+    expected_tensorrt = os.environ.get("ROBORENDER_EXPECTED_TENSORRT")
     imported = {}
     for name in MODULES:
         module = importlib.import_module(name)
@@ -68,10 +76,20 @@ def main() -> None:
     }
     print(json.dumps(report, indent=2, sort_keys=True))
 
-    if platform.machine() not in {"aarch64", "arm64"}:
-        raise SystemExit("expected ARM64 userspace")
-    if not devices or any(row["compute_capability"] != [10, 0] for row in devices):
-        raise SystemExit(f"expected only SM100 devices, found {devices}")
+    if platform.machine() != expected_machine:
+        raise SystemExit(
+            f"expected {expected_machine} userspace, found {platform.machine()}"
+        )
+    if not devices or any(row["compute_capability"] != expected_cc for row in devices):
+        raise SystemExit(f"expected only SM{expected_cc[0]}{expected_cc[1]} devices, found {devices}")
+    if expected_cuda and torch.version.cuda != expected_cuda:
+        raise SystemExit(
+            f"expected torch CUDA {expected_cuda}, found {torch.version.cuda}"
+        )
+    if expected_tensorrt and trt.__version__ != expected_tensorrt:
+        raise SystemExit(
+            f"expected TensorRT {expected_tensorrt}, found {trt.__version__}"
+        )
     if not report["bf16_supported"]:
         raise SystemExit("BF16 is unavailable")
 
@@ -94,7 +112,9 @@ def main() -> None:
     packaged_adapter = adapter_path(load_config())
     if not packaged_adapter.is_file():
         raise SystemExit(f"Image3F adapter is absent from the container: {packaged_adapter}")
-    print("HSG_GB200_RENDERER_IMPORT_GATE_PASS")
+    print("ROBORENDER_RENDERER_IMPORT_GATE_PASS")
+    if expected_machine == "aarch64" and expected_cc == [10, 0]:
+        print("HSG_GB200_RENDERER_IMPORT_GATE_PASS")
 
 
 if __name__ == "__main__":

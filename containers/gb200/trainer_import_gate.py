@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Static ARM64/SM100 import and CUDA gate for the DAgger trainer image."""
+"""Static import and CUDA gate for a declared DAgger trainer target."""
 
 from __future__ import annotations
 
 import importlib
 import json
+import os
 import platform
 import sys
 from pathlib import Path
@@ -44,10 +45,18 @@ MODULES = (
 # that supported lifecycle order.
 KIT_MODULES = ("isaaclab_contrib", "isaaclab_assets", "isaaclab_rl", "isaaclab_tasks")
 
-EXPECTED_GR00T_REVISION = "b4d17449d70eb3fb7caa7ea9366ca59bb0589cdd"
+DEFAULT_GR00T_REVISION = "b4d17449d70eb3fb7caa7ea9366ca59bb0589cdd"
 
 
 def main() -> None:
+    expected_machine = os.environ.get("ROBORENDER_EXPECTED_MACHINE", "aarch64")
+    expected_cc = [
+        int(value)
+        for value in os.environ.get("ROBORENDER_EXPECTED_CC", "10,0").split(",")
+    ]
+    expected_revision = os.environ.get(
+        "ROBORENDER_EXPECTED_GR00T_REVISION", DEFAULT_GR00T_REVISION
+    )
     versions = {}
     for name in MODULES:
         print(f"importing={name}", flush=True)
@@ -79,11 +88,13 @@ def main() -> None:
         "kit_ordered_imports": list(KIT_MODULES),
     }
     print(json.dumps(report, indent=2, sort_keys=True))
-    if platform.machine() not in {"aarch64", "arm64"}:
-        raise SystemExit("expected ARM64 userspace")
-    if not devices or any(row["compute_capability"] != [10, 0] for row in devices):
-        raise SystemExit(f"expected only SM100 devices, found {devices}")
-    if revision != EXPECTED_GR00T_REVISION:
+    if platform.machine() != expected_machine:
+        raise SystemExit(
+            f"expected {expected_machine} userspace, found {platform.machine()}"
+        )
+    if not devices or any(row["compute_capability"] != expected_cc for row in devices):
+        raise SystemExit(f"expected only SM{expected_cc[0]}{expected_cc[1]} devices, found {devices}")
+    if revision != expected_revision:
         raise SystemExit(f"unexpected GR00T source revision: {revision}")
     if not torch.__version__.startswith("2.7.0") or torch.version.cuda != "12.8":
         raise SystemExit(
@@ -94,7 +105,9 @@ def main() -> None:
     sample = torch.arange(4096, device="cuda", dtype=torch.float32)
     if sample.square().sum().item() <= 0:
         raise SystemExit("CUDA kernel validation failed")
-    print("HSG_GB200_TRAINER_IMPORT_GATE_PASS")
+    print("ROBORENDER_TRAINER_IMPORT_GATE_PASS")
+    if expected_machine == "aarch64" and expected_cc == [10, 0]:
+        print("HSG_GB200_TRAINER_IMPORT_GATE_PASS")
 
 
 if __name__ == "__main__":

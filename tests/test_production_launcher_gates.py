@@ -759,6 +759,9 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                         self.assertEqual(1, len(set(partitions)))
                         expected_partition = partitions[0]
                         self.assertIn(expected_partition, {"batch", "batch_long"})
+                    elif path.name.startswith("oci_nrt_h100_"):
+                        expected_account = "general_cs_infra"
+                        expected_partition = "batch_block1"
                     elif path.name in {
                         "oci_packed_256x300.sbatch",
                         "dagger_scale_256x300.sbatch",
@@ -784,6 +787,7 @@ class ProductionLauncherGatesTest(unittest.TestCase):
                         "grizzly": 4 * 3600,
                         "backfill_block1": 16 * 3600,
                         "batch": 4 * 3600,
+                        "batch_block1": 4 * 3600,
                         "batch_long": 7 * 24 * 3600,
                     }[expected_partition]
                     self.assertLessEqual(total_seconds, max_seconds)

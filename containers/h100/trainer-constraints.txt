@@ -1,0 +1,14 @@
+# Preserve the Isaac Sim 5.1 ML ABI on x86_64 H100 (SM90).
+torch==2.7.0+cu128
+torchvision==0.22.0
+numpy==1.26.0
+triton==3.3.0
+packaging==23.2
+wheel==0.45.1
+flatdict==4.0.1
+opencv-python==4.11.0.86
+Cython==3.2.9
+quadprog==0.1.13
+ray==2.52.1
+docstring-parser==0.16
+PyJWT==2.10.1

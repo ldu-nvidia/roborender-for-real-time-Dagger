@@ -1,0 +1,19 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+export ROBORENDER_ROOT=${ROBORENDER_ROOT:-/opt/roborender}
+export ROBORENDER_MODEL_BASE=${ROBORENDER_MODEL_BASE:-/models}
+export ROBORENDER_OUTPUTS=${ROBORENDER_OUTPUTS:-/outputs}
+export DIFFSYNTH_MODEL_BASE_PATH=${DIFFSYNTH_MODEL_BASE_PATH:-$ROBORENDER_MODEL_BASE}
+export DIFFSYNTH_SKIP_DOWNLOAD=true
+export PYTHONDONTWRITEBYTECODE=1
+export ROBORENDER_EXPECTED_MACHINE=x86_64
+export ROBORENDER_EXPECTED_CC=9,0
+export ROBORENDER_EXPECTED_TORCH_CUDA=12.8
+export ROBORENDER_EXPECTED_TENSORRT=10.13.3.9
+export PATH=/opt/roborender-h100-venv/bin:$PATH
+
+if [ "$#" -eq 0 ]; then
+    set -- python /opt/renderer_import_gate.py
+fi
+exec "$@"
