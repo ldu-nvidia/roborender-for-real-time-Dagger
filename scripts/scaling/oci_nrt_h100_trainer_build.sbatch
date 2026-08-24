@@ -124,8 +124,9 @@ PY
 /isaac-sim/python.sh -m venv --system-site-packages /opt/viral-h100
 PY=/opt/viral-h100/bin/python
 install -m 0444 "$ROOT/containers/h100/trainer-constraints.txt" "$PIP_CONSTRAINT"
-"$PY" -m pip install --upgrade pip setuptools "wheel==0.45.1" \
-    poetry-core "flatdict==4.0.1" "packaging==23.2"
+"$PY" -m pip install --upgrade pip==26.1.2 setuptools==80.9.0 \
+    "wheel==0.45.1" poetry-core "packaging==23.2"
+"$PY" -m pip install --no-build-isolation "flatdict==4.0.1"
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 source /isaac-sim/setup_python_env.sh
 "$PY" - <<'PY'
