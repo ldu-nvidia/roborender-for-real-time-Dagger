@@ -1205,6 +1205,7 @@ def build_environment(
     *,
     sealed_source_root: str,
     sealed_source_inventory_sha256: str,
+    learner_contract_sha256: str,
 ) -> dict[str, str]:
     artifact = campaign_contract["artifacts"]
     runtime = campaign_contract["actor_runtime"]
@@ -1273,6 +1274,9 @@ def build_environment(
         "ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256": sealed_source_inventory_sha256,
         "ROUND_DAGGER_REMOTE_CONTAINER": container["path"],
         "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": container["sha256"],
+        "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": _require_sha(
+            learner_contract_sha256, "learner deployment contract SHA-256"
+        ),
         "ROUND_DAGGER_REMOTE_HANDOFF_ROOT": handoff["local_root"],
         "ROUND_DAGGER_REMOTE_POLL_SECONDS": str(handoff["poll_seconds"]),
         "ROUND_DAGGER_REMOTE_MAX_ATTEMPTS": str(handoff["maximum_attempts"]),
@@ -1323,6 +1327,7 @@ def validate_launch(
         learner_contract,
         sealed_source_root=sealed_source_root,
         sealed_source_inventory_sha256=sealed_source_inventory_sha256,
+        learner_contract_sha256=learner_deployment_contract_sha,
     )
     environment["ROUND_DAGGER_LAUNCH_ORCHESTRATION_SHA256"] = orchestration_sha
     if artifacts.sha256_file(campaign_contract_path) != campaign_contract_sha:

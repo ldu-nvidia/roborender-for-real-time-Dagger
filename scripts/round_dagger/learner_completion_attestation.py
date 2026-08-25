@@ -31,15 +31,19 @@ from round_dagger.artifacts import (  # noqa: E402
     publish_immutable_json,
     sha256_file,
 )
+from round_dagger.learner_identity import (  # noqa: E402
+    learner_identity_sha256 as compute_learner_identity_sha256,
+    learner_wandb_run_id,
+)
 from round_dagger.policy_bundle import validate_policy_bundle_identity  # noqa: E402
 from round_dagger.replay import load_snapshot  # noqa: E402
 from scripts.round_dagger import remote_learner_success  # noqa: E402
 
 
-SCHEMA = "fast_roborender.round_dagger.learner_completion.v1"
-READBACK_SCHEMA = "fast_roborender.round_dagger.learner_wandb_readback.v2"
+SCHEMA = "fast_roborender.round_dagger.learner_completion.v2"
+READBACK_SCHEMA = "fast_roborender.round_dagger.learner_wandb_readback.v3"
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
-CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v1"
+CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v2"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -61,7 +65,11 @@ ATTESTATION_KEYS = {
     "macro_round",
     "code_sha256",
     "learner_config_sha256",
+    "learner_contract_sha256",
+    "learner_identity_sha256",
     "model_lineage_sha256",
+    "parent_runtime_policy_sha256",
+    "runtime_container_sha256",
     "runtime_policy_sha256",
     "replay_snapshot_file_sha256",
     "replay_snapshot_sha256",
@@ -108,15 +116,6 @@ def _output_file(output: Path, name: str, label: str) -> Path:
 
 def _artifact(path: Path) -> dict[str, str]:
     return {"path": path.name, "sha256": sha256_file(path)}
-
-
-def _expected_wandb_run_id(
-    campaign_id: str, macro_round: int, snapshot_sha256: str
-) -> str:
-    return (
-        f"{campaign_id}-learner-m{macro_round:06d}-"
-        f"s{_sha(snapshot_sha256, 'snapshot SHA-256')[:12]}"
-    )
 
 
 def _telemetry_records(
@@ -203,8 +202,13 @@ def _wandb_readback(
     telemetry: dict[int, dict[str, Any]],
     campaign_id: str,
     macro_round: int,
+    code_sha256: str,
     config_sha256: str,
+    learner_identity_sha256: str,
     parent_sha256: str,
+    parent_runtime_policy_sha256: str,
+    runtime_container_sha256: str,
+    learner_contract_sha256: str,
     snapshot_file_sha256: str,
     snapshot_sha256: str,
     entity: str,
@@ -240,10 +244,23 @@ def _wandb_readback(
                 raise CompletionAttestationError("W&B campaign identity mismatch")
             if config.get("macro_round") != macro_round:
                 raise CompletionAttestationError("W&B macro-round identity mismatch")
+            if config.get("learner_code_sha256") != code_sha256:
+                raise CompletionAttestationError("W&B learner code identity mismatch")
             if config.get("learner_config_sha256") != config_sha256:
                 raise CompletionAttestationError("W&B learner config identity mismatch")
+            if config.get("learner_identity_sha256") != learner_identity_sha256:
+                raise CompletionAttestationError("W&B learner identity mismatch")
             if config.get("model_lineage_sha256") != parent_sha256:
                 raise CompletionAttestationError("W&B model lineage mismatch")
+            if (
+                config.get("parent_runtime_policy_sha256")
+                != parent_runtime_policy_sha256
+            ):
+                raise CompletionAttestationError("W&B parent runtime identity mismatch")
+            if config.get("runtime_container_sha256") != runtime_container_sha256:
+                raise CompletionAttestationError("W&B runtime container identity mismatch")
+            if config.get("learner_contract_sha256") != learner_contract_sha256:
+                raise CompletionAttestationError("W&B learner contract identity mismatch")
             if config.get("replay_snapshot_file_sha256") != snapshot_file_sha256:
                 raise CompletionAttestationError("W&B replay snapshot file identity mismatch")
             if config.get("replay_snapshot_sha256") != snapshot_sha256:
@@ -302,8 +319,13 @@ def _wandb_readback(
         "run_state": state,
         "campaign_id": campaign_id,
         "macro_round": macro_round,
+        "learner_code_sha256": code_sha256,
         "learner_config_sha256": config_sha256,
+        "learner_identity_sha256": learner_identity_sha256,
         "model_lineage_sha256": parent_sha256,
+        "parent_runtime_policy_sha256": parent_runtime_policy_sha256,
+        "runtime_container_sha256": runtime_container_sha256,
+        "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_file_sha256": snapshot_file_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
         "verified_optimizer_steps": len(observed),
@@ -317,8 +339,13 @@ def _validate_readback(
     *,
     campaign_id: str,
     macro_round: int,
+    code_sha256: str,
     config_sha256: str,
+    learner_identity_sha256: str,
     parent_sha256: str,
+    parent_runtime_policy_sha256: str,
+    runtime_container_sha256: str,
+    learner_contract_sha256: str,
     snapshot_file_sha256: str,
     snapshot_sha256: str,
     entity: str,
@@ -339,8 +366,13 @@ def _validate_readback(
         "run_state": "finished",
         "campaign_id": campaign_id,
         "macro_round": macro_round,
+        "learner_code_sha256": code_sha256,
         "learner_config_sha256": config_sha256,
+        "learner_identity_sha256": learner_identity_sha256,
         "model_lineage_sha256": parent_sha256,
+        "parent_runtime_policy_sha256": parent_runtime_policy_sha256,
+        "runtime_container_sha256": runtime_container_sha256,
+        "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_file_sha256": snapshot_file_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
         "verified_optimizer_steps": 500,
@@ -361,6 +393,13 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
     campaign_id = _token(args.campaign_id, "campaign ID")
     code_sha = _sha(args.code_sha256, "code SHA-256")
     config_sha = _sha(args.config_sha256, "learner config SHA-256")
+    contract_sha = _sha(args.learner_contract_sha256, "learner contract SHA-256")
+    container_sha = _sha(
+        args.runtime_container_sha256, "runtime container SHA-256"
+    )
+    provided_identity_sha = _sha(
+        args.learner_identity_sha256, "learner identity SHA-256"
+    )
     parent_sha = _sha(args.parent_sha256, "parent SHA-256")
     snapshot_file_sha = _sha(args.snapshot_file_sha256, "snapshot file SHA-256")
     snapshot_sha = _sha(args.snapshot_sha256, "snapshot semantic SHA-256")
@@ -375,13 +414,6 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         or snapshot["through_macro_round"] != args.macro_round
     ):
         raise CompletionAttestationError("replay snapshot lineage mismatch")
-    if args.wandb_run_id != _expected_wandb_run_id(
-        campaign_id, args.macro_round, snapshot_sha
-    ):
-        raise CompletionAttestationError(
-            "W&B run ID is not bound to the replay snapshot"
-        )
-
     bundle_path = _output_file(output, args.bundle, "learner bundle")
     bundle = LearnerBundleConfig.load(bundle_path)
     if bundle.sha256 != config_sha or sha256_file(bundle_path) != config_sha:
@@ -401,10 +433,35 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         or bundle.partition_seed != 23
     ):
         raise CompletionAttestationError("production learner bundle contract mismatch")
-    _sha(
+    parent_runtime_sha = _sha(
         bundle.to_mapping()["model_config"]["runtime_policy_sha256"],
         "parent runtime policy SHA-256",
     )
+    identity_sha = compute_learner_identity_sha256(
+        campaign_id=campaign_id,
+        macro_round=args.macro_round,
+        learner_code_sha256=code_sha,
+        learner_config_sha256=config_sha,
+        replay_snapshot_file_sha256=snapshot_file_sha,
+        replay_snapshot_sha256=snapshot_sha,
+        parent_checkpoint_sha256=parent_sha,
+        parent_runtime_policy_sha256=parent_runtime_sha,
+        runtime_container_sha256=container_sha,
+        learner_contract_sha256=contract_sha,
+    )
+    if identity_sha != provided_identity_sha:
+        raise CompletionAttestationError(
+            "learner identity SHA-256 does not bind the exact semantic run"
+        )
+    expected_run_id = learner_wandb_run_id(
+        campaign_id=campaign_id,
+        macro_round=args.macro_round,
+        learner_identity_sha256=identity_sha,
+    )
+    if args.wandb_run_id != expected_run_id:
+        raise CompletionAttestationError(
+            "W&B run ID is not bound to the exact learner identity"
+        )
 
     result_path = _output_file(output, args.result, "learner result")
     result = load_strict_json(result_path)
@@ -456,6 +513,9 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "model_lineage_sha256": parent_sha,
         "code_sha256": code_sha,
         "learner_config_sha256": config_sha,
+        "learner_identity_sha256": identity_sha,
+        "runtime_container_sha256": container_sha,
+        "learner_contract_sha256": contract_sha,
         "replay_snapshot_sha256": snapshot_sha,
         "replay_snapshot_file_sha256": snapshot_file_sha,
         "completed_steps": 500,
@@ -485,8 +545,13 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         telemetry=telemetry,
         campaign_id=campaign_id,
         macro_round=args.macro_round,
+        code_sha256=code_sha,
         config_sha256=config_sha,
+        learner_identity_sha256=identity_sha,
         parent_sha256=parent_sha,
+        parent_runtime_policy_sha256=parent_runtime_sha,
+        runtime_container_sha256=container_sha,
+        learner_contract_sha256=contract_sha,
         snapshot_file_sha256=snapshot_file_sha,
         snapshot_sha256=snapshot_sha,
         entity=args.wandb_entity,
@@ -503,8 +568,13 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         load_strict_json(readback_path),
         campaign_id=campaign_id,
         macro_round=args.macro_round,
+        code_sha256=code_sha,
         config_sha256=config_sha,
+        learner_identity_sha256=identity_sha,
         parent_sha256=parent_sha,
+        parent_runtime_policy_sha256=parent_runtime_sha,
+        runtime_container_sha256=container_sha,
+        learner_contract_sha256=contract_sha,
         snapshot_file_sha256=snapshot_file_sha,
         snapshot_sha256=snapshot_sha,
         entity=args.wandb_entity,
@@ -528,7 +598,11 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "macro_round": args.macro_round,
         "code_sha256": code_sha,
         "learner_config_sha256": config_sha,
+        "learner_contract_sha256": contract_sha,
+        "learner_identity_sha256": identity_sha,
         "model_lineage_sha256": parent_sha,
+        "parent_runtime_policy_sha256": parent_runtime_sha,
+        "runtime_container_sha256": container_sha,
         "runtime_policy_sha256": runtime_sha,
         "replay_snapshot_file_sha256": snapshot_file_sha,
         "replay_snapshot_sha256": snapshot_sha,
@@ -564,7 +638,12 @@ def verify_attestation(
     parent_sha256: str,
     snapshot_file_sha256: str,
     snapshot_sha256: str,
+    runtime_container_sha256: str,
+    learner_contract_sha256: str,
+    learner_identity_sha256: str,
 ) -> dict[str, Any]:
+    import torch
+
     path = _regular(attestation, "learner completion attestation")
     if path.stat().st_mode & 0o222:
         raise CompletionAttestationError("completion attestation must be read-only")
@@ -579,7 +658,16 @@ def verify_attestation(
         "macro_round": macro_round,
         "code_sha256": _sha(code_sha256, "code SHA-256"),
         "learner_config_sha256": _sha(config_sha256, "config SHA-256"),
+        "learner_contract_sha256": _sha(
+            learner_contract_sha256, "learner contract SHA-256"
+        ),
+        "learner_identity_sha256": _sha(
+            learner_identity_sha256, "learner identity SHA-256"
+        ),
         "model_lineage_sha256": _sha(parent_sha256, "parent SHA-256"),
+        "runtime_container_sha256": _sha(
+            runtime_container_sha256, "runtime container SHA-256"
+        ),
         "replay_snapshot_file_sha256": _sha(
             snapshot_file_sha256, "snapshot file SHA-256"
         ),
@@ -592,6 +680,10 @@ def verify_attestation(
     if any(document.get(key) != value for key, value in expected.items()):
         raise CompletionAttestationError("completion attestation lineage mismatch")
     _sha(document.get("runtime_policy_sha256"), "runtime policy SHA-256")
+    parent_runtime_sha256 = _sha(
+        document.get("parent_runtime_policy_sha256"),
+        "parent runtime policy SHA-256",
+    )
     artifacts = document.get("artifacts")
     if not isinstance(artifacts, Mapping) or set(artifacts) != set(ARTIFACT_NAMES):
         raise CompletionAttestationError("completion artifact inventory mismatch")
@@ -654,6 +746,55 @@ def verify_attestation(
         or bundle.get("partition_seed") != 23
     ):
         raise CompletionAttestationError("attested production learner pins mismatch")
+    model_config = bundle.get("model_config")
+    if not isinstance(model_config, Mapping):
+        raise CompletionAttestationError("attested learner model config is malformed")
+    bundle_parent_runtime_sha256 = _sha(
+        model_config.get("runtime_policy_sha256"),
+        "bundle parent runtime policy SHA-256",
+    )
+    if bundle_parent_runtime_sha256 != parent_runtime_sha256:
+        raise CompletionAttestationError("attested parent runtime identity mismatch")
+    provided_identity_sha256 = learner_identity_sha256
+    computed_identity_sha256 = compute_learner_identity_sha256(
+        campaign_id=campaign_id,
+        macro_round=macro_round,
+        learner_code_sha256=code_sha256,
+        learner_config_sha256=config_sha256,
+        replay_snapshot_file_sha256=snapshot_file_sha256,
+        replay_snapshot_sha256=snapshot_sha256,
+        parent_checkpoint_sha256=parent_sha256,
+        parent_runtime_policy_sha256=parent_runtime_sha256,
+        runtime_container_sha256=runtime_container_sha256,
+        learner_contract_sha256=learner_contract_sha256,
+    )
+    if computed_identity_sha256 != provided_identity_sha256:
+        raise CompletionAttestationError(
+            "attested learner identity does not bind the exact semantic run"
+        )
+    restart_document = torch.load(
+        resolved["restart"], map_location="cpu", weights_only=False
+    )
+    restart_expected = {
+        "schema": CHECKPOINT_SCHEMA,
+        "campaign_id": campaign_id,
+        "macro_round": macro_round,
+        "model_lineage_sha256": parent_sha256,
+        "code_sha256": code_sha256,
+        "learner_config_sha256": config_sha256,
+        "learner_identity_sha256": provided_identity_sha256,
+        "runtime_container_sha256": runtime_container_sha256,
+        "learner_contract_sha256": learner_contract_sha256,
+        "replay_snapshot_sha256": snapshot_sha256,
+        "replay_snapshot_file_sha256": snapshot_file_sha256,
+        "completed_steps": 500,
+        "world_size": 8,
+    }
+    if not isinstance(restart_document, Mapping) or any(
+        restart_document.get(key) != value
+        for key, value in restart_expected.items()
+    ):
+        raise CompletionAttestationError("attested restart semantic identity mismatch")
     wandb = document.get("wandb")
     if not isinstance(wandb, Mapping) or set(wandb) != {
         "entity", "project", "run_id", "run_state", "verified_optimizer_steps"
@@ -666,15 +807,24 @@ def verify_attestation(
         or TOKEN_RE.fullmatch(str(wandb.get("project", ""))) is None
         or TOKEN_RE.fullmatch(str(wandb.get("run_id", ""))) is None
         or wandb.get("run_id")
-        != _expected_wandb_run_id(campaign_id, macro_round, snapshot_sha256)
+        != learner_wandb_run_id(
+            campaign_id=campaign_id,
+            macro_round=macro_round,
+            learner_identity_sha256=provided_identity_sha256,
+        )
     ):
         raise CompletionAttestationError("W&B completion summary mismatch")
     _validate_readback(
         load_strict_json(resolved["wandb_readback"]),
         campaign_id=campaign_id,
         macro_round=macro_round,
+        code_sha256=code_sha256,
         config_sha256=config_sha256,
+        learner_identity_sha256=provided_identity_sha256,
         parent_sha256=parent_sha256,
+        parent_runtime_policy_sha256=parent_runtime_sha256,
+        runtime_container_sha256=runtime_container_sha256,
+        learner_contract_sha256=learner_contract_sha256,
         snapshot_file_sha256=snapshot_file_sha256,
         snapshot_sha256=snapshot_sha256,
         entity=str(wandb["entity"]),
@@ -694,6 +844,9 @@ def _common(command: argparse.ArgumentParser) -> None:
     command.add_argument("--parent-sha256", required=True)
     command.add_argument("--snapshot-file-sha256", required=True)
     command.add_argument("--snapshot-sha256", required=True)
+    command.add_argument("--runtime-container-sha256", required=True)
+    command.add_argument("--learner-contract-sha256", required=True)
+    command.add_argument("--learner-identity-sha256", required=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -736,6 +889,9 @@ def main(argv: list[str] | None = None) -> int:
             parent_sha256=args.parent_sha256,
             snapshot_file_sha256=args.snapshot_file_sha256,
             snapshot_sha256=args.snapshot_sha256,
+            runtime_container_sha256=args.runtime_container_sha256,
+            learner_contract_sha256=args.learner_contract_sha256,
+            learner_identity_sha256=args.learner_identity_sha256,
         )
         if args.command == "adopt":
             remote_learner_success.publish(
@@ -746,6 +902,7 @@ def main(argv: list[str] | None = None) -> int:
                 macro_round=args.macro_round,
                 learner_code_sha256=args.code_sha256,
                 learner_config_sha256=args.config_sha256,
+                learner_identity_sha256=args.learner_identity_sha256,
             )
     print(json.dumps(document, sort_keys=True, separators=(",", ":")))
     return 0

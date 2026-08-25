@@ -79,7 +79,10 @@ COMPLETION_ATTESTATION="$OUTPUT/learner_completion_round_${ROUND_PADDED}.json"
     --config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
     --parent-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
     --snapshot-file-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
-    --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" >/dev/null
+    --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" \
+    --runtime-container-sha256 "$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
+    --learner-contract-sha256 "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" \
+    --learner-identity-sha256 "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256" >/dev/null
 "$PYTHON" "$ROOT/scripts/round_dagger/remote_learner_success.py" verify \
     --marker "$SUCCESS_MARKER" \
     --result "$ROUND_DAGGER_LEARNER_RESULT" \
@@ -87,5 +90,6 @@ COMPLETION_ATTESTATION="$OUTPUT/learner_completion_round_${ROUND_PADDED}.json"
     --campaign-id "$ROUND_DAGGER_CAMPAIGN_ID" \
     --macro-round "$ROUND_DAGGER_MACRO_ROUND" \
     --learner-code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
-    --learner-config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" >/dev/null
+    --learner-config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
+    --learner-identity-sha256 "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256" >/dev/null
 echo "OCI_NRT_CONTAINER_COMPLETION_ADOPTED marker=$SUCCESS_MARKER"

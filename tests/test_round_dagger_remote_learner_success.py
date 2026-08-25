@@ -21,6 +21,7 @@ class RemoteLearnerSuccessTest(unittest.TestCase):
                 "macro_round": 0,
                 "learner_code_sha256": "1" * 64,
                 "learner_config_sha256": "2" * 64,
+                "learner_identity_sha256": "3" * 64,
             }
             first = success.publish(marker, result, attestation, **arguments)
             self.assertEqual(success.publish(marker, result, attestation, **arguments), first)
@@ -40,6 +41,7 @@ class RemoteLearnerSuccessTest(unittest.TestCase):
                 "macro_round": 0,
                 "learner_code_sha256": "1" * 64,
                 "learner_config_sha256": "2" * 64,
+                "learner_identity_sha256": "3" * 64,
             }
             success.publish(marker, result, attestation, **arguments)
             result.write_bytes(b"changed")
@@ -65,6 +67,7 @@ class RemoteLearnerSuccessTest(unittest.TestCase):
                 "macro_round": 0,
                 "learner_code_sha256": "1" * 64,
                 "learner_config_sha256": "2" * 64,
+                "learner_identity_sha256": "3" * 64,
             }
             success.publish(marker, result, attestation, **arguments)
             marker.chmod(0o644)

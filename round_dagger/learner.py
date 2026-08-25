@@ -50,7 +50,7 @@ from round_dagger.replay import load_snapshot
 
 
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
-CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v1"
+CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v2"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -918,6 +918,9 @@ def _checkpoint_document(
     initial_loss: float,
     rng_states: Sequence[Mapping[str, Any]],
     world_size: int,
+    learner_identity_sha256: str | None,
+    runtime_container_sha256: str | None,
+    learner_contract_sha256: str | None,
 ) -> dict[str, Any]:
     policy = _unwrap_model(model)
     policy_state = policy.state_dict()
@@ -934,6 +937,9 @@ def _checkpoint_document(
         "model_lineage_sha256": config.model_lineage_sha256,
         "code_sha256": config.code_sha256,
         "learner_config_sha256": config.sha256,
+        "learner_identity_sha256": learner_identity_sha256,
+        "runtime_container_sha256": runtime_container_sha256,
+        "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_sha256": snapshot["snapshot_sha256"],
         "replay_snapshot_file_sha256": snapshot["file_sha256"],
         "completed_steps": completed_steps,
@@ -960,6 +966,9 @@ def _load_restart(
     snapshot: Mapping[str, Any],
     rank: int,
     world_size: int,
+    learner_identity_sha256: str | None,
+    runtime_container_sha256: str | None,
+    learner_contract_sha256: str | None,
 ) -> tuple[int, float]:
     if path.is_symlink() or not path.is_file():
         raise LearnerError("restart checkpoint must be a regular non-symlink file")
@@ -978,6 +987,9 @@ def _load_restart(
         "model_lineage_sha256": config.model_lineage_sha256,
         "code_sha256": config.code_sha256,
         "learner_config_sha256": config.sha256,
+        "learner_identity_sha256": learner_identity_sha256,
+        "runtime_container_sha256": runtime_container_sha256,
+        "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_sha256": snapshot["snapshot_sha256"],
         "replay_snapshot_file_sha256": snapshot["file_sha256"],
         "world_size": world_size,
@@ -1137,11 +1149,33 @@ def train_from_replay(
     save_every: int = 100,
     telemetry: JsonlTelemetry | None = None,
     validation_stop_at_step: int | None = None,
+    learner_identity_sha256: str | None = None,
+    runtime_container_sha256: str | None = None,
+    learner_contract_sha256: str | None = None,
 ) -> TrainResult:
     """Run supervised DAgger updates over one immutable cumulative snapshot."""
 
     max_steps = _true_int(max_steps, "max_steps", minimum=1)
     save_every = _true_int(save_every, "save_every", minimum=1)
+    semantic_identity = (
+        learner_identity_sha256,
+        runtime_container_sha256,
+        learner_contract_sha256,
+    )
+    if any(value is None for value in semantic_identity) and any(
+        value is not None for value in semantic_identity
+    ):
+        raise LearnerError("restart semantic identity fields are incomplete")
+    if all(value is not None for value in semantic_identity):
+        learner_identity_sha256 = _require_sha256(
+            learner_identity_sha256, "learner identity SHA-256"
+        )
+        runtime_container_sha256 = _require_sha256(
+            runtime_container_sha256, "runtime container SHA-256"
+        )
+        learner_contract_sha256 = _require_sha256(
+            learner_contract_sha256, "learner contract SHA-256"
+        )
     if validation_stop_at_step is not None:
         validation_stop_at_step = _true_int(
             validation_stop_at_step, "validation_stop_at_step", minimum=1
@@ -1195,6 +1229,9 @@ def train_from_replay(
             snapshot=partition.snapshot,
             rank=rank,
             world_size=world_size,
+            learner_identity_sha256=learner_identity_sha256,
+            runtime_container_sha256=runtime_container_sha256,
+            learner_contract_sha256=learner_contract_sha256,
         )
     if completed_steps > max_steps:
         raise LearnerError("restart completed_steps exceeds requested max_steps")
@@ -1280,6 +1317,9 @@ def train_from_replay(
                         initial_loss=first_loss,
                         rng_states=gathered_rng_states,
                         world_size=world_size,
+                        learner_identity_sha256=learner_identity_sha256,
+                        runtime_container_sha256=runtime_container_sha256,
+                        learner_contract_sha256=learner_contract_sha256,
                     ),
                 )
             saved_at_step = completed_steps
@@ -1304,6 +1344,9 @@ def train_from_replay(
                     initial_loss=first_loss,
                     rng_states=gathered_rng_states,
                     world_size=world_size,
+                    learner_identity_sha256=learner_identity_sha256,
+                    runtime_container_sha256=runtime_container_sha256,
+                    learner_contract_sha256=learner_contract_sha256,
                 ),
             )
         if world_size > 1:

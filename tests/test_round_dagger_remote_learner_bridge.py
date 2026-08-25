@@ -8,6 +8,10 @@ import unittest
 from pathlib import Path
 
 from round_dagger import artifacts
+from round_dagger.learner_identity import (
+    learner_identity_sha256,
+    learner_wandb_run_id,
+)
 from scripts.round_dagger import remote_campaign_transfer as transfer
 from tests.policy_bundle_helpers import publish_policy_bundle
 
@@ -19,6 +23,40 @@ CONTAINER_WRAPPER = ROOT / "scripts/round_dagger/run_oci_nrt_learner_container.s
 
 
 class RemoteLearnerBridgeContractTest(unittest.TestCase):
+    @staticmethod
+    def _bind_identity(environment: dict[str, str]) -> dict[str, str]:
+        identity = learner_identity_sha256(
+            campaign_id=environment["ROUND_DAGGER_CAMPAIGN_ID"],
+            macro_round=int(environment["ROUND_DAGGER_MACRO_ROUND"]),
+            learner_code_sha256=environment["ROUND_DAGGER_LEARNER_CODE_SHA256"],
+            learner_config_sha256=environment[
+                "ROUND_DAGGER_LEARNER_CONFIG_SHA256"
+            ],
+            replay_snapshot_file_sha256=environment[
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256"
+            ],
+            replay_snapshot_sha256=environment[
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256"
+            ],
+            parent_checkpoint_sha256=environment["ROUND_DAGGER_POLICY_SHA256"],
+            parent_runtime_policy_sha256=environment[
+                "ROUND_DAGGER_RUNTIME_POLICY_SHA256"
+            ],
+            runtime_container_sha256=environment[
+                "ROUND_DAGGER_REMOTE_CONTAINER_SHA256"
+            ],
+            learner_contract_sha256=environment[
+                "ROUND_DAGGER_LEARNER_CONTRACT_SHA256"
+            ],
+        )
+        environment["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"] = identity
+        environment["ROUND_DAGGER_WANDB_RUN_ID"] = learner_wandb_run_id(
+            campaign_id=environment["ROUND_DAGGER_CAMPAIGN_ID"],
+            macro_round=int(environment["ROUND_DAGGER_MACRO_ROUND"]),
+            learner_identity_sha256=identity,
+        )
+        return environment
+
     def _fixture(self, root: Path) -> tuple[dict[str, str], Path]:
         campaign = root / "campaign"
         policy_dir = campaign / "policies/policy_000000"
@@ -62,6 +100,8 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             ),
             "ROUND_DAGGER_LEARNER_CODE_SHA256": "4" * 64,
             "ROUND_DAGGER_LEARNER_CONFIG_SHA256": "5" * 64,
+            "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": "6" * 64,
+            "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": "7" * 64,
             "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": checkpoint_sha,
             "ROUND_DAGGER_BASE_POLICY_SPEC": str(spec),
             "ROUND_DAGGER_TARGET_ENVIRONMENTS": "256",
@@ -70,7 +110,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
             "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "76800",
         }
-        return environment, root / "handoff"
+        return self._bind_identity(environment), root / "handoff"
 
     def _run(self, environment: dict[str, str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -114,7 +154,75 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             )
             completed = self._run(bad_wandb_run, cwd=root)
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("not bound to the replay snapshot", completed.stderr)
+            self.assertIn(
+                "not bound to the exact learner identity",
+                completed.stderr,
+            )
+
+    def test_maximum_campaign_token_keeps_wandb_run_id_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment, _ = self._fixture(root)
+            environment["ROUND_DAGGER_CAMPAIGN_ID"] = "c" * 128
+            self._bind_identity(environment)
+            completed = self._run(environment, cwd=root)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            run_id = environment["ROUND_DAGGER_WANDB_RUN_ID"]
+            self.assertLessEqual(len(run_id), 128)
+            self.assertIn(f"wandb_run_id={run_id}", completed.stdout)
+
+    def test_identity_namespaces_do_not_collide_and_identical_retry_resumes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, handoff_root = self._fixture(root)
+            second = self._bind_identity(
+                dict(first, ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256="8" * 64)
+            )
+            third = self._bind_identity(
+                dict(first, ROUND_DAGGER_REMOTE_CONTAINER_SHA256="9" * 64)
+            )
+
+            first_run = self._run(first, cwd=root)
+            identical_retry = self._run(first, cwd=root)
+            second_run = self._run(second, cwd=root)
+            third_run = self._run(third, cwd=root)
+            for completed in (first_run, identical_retry, second_run, third_run):
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            first_identity = first["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"]
+            second_identity = second["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"]
+            third_identity = third["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"]
+            first_handoff = (
+                handoff_root
+                / "bridge-contract/macro_round_000000"
+                / f"identity_{first_identity}"
+            )
+            second_handoff = (
+                handoff_root
+                / "bridge-contract/macro_round_000000"
+                / f"identity_{second_identity}"
+            )
+            self.assertIn(f"identity={first_identity}", first_run.stdout)
+            self.assertIn(f"local_handoff={first_handoff}", first_run.stdout)
+            self.assertIn(
+                f"wandb_run_id=rrd-m000000-id{first_identity}",
+                first_run.stdout,
+            )
+            self.assertIn(f"job_name=rr-rd-{first_identity}", first_run.stdout)
+            self.assertIn(f"identity={second_identity}", second_run.stdout)
+            self.assertIn(f"local_handoff={second_handoff}", second_run.stdout)
+            self.assertIn(
+                f"wandb_run_id=rrd-m000000-id{second_identity}",
+                second_run.stdout,
+            )
+            self.assertEqual(first_run.stdout, identical_retry.stdout)
+            self.assertNotEqual(first_handoff, second_handoff)
+            self.assertNotEqual(second_identity, third_identity)
+            self.assertNotEqual(first_identity, third_identity)
+            self.assertIn(f"identity={third_identity}", third_run.stdout)
+            self.assertFalse(handoff_root.exists())
 
     def test_scripts_pin_restart_security_and_topology_contracts(self) -> None:
         bridge = BRIDGE.read_text(encoding="utf-8")
@@ -180,9 +288,11 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn("ROUND_DAGGER_CONTAINER_SUCCESS_MARKER", batch)
         self.assertIn('"256:4:64:300:76800"', bridge)
         self.assertIn('"256:4:64:300:76800"', batch)
-        self.assertIn(
-            '-s${ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256:0:12}', bridge
-        )
+        self.assertIn("LEARNER_NAMESPACE=identity_", bridge)
+        self.assertIn('JOB_NAME="rr-rd-${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"', bridge)
+        self.assertIn("learner_run_identity.v2", bridge)
+        self.assertIn("runtime_container_sha256=", bridge)
+        self.assertIn("learner_contract_sha256=", bridge)
 
     def test_container_launcher_supports_idempotent_finalization_recovery(self) -> None:
         launcher = (
@@ -284,6 +394,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
                 ),
                 "ROUND_DAGGER_LEARNER_CODE_SHA256": "a" * 64,
                 "ROUND_DAGGER_LEARNER_CONFIG_SHA256": "e" * 64,
+                "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": "f" * 64,
                 "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": artifacts.sha256_file(
                     checkpoint
                 ),
@@ -297,7 +408,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
                 "ROUND_DAGGER_LEARNER_PARTITION_SEED": "23",
                 "ROUND_DAGGER_WANDB_PROJECT": "roborender-round-dagger",
                 "ROUND_DAGGER_WANDB_ENTITY": "nvidia",
-                "ROUND_DAGGER_WANDB_RUN_ID": "bare-host-run",
+                "ROUND_DAGGER_WANDB_RUN_ID": "pending-identity",
                 "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": "ldu@nvidia.com",
                 "ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE": "team",
                 "ROUND_DAGGER_REMOTE_SUCCESS_MARKER": str(
@@ -309,6 +420,26 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
                 "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
                 "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "76800",
             }
+            self._bind_identity(environment)
+            identity = environment["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"]
+            identity_root = root / f"identity_{identity}"
+            identity_root.mkdir()
+            identity_campaign = identity_root / "campaign_input"
+            remote_campaign.rename(identity_campaign)
+            identity_inventory = identity_root / "campaign_input.inventory.json"
+            inventory.rename(identity_inventory)
+            identity_output = identity_root / "learner_output"
+            identity_job = identity_root / "job"
+            environment.update(
+                ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT=str(identity_campaign),
+                ROUND_DAGGER_REMOTE_CAMPAIGN_INVENTORY=str(identity_inventory),
+                ROUND_DAGGER_REMOTE_LEARNER_OUTPUT=str(identity_output),
+                ROUND_DAGGER_REMOTE_JOB_ROOT=str(identity_job),
+                ROUND_DAGGER_REMOTE_SUCCESS_MARKER=str(
+                    identity_job / "learner_success.json"
+                ),
+                SLURM_JOB_NAME=f"rr-rd-{identity}",
+            )
             readonly_directories = [source_tools, source]
             for path in source.rglob("*"):
                 path.chmod(0o555 if path.is_dir() else 0o444)
@@ -324,6 +455,31 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
                     timeout=30,
                     check=False,
                 )
+                missing_identity = dict(environment)
+                missing_identity.pop("ROUND_DAGGER_LEARNER_IDENTITY_SHA256")
+                omitted = subprocess.run(
+                    ["bash", str(batch)],
+                    cwd=root,
+                    env=missing_identity,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                    check=False,
+                )
+                tampered_identity = dict(
+                    environment, ROUND_DAGGER_LEARNER_IDENTITY_SHA256="0" * 64
+                )
+                tampered = subprocess.run(
+                    ["bash", str(batch)],
+                    cwd=root,
+                    env=tampered_identity,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                    check=False,
+                )
             finally:
                 for directory in readonly_directories:
                     directory.chmod(0o755)
@@ -331,6 +487,10 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             self.assertIn("HOST_DRY_RUN_OK", completed.stdout)
             self.assertIn("host_python=unused", completed.stdout)
             self.assertFalse(invoked.exists(), "bare host Python was unexpectedly invoked")
+            self.assertNotEqual(omitted.returncode, 0)
+            self.assertIn("missing required environment", omitted.stderr)
+            self.assertNotEqual(tampered.returncode, 0)
+            self.assertIn("exact semantic run", tampered.stderr)
 
     def test_local_projection_filters_mutable_state_before_inventory(self) -> None:
         bridge = BRIDGE.read_text(encoding="utf-8")

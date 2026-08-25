@@ -314,7 +314,7 @@ class H100ValidationAttestationTest(unittest.TestCase):
     def _checkpoint(self, path: Path, steps: int) -> None:
         torch.save(
             {
-                "schema": "fast_roborender.round_dagger.learner_checkpoint.v1",
+                "schema": "fast_roborender.round_dagger.learner_checkpoint.v2",
                 "completed_steps": steps,
                 "world_size": 8,
                 "rng_states": [{} for _ in range(8)],

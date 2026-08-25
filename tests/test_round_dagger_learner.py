@@ -698,6 +698,41 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
                 resume_from=partial.restart_checkpoint,
             )
 
+    def test_resume_rejects_identity_container_or_contract_drift(self):
+        identity = "a" * 64
+        container = "b" * 64
+        contract = "c" * 64
+        partial = train_from_replay(
+            TinyPolicy(),
+            snapshot_path=self.snapshot_path,
+            config=_config(),
+            output_dir=self.root / "semantic-restart",
+            max_steps=2,
+            save_every=2,
+            learner_identity_sha256=identity,
+            runtime_container_sha256=container,
+            learner_contract_sha256=contract,
+        )
+        for field, values in {
+            "learner_identity_sha256": ("d" * 64, container, contract),
+            "runtime_container_sha256": (identity, "e" * 64, contract),
+            "learner_contract_sha256": (identity, container, "f" * 64),
+        }.items():
+            with self.subTest(field=field), self.assertRaisesRegex(
+                LearnerError, field
+            ):
+                train_from_replay(
+                    TinyPolicy(),
+                    snapshot_path=self.snapshot_path,
+                    config=_config(),
+                    output_dir=self.root / f"semantic-restart-{field}",
+                    max_steps=3,
+                    resume_from=partial.restart_checkpoint,
+                    learner_identity_sha256=values[0],
+                    runtime_container_sha256=values[1],
+                    learner_contract_sha256=values[2],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

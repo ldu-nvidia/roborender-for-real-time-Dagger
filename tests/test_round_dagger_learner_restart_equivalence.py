@@ -43,7 +43,7 @@ class RestartEquivalenceGateTest(unittest.TestCase):
         state = {"linear.weight": torch.tensor([[weight]], dtype=torch.float32)}
         torch.save(
             {
-                "schema": "fast_roborender.round_dagger.learner_checkpoint.v1",
+                "schema": "fast_roborender.round_dagger.learner_checkpoint.v2",
                 "checkpoint_schema": "gr00t.trl.full_state.v2",
                 "policy_state_dict": state,
                 "policy_parameter_names": ["linear.weight"],
@@ -52,6 +52,9 @@ class RestartEquivalenceGateTest(unittest.TestCase):
                 "model_lineage_sha256": "1" * 64,
                 "code_sha256": "2" * 64,
                 "learner_config_sha256": "3" * 64,
+                "learner_identity_sha256": None,
+                "runtime_container_sha256": None,
+                "learner_contract_sha256": None,
                 "replay_snapshot_sha256": "4" * 64,
                 "replay_snapshot_file_sha256": "5" * 64,
                 "completed_steps": 2,

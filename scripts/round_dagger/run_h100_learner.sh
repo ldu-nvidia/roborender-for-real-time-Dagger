@@ -16,7 +16,8 @@ required=(
     ROUND_DAGGER_REPLAY_SNAPSHOT ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256
     ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256 ROUND_DAGGER_LEARNER_OUTPUT_DIR
     ROUND_DAGGER_LEARNER_RESULT ROUND_DAGGER_LEARNER_CODE_SHA256
-    ROUND_DAGGER_LEARNER_CONFIG_SHA256
+    ROUND_DAGGER_LEARNER_CONFIG_SHA256 ROUND_DAGGER_LEARNER_CONTRACT_SHA256
+    ROUND_DAGGER_LEARNER_IDENTITY_SHA256 ROUND_DAGGER_REMOTE_CONTAINER_SHA256
     ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256
     ROUND_DAGGER_BASE_POLICY_SPEC ROUND_DAGGER_LEARNER_BATCH_SIZE
     ROUND_DAGGER_LEARNER_MAX_STEPS ROUND_DAGGER_LEARNER_SAVE_EVERY
@@ -25,6 +26,15 @@ required=(
 )
 for name in "${required[@]}"; do
     [[ -n ${!name:-} ]] || fatal "missing required environment: $name"
+done
+for name in ROUND_DAGGER_POLICY_SHA256 ROUND_DAGGER_RUNTIME_POLICY_SHA256 \
+            ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256 \
+            ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256 ROUND_DAGGER_LEARNER_CODE_SHA256 \
+            ROUND_DAGGER_LEARNER_CONFIG_SHA256 \
+            ROUND_DAGGER_LEARNER_CONTRACT_SHA256 \
+            ROUND_DAGGER_LEARNER_IDENTITY_SHA256 \
+            ROUND_DAGGER_REMOTE_CONTAINER_SHA256; do
+    [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
 [[ -n $H100_PYTHON ]] || fatal "set ROUND_DAGGER_H100_PYTHON"
 [[ $H100_PYTHON == /* && -x $H100_PYTHON ]] || \
@@ -101,6 +111,26 @@ done
     fatal "transitions per macro-round must be 76800"
 
 printf -v ROUND_PADDED '%06d' "$((10#$ROUND_DAGGER_MACRO_ROUND))"
+ROUND_DECIMAL=$((10#$ROUND_DAGGER_MACRO_ROUND))
+EXPECTED_LEARNER_IDENTITY_SHA256=$(
+    printf '%s\n' \
+        'fast_roborender.round_dagger.learner_run_identity.v2' \
+        "campaign_id=$ROUND_DAGGER_CAMPAIGN_ID" \
+        "macro_round=$ROUND_DECIMAL" \
+        "learner_code_sha256=$ROUND_DAGGER_LEARNER_CODE_SHA256" \
+        "learner_config_sha256=$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
+        "replay_snapshot_file_sha256=$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
+        "replay_snapshot_sha256=$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" \
+        "parent_checkpoint_sha256=$ROUND_DAGGER_POLICY_SHA256" \
+        "parent_runtime_policy_sha256=$ROUND_DAGGER_RUNTIME_POLICY_SHA256" \
+        "runtime_container_sha256=$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
+        "learner_contract_sha256=$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" | \
+        sha256sum | awk '{print $1}'
+)
+[[ $ROUND_DAGGER_LEARNER_IDENTITY_SHA256 =~ ^[0-9a-f]{64}$ && \
+   $ROUND_DAGGER_LEARNER_IDENTITY_SHA256 == \
+   "$EXPECTED_LEARNER_IDENTITY_SHA256" ]] || \
+    fatal "learner identity SHA-256 does not bind the exact semantic run"
 BUNDLE="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/learner_bundle_round_${ROUND_PADDED}.json"
 EXPECTED_RESULT="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/learner_result_round_${ROUND_PADDED}.json"
 [[ $ROUND_DAGGER_LEARNER_RESULT == "$EXPECTED_RESULT" ]] || \
@@ -182,7 +212,10 @@ RESUME_PATH=$("$H100_PYTHON" - \
     "$ROUND_DAGGER_LEARNER_MAX_STEPS" "$RESTART" \
     "$ROUND_DAGGER_POLICY_SHA256" "$ROUND_DAGGER_RUNTIME_POLICY_SHA256" \
     "$ROUND_DAGGER_LEARNER_PARTITION_SEED" \
-    "$ROUND_DAGGER_BASE_POLICY_SPEC" <<'PY'
+    "$ROUND_DAGGER_BASE_POLICY_SPEC" \
+    "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256" \
+    "$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
+    "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" <<'PY'
 import math
 import sys
 from collections.abc import Mapping, Sequence
@@ -202,6 +235,7 @@ from round_dagger.replay import load_snapshot
     snapshot_file_sha, snapshot_semantic_sha, campaign_id, macro_round,
     world_size, max_steps, restart_path, parent_policy_sha,
     runtime_policy_sha, partition_seed, base_policy_spec_path,
+    learner_identity_sha, runtime_container_sha, learner_contract_sha,
 ) = sys.argv[1:]
 dry_run = dry_run == "1"
 macro_round = int(macro_round)
@@ -315,6 +349,9 @@ expected = {
     "model_lineage_sha256": bundle.model_lineage_sha256,
     "code_sha256": bundle.code_sha256,
     "learner_config_sha256": bundle.sha256,
+    "learner_identity_sha256": learner_identity_sha,
+    "runtime_container_sha256": runtime_container_sha,
+    "learner_contract_sha256": learner_contract_sha,
     "replay_snapshot_sha256": snapshot_semantic_sha,
     "replay_snapshot_file_sha256": snapshot_file_sha,
     "world_size": world_size,
@@ -356,6 +393,9 @@ COMMAND=(
     --adapter-factory round_dagger.gr00t_policy:vision_actor_obj_pred_adapter_factory
     --initial-checkpoint "$ROUND_DAGGER_POLICY_CHECKPOINT"
     --expected-snapshot-file-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256"
+    --learner-identity-sha256 "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256"
+    --runtime-container-sha256 "$ROUND_DAGGER_REMOTE_CONTAINER_SHA256"
+    --learner-contract-sha256 "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256"
     --max-steps "$ROUND_DAGGER_LEARNER_MAX_STEPS"
     --save-every "$ROUND_DAGGER_LEARNER_SAVE_EVERY"
     # This is the production GPU learner.  Never silently fall back to a CPU
@@ -372,12 +412,12 @@ WANDB_RUN_ID=${ROUND_DAGGER_WANDB_RUN_ID:-}
 if [[ -n $WANDB_PROJECT ]]; then
     COMMAND+=(--wandb-project "$WANDB_PROJECT")
     [[ -z $WANDB_ENTITY ]] || COMMAND+=(--wandb-entity "$WANDB_ENTITY")
-    EXPECTED_WANDB_RUN_ID="${ROUND_DAGGER_CAMPAIGN_ID}-learner-m${ROUND_PADDED}-s${ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256:0:12}"
+    EXPECTED_WANDB_RUN_ID="rrd-m${ROUND_PADDED}-id${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"
     if [[ -z $WANDB_RUN_ID ]]; then
         WANDB_RUN_ID=$EXPECTED_WANDB_RUN_ID
     fi
     [[ $WANDB_RUN_ID == "$EXPECTED_WANDB_RUN_ID" ]] || \
-        fatal "W&B run ID is not bound to the replay snapshot"
+        fatal "W&B run ID is not bound to the exact learner identity"
     COMMAND+=(--wandb-run-id "$WANDB_RUN_ID")
 elif [[ -n $WANDB_ENTITY || -n $WANDB_RUN_ID ]]; then
     fatal "W&B entity/run ID requires ROUND_DAGGER_WANDB_PROJECT"
@@ -502,7 +542,10 @@ if [[ -e $COMPLETION_ATTESTATION || -L $COMPLETION_ATTESTATION ]]; then
         --config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
         --parent-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
         --snapshot-file-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
-        --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" >/dev/null
+        --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" \
+        --runtime-container-sha256 "$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
+        --learner-contract-sha256 "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" \
+        --learner-identity-sha256 "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256" >/dev/null
     echo "H100_LEARNER_COMPLETE result=$ROUND_DAGGER_LEARNER_RESULT recovered=attested"
     exit 0
 fi
@@ -524,6 +567,9 @@ fi
     --macro-round "$ROUND_DAGGER_MACRO_ROUND" \
     --code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
     --config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
+    --runtime-container-sha256 "$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
+    --learner-contract-sha256 "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" \
+    --learner-identity-sha256 "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256" \
     --wandb-readback "$WANDB_READBACK" \
     --wandb-entity "$WANDB_ENTITY" \
     --wandb-project "$WANDB_PROJECT" \

@@ -16,6 +16,10 @@ from unittest import mock
 import numpy as np
 
 from round_dagger import artifacts, replay
+from round_dagger.learner_identity import (
+    learner_identity_sha256,
+    learner_wandb_run_id,
+)
 from round_dagger.gr00t_policy import (
     BASE_MODULE_TARGET,
     POLICY_TARGET,
@@ -481,9 +485,43 @@ class H100LauncherDryRunTest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    @staticmethod
+    def _bind_identity(environment: dict[str, str]) -> dict[str, str]:
+        identity = learner_identity_sha256(
+            campaign_id=environment["ROUND_DAGGER_CAMPAIGN_ID"],
+            macro_round=int(environment["ROUND_DAGGER_MACRO_ROUND"]),
+            learner_code_sha256=environment["ROUND_DAGGER_LEARNER_CODE_SHA256"],
+            learner_config_sha256=environment[
+                "ROUND_DAGGER_LEARNER_CONFIG_SHA256"
+            ],
+            replay_snapshot_file_sha256=environment[
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256"
+            ],
+            replay_snapshot_sha256=environment[
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256"
+            ],
+            parent_checkpoint_sha256=environment["ROUND_DAGGER_POLICY_SHA256"],
+            parent_runtime_policy_sha256=environment[
+                "ROUND_DAGGER_RUNTIME_POLICY_SHA256"
+            ],
+            runtime_container_sha256=environment[
+                "ROUND_DAGGER_REMOTE_CONTAINER_SHA256"
+            ],
+            learner_contract_sha256=environment[
+                "ROUND_DAGGER_LEARNER_CONTRACT_SHA256"
+            ],
+        )
+        environment["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"] = identity
+        environment["ROUND_DAGGER_WANDB_RUN_ID"] = learner_wandb_run_id(
+            campaign_id=environment["ROUND_DAGGER_CAMPAIGN_ID"],
+            macro_round=int(environment["ROUND_DAGGER_MACRO_ROUND"]),
+            learner_identity_sha256=identity,
+        )
+        return environment
+
     def _environment(self) -> dict[str, str]:
         result_path = self.output / "learner_result_round_000000.json"
-        return {
+        environment = {
             **os.environ,
             "DRY_RUN": "1",
             "ROUND_DAGGER_H100_PYTHON": sys.executable,
@@ -502,6 +540,8 @@ class H100LauncherDryRunTest(unittest.TestCase):
             "ROUND_DAGGER_LEARNER_RESULT": str(result_path),
             "ROUND_DAGGER_LEARNER_CODE_SHA256": self.kwargs["code_sha256"],
             "ROUND_DAGGER_LEARNER_CONFIG_SHA256": self.bundle.sha256,
+            "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": "5" * 64,
+            "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": "6" * 64,
             "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": self.kwargs[
                 "expected_parent_checkpoint_sha256"
             ],
@@ -525,6 +565,7 @@ class H100LauncherDryRunTest(unittest.TestCase):
             "ROUND_DAGGER_WANDB_ENTITY": "entity-test",
             "WANDB_API_KEY": "must-never-appear-in-launch-output",
         }
+        return self._bind_identity(environment)
 
     def _launch(self, environment: dict[str, str] | None = None):
         return subprocess.run(
@@ -573,12 +614,17 @@ class H100LauncherDryRunTest(unittest.TestCase):
         restart = self.output / "restart.pt"
         torch.save(
             {
-                "schema": "fast_roborender.round_dagger.learner_checkpoint.v1",
+                "schema": "fast_roborender.round_dagger.learner_checkpoint.v2",
                 "campaign_id": "production-test",
                 "macro_round": 0,
                 "model_lineage_sha256": self.bundle.model_lineage_sha256,
                 "code_sha256": self.bundle.code_sha256,
                 "learner_config_sha256": self.bundle.sha256,
+                "learner_identity_sha256": self._environment()[
+                    "ROUND_DAGGER_LEARNER_IDENTITY_SHA256"
+                ],
+                "runtime_container_sha256": "6" * 64,
+                "learner_contract_sha256": "5" * 64,
                 "replay_snapshot_sha256": self.snapshot["snapshot_sha256"],
                 "replay_snapshot_file_sha256": self.snapshot["file_sha256"],
                 "world_size": 1,
@@ -619,6 +665,7 @@ class H100LauncherDryRunTest(unittest.TestCase):
             **dict(self.kwargs, runtime_policy_sha256="9" * 64)
         )
         environment["ROUND_DAGGER_LEARNER_CONFIG_SHA256"] = changed.sha256
+        self._bind_identity(environment)
         completed = self._launch(environment)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn(

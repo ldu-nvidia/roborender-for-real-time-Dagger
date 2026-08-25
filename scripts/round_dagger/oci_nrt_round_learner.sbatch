@@ -35,7 +35,8 @@ required=(
     ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256
     ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256 ROUND_DAGGER_LEARNER_OUTPUT_DIR
     ROUND_DAGGER_LEARNER_RESULT ROUND_DAGGER_LEARNER_CODE_SHA256
-    ROUND_DAGGER_LEARNER_CONFIG_SHA256
+    ROUND_DAGGER_LEARNER_CONFIG_SHA256 ROUND_DAGGER_LEARNER_CONTRACT_SHA256
+    ROUND_DAGGER_LEARNER_IDENTITY_SHA256
     ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256
     ROUND_DAGGER_BASE_POLICY_SPEC ROUND_DAGGER_LEARNER_BATCH_SIZE
     ROUND_DAGGER_LEARNER_MAX_STEPS ROUND_DAGGER_LEARNER_SAVE_EVERY
@@ -84,9 +85,51 @@ for name in ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256 \
             ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256 \
             ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256 ROUND_DAGGER_LEARNER_CODE_SHA256 \
             ROUND_DAGGER_LEARNER_CONFIG_SHA256 \
+            ROUND_DAGGER_LEARNER_CONTRACT_SHA256 \
+            ROUND_DAGGER_LEARNER_IDENTITY_SHA256 \
             ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256; do
     [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
+[[ $ROUND_DAGGER_MACRO_ROUND =~ ^[0-9]+$ ]] || fatal "macro round is invalid"
+[[ $ROUND_DAGGER_CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
+    fatal "campaign ID is malformed"
+printf -v ROUND_PADDED '%06d' "$((10#$ROUND_DAGGER_MACRO_ROUND))"
+ROUND_DECIMAL=$((10#$ROUND_DAGGER_MACRO_ROUND))
+EXPECTED_LEARNER_IDENTITY_SHA256=$(
+    printf '%s\n' \
+        'fast_roborender.round_dagger.learner_run_identity.v2' \
+        "campaign_id=$ROUND_DAGGER_CAMPAIGN_ID" \
+        "macro_round=$ROUND_DECIMAL" \
+        "learner_code_sha256=$ROUND_DAGGER_LEARNER_CODE_SHA256" \
+        "learner_config_sha256=$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
+        "replay_snapshot_file_sha256=$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
+        "replay_snapshot_sha256=$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" \
+        "parent_checkpoint_sha256=$ROUND_DAGGER_POLICY_SHA256" \
+        "parent_runtime_policy_sha256=$ROUND_DAGGER_RUNTIME_POLICY_SHA256" \
+        "runtime_container_sha256=$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
+        "learner_contract_sha256=$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" | \
+        sha256sum | awk '{print $1}'
+)
+[[ $ROUND_DAGGER_LEARNER_IDENTITY_SHA256 == \
+   "$EXPECTED_LEARNER_IDENTITY_SHA256" ]] || \
+    fatal "learner identity SHA-256 does not bind the exact semantic run"
+EXPECTED_WANDB_RUN_ID="rrd-m${ROUND_PADDED}-id${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"
+[[ $ROUND_DAGGER_WANDB_RUN_ID == "$EXPECTED_WANDB_RUN_ID" ]] || \
+    fatal "W&B run ID is not bound to the exact learner identity"
+((${#ROUND_DAGGER_WANDB_RUN_ID} <= 128)) || fatal "W&B run ID is too long"
+EXPECTED_JOB_NAME="rr-rd-${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"
+[[ ${SLURM_JOB_NAME:-} == "$EXPECTED_JOB_NAME" ]] || \
+    fatal "Slurm job name is not bound to the exact learner identity"
+IDENTITY_NAMESPACE="identity_${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"
+REMOTE_RUN=${ROUND_DAGGER_REMOTE_JOB_ROOT%/job}
+[[ $REMOTE_RUN != "$ROUND_DAGGER_REMOTE_JOB_ROOT" && \
+   $REMOTE_RUN == */"$IDENTITY_NAMESPACE" ]] || \
+    fatal "remote job root is outside the learner identity namespace"
+[[ $ROUND_DAGGER_REMOTE_LEARNER_OUTPUT == "$REMOTE_RUN/learner_output" && \
+   $ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT == "$REMOTE_RUN/campaign_input" && \
+   $ROUND_DAGGER_REMOTE_CAMPAIGN_INVENTORY == \
+   "$REMOTE_RUN/campaign_input.inventory.json" ]] || \
+    fatal "remote learner paths do not share the exact identity namespace"
 [[ -d $ROUND_DAGGER_REMOTE_SOURCE_ROOT && ! -L $ROUND_DAGGER_REMOTE_SOURCE_ROOT ]] || \
     fatal "sealed source root is missing or unsafe"
 [[ -d $ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT && ! -L $ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT ]] || \
@@ -212,7 +255,6 @@ RESULT_RELATIVE=${ROUND_DAGGER_LEARNER_RESULT#"$ROUND_DAGGER_LEARNER_OUTPUT_DIR"
 [[ -f $ROUND_DAGGER_REMOTE_LEARNER_OUTPUT/$RESULT_RELATIVE && \
    ! -L $ROUND_DAGGER_REMOTE_LEARNER_OUTPUT/$RESULT_RELATIVE ]] || \
     fatal "learner exited without the canonical result"
-printf -v ROUND_PADDED '%06d' "$((10#$ROUND_DAGGER_MACRO_ROUND))"
 COMPLETION_ATTESTATION="$ROUND_DAGGER_REMOTE_LEARNER_OUTPUT/learner_completion_round_${ROUND_PADDED}.json"
 [[ -f $COMPLETION_ATTESTATION && ! -L $COMPLETION_ATTESTATION ]] || \
     fatal "learner exited without the canonical completion attestation"
