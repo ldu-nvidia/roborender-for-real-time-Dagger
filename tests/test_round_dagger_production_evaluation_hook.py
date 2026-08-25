@@ -40,8 +40,20 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.state = load_state(self.root)
         self.campaign = load_campaign(self.root)
 
+        self.teacher_checkpoint = self.tmp / "configured-teacher.pt"
+        self.sealed_teacher = self.tmp / "sealed-teacher.pt"
+        # _campaign pins sha256(b"teacher") as the expert identity.
+        teacher_bytes = b"teacher"
+        self.teacher_checkpoint.write_bytes(teacher_bytes)
+        self.sealed_teacher.write_bytes(teacher_bytes)
+        self.teacher_checkpoint.chmod(0o600)
+        self.sealed_teacher.chmod(0o444)
+        self.teacher_sha = sha256_file(self.teacher_checkpoint)
         self.config = self.tmp / "evaluation_config.yaml"
-        self.config.write_text("fixed_seed: true\n", encoding="utf-8")
+        self.config.write_text(
+            f"teacher_actor_path: {self.teacher_checkpoint}\nfixed_seed: true\n",
+            encoding="utf-8",
+        )
         self.gr00t = self.tmp / "GR00T-VisualSim2Real"
         for relative in (
             "gr00t/rl/eval_agent_trl.py",
@@ -116,6 +128,9 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                 self.repository_root
                 / "configs/round_dagger/production_paired_thresholds.json"
             ),
+            "ROUND_DAGGER_TEACHER_CHECKPOINT": str(self.teacher_checkpoint),
+            "ROUND_DAGGER_TEACHER_SHA256": self.teacher_sha,
+            "ROUND_DAGGER_EVALUATION_SEALED_TEACHER": str(self.sealed_teacher),
             "ROUND_DAGGER_EVALUATION_ENDPOINT_DIR": str(self.endpoints),
             "ROUND_DAGGER_RENDERER_RUNTIME_SHA256": _sha("renderer-runtime"),
             "ROUND_DAGGER_EXPECTED_RENDERERS": "2",
@@ -174,6 +189,29 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.assertIn("--network=host", completed.stdout)
         self.assertIn("device=0", completed.stdout)
         self.assertIn(str(self.result), completed.stdout)
+        self.assertIn("--teacher-checkpoint", completed.stdout)
+        self.assertIn("--teacher-sha256", completed.stdout)
+        self.assertIn("--sealed-teacher-checkpoint", completed.stdout)
+        self.assertIn("--require-teacher-readonly-mount", completed.stdout)
+        teacher_mount = (
+            f"type=bind,src={self.sealed_teacher},"
+            f"dst={self.teacher_checkpoint},readonly"
+        )
+        seal_mount = (
+            f"type=bind,src={self.sealed_teacher},"
+            f"dst={self.sealed_teacher},readonly"
+        )
+        unescaped_stdout = completed.stdout.replace("\\,", ",")
+        self.assertIn(seal_mount, unescaped_stdout)
+        self.assertIn(teacher_mount, unescaped_stdout)
+        self.assertLess(
+            unescaped_stdout.index("type=bind,src=/mnt/data2,dst=/mnt/data2"),
+            unescaped_stdout.index(seal_mount),
+        )
+        self.assertLess(
+            unescaped_stdout.index(seal_mount),
+            unescaped_stdout.index(teacher_mount),
+        )
         self.assertFalse(self.contract.exists())
         self.assertFalse(self.result.exists())
         docker_calls = self.docker_log.read_text(encoding="utf-8").splitlines()
@@ -195,6 +233,30 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.assertIn("--network=host", invocation)
         self.assertIn("run_paired_evaluation.sh", invocation)
         self.assertIn(str(self.result), invocation)
+        teacher_mount = (
+            f"type=bind,src={self.sealed_teacher},"
+            f"dst={self.teacher_checkpoint},readonly"
+        )
+        seal_mount = (
+            f"type=bind,src={self.sealed_teacher},"
+            f"dst={self.sealed_teacher},readonly"
+        )
+        self.assertIn(seal_mount, invocation)
+        self.assertIn(teacher_mount, invocation)
+        self.assertLess(
+            invocation.index("type=bind,src=/mnt/data2,dst=/mnt/data2"),
+            invocation.index(seal_mount),
+        )
+        self.assertLess(
+            invocation.index(seal_mount),
+            invocation.index(teacher_mount),
+        )
+        self.assertIn(f"--teacher-checkpoint {self.teacher_checkpoint}", invocation)
+        self.assertIn(f"--teacher-sha256 {self.teacher_sha}", invocation)
+        self.assertIn(
+            f"--sealed-teacher-checkpoint {self.sealed_teacher}", invocation
+        )
+        self.assertIn("--require-teacher-readonly-mount", invocation)
 
     def test_candidate_manifest_and_image_id_mismatches_fail_closed(self) -> None:
         for key, value, message in (
@@ -244,6 +306,81 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(message, completed.stderr)
                 self.assertFalse(self.contract.exists())
+
+    def test_mutated_teacher_inputs_fail_closed(self) -> None:
+        for target, message in (
+            (self.teacher_checkpoint, "configured teacher checkpoint SHA mismatch"),
+            (self.sealed_teacher, "sealed teacher checkpoint SHA mismatch"),
+        ):
+            with self.subTest(target=target.name):
+                target.chmod(0o644)
+                original = target.read_bytes()
+                try:
+                    target.write_bytes(b"mutated teacher fixture\n")
+                    if target == self.sealed_teacher:
+                        target.chmod(0o444)
+                    completed = self._run(dry_run=True)
+                finally:
+                    target.chmod(0o644)
+                    target.write_bytes(original)
+                    target.chmod(
+                        0o444 if target == self.sealed_teacher else 0o600
+                    )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stderr)
+                self.assertFalse(self.contract.exists())
+
+    def test_sealed_teacher_requires_exact_read_only_mode(self) -> None:
+        self.sealed_teacher.chmod(0o644)
+        completed = self._run(dry_run=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "sealed teacher checkpoint mode must be exactly 0444",
+            completed.stderr,
+        )
+        self.assertFalse(self.contract.exists())
+
+    def test_sealed_teacher_rejects_hard_link_aliases(self) -> None:
+        os.link(self.sealed_teacher, self.tmp / "sealed-teacher-alias.pt")
+        completed = self._run(dry_run=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "sealed teacher checkpoint must have exactly one hard link",
+            completed.stderr,
+        )
+        self.assertFalse(self.contract.exists())
+
+    def test_teacher_identity_must_match_campaign(self) -> None:
+        for path in (self.teacher_checkpoint, self.sealed_teacher):
+            path.chmod(0o644)
+            path.write_bytes(b"different teacher")
+        self.teacher_checkpoint.chmod(0o600)
+        self.sealed_teacher.chmod(0o444)
+        self.environment["ROUND_DAGGER_TEACHER_SHA256"] = sha256_file(
+            self.teacher_checkpoint
+        )
+        completed = self._run(dry_run=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "teacher checkpoint SHA differs from campaign", completed.stderr
+        )
+        self.assertFalse(self.contract.exists())
+
+    def test_pinned_config_must_name_mounted_teacher_target(self) -> None:
+        self.config.write_text(
+            f"teacher_actor_path: {self.tmp / 'other-teacher.pt'}\n"
+            "fixed_seed: true\n",
+            encoding="utf-8",
+        )
+        self.environment["ROUND_DAGGER_EVALUATOR_CONFIG_SHA256"] = sha256_file(
+            self.config
+        )
+        completed = self._run(dry_run=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "pinned evaluation config teacher path mismatch", completed.stderr
+        )
+        self.assertFalse(self.contract.exists())
 
 
 if __name__ == "__main__":

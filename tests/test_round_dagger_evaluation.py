@@ -65,8 +65,18 @@ class PairedEvaluationTest(unittest.TestCase):
         self.evaluator_code_sha = evaluator_source_bundle_sha256(
             self.repository_root, self.gr00t
         )
+        self.teacher_checkpoint = self.tmp / "teacher.pt"
+        # _campaign pins sha256(b"teacher") as the expert identity.
+        self.teacher_checkpoint.write_bytes(b"teacher")
+        self.teacher_checkpoint.chmod(0o444)
+        self.sealed_teacher = self.tmp / "sealed-teacher.pt"
+        self.sealed_teacher.write_bytes(b"teacher")
+        self.sealed_teacher.chmod(0o444)
+        self.teacher_sha = sha256_file(self.teacher_checkpoint)
         self.config = self.tmp / "evaluation_config.yaml"
-        self.config.write_text("fixed_seed: true\n")
+        self.config.write_text(
+            f"teacher_actor_path: {self.teacher_checkpoint}\nfixed_seed: true\n"
+        )
         self.renderer_identity = {
             "schema_version": 1,
             "release_id": "fixture",
@@ -320,7 +330,15 @@ class PairedEvaluationTest(unittest.TestCase):
         )
         return outcome
 
-    def _run_launcher(self, results: Path) -> subprocess.CompletedProcess[str]:
+    def _run_launcher(
+        self,
+        results: Path,
+        *,
+        teacher_sha: str | None = None,
+        require_teacher_readonly_mount: bool = False,
+        dry_run: bool = False,
+        extra_environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         endpoints = self.tmp / "launcher-endpoints"
         endpoints.mkdir(exist_ok=True)
         endpoint = endpoints / "renderer_0.txt"
@@ -332,23 +350,34 @@ class PairedEvaluationTest(unittest.TestCase):
             / "round_dagger"
             / "run_paired_evaluation.sh"
         )
+        command = [
+            "bash",
+            str(launcher),
+            "--root",
+            str(self.root),
+            "--contract",
+            str(self.root / self.contract["contract_path"]),
+            "--results-dir",
+            str(results),
+            "--gr00t-root",
+            str(self.gr00t),
+            "--evaluation-config",
+            str(self.config),
+            "--endpoint-dir",
+            str(endpoints),
+            "--teacher-checkpoint",
+            str(self.teacher_checkpoint),
+            "--teacher-sha256",
+            teacher_sha or self.teacher_sha,
+            "--sealed-teacher-checkpoint",
+            str(self.sealed_teacher),
+        ]
+        if require_teacher_readonly_mount:
+            command.append("--require-teacher-readonly-mount")
+        if dry_run:
+            command.append("--dry-run")
         return subprocess.run(
-            [
-                "bash",
-                str(launcher),
-                "--root",
-                str(self.root),
-                "--contract",
-                str(self.root / self.contract["contract_path"]),
-                "--results-dir",
-                str(results),
-                "--gr00t-root",
-                str(self.gr00t),
-                "--evaluation-config",
-                str(self.config),
-                "--endpoint-dir",
-                str(endpoints),
-            ],
+            command,
             text=True,
             capture_output=True,
             check=False,
@@ -360,8 +389,75 @@ class PairedEvaluationTest(unittest.TestCase):
                 "ROUND_DAGGER_EVALUATOR_CONFIG_SHA256": self.contract[
                     "evaluation_config_sha256"
                 ],
+                **(extra_environment or {}),
             },
         )
+
+    def test_launcher_rejects_teacher_digest_and_mount_mismatches(self) -> None:
+        results = self.root / self.results_relative
+        bad_digest = self._run_launcher(
+            results, teacher_sha=_sha("wrong-teacher")
+        )
+        self.assertNotEqual(bad_digest.returncode, 0)
+        self.assertIn(
+            "teacher checkpoint SHA differs from campaign", bad_digest.stderr
+        )
+        self.assertFalse(results.exists())
+
+        self.teacher_checkpoint.chmod(0o644)
+        self.teacher_checkpoint.write_bytes(b"tampered teacher")
+        self.teacher_checkpoint.chmod(0o444)
+        try:
+            bad_bytes = self._run_launcher(results)
+        finally:
+            self.teacher_checkpoint.chmod(0o644)
+            self.teacher_checkpoint.write_bytes(b"teacher")
+            self.teacher_checkpoint.chmod(0o444)
+        self.assertNotEqual(bad_bytes.returncode, 0)
+        self.assertIn("teacher checkpoint SHA mismatch", bad_bytes.stderr)
+        self.assertFalse(results.exists())
+
+        ordinary_file = self._run_launcher(
+            results, require_teacher_readonly_mount=True
+        )
+        self.assertNotEqual(ordinary_file.returncode, 0)
+        self.assertIn(
+            "teacher target and sealed source mounts differ",
+            ordinary_file.stderr,
+        )
+        self.assertFalse(results.exists())
+
+    def test_launcher_rechecks_teacher_before_every_role_seed_case(self) -> None:
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir()
+        teacher_log = self.tmp / "teacher-sha.log"
+        sha_wrapper = fake_bin / "sha256sum"
+        sha_wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            "if [[ ${1:-} == \"$TEACHER_LOG_TARGET\" ]]; then\n"
+            "  printf '%s\\n' \"$1\" >>\"$TEACHER_SHA_LOG\"\n"
+            "fi\n"
+            "exec /usr/bin/sha256sum \"$@\"\n",
+            encoding="utf-8",
+        )
+        sha_wrapper.chmod(0o755)
+        completed = self._run_launcher(
+            self.root / self.results_relative,
+            dry_run=True,
+            extra_environment={
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "TEACHER_LOG_TARGET": str(self.teacher_checkpoint),
+                "TEACHER_SHA_LOG": str(teacher_log),
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        # One startup check plus parent/candidate x two fixed seeds.
+        self.assertEqual(
+            teacher_log.read_text(encoding="utf-8").splitlines(),
+            [str(self.teacher_checkpoint)] * 5,
+        )
+        self.assertFalse((self.root / self.results_relative).exists())
 
     def test_contract_binds_parent_candidate_cases_and_lagged_three_views(self) -> None:
         loaded = load_contract(self.root, self.contract["contract_path"])
@@ -598,6 +694,12 @@ class PairedEvaluationTest(unittest.TestCase):
                 str(self.config),
                 "--endpoint-dir",
                 str(endpoints),
+                "--teacher-checkpoint",
+                str(self.teacher_checkpoint),
+                "--teacher-sha256",
+                self.teacher_sha,
+                "--sealed-teacher-checkpoint",
+                str(self.sealed_teacher),
             ],
             text=True,
             capture_output=True,
@@ -837,7 +939,7 @@ class PairedEvaluationTest(unittest.TestCase):
 
     def test_evaluator_identity_binds_all_custom_producer_sources(self) -> None:
         bundle = evaluator_source_bundle(self.repository_root, self.gr00t)
-        self.assertEqual(len(bundle["sources"]), 9)
+        self.assertEqual(len(bundle["sources"]), 10)
         self.assertIn(
             "gr00t/gr00t/rl/utils/image3f_frame_client.py",
             {item["source"] for item in bundle["sources"]},
@@ -925,6 +1027,12 @@ class PairedEvaluationTest(unittest.TestCase):
                 str(self.config),
                 "--endpoint-dir",
                 str(endpoints),
+                "--teacher-checkpoint",
+                str(self.teacher_checkpoint),
+                "--teacher-sha256",
+                self.teacher_sha,
+                "--sealed-teacher-checkpoint",
+                str(self.sealed_teacher),
             ],
             text=True,
             capture_output=True,
@@ -987,6 +1095,12 @@ class PairedEvaluationTest(unittest.TestCase):
             str(self.config),
             "--endpoint-dir",
             str(endpoints),
+            "--teacher-checkpoint",
+            str(self.teacher_checkpoint),
+            "--teacher-sha256",
+            self.teacher_sha,
+            "--sealed-teacher-checkpoint",
+            str(self.sealed_teacher),
         ]
         environment = {
             **os.environ,

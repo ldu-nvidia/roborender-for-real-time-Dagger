@@ -47,6 +47,9 @@ SCENARIO_CASES=${ROUND_DAGGER_EVALUATION_SCENARIOS:?missing ROUND_DAGGER_EVALUAT
 SCENARIO_CASES_SHA=${ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256:?missing ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256}
 THRESHOLDS=${ROUND_DAGGER_EVALUATION_THRESHOLDS:?missing ROUND_DAGGER_EVALUATION_THRESHOLDS}
 THRESHOLDS_SHA=${ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256:?missing ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256}
+TEACHER_CHECKPOINT=${ROUND_DAGGER_TEACHER_CHECKPOINT:?missing ROUND_DAGGER_TEACHER_CHECKPOINT}
+TEACHER_SHA=${ROUND_DAGGER_TEACHER_SHA256:?missing ROUND_DAGGER_TEACHER_SHA256}
+SEALED_TEACHER=${ROUND_DAGGER_EVALUATION_SEALED_TEACHER:?missing ROUND_DAGGER_EVALUATION_SEALED_TEACHER}
 ENDPOINT_DIR=${ROUND_DAGGER_EVALUATION_ENDPOINT_DIR:?missing ROUND_DAGGER_EVALUATION_ENDPOINT_DIR}
 RENDERER_RUNTIME_SHA=${ROUND_DAGGER_RENDERER_RUNTIME_SHA256:?missing ROUND_DAGGER_RENDERER_RUNTIME_SHA256}
 EXPECTED_RENDERERS=${ROUND_DAGGER_EXPECTED_RENDERERS:?missing ROUND_DAGGER_EXPECTED_RENDERERS}
@@ -74,6 +77,7 @@ require_sha "$CANDIDATE_MANIFEST_SHA" ROUND_DAGGER_CANDIDATE_SHA256
 require_sha "$EVALUATOR_CONFIG_SHA" ROUND_DAGGER_EVALUATOR_CONFIG_SHA256
 require_sha "$SCENARIO_CASES_SHA" ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256
 require_sha "$THRESHOLDS_SHA" ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256
+require_sha "$TEACHER_SHA" ROUND_DAGGER_TEACHER_SHA256
 require_sha "$RENDERER_RUNTIME_SHA" ROUND_DAGGER_RENDERER_RUNTIME_SHA256
 require_sha "$EXPECTED_IMAGE_ID_SHA" ROUND_DAGGER_RTX_IMAGE_ID_SHA256
 require_directory "$CAMPAIGN_ROOT" "campaign root"
@@ -84,6 +88,17 @@ require_regular "$CANDIDATE_MANIFEST" "candidate manifest"
 require_regular "$EVALUATION_CONFIG" "evaluation config"
 require_regular "$SCENARIO_CASES" "scenario cases"
 require_regular "$THRESHOLDS" "evaluation thresholds"
+require_regular "$TEACHER_CHECKPOINT" "configured teacher checkpoint"
+require_regular "$SEALED_TEACHER" "sealed teacher checkpoint"
+[[ $TEACHER_CHECKPOINT != "$SEALED_TEACHER" ]] || \
+    fatal "sealed teacher source must differ from the configured target"
+[[ $(stat -c %a "$SEALED_TEACHER") == 444 ]] || \
+    fatal "sealed teacher checkpoint mode must be exactly 0444"
+[[ $(stat -c %h "$SEALED_TEACHER") == 1 ]] || \
+    fatal "sealed teacher checkpoint must have exactly one hard link"
+[[ $(stat -c '%d:%i' "$TEACHER_CHECKPOINT") != \
+   "$(stat -c '%d:%i' "$SEALED_TEACHER")" ]] || \
+    fatal "sealed teacher source and configured target must be distinct files"
 [[ $CONTAINER_PYTHON == /* ]] || fatal "GR00T_PYTHON must be an absolute container path"
 case "$DOCKER" in /*) ;; *) fatal "Docker executable must be absolute" ;; esac
 [[ -x $DOCKER && ! -L $DOCKER ]] || fatal "Docker executable is unsafe or unavailable"
@@ -112,6 +127,33 @@ CONTROL_PYTHON_TARGET=$(readlink -f -- "$CONTROL_PYTHON") || \
     fatal "evaluation scenario cases SHA mismatch"
 [[ $(sha256sum "$THRESHOLDS" | awk '{print $1}') == "$THRESHOLDS_SHA" ]] || \
     fatal "evaluation thresholds SHA mismatch"
+[[ $(sha256sum "$TEACHER_CHECKPOINT" | awk '{print $1}') == "$TEACHER_SHA" ]] || \
+    fatal "configured teacher checkpoint SHA mismatch"
+[[ $(sha256sum "$SEALED_TEACHER" | awk '{print $1}') == "$TEACHER_SHA" ]] || \
+    fatal "sealed teacher checkpoint SHA mismatch"
+
+# The pinned Hydra config must name the host path that will be shadowed by the
+# more-specific read-only file bind below.  Parsing the exact, digest-checked
+# config prevents a valid teacher from being mounted at a path the evaluator
+# never consumes.
+CONFIGURED_TEACHER=$($CONTROL_PYTHON - "$EVALUATION_CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+with Path(sys.argv[1]).open("r", encoding="utf-8") as handle:
+    document = yaml.safe_load(handle)
+if not isinstance(document, dict):
+    raise SystemExit("evaluation config must contain a YAML mapping")
+teacher = document.get("teacher_actor_path")
+if not isinstance(teacher, str) or not Path(teacher).is_absolute():
+    raise SystemExit("evaluation config teacher_actor_path must be absolute")
+print(teacher)
+PY
+) || fatal "cannot read teacher path from the pinned evaluation config"
+[[ $CONFIGURED_TEACHER == "$TEACHER_CHECKPOINT" ]] || \
+    fatal "pinned evaluation config teacher path mismatch"
 
 PADDED_ROUND=$(printf '%06d' "$MACRO_ROUND")
 if [[ -n $RECOVERY_ID ]]; then
@@ -129,7 +171,8 @@ EXPECTED_RESULT="$EVALUATION_ROOT/result.json"
 # read/write mounts.  This prevents a host-only path from silently becoming a
 # different file inside the actor image.
 for path in "$REPOSITORY_ROOT" "$CAMPAIGN_ROOT" "$GR00T_SOURCE_ROOT" \
-    "$EVALUATION_CONFIG" "$SCENARIO_CASES" "$THRESHOLDS" "$ENDPOINT_DIR"; do
+    "$EVALUATION_CONFIG" "$SCENARIO_CASES" "$THRESHOLDS" "$ENDPOINT_DIR" \
+    "$TEACHER_CHECKPOINT" "$SEALED_TEACHER"; do
     case "$path" in
         /mnt/data1|/mnt/data1/*|/mnt/data2|/mnt/data2/*) ;;
         *) fatal "container input is outside /mnt/data1 and /mnt/data2: $path" ;;
@@ -154,7 +197,8 @@ ACTUAL_IMAGE_ID=$("$DOCKER" image inspect --format '{{.Id}}' "$IMAGE") || \
 # is the candidate runtime ABI hash needed by the immutable contract.
 CANDIDATE_RUNTIME_SHA=$($CONTROL_PYTHON - \
     "$CAMPAIGN_ROOT" "$CAMPAIGN_ID" "$MACRO_ROUND" "$CANDIDATE_MANIFEST" \
-    "$PARENT_CHECKPOINT" "$PARENT_RUNTIME_SHA" "$SCENARIO_CASES" "$THRESHOLDS" <<'PY'
+    "$PARENT_CHECKPOINT" "$PARENT_RUNTIME_SHA" "$TEACHER_SHA" \
+    "$SCENARIO_CASES" "$THRESHOLDS" <<'PY'
 import sys
 from pathlib import Path
 
@@ -168,6 +212,8 @@ campaign = load_campaign(root)
 state = load_state(root)
 if campaign["campaign_id"] != sys.argv[2]:
     raise SystemExit("campaign ID differs from coordinator")
+if campaign["teacher_sha256"] != sys.argv[7]:
+    raise SystemExit("teacher checkpoint SHA differs from campaign")
 macro_round = int(sys.argv[3])
 if state.get("phase") != "TRAINED" or state.get("open_macro_round") != macro_round:
     raise SystemExit("coordinator is not in the requested TRAINED round")
@@ -179,10 +225,10 @@ if str(root / active["checkpoint_path"]) != sys.argv[5]:
     raise SystemExit("parent checkpoint path differs from active policy")
 if active["runtime_policy_sha256"] != sys.argv[6]:
     raise SystemExit("parent runtime ABI differs from active policy")
-cases = _validate_cases(load_strict_json(sys.argv[7]))
-if cases != load_strict_json(sys.argv[7]):
+cases = _validate_cases(load_strict_json(sys.argv[8]))
+if cases != load_strict_json(sys.argv[8]):
     raise SystemExit("scenario cases are not canonically ordered")
-_validate_thresholds(load_strict_json(sys.argv[8]))
+_validate_thresholds(load_strict_json(sys.argv[9]))
 print(candidate["runtime_policy_sha256"])
 PY
 ) || fatal "campaign/candidate/evaluation preflight failed"
@@ -229,6 +275,8 @@ DOCKER_RUN=("$DOCKER" run --rm
     --workdir "$REPOSITORY_ROOT"
     --mount type=bind,src=/mnt/data1,dst=/mnt/data1
     --mount type=bind,src=/mnt/data2,dst=/mnt/data2
+    --mount "type=bind,src=$SEALED_TEACHER,dst=$SEALED_TEACHER,readonly"
+    --mount "type=bind,src=$SEALED_TEACHER,dst=$TEACHER_CHECKPOINT,readonly"
     "${ENV_ARGS[@]}"
     "$IMAGE"
     /usr/bin/env bash "$RUNNER"
@@ -238,6 +286,10 @@ DOCKER_RUN=("$DOCKER" run --rm
     --gr00t-root "$GR00T_SOURCE_ROOT"
     --evaluation-config "$EVALUATION_CONFIG"
     --endpoint-dir "$ENDPOINT_DIR"
+    --teacher-checkpoint "$TEACHER_CHECKPOINT"
+    --teacher-sha256 "$TEACHER_SHA"
+    --sealed-teacher-checkpoint "$SEALED_TEACHER"
+    --require-teacher-readonly-mount
     --orchestrator-result "$EVALUATOR_RESULT"
     --python "$CONTAINER_PYTHON")
 

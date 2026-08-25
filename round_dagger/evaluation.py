@@ -71,6 +71,7 @@ class EvaluationError(ArtifactError):
 
 _REPOSITORY_EVALUATOR_SOURCES = (
     "round_dagger/evaluation.py",
+    "round_dagger/evaluation_inputs.py",
     "scripts/eval/eval_agent_metrics_adapter.py",
     "scripts/round_dagger/run_paired_evaluation.sh",
     "scripts/round_dagger/run_production_paired_evaluation_hook.sh",

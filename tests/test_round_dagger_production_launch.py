@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -32,6 +33,52 @@ class ProductionLaunchTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="rr_production_launch_")
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name)
+        scratch = Path(
+            "/mnt/data2/ldu/roborender_round_dagger_validation/unit_tests"
+        )
+        scratch.mkdir(parents=True, exist_ok=True)
+        local_temporary = tempfile.TemporaryDirectory(
+            prefix="rr_local_seal_", dir=scratch
+        )
+        self.addCleanup(local_temporary.cleanup)
+        self.local_base = Path(local_temporary.name)
+
+    def _local_seal_fixture(
+        self, name: str = "fast_roborender_deadbee_cafef00_sealed"
+    ) -> tuple[Path, dict, dict, dict]:
+        root = self.local_base / name
+        teacher = root / production_launch.TEACHER_CHECKPOINT_RELATIVE
+        teacher.parent.mkdir(parents=True)
+        teacher.write_bytes(b"sealed teacher")
+        teacher.chmod(0o444)
+        configured = self.local_base / f"configured-{name}.pt"
+        configured.write_bytes(b"sealed teacher")
+        teacher_sha = artifacts.sha256_file(teacher)
+        campaign = {
+            "artifacts": {
+                "teacher": {
+                    "checkpoint_path": str(configured),
+                    "checkpoint_sha256": teacher_sha,
+                }
+            }
+        }
+        remote = {
+            "root": f"/lustre/stage/src_snapshots/{name}",
+            "snapshot_name": name,
+            "inventory_sha256": SOURCE_SHA,
+            "fast_roborender_revision": "1" * 40,
+            "gr00t_revision": "2" * 40,
+        }
+        local = {
+            "schema": production_launch.SEALED_REPORT_SCHEMA,
+            "status": "PASS",
+            "root": str(root),
+            "snapshot_name": name,
+            "inventory_sha256": SOURCE_SHA,
+            "fast_roborender_revision": "1" * 40,
+            "gr00t_revision": "2" * 40,
+        }
+        return root, campaign, remote, local
 
     def _campaign_and_orchestration(
         self,
@@ -215,9 +262,25 @@ class ProductionLaunchTests(unittest.TestCase):
                 "allowed_untracked": [".source_revision", "core"],
             },
         }
+        local_sealed_root = Path(
+            "/mnt/data2/ldu/roborender_source_snapshots/fast_roborender_source"
+        )
+        sealed_teacher = (
+            local_sealed_root / production_launch.TEACHER_CHECKPOINT_RELATIVE
+        )
+        local_seal_report = {
+            "root": str(local_sealed_root),
+            "sealed_teacher_checkpoint": str(sealed_teacher),
+            "sealed_teacher_sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38",
+        }
         with (
             mock.patch.object(production_launch, "_verify_static_inputs"),
             mock.patch.object(production_launch, "_verify_remote_source", return_value=source_report),
+            mock.patch.object(
+                production_launch,
+                "_verify_local_evaluation_seal",
+                return_value=local_seal_report,
+            ) as verify_local_seal,
             mock.patch.object(
                 production_launch,
                 "_verify_local_source_checkout",
@@ -230,11 +293,18 @@ class ProductionLaunchTests(unittest.TestCase):
                 learner_contract_path=LEARNER_CONTRACT,
                 sealed_source_root=source_report["root"],
                 sealed_source_inventory_sha256=SOURCE_SHA,
+                local_sealed_source_root=local_sealed_root,
             )
+        verify_local_seal.assert_called_once()
         self.assertEqual(plan["status"], "validated_no_submission")
         self.assertEqual(plan["coordinator_phase"], "READY")
         self.assertFalse(plan["credentials_in_plan"])
         self.assertEqual(environment["ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256"], SOURCE_SHA)
+        self.assertEqual(
+            environment["ROUND_DAGGER_EVALUATION_SEALED_TEACHER"],
+            str(sealed_teacher),
+        )
+        self.assertEqual(plan["local_sealed_source_root"], str(local_sealed_root))
         self.assertEqual(environment["ROUND_DAGGER_LEARNER_MAX_STEPS"], "500")
         self.assertEqual(environment["ROUND_DAGGER_LEARNER_BATCH_SIZE"], "8")
         self.assertEqual(environment["ROUND_DAGGER_LEARNER_LEARNING_RATE"], "2.5e-5")
@@ -351,6 +421,84 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertNotIn("wandb_v1_", flattened)
         self.assertIn(root, flattened)
 
+    def test_local_seal_derives_inventory_bound_teacher_for_rtx(self) -> None:
+        root, campaign, remote, local = self._local_seal_fixture()
+        with mock.patch.object(
+            production_launch,
+            "verify_sealed_source_snapshot",
+            return_value=local,
+        ) as verifier:
+            observed = production_launch._verify_local_evaluation_seal(
+                root,
+                SOURCE_SHA,
+                remote_report=remote,
+                campaign_contract=campaign,
+            )
+        verifier.assert_called_once_with(root, SOURCE_SHA)
+        self.assertEqual(observed["root"], str(root))
+        self.assertEqual(
+            observed["sealed_teacher_checkpoint"],
+            str(root / production_launch.TEACHER_CHECKPOINT_RELATIVE),
+        )
+        self.assertEqual(
+            observed["sealed_teacher_sha256"],
+            campaign["artifacts"]["teacher"]["checkpoint_sha256"],
+        )
+
+    def test_local_seal_rejects_basename_revision_and_inventory_mismatch(self) -> None:
+        for mismatch in ("basename", "revision", "inventory"):
+            with self.subTest(mismatch=mismatch):
+                root, campaign, remote, local = self._local_seal_fixture(
+                    f"fast_roborender_{mismatch}_cafef00_sealed"
+                )
+                if mismatch == "basename":
+                    remote["root"] += "_different"
+                    remote["snapshot_name"] += "_different"
+                elif mismatch == "revision":
+                    local["gr00t_revision"] = "3" * 40
+                else:
+                    local["inventory_sha256"] = "b" * 64
+                with mock.patch.object(
+                    production_launch,
+                    "verify_sealed_source_snapshot",
+                    return_value=local,
+                ):
+                    with self.assertRaises(production_launch.ProductionLaunchError):
+                        production_launch._verify_local_evaluation_seal(
+                            root,
+                            SOURCE_SHA,
+                            remote_report=remote,
+                            campaign_contract=campaign,
+                        )
+
+    def test_local_sealed_teacher_mode_link_and_hash_fail_closed(self) -> None:
+        for mismatch in ("mode", "hardlink", "hash"):
+            with self.subTest(mismatch=mismatch):
+                root, campaign, remote, local = self._local_seal_fixture(
+                    f"fast_roborender_{mismatch}_deadbee_sealed"
+                )
+                teacher = root / production_launch.TEACHER_CHECKPOINT_RELATIVE
+                if mismatch == "mode":
+                    teacher.chmod(0o644)
+                elif mismatch == "hardlink":
+                    os.link(teacher, self.local_base / f"{mismatch}-alias.pt")
+                else:
+                    teacher.chmod(0o644)
+                    teacher.write_bytes(b"wrong teacher")
+                    teacher.chmod(0o444)
+                with mock.patch.object(
+                    production_launch,
+                    "verify_sealed_source_snapshot",
+                    return_value=local,
+                ):
+                    with self.assertRaises(production_launch.ProductionLaunchError):
+                        production_launch._verify_local_evaluation_seal(
+                            root,
+                            SOURCE_SHA,
+                            remote_report=remote,
+                            campaign_contract=campaign,
+                        )
+
     def test_clean_local_root_and_nested_revisions_match_remote_snapshot(self) -> None:
         root, report = self._clean_source_fixture("clean-source")
         observed = production_launch._verify_local_source_checkout(
@@ -442,6 +590,7 @@ class ProductionLaunchTests(unittest.TestCase):
     def test_shell_launcher_has_non_mutating_dry_run_and_no_secret_config(self) -> None:
         script = (ROOT / "scripts/round_dagger/launch_production_macro_round.sh").read_text()
         self.assertIn("PRODUCTION_MACRO_ROUND_DRY_RUN_OK", script)
+        self.assertIn("--local-sealed-source-root", script)
         self.assertIn("unset WANDB_API_KEY", script)
         self.assertIn('exec "$PYTHON" "$ORCHESTRATOR"', script)
         self.assertIn('PYTHON_REAL=$(realpath -e -- "$PYTHON")', script)

@@ -16,12 +16,14 @@ DRY_RUN=${DRY_RUN:-0}
 ORCHESTRATION_CONFIG=
 SEALED_SOURCE_ROOT=
 SEALED_SOURCE_INVENTORY_SHA256=
+LOCAL_SEALED_SOURCE_ROOT=
 
 usage() {
     cat >&2 <<'EOF'
 usage: launch_production_macro_round.sh \
   --orchestration-config ABSOLUTE_CONFIG_JSON \
   --sealed-source-root ABSOLUTE_OCI_SOURCE_ROOT \
+  --local-sealed-source-root ABSOLUTE_RTX_SOURCE_ROOT \
   --sealed-source-inventory-sha256 LOWERCASE_SHA256 [--dry-run]
 EOF
     exit 2
@@ -44,6 +46,11 @@ while (($#)); do
             SEALED_SOURCE_INVENTORY_SHA256=$2
             shift 2
             ;;
+        --local-sealed-source-root)
+            (($# >= 2)) || usage
+            LOCAL_SEALED_SOURCE_ROOT=$2
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -56,6 +63,10 @@ done
 [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be exactly 0 or 1"
 [[ $ORCHESTRATION_CONFIG == /* ]] || fatal "--orchestration-config must be absolute"
 [[ $SEALED_SOURCE_ROOT == /* ]] || fatal "--sealed-source-root must be absolute"
+[[ $LOCAL_SEALED_SOURCE_ROOT == /* ]] || \
+    fatal "--local-sealed-source-root must be absolute"
+[[ -d $LOCAL_SEALED_SOURCE_ROOT && ! -L $LOCAL_SEALED_SOURCE_ROOT ]] || \
+    fatal "--local-sealed-source-root is missing or unsafe"
 [[ $SEALED_SOURCE_INVENTORY_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
     fatal "--sealed-source-inventory-sha256 must be lowercase SHA-256"
 [[ -f $ORCHESTRATION_CONFIG && ! -L $ORCHESTRATION_CONFIG ]] || \
@@ -87,6 +98,7 @@ PLAN=$(
         --campaign-contract "$CAMPAIGN_CONTRACT" \
         --learner-contract "$LEARNER_CONTRACT" \
         --sealed-source-root "$SEALED_SOURCE_ROOT" \
+        --local-sealed-source-root "$LOCAL_SEALED_SOURCE_ROOT" \
         --sealed-source-inventory-sha256 "$SEALED_SOURCE_INVENTORY_SHA256" \
         --env-output "$ENV_HANDOFF"
 ) || fatal "fail-closed preflight rejected the launch"

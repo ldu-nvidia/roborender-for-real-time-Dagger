@@ -6,6 +6,9 @@ usage() {
     cat <<'EOF'
 Usage: run_paired_evaluation.sh --root DIR --contract FILE --results-dir DIR
        --gr00t-root DIR --evaluation-config FILE --endpoint-dir DIR
+       --teacher-checkpoint FILE --teacher-sha256 SHA256
+       --sealed-teacher-checkpoint FILE
+       [--require-teacher-readonly-mount]
        [--orchestrator-result FILE] [--python PYTHON] [--dry-run]
 
 The contract must already be prepared by `python -m round_dagger.evaluation
@@ -23,6 +26,10 @@ RESULTS_DIR=
 GR00T_ROOT=
 EVALUATION_CONFIG=
 ENDPOINT_DIR=
+TEACHER_CHECKPOINT=
+TEACHER_SHA=
+SEALED_TEACHER=
+REQUIRE_TEACHER_READONLY_MOUNT=0
 ORCHESTRATOR_RESULT=${ROUND_DAGGER_EVALUATOR_RESULT:-}
 PYTHON_BIN=python3
 DRY_RUN=0
@@ -34,6 +41,13 @@ while (($#)); do
         --gr00t-root) GR00T_ROOT=${2:?}; shift 2 ;;
         --evaluation-config) EVALUATION_CONFIG=${2:?}; shift 2 ;;
         --endpoint-dir) ENDPOINT_DIR=${2:?}; shift 2 ;;
+        --teacher-checkpoint) TEACHER_CHECKPOINT=${2:?}; shift 2 ;;
+        --teacher-sha256) TEACHER_SHA=${2:?}; shift 2 ;;
+        --sealed-teacher-checkpoint) SEALED_TEACHER=${2:?}; shift 2 ;;
+        --require-teacher-readonly-mount)
+            REQUIRE_TEACHER_READONLY_MOUNT=1
+            shift
+            ;;
         --orchestrator-result) ORCHESTRATOR_RESULT=${2:?}; shift 2 ;;
         --python) PYTHON_BIN=${2:?}; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -43,12 +57,22 @@ while (($#)); do
 done
 
 fatal() { echo "FATAL: $*" >&2; exit 2; }
-for value in ROOT CONTRACT RESULTS_DIR GR00T_ROOT EVALUATION_CONFIG ENDPOINT_DIR ORCHESTRATOR_RESULT; do
+for value in ROOT CONTRACT RESULTS_DIR GR00T_ROOT EVALUATION_CONFIG ENDPOINT_DIR \
+    TEACHER_CHECKPOINT TEACHER_SHA SEALED_TEACHER ORCHESTRATOR_RESULT; do
     [[ -n ${!value} ]] || fatal "missing --${value,,}"
 done
 [[ -d $ROOT && ! -L $ROOT ]] || fatal "unsafe/missing campaign root"
 [[ -f $CONTRACT && ! -L $CONTRACT ]] || fatal "unsafe/missing evaluation contract"
 [[ -f $EVALUATION_CONFIG && ! -L $EVALUATION_CONFIG ]] || fatal "unsafe/missing evaluation config"
+[[ $TEACHER_CHECKPOINT == /* && -f $TEACHER_CHECKPOINT && \
+   ! -L $TEACHER_CHECKPOINT ]] || \
+    fatal "teacher checkpoint must be an absolute, non-symlink regular file"
+[[ $TEACHER_SHA =~ ^[0-9a-f]{64}$ ]] || \
+    fatal "teacher checkpoint SHA must be a lowercase SHA-256"
+[[ $SEALED_TEACHER == /* && -f $SEALED_TEACHER && ! -L $SEALED_TEACHER ]] || \
+    fatal "sealed teacher checkpoint must be an absolute, non-symlink regular file"
+[[ $SEALED_TEACHER != "$TEACHER_CHECKPOINT" ]] || \
+    fatal "sealed teacher source must differ from the configured target"
 EVALUATOR="$GR00T_ROOT/gr00t/rl/eval_agent_trl.py"
 [[ -f $EVALUATOR && ! -L $EVALUATOR ]] || fatal "unsafe/missing GR00T evaluator"
 
@@ -58,20 +82,26 @@ export PYTHONPATH="$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 "$PYTHON_BIN" -m round_dagger.evaluation verify-contract \
     --root "$ROOT" --contract "$CONTRACT" >/dev/null || fatal "contract verification failed"
 
-readarray -t CONTRACT_FIELDS < <("$PYTHON_BIN" - "$CONTRACT" <<'PY'
+readarray -t CONTRACT_FIELDS < <("$PYTHON_BIN" - "$CONTRACT" "$ROOT" <<'PY'
 import json, sys
+from round_dagger.state import load_campaign
+
 d=json.load(open(sys.argv[1], encoding="utf-8"))
 print(d["evaluation_config_sha256"])
 print(d["evaluator_code_sha256"])
 print(d["expected_renderer_count"])
 print(d["num_envs_per_seed"])
+print(load_campaign(sys.argv[2])["teacher_sha256"])
 PY
 )
-[[ ${#CONTRACT_FIELDS[@]} -eq 4 ]] || fatal "cannot read evaluation contract"
+[[ ${#CONTRACT_FIELDS[@]} -eq 5 ]] || fatal "cannot read evaluation contract"
 EXPECTED_CONFIG_SHA=${CONTRACT_FIELDS[0]}
 EXPECTED_EVALUATOR_SHA=${CONTRACT_FIELDS[1]}
 EXPECTED_RENDERERS=${CONTRACT_FIELDS[2]}
 NUM_ENVS=${CONTRACT_FIELDS[3]}
+EXPECTED_TEACHER_SHA=${CONTRACT_FIELDS[4]}
+[[ $TEACHER_SHA == "$EXPECTED_TEACHER_SHA" ]] || \
+    fatal "teacher checkpoint SHA differs from campaign"
 [[ $(sha256sum "$EVALUATION_CONFIG" | awk '{print $1}') == "$EXPECTED_CONFIG_SHA" ]] || \
     fatal "evaluation config SHA mismatch"
 if [[ -n ${ROUND_DAGGER_EVALUATOR_CONFIG_SHA256:-} ]]; then
@@ -87,6 +117,79 @@ PY
 )
 [[ $ACTUAL_EVALUATOR_SHA == "$EXPECTED_EVALUATOR_SHA" ]] || \
     fatal "evaluator source-bundle SHA mismatch"
+
+CONFIGURED_TEACHER=$("$PYTHON_BIN" - "$EVALUATION_CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+with Path(sys.argv[1]).open("r", encoding="utf-8") as handle:
+    document = yaml.safe_load(handle)
+if not isinstance(document, dict):
+    raise SystemExit("evaluation config must contain a YAML mapping")
+teacher = document.get("teacher_actor_path")
+if not isinstance(teacher, str) or not Path(teacher).is_absolute():
+    raise SystemExit("evaluation config teacher_actor_path must be absolute")
+print(teacher)
+PY
+) || fatal "cannot read teacher path from the pinned evaluation config"
+[[ $CONFIGURED_TEACHER == "$TEACHER_CHECKPOINT" ]] || \
+    fatal "pinned evaluation config teacher path mismatch"
+
+verify_teacher() {
+    [[ -f $TEACHER_CHECKPOINT && ! -L $TEACHER_CHECKPOINT ]] || \
+        fatal "teacher checkpoint became unsafe or unavailable"
+    [[ -f $SEALED_TEACHER && ! -L $SEALED_TEACHER ]] || \
+        fatal "sealed teacher checkpoint became unsafe or unavailable"
+    [[ $(stat -c %a "$TEACHER_CHECKPOINT") == 444 ]] || \
+        fatal "teacher checkpoint mode must be exactly 0444"
+    [[ $(stat -c %a "$SEALED_TEACHER") == 444 ]] || \
+        fatal "sealed teacher checkpoint mode must be exactly 0444"
+    [[ $(stat -c %h "$SEALED_TEACHER") == 1 ]] || \
+        fatal "sealed teacher checkpoint must have exactly one hard link"
+    [[ $(sha256sum "$TEACHER_CHECKPOINT" | awk '{print $1}') == "$TEACHER_SHA" ]] || \
+        fatal "teacher checkpoint SHA mismatch"
+    [[ $(sha256sum "$SEALED_TEACHER" | awk '{print $1}') == "$TEACHER_SHA" ]] || \
+        fatal "sealed teacher checkpoint SHA mismatch"
+    if ((REQUIRE_TEACHER_READONLY_MOUNT)); then
+        [[ $(stat -c '%d:%i' "$TEACHER_CHECKPOINT") == \
+           "$(stat -c '%d:%i' "$SEALED_TEACHER")" ]] || \
+            fatal "teacher target and sealed source mounts differ"
+        "$PYTHON_BIN" - "$TEACHER_CHECKPOINT" "$SEALED_TEACHER" <<'PY' || \
+            fatal "teacher checkpoints are not exact read-only mounts"
+import re
+import sys
+
+
+def decode_mountinfo(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+expected = set(sys.argv[1:])
+found = {path: [] for path in expected}
+with open("/proc/self/mountinfo", "r", encoding="utf-8") as handle:
+    for raw in handle:
+        left = raw.rstrip("\n").split(" - ", 1)[0].split()
+        if len(left) < 6:
+            continue
+        mountpoint = decode_mountinfo(left[4])
+        if mountpoint in found:
+            found[mountpoint].append(set(left[5].split(",")))
+if any(len(entries) != 1 or "ro" not in entries[0] for entries in found.values()):
+    raise SystemExit(1)
+PY
+    fi
+}
+
+# Check the exact file presented to the process before any evaluation setup.
+# The same check runs immediately before each policy-role evaluator invocation,
+# closing the window for a mutable broad bind to replace the pinned teacher.
+verify_teacher
 [[ $EXPECTED_RENDERERS =~ ^[1-9][0-9]*$ ]] || fatal "invalid renderer count"
 [[ $NUM_ENVS =~ ^[1-9][0-9]*$ ]] || fatal "invalid environment count"
 [[ -d $ENDPOINT_DIR && ! -L $ENDPOINT_DIR ]] || fatal "unsafe/missing endpoint directory"
@@ -240,9 +343,15 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         --checkpoint "$CHECKPOINT" --expected-sha256 "$CHECKPOINT_SHA"
         --output "$STAGED" --provenance "$RESULTS_DIR/stage/$ROLE/provenance.json")
     CONFIG_COPY=(install -m 0444 "$EVALUATION_CONFIG" "$RESULTS_DIR/stage/$ROLE/config.yaml")
-    VERIFY_STAGE=("$PYTHON_BIN" - "$CHECKPOINT" "$CHECKPOINT_SHA" "$STAGED"
-        "$RESULTS_DIR/stage/$ROLE/provenance.json"
-        "$RESULTS_DIR/stage/$ROLE/config.yaml" "$EXPECTED_CONFIG_SHA")
+    VERIFY_STAGE=("$PYTHON_BIN" -m round_dagger.evaluation_inputs
+        --checkpoint-source "$CHECKPOINT"
+        --expected-checkpoint-sha256 "$CHECKPOINT_SHA"
+        --staged-checkpoint "$STAGED"
+        --provenance "$RESULTS_DIR/stage/$ROLE/provenance.json"
+        --evaluation-config "$EVALUATION_CONFIG"
+        --staged-config "$RESULTS_DIR/stage/$ROLE/config.yaml"
+        --expected-config-sha256 "$EXPECTED_CONFIG_SHA"
+        --teacher-checkpoint "$TEACHER_CHECKPOINT")
     PROBE_BEFORE=("$PYTHON_BIN" "$REPOSITORY_ROOT/scripts/scaling/image3f_probe.py"
         --endpoint-dir "$ENDPOINT_DIR" --expected "$EXPECTED_RENDERERS"
         --required-reference-lag 256 --require-reference-history
@@ -287,10 +396,14 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         --outcome "$CANONICAL_OUTCOME")
 
     if ((DRY_RUN)); then
+        verify_teacher
         print_command "${SANITIZE[@]}"
         print_command "${CONFIG_COPY[@]}"
+        print_command "${VERIFY_STAGE[@]}"
         print_command "${PROBE_BEFORE[@]}"
+        print_command "${VERIFY_STAGE[@]}"
         print_command "${EVAL[@]}"
+        print_command "${VERIFY_STAGE[@]}"
         print_command "${PROBE_AFTER[@]}"
         print_command "${ATTEST[@]}"
         print_command "${PUBLISH[@]}"
@@ -310,31 +423,8 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
                 fatal "staged role directory contains a symlink"
         fi
         if [[ -e $STAGED && -e $STAGE_PROVENANCE && -e $STAGE_CONFIG ]]; then
-            "${VERIFY_STAGE[@]}" <<'PY' || fatal "staged evaluation inputs changed"
-import hashlib, json, os, pathlib, sys
-
-source, source_sha, staged, provenance, config, config_sha = map(pathlib.Path, sys.argv[1:])
-source_sha = str(source_sha)
-config_sha = str(config_sha)
-def digest(path):
-    h = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-for path in (staged, provenance, config):
-    if path.is_symlink() or not path.is_file():
-        raise SystemExit(f"unsafe/missing staged input: {path}")
-row = json.loads(provenance.read_text(encoding="utf-8"))
-if row.get("source") != str(source.resolve()) or row.get("source_sha256") != source_sha:
-    raise SystemExit("staged checkpoint source provenance mismatch")
-if row.get("output") != str(staged) or row.get("output_sha256") != digest(staged):
-    raise SystemExit("staged checkpoint output provenance mismatch")
-if row.get("environment_state_restored") is not False:
-    raise SystemExit("staged checkpoint restored environment state")
-if digest(source) != source_sha or digest(config) != config_sha:
-    raise SystemExit("staged source/config digest mismatch")
-PY
+            "${VERIFY_STAGE[@]}" >/dev/null || \
+                fatal "staged evaluation inputs changed"
         else
             if [[ -e $STAGED || -e $STAGE_PROVENANCE || -e $STAGE_CONFIG ]]; then
                 STAGE_PARTIAL_BASE="$RESULTS_DIR/stage_partial/$ROLE"
@@ -349,9 +439,17 @@ PY
             mkdir -p "$STAGE_ROLE_DIR"
             "${SANITIZE[@]}"
             "${CONFIG_COPY[@]}"
+            "${VERIFY_STAGE[@]}" >/dev/null || \
+                fatal "new staged evaluation inputs failed verification"
         fi
         "${PROBE_BEFORE[@]}" >/dev/null
+        "${VERIFY_STAGE[@]}" >/dev/null || \
+            fatal "staged evaluation inputs changed before evaluator launch"
+        verify_teacher
         "${EVAL[@]}"
+        verify_teacher
+        "${VERIFY_STAGE[@]}" >/dev/null || \
+            fatal "staged evaluation inputs changed during evaluator run"
         "${PROBE_AFTER[@]}" >/dev/null
         "${ATTEST[@]}" >/dev/null
         "${PUBLISH[@]}" >/dev/null
