@@ -597,6 +597,59 @@ class ConfigAndTopologyTest(unittest.TestCase):
 
 
 class MacroRoundExecutionTest(unittest.TestCase):
+    def test_collect_hook_receives_complete_production_topology_environment(self):
+        """The production actor hook must not reconstruct global topology."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = FakeBackend(configuration)
+            runner = RecordingRunner(backend)
+            MacroRoundOrchestrator(
+                configuration, backend=backend, hook_runner=runner
+            ).run()
+
+            collect_environments = [
+                environment
+                for (name, _), environment, _workdir in runner.calls
+                if name == "collect"
+            ]
+            self.assertEqual(len(collect_environments), COHORT_COUNT)
+            common_topology = {
+                "ROUND_DAGGER_TARGET_ENVIRONMENTS": str(TARGET_ENVIRONMENTS),
+                "ROUND_DAGGER_COHORT_COUNT": str(COHORT_COUNT),
+                "ROUND_DAGGER_ENVIRONMENTS_PER_COHORT": str(
+                    ENVIRONMENTS_PER_COHORT
+                ),
+                "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": str(
+                    STEPS_PER_ENVIRONMENT
+                ),
+                "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": str(
+                    TRANSITIONS_PER_MACRO_ROUND
+                ),
+            }
+            for cohort_index, environment in enumerate(collect_environments):
+                with self.subTest(cohort_index=cohort_index):
+                    self.assertEqual(
+                        {
+                            key: environment.get(key)
+                            for key in common_topology
+                        },
+                        common_topology,
+                    )
+                    self.assertEqual(
+                        environment.get("ROUND_DAGGER_GLOBAL_ENV_OFFSET"),
+                        str(cohort_index * ENVIRONMENTS_PER_COHORT),
+                    )
+                    self.assertEqual(
+                        environment.get("ROUND_DAGGER_LOGICAL_ENV_COUNT"),
+                        str(ENVIRONMENTS_PER_COHORT),
+                    )
+                    self.assertEqual(
+                        environment.get("ROUND_DAGGER_EXPECTED_TRANSITIONS"),
+                        str(TRANSITIONS_PER_COHORT),
+                    )
+
     def test_hooks_are_sequential_and_promotion_follows_strict_aggregate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

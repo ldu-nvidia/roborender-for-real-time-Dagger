@@ -1165,15 +1165,18 @@ class MacroRoundOrchestrator:
                         cohort_index=cohort_index,
                     )
                 )
-                environment = _cohort_environment(
-                    config=self.config,
-                    campaign=campaign,
-                    contract=contract,
-                    cohort_index=cohort_index,
-                    source=source,
-                    destination=destination,
-                    actor_run_dir=actor_run_dir,
-                )
+                environment = {
+                    **base_environment,
+                    **_cohort_environment(
+                        config=self.config,
+                        campaign=campaign,
+                        contract=contract,
+                        cohort_index=cohort_index,
+                        source=source,
+                        destination=destination,
+                        actor_run_dir=actor_run_dir,
+                    ),
+                }
                 source_report = self.backend.complete_cohort(source)
                 if source_report is None:
                     self._run_hook("collect", environment)
