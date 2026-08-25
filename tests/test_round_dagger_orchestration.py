@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from round_dagger import artifacts
 from round_dagger.artifacts import publish_immutable_json, sha256_file
 from round_dagger.orchestration import (
     COHORT_COUNT,
@@ -354,6 +355,25 @@ class RecordingRunner:
 
 
 class ConfigAndTopologyTest(unittest.TestCase):
+    def test_actor_source_seal_is_incomplete_without_stream_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = ProductionBackend(configuration)
+            source = (
+                configuration.actor_root
+                / "production-campaign"
+                / "macro_round_000000"
+                / "cohort_00"
+            )
+            source.mkdir(parents=True)
+            (source / artifacts.SEAL_FILENAME).write_text("{}", encoding="utf-8")
+            self.assertIsNone(backend.complete_cohort(source))
+            with self.assertRaisesRegex(
+                OrchestrationError, "without verified Image3F cleanup"
+            ):
+                backend.seal_cohort(source)
+
     def test_learner_result_requires_exact_colocated_policy_sidecars(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

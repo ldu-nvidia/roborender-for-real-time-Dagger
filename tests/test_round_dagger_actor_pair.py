@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import os
+import pickle
+import re
+import socket
+import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -17,6 +22,7 @@ from round_dagger.actor_pair import (
     require_actor_rank_completion,
     seal_actor_pair,
 )
+from round_dagger.image3f_lifecycle import create_attempt_plan, record_rank_completion
 from tests.test_round_dagger_handoff import publish_policy_bundle
 
 
@@ -32,6 +38,55 @@ DIGESTS = {
     "beta_sha256": "5" * 64,
     "config_sha256": "6" * 64,
 }
+
+
+class _ResetAckServer:
+    """Minimal protocol-2 reset endpoint for actor-pair lifecycle tests."""
+
+    def __init__(self, server_id: str):
+        self.server_id = server_id
+        self.stopped = threading.Event()
+        self.socket = socket.socket()
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.listen(64)
+        self.socket.settimeout(0.1)
+        self.port = int(self.socket.getsockname()[1])
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _recv_exact(connection: socket.socket, size: int) -> bytes:
+        result = bytearray()
+        while len(result) < size:
+            chunk = connection.recv(size - len(result))
+            if not chunk:
+                raise ConnectionError("client closed")
+            result.extend(chunk)
+        return bytes(result)
+
+    def _run(self) -> None:
+        while not self.stopped.is_set():
+            try:
+                connection, _ = self.socket.accept()
+            except (TimeoutError, OSError):
+                continue
+            with connection:
+                size = struct.unpack("!Q", self._recv_exact(connection, 8))[0]
+                request = pickle.loads(self._recv_exact(connection, size))
+                response = {
+                    "ok": True,
+                    "removed": False,
+                    "stream_id": request["stream_id"],
+                    "server_id": self.server_id,
+                    "renderer_identity_sha256": DIGESTS["renderer_sha256"],
+                }
+                payload = pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+                connection.sendall(struct.pack("!Q", len(payload)) + payload)
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.socket.close()
+        self.thread.join(timeout=2)
 
 
 def _arrays(rank: int) -> dict[str, np.ndarray]:
@@ -211,7 +266,9 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
         endpoints = []
         for rank in (0, 1):
             endpoint = self.root / f"endpoint-{rank}.json"
-            endpoint.write_text("{}\n", encoding="utf-8")
+            endpoint.write_text(
+                f"renderer-{rank}.example {21000 + rank}\n", encoding="utf-8"
+            )
             endpoints.append(endpoint)
         self.endpoint_manifest = self.root / "endpoints.txt"
         self.endpoint_manifest.write_text(
@@ -278,6 +335,9 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
         self.assertIn("actor_rank=1 actor_world_size=2", result.stdout)
         self.assertIn("no_torch_distributed=1", result.stdout)
         self.assertNotIn("--multi_gpu", result.stdout)
+        match = re.search(r"ACTOR_PAIR_STREAM_PLAN namespace=([^ ]+) ", result.stdout)
+        self.assertIsNotNone(match)
+        self.assertEqual(result.stdout.count(f"image3f_run_id={match.group(1)}"), 2)
         self.assertFalse((self.cohort / "seal.json").exists())
 
     def test_one_failed_executor_is_reaped_without_sealing_partial_pair(self) -> None:
@@ -343,6 +403,40 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             **DIGESTS,
         )
         self.run_dir = self.root / "run"
+        (self.run_dir / "actor_pair_attempts").mkdir(parents=True)
+        self.reset_servers = [_ResetAckServer(f"test-renderer:{rank}") for rank in (0, 1)]
+        self.endpoints = []
+        for rank, server in enumerate(self.reset_servers):
+            endpoint = self.root / f"endpoint-{rank}.txt"
+            endpoint.write_text(f"127.0.0.1 {server.port}\n", encoding="utf-8")
+            self.endpoints.append(endpoint)
+        self.endpoint_manifest = self.root / "endpoints.txt"
+        self.endpoint_manifest.write_text(
+            "".join(f"{path}\n" for path in self.endpoints), encoding="utf-8"
+        )
+        prior_attempt = self.run_dir / "actor_pair_attempts" / "attempt_000001"
+        prior_attempt.mkdir()
+        prior_plan = prior_attempt / "image3f_stream_plan.json"
+        create_attempt_plan(
+            prior_plan,
+            campaign_id="actor-pair-test",
+            macro_round=0,
+            cohort_index=0,
+            attempt_dir=prior_attempt,
+            cohort_dir=self.cohort,
+            endpoint_manifest=self.endpoint_manifest,
+            expected_renderers=2,
+            renderer_sha256=DIGESTS["renderer_sha256"],
+            local_environments=32,
+            actor_world_size=2,
+            launched_ranks=[0],
+        )
+        record_rank_completion(
+            prior_attempt / "rank_0000_stream_completion.json",
+            plan_path=prior_plan,
+            cohort_dir=self.cohort,
+            rank=0,
+        )
         self.owner_log = self.root / "owner.log"
         self.drained = self.root / "sidecar-drained"
         self.publisher = self.root / "publish_rank.py"
@@ -386,6 +480,8 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
         self.executor.chmod(0o755)
 
     def tearDown(self) -> None:
+        for server in self.reset_servers:
+            server.close()
         self.temporary.cleanup()
 
     def _environment(self) -> dict[str, str]:
@@ -396,10 +492,18 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
             "ROUND_DAGGER_EXPECTED_TRANSITIONS": "19200",
             "ROUND_DAGGER_COHORT_DIR": str(self.cohort),
+            "ROUND_DAGGER_CAMPAIGN_ID": "actor-pair-test",
+            "ROUND_DAGGER_MACRO_ROUND": "0",
+            "ROUND_DAGGER_COHORT_INDEX": "0",
             "TRAIN_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_ACTOR_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_ACTOR_PAIR_EXECUTOR": str(self.executor),
             "ROUND_DAGGER_WANDB_ENABLED": "1",
+            "ROUND_DAGGER_RENDERER_SHA256": DIGESTS["renderer_sha256"],
+            "IMAGE3F_ENDPOINT_MANIFEST": str(self.endpoint_manifest),
+            "ROUND_DAGGER_EXPECTED_RENDERERS": "2",
+            "ROUND_DAGGER_IMAGE3F_RESET_TIMEOUT_S": "1",
+            "ROUND_DAGGER_IMAGE3F_RESET_RETRIES": "0",
         }
 
     def test_rank_one_owns_and_drains_sidecar_before_retry_seals(self) -> None:

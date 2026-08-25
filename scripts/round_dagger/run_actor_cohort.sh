@@ -23,17 +23,19 @@ required=(
     ROUND_DAGGER_RUNTIME_POLICY_SHA256 ROUND_DAGGER_TEACHER_CHECKPOINT
     ROUND_DAGGER_TEACHER_SHA256 ROUND_DAGGER_RENDERER_SHA256
     ROUND_DAGGER_BETA ROUND_DAGGER_BETA_SHA256 ROUND_DAGGER_CONFIG_SHA256
+    ROUND_DAGGER_IMAGE3F_ATTEMPT_NAMESPACE ROUND_DAGGER_IMAGE3F_STREAM_PLAN
     IMAGE3F_ENDPOINT_MANIFEST ANCHORS TRAIN_RUN_DIR
 )
 for name in "${required[@]}"; do
     [ -n "${!name:-}" ] || { echo "missing required environment: $name" >&2; exit 2; }
 done
 
-case "$ROUND_DAGGER_COHORT_DIR:$ROUND_DAGGER_POLICY_CHECKPOINT:$ROUND_DAGGER_TEACHER_CHECKPOINT:$IMAGE3F_ENDPOINT_MANIFEST:$ANCHORS:$TRAIN_RUN_DIR" in
-    /*:/*:/*:/*:/*:/*) ;;
+case "$ROUND_DAGGER_COHORT_DIR:$ROUND_DAGGER_POLICY_CHECKPOINT:$ROUND_DAGGER_TEACHER_CHECKPOINT:$IMAGE3F_ENDPOINT_MANIFEST:$ROUND_DAGGER_IMAGE3F_STREAM_PLAN:$ANCHORS:$TRAIN_RUN_DIR" in
+    /*:/*:/*:/*:/*:/*:/*) ;;
     *) echo "all actor artifact paths must be absolute" >&2; exit 2 ;;
 esac
-for file in "$ROUND_DAGGER_POLICY_CHECKPOINT" "$ROUND_DAGGER_TEACHER_CHECKPOINT" "$IMAGE3F_ENDPOINT_MANIFEST"; do
+for file in "$ROUND_DAGGER_POLICY_CHECKPOINT" "$ROUND_DAGGER_TEACHER_CHECKPOINT" \
+    "$IMAGE3F_ENDPOINT_MANIFEST" "$ROUND_DAGGER_IMAGE3F_STREAM_PLAN"; do
     [ -f "$file" ] && [ ! -L "$file" ] || { echo "unsafe or missing file: $file" >&2; exit 2; }
 done
 [ -d "$ANCHORS" ] && [ ! -L "$ANCHORS" ] || { echo "unsafe anchor directory" >&2; exit 2; }
@@ -177,7 +179,20 @@ export IMAGE_DAGGER_TELEMETRY_IMAGE_EVERY=${IMAGE_DAGGER_TELEMETRY_IMAGE_EVERY:-
 export IMAGE_DAGGER_TELEMETRY_CLIP_EVERY=${IMAGE_DAGGER_TELEMETRY_CLIP_EVERY:-300}
 export IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES=${IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES:-32}
 export IMAGE_DAGGER_TELEMETRY_CLIP_FPS=${IMAGE_DAGGER_TELEMETRY_CLIP_FPS:-10}
-export IMAGE3F_RUN_ID="${ROUND_DAGGER_CAMPAIGN_ID}-m${ROUND_DAGGER_MACRO_ROUND}-c${ROUND_DAGGER_COHORT_INDEX}"
+PLAN_IDENTITY=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \
+    -m round_dagger.image3f_lifecycle verify-rank \
+    --plan "$ROUND_DAGGER_IMAGE3F_STREAM_PLAN" --rank "$ACTOR_RANK" \
+    --expected-namespace "$ROUND_DAGGER_IMAGE3F_ATTEMPT_NAMESPACE" \
+    --endpoint-manifest "$IMAGE3F_ENDPOINT_MANIFEST" \
+    --renderer-sha256 "$ROUND_DAGGER_RENDERER_SHA256" \
+    --local-environments 32 --actor-world-size "$ACTOR_WORLD_SIZE")
+PLAN_NAMESPACE=$(python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["attempt_namespace"])' \
+    <<<"$PLAN_IDENTITY")
+[[ "$PLAN_NAMESPACE" == "$ROUND_DAGGER_IMAGE3F_ATTEMPT_NAMESPACE" ]] || {
+    echo "actor attempt namespace differs from immutable stream plan" >&2; exit 2;
+}
+export IMAGE3F_RUN_ID="$ROUND_DAGGER_IMAGE3F_ATTEMPT_NAMESPACE"
 export IMAGE3F_REFERENCE_LAG=256
 export IMAGE3F_LOCAL_ENVS=32
 export ROBORENDER_TELEMETRY_DIR="$BASE_TRAIN_RUN_DIR/telemetry"
@@ -219,7 +234,8 @@ COMMAND=(
 )
 
 if [ "$DRY_RUN" = 1 ]; then
-    printf 'DRY_RUN actor_rank=%q actor_world_size=%q' "$ACTOR_RANK" "$ACTOR_WORLD_SIZE"
+    printf 'DRY_RUN actor_rank=%q actor_world_size=%q image3f_run_id=%q' \
+        "$ACTOR_RANK" "$ACTOR_WORLD_SIZE" "$IMAGE3F_RUN_ID"
     printf ' %q' "${COMMAND[@]}"
     printf '\n'
 else
@@ -231,6 +247,15 @@ else
     # and coverage before returning success to the outer pair launcher.
     PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \
         -m round_dagger.actor_pair rank \
+        --cohort-dir "$ROUND_DAGGER_COHORT_DIR" \
+        --rank "$ACTOR_RANK" >/dev/null
+    ATTEMPT_DIR=$(dirname "$ROUND_DAGGER_IMAGE3F_STREAM_PLAN")
+    printf -v COMPLETION_PATH '%s/rank_%04d_stream_completion.json' \
+        "$ATTEMPT_DIR" "$ACTOR_RANK"
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \
+        -m round_dagger.image3f_lifecycle complete-rank \
+        --output "$COMPLETION_PATH" \
+        --plan "$ROUND_DAGGER_IMAGE3F_STREAM_PLAN" \
         --cohort-dir "$ROUND_DAGGER_COHORT_DIR" \
         --rank "$ACTOR_RANK" >/dev/null
     echo "ROUND_ACTOR_RANK_OK rank=$ACTOR_RANK purpose=train"

@@ -9,6 +9,7 @@ import numpy as np
 
 from round_dagger import artifacts
 from round_dagger import handoff
+from round_dagger.image3f_lifecycle import create_attempt_plan
 from round_dagger.gr00t_policy import (
     BASE_MODULE_TARGET,
     POLICY_TARGET,
@@ -307,7 +308,9 @@ class ActorLauncherContractTest(unittest.TestCase):
             endpoints = []
             for index in range(2):
                 endpoint = root / f"endpoint_{index}.txt"
-                endpoint.write_text("127.0.0.1:1\n", encoding="utf-8")
+                endpoint.write_text(
+                    f"127.0.0.1 {index + 1}\n", encoding="utf-8"
+                )
                 endpoints.append(endpoint)
             endpoint_manifest = root / "endpoints.txt"
             endpoint_manifest.write_text(
@@ -323,8 +326,26 @@ class ActorLauncherContractTest(unittest.TestCase):
             )
             accelerate.chmod(0o755)
             run_dir = root / "run"
+            attempt_dir = run_dir / "actor_pair_attempts" / "attempt_000001"
+            attempt_dir.mkdir(parents=True)
+            stream_plan = attempt_dir / "image3f_stream_plan.json"
+            plan = create_attempt_plan(
+                stream_plan,
+                campaign_id="launcher-test",
+                macro_round=0,
+                cohort_index=0,
+                attempt_dir=attempt_dir,
+                cohort_dir=cohort,
+                endpoint_manifest=endpoint_manifest,
+                expected_renderers=2,
+                renderer_sha256=renderer_sha,
+                local_environments=32,
+                actor_world_size=2,
+                launched_ranks=[0, 1],
+            )
             environment = {
                 "DRY_RUN": "1",
+                "GR00T_ROOT": str(root),
                 "GR00T_PYTHON": "/usr/bin/python3",
                 "ACCELERATE": str(accelerate),
                 "ROUND_DAGGER_ACTOR_RANK": "0",
@@ -342,6 +363,10 @@ class ActorLauncherContractTest(unittest.TestCase):
                 "ROUND_DAGGER_BETA": "0.5",
                 "ROUND_DAGGER_BETA_SHA256": beta_sha,
                 "ROUND_DAGGER_CONFIG_SHA256": config_sha,
+                "ROUND_DAGGER_IMAGE3F_ATTEMPT_NAMESPACE": plan[
+                    "attempt_namespace"
+                ],
+                "ROUND_DAGGER_IMAGE3F_STREAM_PLAN": str(stream_plan),
                 "ROUND_DAGGER_POLICY_SPEC": str(policy_spec),
                 "ROUND_DAGGER_POLICY_MANIFEST": str(policy_manifest),
                 "ROUND_DAGGER_POLICY_SPEC_SHA256": artifacts.sha256_file(

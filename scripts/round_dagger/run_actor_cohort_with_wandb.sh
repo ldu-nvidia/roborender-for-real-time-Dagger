@@ -79,15 +79,26 @@ mkdir -p "$RUN_DIR/telemetry" "$RUN_DIR/logs"
 READY="$RUN_DIR/telemetry/WANDB_WATCHER_READY.json"
 FINISH_MARKER=RUN_DONE
 ACTOR_DONE=
+PAIR_HEARTBEAT=
+PAIR_ORPHAN_TIMEOUT=
 if [ "$PAIR_LIFECYCLE" = 1 ]; then
     FINISH_MARKER=${ROUND_DAGGER_WANDB_PAIR_FINISH_MARKER:?missing pair finish marker}
     ACTOR_DONE=${ROUND_DAGGER_WANDB_ACTOR_DONE_MARKER:?missing actor done marker}
+    PAIR_HEARTBEAT=${ROUND_DAGGER_WANDB_PAIR_HEARTBEAT:?missing pair heartbeat}
+    PAIR_ORPHAN_TIMEOUT=${ROUND_DAGGER_WANDB_PAIR_ORPHAN_TIMEOUT_SECONDS:-30}
     case "$FINISH_MARKER" in
         /*|*..*|*//*|"") echo "unsafe W&B pair finish marker" >&2; exit 2 ;;
     esac
     case "$ACTOR_DONE" in /*) ;; *) echo "W&B actor-done marker must be absolute" >&2; exit 2 ;; esac
     [[ "$ACTOR_DONE" == "$RUN_DIR"/* ]] || {
         echo "W&B actor-done marker must be inside the common run directory" >&2; exit 2;
+    }
+    [[ "$PAIR_HEARTBEAT" == "$RUN_DIR"/* && -f "$PAIR_HEARTBEAT" && \
+       ! -L "$PAIR_HEARTBEAT" ]] || {
+        echo "W&B pair heartbeat must be a safe file inside the run directory" >&2; exit 2;
+    }
+    [[ "$PAIR_ORPHAN_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+        echo "W&B pair orphan timeout must be a positive integer" >&2; exit 2;
     }
 fi
 DONE="$RUN_DIR/$FINISH_MARKER"
@@ -152,6 +163,19 @@ set -e
 # mode retains the original actor-scoped lifecycle.
 if [ "$PAIR_LIFECYCLE" = 1 ]; then
     printf '%s\n' "$ACTOR_STATUS" >"$ACTOR_DONE"
+    while [ ! -f "$DONE" ]; do
+        if ! kill -0 "$WATCHER_PID" 2>/dev/null; then
+            break
+        fi
+        NOW=$(date +%s)
+        HEARTBEAT_MTIME=$(stat -c %Y "$PAIR_HEARTBEAT" 2>/dev/null || echo 0)
+        if [ $((NOW - HEARTBEAT_MTIME)) -gt "$PAIR_ORPHAN_TIMEOUT" ]; then
+            : >"$DONE"
+            echo "W&B pair supervisor lease expired; self-finalizing sidecar" >&2
+            break
+        fi
+        sleep 1
+    done
 else
     : >"$DONE"
 fi

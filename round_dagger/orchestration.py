@@ -21,7 +21,15 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol, Sequence
 
-from round_dagger import artifacts, handoff, policy_bundle, promotion, replay, state
+from round_dagger import (
+    artifacts,
+    handoff,
+    image3f_lifecycle,
+    policy_bundle,
+    promotion,
+    replay,
+    state,
+)
 
 
 ORCHESTRATION_CONFIG_SCHEMA = "fast_roborender.round_dagger.orchestration_config.v1"
@@ -553,12 +561,53 @@ class ProductionBackend:
             config_sha256=contract["training_config_sha256"],
         )
 
+    def _actor_run_dir(self, path: Path) -> Path | None:
+        """Map an exact actor-source cohort to its lifecycle run directory."""
+
+        try:
+            relative = path.relative_to(self.config.actor_root)
+        except ValueError:
+            return None
+        expected_round = f"macro_round_{self.config.macro_round:06d}"
+        if (
+            len(relative.parts) != 3
+            or relative.parts[1] != expected_round
+            or re.fullmatch(r"cohort_[0-9]{2}", relative.parts[2]) is None
+        ):
+            return None
+        return path.with_name(f"{path.name}_run")
+
+    def _require_actor_cleanup(self, path: Path) -> dict[str, Any] | None:
+        run_dir = self._actor_run_dir(path)
+        if run_dir is None:
+            return None
+        report = run_dir / "image3f_stream_cleanup" / "cleanup_complete.json"
+        if not report.exists():
+            return None
+        try:
+            return image3f_lifecycle.verify_cleanup_report(
+                run_dir, cohort_dir=path
+            )
+        except image3f_lifecycle.Image3FLifecycleError as exc:
+            raise OrchestrationError(
+                f"actor cohort has invalid Image3F cleanup evidence: {exc}"
+            ) from exc
+
     def complete_cohort(self, path: Path) -> dict[str, Any] | None:
         if not (path / artifacts.SEAL_FILENAME).exists():
+            return None
+        if self._actor_run_dir(path) is not None and self._require_actor_cleanup(path) is None:
+            # A pre-hotfix or interrupted seal is not collection completion.
+            # Returning None makes the orchestrator invoke the idempotent
+            # collection hook, whose sealed recovery path performs cleanup.
             return None
         return artifacts.verify_cohort(path)
 
     def seal_cohort(self, path: Path) -> dict[str, Any]:
+        if self._actor_run_dir(path) is not None and self._require_actor_cleanup(path) is None:
+            raise OrchestrationError(
+                "actor cohort cannot be sealed without verified Image3F cleanup"
+            )
         return artifacts.seal_cohort(path)
 
     def transfer_local(self, source: Path, destination: Path) -> dict[str, Any]:
