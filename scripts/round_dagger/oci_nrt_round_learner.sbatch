@@ -15,6 +15,10 @@ set -Eeuo pipefail
 
 fatal() { echo "FATAL: $*" >&2; exit 2; }
 
+BATCH_DRY_RUN=${ROUND_DAGGER_BATCH_DRY_RUN:-0}
+[[ $BATCH_DRY_RUN == 0 || $BATCH_DRY_RUN == 1 ]] || \
+    fatal "ROUND_DAGGER_BATCH_DRY_RUN must be exactly 0 or 1"
+
 required=(
     ROUND_DAGGER_REMOTE_SOURCE_ROOT ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256
     ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT
@@ -60,7 +64,9 @@ done
     fatal "learner allocation must expose eight GPUs"
 for path in \
     "$ROUND_DAGGER_REMOTE_SOURCE_ROOT" "$ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT" \
+    "$ROUND_DAGGER_REMOTE_CAMPAIGN_INVENTORY" \
     "$ROUND_DAGGER_REMOTE_LEARNER_OUTPUT" "$ROUND_DAGGER_REMOTE_JOB_ROOT" \
+    "$ROUND_DAGGER_REMOTE_CONTAINER" "$ROUND_DAGGER_REMOTE_WANDB_NETRC" \
     "$ROUND_DAGGER_LOCAL_CAMPAIGN_ROOT" "$ROUND_DAGGER_CAMPAIGN_ROOT" \
     "$ROUND_DAGGER_REMOTE_SUCCESS_MARKER"; do
     [[ $path == /* && $path != *,* && $path != *:* ]] || \
@@ -136,29 +142,13 @@ done
 VERIFY_SOURCE="$ROUND_DAGGER_REMOTE_SOURCE_ROOT/scripts/round_dagger/verify_sealed_source_snapshot.py"
 [[ -f $VERIFY_SOURCE && ! -L $VERIFY_SOURCE ]] || \
     fatal "sealed source lacks its verifier"
-python3 "$VERIFY_SOURCE" --root "$ROUND_DAGGER_REMOTE_SOURCE_ROOT" \
-    --expected-inventory-sha256 \
-    "$ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256" >/dev/null
 
 REMOTE_TRANSFER="$ROUND_DAGGER_REMOTE_SOURCE_ROOT/scripts/round_dagger/remote_campaign_transfer.py"
 [[ -f $REMOTE_TRANSFER && ! -L $REMOTE_TRANSFER ]] || \
     fatal "sealed source lacks remote transfer verifier"
-python3 "$REMOTE_TRANSFER" verify \
-    --root "$ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT" \
-    --inventory "$ROUND_DAGGER_REMOTE_CAMPAIGN_INVENTORY" >/dev/null
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROUND_DAGGER_REMOTE_SOURCE_ROOT" python3 - \
-    "${policy_remote_paths[0]}" "${policy_remote_paths[1]}" \
-    "${policy_remote_paths[2]}" "$ROUND_DAGGER_POLICY_SHA256" \
-    "$ROUND_DAGGER_RUNTIME_POLICY_SHA256" <<'PY'
-import sys
-from round_dagger.policy_bundle import validate_policy_bundle_identity
-
-validate_policy_bundle_identity(
-    checkpoint=sys.argv[1], policy_spec=sys.argv[2], manifest=sys.argv[3],
-    expected_checkpoint_sha256=sys.argv[4],
-    expected_runtime_policy_sha256=sys.argv[5],
-)
-PY
+# Dependency-bearing validation is deliberately deferred to the mounted
+# trainer container. OCI compute-node host Python is not part of the sealed
+# runtime and is not required to provide NumPy or PyTorch.
 
 mkdir -p "$ROUND_DAGGER_REMOTE_JOB_ROOT/logs" "$ROUND_DAGGER_REMOTE_LEARNER_OUTPUT"
 [[ ! -L $ROUND_DAGGER_REMOTE_LEARNER_OUTPUT ]] || \
@@ -166,11 +156,21 @@ mkdir -p "$ROUND_DAGGER_REMOTE_JOB_ROOT/logs" "$ROUND_DAGGER_REMOTE_LEARNER_OUTP
 
 CONTAINER_ROOT=/workspace/fast_roborender
 CONTAINER_HOME=/home/ldu
+CONTAINER_VERIFY_CAMPAIGN_ROOT=/round_dagger_campaign_input
+CONTAINER_VERIFY_CAMPAIGN_INVENTORY=/round_dagger_campaign_input.inventory.json
+CONTAINER_SUCCESS_MARKER=/round_dagger_job/learner_success.json
 MOUNTS="$ROUND_DAGGER_REMOTE_SOURCE_ROOT:$CONTAINER_ROOT:ro"
 MOUNTS+=",$ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT:$ROUND_DAGGER_LOCAL_CAMPAIGN_ROOT:ro"
 MOUNTS+=",$ROUND_DAGGER_REMOTE_LEARNER_OUTPUT:$ROUND_DAGGER_LEARNER_OUTPUT_DIR"
 MOUNTS+=",$ROUND_DAGGER_REMOTE_JOB_ROOT:/round_dagger_job"
 MOUNTS+=",$ROUND_DAGGER_REMOTE_WANDB_NETRC:$CONTAINER_HOME/.netrc:ro"
+MOUNTS+=",$ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT:$CONTAINER_VERIFY_CAMPAIGN_ROOT:ro"
+MOUNTS+=",$ROUND_DAGGER_REMOTE_CAMPAIGN_INVENTORY:$CONTAINER_VERIFY_CAMPAIGN_INVENTORY:ro"
+
+if ((BATCH_DRY_RUN)); then
+    echo "OCI_NRT_ROUND_LEARNER_HOST_DRY_RUN_OK validation=containerized host_python=unused"
+    exit 0
+fi
 
 set +e
 srun --nodes=1 --ntasks=1 --gpus=8 --gpus-per-task=8 \
@@ -185,6 +185,9 @@ srun --nodes=1 --ntasks=1 --gpus=8 --gpus-per-task=8 \
       GR00T_ROOT="$CONTAINER_ROOT/GR00T-VisualSim2Real" \
       ROUND_DAGGER_H100_PYTHON=/opt/viral-h100/bin/python \
       ROUND_DAGGER_WANDB_RUNTIME_DIR=/round_dagger_job/wandb \
+      ROUND_DAGGER_CONTAINER_VERIFY_CAMPAIGN_ROOT="$CONTAINER_VERIFY_CAMPAIGN_ROOT" \
+      ROUND_DAGGER_CONTAINER_VERIFY_CAMPAIGN_INVENTORY="$CONTAINER_VERIFY_CAMPAIGN_INVENTORY" \
+      ROUND_DAGGER_CONTAINER_SUCCESS_MARKER="$CONTAINER_SUCCESS_MARKER" \
       ROUND_DAGGER_LEARNER_NNODES=1 \
       ROUND_DAGGER_LEARNER_NPROC_PER_NODE=8 \
       ROUND_DAGGER_LEARNER_NODE_RANK=0 \
@@ -213,19 +216,9 @@ printf -v ROUND_PADDED '%06d' "$((10#$ROUND_DAGGER_MACRO_ROUND))"
 COMPLETION_ATTESTATION="$ROUND_DAGGER_REMOTE_LEARNER_OUTPUT/learner_completion_round_${ROUND_PADDED}.json"
 [[ -f $COMPLETION_ATTESTATION && ! -L $COMPLETION_ATTESTATION ]] || \
     fatal "learner exited without the canonical completion attestation"
-ADOPT_TOOL="$ROUND_DAGGER_REMOTE_SOURCE_ROOT/scripts/round_dagger/learner_completion_attestation.py"
-[[ -f $ADOPT_TOOL && ! -L $ADOPT_TOOL ]] || \
-    fatal "sealed source lacks completion-attestation verifier"
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROUND_DAGGER_REMOTE_SOURCE_ROOT" \
-python3 "$ADOPT_TOOL" adopt \
-    --attestation "$COMPLETION_ATTESTATION" \
-    --result "$ROUND_DAGGER_REMOTE_LEARNER_OUTPUT/$RESULT_RELATIVE" \
-    --success-marker "$ROUND_DAGGER_REMOTE_SUCCESS_MARKER" \
-    --campaign-id "$ROUND_DAGGER_CAMPAIGN_ID" \
-    --macro-round "$ROUND_DAGGER_MACRO_ROUND" \
-    --code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
-    --config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
-    --parent-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
-    --snapshot-file-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
-    --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" >/dev/null
+[[ -f $ROUND_DAGGER_REMOTE_SUCCESS_MARKER && \
+   ! -L $ROUND_DAGGER_REMOTE_SUCCESS_MARKER ]] || \
+    fatal "container exited without the verified success marker"
+[[ -z $(find "$ROUND_DAGGER_REMOTE_SUCCESS_MARKER" -perm /222 -print -quit) ]] || \
+    fatal "container success marker is writable"
 echo "OCI_NRT_ROUND_LEARNER_COMPLETE job_id=${SLURM_JOB_ID:-unknown}"

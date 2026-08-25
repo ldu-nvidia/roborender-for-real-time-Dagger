@@ -130,13 +130,13 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertNotIn("WANDB_API_KEY", bridge + batch)
         self.assertIn("flock -n 9", bridge)
         self.assertIn("remote-complete", bridge)
-        self.assertIn("adopt_remote_success", bridge)
+        self.assertNotIn("adopt_remote_success", bridge)
         self.assertIn("learner_completion_attestation.py", bridge)
-        self.assertIn("refusing rerun or adoption", bridge)
         self.assertIn("attested-result", bridge)
         self.assertIn("result-only", bridge)
+        self.assertIn("submitting container finalization", bridge)
         self.assertIn("submitting finalization recovery", bridge)
-        self.assertIn("retrying finalizer", bridge)
+        self.assertIn("container finalization incomplete", bridge)
         self.assertIn("$state == FAILED || $state =~ $retryable", bridge)
         self.assertIn("remote_restart_state", bridge)
         self.assertIn("FAILED after durable restart", bridge)
@@ -169,6 +169,15 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn(":ro", batch)
         self.assertIn("/round_dagger_job/wandb", container_wrapper)
         self.assertNotIn('$OUTPUT/wandb', container_wrapper)
+        self.assertNotIn("python3", batch)
+        self.assertNotIn("PYTHONPATH=", batch)
+        self.assertNotIn("from round_dagger", batch)
+        self.assertIn("validate_policy_bundle_identity", container_wrapper)
+        self.assertIn("verify_sealed_source_snapshot.py", container_wrapper)
+        self.assertIn("remote_campaign_transfer.py", container_wrapper)
+        self.assertIn("learner_completion_attestation.py\" adopt", container_wrapper)
+        self.assertIn("remote_learner_success.py\" verify", container_wrapper)
+        self.assertIn("ROUND_DAGGER_CONTAINER_SUCCESS_MARKER", batch)
         self.assertIn('"256:4:64:300:76800"', bridge)
         self.assertIn('"256:4:64:300:76800"', batch)
         self.assertIn(
@@ -185,6 +194,143 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn("existing learner result restart is not at the final frontier", launcher)
         self.assertIn("H100_LEARNER_RECOVERY_CLEANUP", launcher)
         self.assertIn("recovered=attested", launcher)
+
+    def test_batch_host_dry_run_does_not_require_python_or_numpy(self) -> None:
+        batch = ROOT / "scripts/round_dagger/oci_nrt_round_learner.sbatch"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sealed-source"
+            source_tools = source / "scripts/round_dagger"
+            source_tools.mkdir(parents=True)
+            for path in (
+                source / ".source_snapshot_manifest.json",
+                source_tools / "verify_sealed_source_snapshot.py",
+                source_tools / "remote_campaign_transfer.py",
+            ):
+                path.write_text("{}\n", encoding="utf-8")
+
+            remote_campaign = root / "remote-campaign"
+            policy_dir = remote_campaign / "policies"
+            policy_dir.mkdir(parents=True)
+            checkpoint = policy_dir / "checkpoint.pt"
+            specification = Path(f"{checkpoint}.policy_spec.json")
+            manifest = Path(f"{checkpoint}.manifest.json")
+            checkpoint.write_bytes(b"host-dry-run-checkpoint")
+            specification.write_text("{}\n", encoding="utf-8")
+            manifest.write_text("{}\n", encoding="utf-8")
+
+            inventory = root / "campaign.inventory.json"
+            inventory.write_text("{}\n", encoding="utf-8")
+            container = root / "trainer.sqsh"
+            container.write_bytes(b"sealed-container")
+            netrc = root / "wandb.netrc"
+            netrc.write_text("machine api.wandb.ai\n", encoding="utf-8")
+            netrc.chmod(0o600)
+            remote_output = root / "learner-output"
+            job_root = root / "job"
+
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            invoked = root / "bare-python-was-invoked"
+            fake_python = fake_bin / "python3"
+            fake_python.write_text(
+                "#!/bin/sh\n: > \"$PYTHON_INVOKED_MARKER\"\nexit 91\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+
+            canonical_campaign = Path("/canonical/round-dagger-campaign")
+            canonical_checkpoint = canonical_campaign / "policies/checkpoint.pt"
+            canonical_specification = Path(
+                f"{canonical_checkpoint}.policy_spec.json"
+            )
+            canonical_manifest = Path(f"{canonical_checkpoint}.manifest.json")
+            canonical_output = canonical_campaign / "rounds/macro_round_000000/learner"
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "PYTHON_INVOKED_MARKER": str(invoked),
+                "ROUND_DAGGER_BATCH_DRY_RUN": "1",
+                "SLURM_JOB_NUM_NODES": "1",
+                "SLURM_GPUS_ON_NODE": "8",
+                "ROUND_DAGGER_REMOTE_SOURCE_ROOT": str(source),
+                "ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256": "a" * 64,
+                "ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT": str(remote_campaign),
+                "ROUND_DAGGER_REMOTE_CAMPAIGN_INVENTORY": str(inventory),
+                "ROUND_DAGGER_LOCAL_CAMPAIGN_ROOT": str(canonical_campaign),
+                "ROUND_DAGGER_CAMPAIGN_ROOT": str(canonical_campaign),
+                "ROUND_DAGGER_REMOTE_LEARNER_OUTPUT": str(remote_output),
+                "ROUND_DAGGER_REMOTE_CONTAINER": str(container),
+                "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": artifacts.sha256_file(container),
+                "ROUND_DAGGER_REMOTE_WANDB_NETRC": str(netrc),
+                "ROUND_DAGGER_REMOTE_JOB_ROOT": str(job_root),
+                "ROUND_DAGGER_CAMPAIGN_ID": "bare-host-dry-run",
+                "ROUND_DAGGER_MACRO_ROUND": "0",
+                "ROUND_DAGGER_POLICY_SPEC": str(canonical_specification),
+                "ROUND_DAGGER_POLICY_MANIFEST": str(canonical_manifest),
+                "ROUND_DAGGER_POLICY_SPEC_SHA256": artifacts.sha256_file(specification),
+                "ROUND_DAGGER_POLICY_MANIFEST_SHA256": artifacts.sha256_file(manifest),
+                "ROUND_DAGGER_POLICY_CHECKPOINT": str(canonical_checkpoint),
+                "ROUND_DAGGER_POLICY_SHA256": artifacts.sha256_file(checkpoint),
+                "ROUND_DAGGER_RUNTIME_POLICY_SHA256": "b" * 64,
+                "ROUND_DAGGER_REPLAY_SNAPSHOT": str(
+                    canonical_campaign / "replay/snapshots/round_000000.json"
+                ),
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256": "c" * 64,
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256": "d" * 64,
+                "ROUND_DAGGER_LEARNER_OUTPUT_DIR": str(canonical_output),
+                "ROUND_DAGGER_LEARNER_RESULT": str(
+                    canonical_output / "learner_result_round_000000.json"
+                ),
+                "ROUND_DAGGER_LEARNER_CODE_SHA256": "a" * 64,
+                "ROUND_DAGGER_LEARNER_CONFIG_SHA256": "e" * 64,
+                "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": artifacts.sha256_file(
+                    checkpoint
+                ),
+                "ROUND_DAGGER_BASE_POLICY_SPEC": str(canonical_specification),
+                "ROUND_DAGGER_LEARNER_BATCH_SIZE": "8",
+                "ROUND_DAGGER_LEARNER_MAX_STEPS": "500",
+                "ROUND_DAGGER_LEARNER_SAVE_EVERY": "5",
+                "ROUND_DAGGER_LEARNER_LEARNING_RATE": "2.5e-5",
+                "ROUND_DAGGER_LEARNER_WEIGHT_DECAY": "0.01",
+                "ROUND_DAGGER_LEARNER_SEED": "17",
+                "ROUND_DAGGER_LEARNER_PARTITION_SEED": "23",
+                "ROUND_DAGGER_WANDB_PROJECT": "roborender-round-dagger",
+                "ROUND_DAGGER_WANDB_ENTITY": "nvidia",
+                "ROUND_DAGGER_WANDB_RUN_ID": "bare-host-run",
+                "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": "ldu@nvidia.com",
+                "ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE": "team",
+                "ROUND_DAGGER_REMOTE_SUCCESS_MARKER": str(
+                    job_root / "learner_success.json"
+                ),
+                "ROUND_DAGGER_TARGET_ENVIRONMENTS": "256",
+                "ROUND_DAGGER_COHORT_COUNT": "4",
+                "ROUND_DAGGER_ENVIRONMENTS_PER_COHORT": "64",
+                "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
+                "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "76800",
+            }
+            readonly_directories = [source_tools, source]
+            for path in source.rglob("*"):
+                path.chmod(0o555 if path.is_dir() else 0o444)
+            source.chmod(0o555)
+            try:
+                completed = subprocess.run(
+                    ["bash", str(batch)],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                    check=False,
+                )
+            finally:
+                for directory in readonly_directories:
+                    directory.chmod(0o755)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("HOST_DRY_RUN_OK", completed.stdout)
+            self.assertIn("host_python=unused", completed.stdout)
+            self.assertFalse(invoked.exists(), "bare host Python was unexpectedly invoked")
 
     def test_local_projection_filters_mutable_state_before_inventory(self) -> None:
         bridge = BRIDGE.read_text(encoding="utf-8")

@@ -327,25 +327,6 @@ verify_remote_success() {
         --learner-code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
         --learner-config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" >/dev/null
 }
-adopt_remote_success() {
-    # This path performs no training.  It is the fail-closed recovery for an
-    # allocation that finished every learner/W&B validation and published its
-    # immutable completion attestation, but died before creating the tiny job
-    # success marker.
-    ssh -o BatchMode=yes "$REMOTE" env PYTHONDONTWRITEBYTECODE=1 \
-        PYTHONPATH="$REMOTE_SOURCE" \
-        python3 "$REMOTE_SOURCE/scripts/round_dagger/learner_completion_attestation.py" \
-        adopt --attestation "$REMOTE_COMPLETION_ATTESTATION" \
-        --result "$REMOTE_OUTPUT/$REMOTE_RESULT_REL" \
-        --success-marker "$REMOTE_SUCCESS_MARKER" \
-        --campaign-id "$ROUND_DAGGER_CAMPAIGN_ID" \
-        --macro-round "$ROUND_DAGGER_MACRO_ROUND" \
-        --code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
-        --config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
-        --parent-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
-        --snapshot-file-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
-        --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" >/dev/null
-}
 remote_completion_state() {
     ssh -o BatchMode=yes "$REMOTE" bash -s -- \
         "$REMOTE_SUCCESS_MARKER" "$REMOTE_OUTPUT/$REMOTE_RESULT_REL" \
@@ -416,16 +397,11 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
                 break
                 ;;
             attested-result)
-                adopt_remote_success || \
-                    fatal "remote learner result lacks a valid completion attestation; refusing rerun or adoption"
-                verify_remote_success || \
-                    fatal "adopted remote learner success marker is invalid"
-                remote_result_complete=1
-                job_id=remote-adopted
-                attempt=0
-                echo "OCI-NRT learner completion attestation adopted; resuming artifact return"
-                break
-                ;;
+                # Completion adoption imports the learner stack and therefore
+                # belongs inside the pinned trainer container, never in bare
+                # host Python. Resubmit the same sealed job as a finalizer.
+                echo "OCI-NRT learner attestation found without marker; submitting container finalization" >&2
+                ;;&
             result-only)
                 # Training has already committed its immutable result, which
                 # is published only after W&B finish.  Resubmit the same sealed
@@ -434,7 +410,7 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
                 # the missing completion attestation without another update.
                 echo "OCI-NRT learner result found without completion attestation; submitting finalization recovery" >&2
                 ;;&
-            empty|result-only)
+            empty|result-only|attested-result)
                 submission=$(ssh -o BatchMode=yes "$REMOTE" sbatch --parsable \
                 --account="$ACCOUNT" --partition="$PARTITION" --qos="$QOS" \
                 --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=64 --mem=0 \
@@ -484,20 +460,13 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
         remote_result_complete=1
         break
     fi
-    if [[ $completion_state == attested-result ]]; then
-        adopt_remote_success || \
-            fatal "post-allocation completion attestation is invalid"
-        verify_remote_success || \
-            fatal "post-allocation adopted success marker is invalid"
-        remote_result_complete=1
-        break
-    fi
     if [[ $state == COMPLETED && $exit_code == 0:0 ]]; then
         fatal "completed allocation lacks a valid learner completion marker"
     fi
-    if [[ $completion_state == result-only && $attempt -lt $MAX_ATTEMPTS ]] &&
+    if [[ $completion_state =~ ^(result-only|attested-result)$ && \
+          $attempt -lt $MAX_ATTEMPTS ]] &&
        [[ $state == FAILED || $state =~ $retryable ]]; then
-        echo "OCI-NRT learner finalization incomplete state=$state; retrying finalizer" >&2
+        echo "OCI-NRT learner container finalization incomplete state=$state; retrying" >&2
         attempt=$((attempt + 1))
         continue
     fi
