@@ -47,6 +47,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "gr00t/rl/eval_agent_trl.py",
             "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
             "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+            "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
         ):
             source = self.gr00t / relative
@@ -103,7 +104,15 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                 self.repository_root
                 / "configs/round_dagger/production_paired_scenarios_2x8.json"
             ),
+            "ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256": sha256_file(
+                self.repository_root
+                / "configs/round_dagger/production_paired_scenarios_2x8.json"
+            ),
             "ROUND_DAGGER_EVALUATION_THRESHOLDS": str(
+                self.repository_root
+                / "configs/round_dagger/production_paired_thresholds.json"
+            ),
+            "ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256": sha256_file(
                 self.repository_root
                 / "configs/round_dagger/production_paired_thresholds.json"
             ),
@@ -207,6 +216,31 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                     completed = self._run(dry_run=True)
                 finally:
                     self.environment[key] = original
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stderr)
+                self.assertFalse(self.contract.exists())
+
+    def test_mutated_scenario_and_threshold_inputs_fail_closed(self) -> None:
+        for variable, path, message in (
+            (
+                "ROUND_DAGGER_EVALUATION_SCENARIOS",
+                self.tmp / "mutated-scenarios.json",
+                "evaluation scenario cases SHA mismatch",
+            ),
+            (
+                "ROUND_DAGGER_EVALUATION_THRESHOLDS",
+                self.tmp / "mutated-thresholds.json",
+                "evaluation thresholds SHA mismatch",
+            ),
+        ):
+            with self.subTest(variable=variable):
+                path.write_text("{}\n", encoding="utf-8")
+                original = self.environment[variable]
+                self.environment[variable] = str(path)
+                try:
+                    completed = self._run(dry_run=True)
+                finally:
+                    self.environment[variable] = original
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(message, completed.stderr)
                 self.assertFalse(self.contract.exists())

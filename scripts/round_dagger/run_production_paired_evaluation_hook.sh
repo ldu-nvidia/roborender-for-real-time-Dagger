@@ -44,7 +44,9 @@ EVALUATOR_RESULT=${ROUND_DAGGER_EVALUATOR_RESULT:?missing ROUND_DAGGER_EVALUATOR
 # from an interactive shell.
 EVALUATION_CONFIG=${ROUND_DAGGER_EVALUATION_CONFIG:?missing ROUND_DAGGER_EVALUATION_CONFIG}
 SCENARIO_CASES=${ROUND_DAGGER_EVALUATION_SCENARIOS:?missing ROUND_DAGGER_EVALUATION_SCENARIOS}
+SCENARIO_CASES_SHA=${ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256:?missing ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256}
 THRESHOLDS=${ROUND_DAGGER_EVALUATION_THRESHOLDS:?missing ROUND_DAGGER_EVALUATION_THRESHOLDS}
+THRESHOLDS_SHA=${ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256:?missing ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256}
 ENDPOINT_DIR=${ROUND_DAGGER_EVALUATION_ENDPOINT_DIR:?missing ROUND_DAGGER_EVALUATION_ENDPOINT_DIR}
 RENDERER_RUNTIME_SHA=${ROUND_DAGGER_RENDERER_RUNTIME_SHA256:?missing ROUND_DAGGER_RENDERER_RUNTIME_SHA256}
 EXPECTED_RENDERERS=${ROUND_DAGGER_EXPECTED_RENDERERS:?missing ROUND_DAGGER_EXPECTED_RENDERERS}
@@ -65,6 +67,8 @@ require_sha "$PARENT_CHECKPOINT_SHA" ROUND_DAGGER_POLICY_SHA256
 require_sha "$PARENT_RUNTIME_SHA" ROUND_DAGGER_RUNTIME_POLICY_SHA256
 require_sha "$CANDIDATE_MANIFEST_SHA" ROUND_DAGGER_CANDIDATE_SHA256
 require_sha "$EVALUATOR_CONFIG_SHA" ROUND_DAGGER_EVALUATOR_CONFIG_SHA256
+require_sha "$SCENARIO_CASES_SHA" ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256
+require_sha "$THRESHOLDS_SHA" ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256
 require_sha "$RENDERER_RUNTIME_SHA" ROUND_DAGGER_RENDERER_RUNTIME_SHA256
 require_sha "$EXPECTED_IMAGE_ID_SHA" ROUND_DAGGER_RTX_IMAGE_ID_SHA256
 require_directory "$CAMPAIGN_ROOT" "campaign root"
@@ -99,6 +103,10 @@ CONTROL_PYTHON_TARGET=$(readlink -f -- "$CONTROL_PYTHON") || \
     fatal "candidate manifest SHA mismatch"
 [[ $(sha256sum "$EVALUATION_CONFIG" | awk '{print $1}') == "$EVALUATOR_CONFIG_SHA" ]] || \
     fatal "evaluation config SHA mismatch"
+[[ $(sha256sum "$SCENARIO_CASES" | awk '{print $1}') == "$SCENARIO_CASES_SHA" ]] || \
+    fatal "evaluation scenario cases SHA mismatch"
+[[ $(sha256sum "$THRESHOLDS" | awk '{print $1}') == "$THRESHOLDS_SHA" ]] || \
+    fatal "evaluation thresholds SHA mismatch"
 
 PADDED_ROUND=$(printf '%06d' "$MACRO_ROUND")
 EVALUATION_ROOT="$CAMPAIGN_ROOT/rounds/macro_round_$PADDED_ROUND/evaluation"
@@ -250,6 +258,10 @@ fi
     --results-dir "$RESULTS_DIR" --output "$EVALUATOR_RESULT" >/dev/null || \
     fatal "paired evaluation evidence validation failed"
 require_regular "$EVALUATOR_RESULT" "orchestrator evaluator result"
+"$CONTROL_PYTHON" -m round_dagger.evaluation verify-result \
+    --root "$CAMPAIGN_ROOT" --contract "$CONTRACT" \
+    --results-dir "$RESULTS_DIR" --result "$EVALUATOR_RESULT" >/dev/null || \
+    fatal "paired evaluation deep result verification failed"
 
 # Validate the hook's exact output lineage and its digest-bound canonical bundle
 # before returning success to the coordinator.

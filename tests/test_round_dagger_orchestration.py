@@ -128,6 +128,7 @@ class FakeBackend:
         self.snapshot = None
         self.candidate = None
         self.evaluation = None
+        self.evaluation_passed = True
         self.collection_sealed = False
         self.ingest_started_after_collection = False
 
@@ -296,7 +297,7 @@ class FakeBackend:
     def load_evaluator_result(self, **_kwargs):
         return {
             "schema": EVALUATOR_RESULT_SCHEMA,
-            "passed": True,
+            "passed": self.evaluation_passed,
             "metrics": {"success_rate": 0.75},
         }
 
@@ -304,6 +305,7 @@ class FakeBackend:
         self.evaluation = {
             "manifest_path": "policies/policy_000001/evaluation.json",
             "evidence_sha256": "a" * 64,
+            "passed": bool(_result["passed"]),
         }
         return dict(self.evaluation)
 
@@ -459,11 +461,11 @@ class ConfigAndTopologyTest(unittest.TestCase):
                     "metrics": {"paired_cases": 8.0},
                 },
             )
-            loaded = backend.load_evaluator_result(
-                campaign={"campaign_id": "production-campaign"},
-                candidate={"manifest_sha256": SHA["candidate"]},
-            )
-            self.assertEqual(loaded["evidence_bundle_sha256"], bundle_sha)
+            with self.assertRaisesRegex(OrchestrationError, "deep evidence validation"):
+                backend.load_evaluator_result(
+                    campaign={"campaign_id": "production-campaign"},
+                    candidate={"manifest_sha256": SHA["candidate"]},
+                )
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -787,6 +789,25 @@ class MacroRoundExecutionTest(unittest.TestCase):
             self.assertFalse(backend.collection_sealed)
             self.assertIsNone(backend.snapshot)
             self.assertIsNone(backend.candidate)
+
+    def test_failed_evaluation_never_invokes_external_promotion_hook(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = FakeBackend(configuration)
+            backend.evaluation_passed = False
+            runner = RecordingRunner(backend)
+            with self.assertRaisesRegex(
+                OrchestrationError, "promotion hook was not invoked"
+            ):
+                MacroRoundOrchestrator(
+                    configuration, backend=backend, hook_runner=runner
+                ).run()
+            self.assertEqual(backend.phase, "EVALUATED")
+            self.assertNotIn(
+                ("promote", None),
+                [identity for identity, _environment, _workdir in runner.calls],
+            )
 
     def test_existing_sealed_cohort_is_verified_and_skipped_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:

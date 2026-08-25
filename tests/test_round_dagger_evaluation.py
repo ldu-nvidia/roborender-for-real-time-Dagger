@@ -54,6 +54,7 @@ class PairedEvaluationTest(unittest.TestCase):
             "gr00t/rl/eval_agent_trl.py",
             "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
             "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+            "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
         )
         for relative in fixture_sources:
@@ -92,7 +93,7 @@ class PairedEvaluationTest(unittest.TestCase):
             evaluation_config_sha256=sha256_file(self.config),
             evaluator_code_sha256=self.evaluator_code_sha,
             expected_renderer_count=1,
-            output="evaluation/contract.json",
+            output="rounds/macro_round_000000/evaluation/contract.json",
         )
         self.results_relative = "rounds/macro_round_000000/evaluation/results"
         self.result_relative = "rounds/macro_round_000000/evaluation/result.json"
@@ -112,6 +113,9 @@ class PairedEvaluationTest(unittest.TestCase):
         bad_scenario: bool = False,
         omit_view: bool = False,
         attempt: int = 1,
+        condition_tag: str = "shared",
+        generated_tag: str = "shared",
+        episode_length: int = 300,
     ) -> tuple[Path, Path, Path]:
         raw = (
             self.root
@@ -130,29 +134,60 @@ class PairedEvaluationTest(unittest.TestCase):
             self.contract, role=role, seed=seed, attempt=attempt
         )
         episodes = []
+        fixed_episodes = []
+        first_conditions = {}
+        first_generated = {}
         for case, success, unsafe in zip(
             expected_cases, successes, safety, strict=True
         ):
+            env_index = case["env_index"]
             views = {
-                view: _sha(f"{role}:{seed}:{case['env_index']}:{view}")
+                view: _sha(f"{role}:{seed}:{env_index}:{view}")
                 for view in POLICY_VIEWS
             }
-            if omit_view and case["env_index"] == 0:
+            if omit_view and env_index == 0:
                 views.pop("hand_right")
+            condition_sha = _sha(f"condition:{condition_tag}:{seed}:{env_index}")
+            generated_sha = _sha(
+                f"generated:{generated_tag}:{seed}:{env_index}"
+            )
+            first_conditions[str(env_index)] = condition_sha
+            first_generated[str(env_index)] = generated_sha
             episodes.append(
                 {
-                    "env_index": case["env_index"],
+                    "env_index": env_index,
                     "seed": seed,
                     "scenario_id": _sha("wrong")
-                    if bad_scenario and case["env_index"] == 0
+                    if bad_scenario and env_index == 0
                     else case["scenario_id"],
                     "success": success,
                     "safety_violation": unsafe,
                     "action_imitation_mse": action_mse,
-                    "episode_length": 30,
+                    "episode_length": episode_length,
                     "generated_view_sha256": views,
                 }
             )
+            fixed_episodes.append(
+                {
+                    "env_index": env_index,
+                    "success": success,
+                    "reward": float(env_index),
+                    "episode_length": episode_length,
+                    "object_class": "fixture",
+                    "seed": seed,
+                    "first_condition_sha256": condition_sha,
+                    "first_generated_sha256": generated_sha,
+                    "scenario_id": canonical_json_sha256(
+                        {
+                            "seed": seed,
+                            "env_index": env_index,
+                            "first_condition_sha256": condition_sha,
+                        }
+                    ),
+                }
+            )
+        generated_policy_steps = episode_length
+        generated_frames = generated_policy_steps * len(expected_cases)
         metrics = {
             "_roborender_eval_adapter": {
                 "schema_version": 1,
@@ -172,8 +207,21 @@ class PairedEvaluationTest(unittest.TestCase):
                 "evaluation_config_sha256": self.contract["evaluation_config_sha256"],
                 "evaluator_code_sha256": self.contract["evaluator_code_sha256"],
             },
-            "generated_policy_steps": 1,
-            "generated_frames": 4,
+            "generated_policy_steps": generated_policy_steps,
+            "generated_frames": generated_frames,
+            "_roborender_image3f_eval": {
+                "schema": "fast_roborender.image3f_fixed_eval_runtime.v1",
+                "eval_relabel_enabled": True,
+                "raytraced_mix_prob": 0.0,
+                "reference_lag": 256,
+                "generation_seed": seed,
+                "policy_views": list(POLICY_VIEWS),
+                "generated_policy_steps": generated_policy_steps,
+                "generated_frames": generated_frames,
+                "first_condition_sha256_by_env": first_conditions,
+                "first_generated_sha256_by_env": first_generated,
+            },
+            "_roborender_fixed_seed_episodes": fixed_episodes,
             "_roborender_paired_episodes": episodes,
         }
         before = {
@@ -190,7 +238,7 @@ class PairedEvaluationTest(unittest.TestCase):
         }
         after = json.loads(json.dumps(before))
         after["selected"][0]["response"]["metrics"] = {
-            "requests": 14,
+            "requests": 10 + generated_frames,
             "errors": renderer_errors,
             "replays": 0,
         }
@@ -666,6 +714,95 @@ class PairedEvaluationTest(unittest.TestCase):
                         output=f"evaluation/bad/{index}/outcome.json",
                     )
 
+    def test_actual_initial_conditions_must_match_across_policy_roles(self) -> None:
+        for role in ("parent", "candidate"):
+            for seed in self.contract["seeds"]:
+                metrics, before, after = self._raw_evidence(
+                    role,
+                    seed,
+                    successes=[True, False, False, False],
+                    safety=[False] * 4,
+                    action_mse=1.0,
+                    condition_tag=role,
+                )
+                attest_outcome(
+                    self.root,
+                    contract_path=self.contract["contract_path"],
+                    role=role,
+                    seed=seed,
+                    metrics_path=metrics,
+                    renderer_before_path=before,
+                    renderer_after_path=after,
+                    image3f_run_id=evaluation_run_id(
+                        self.contract, role=role, seed=seed, attempt=1
+                    ),
+                    output=f"{self.results_relative}/{role}/seed_{seed}/outcome.json",
+                )
+        with self.assertRaisesRegex(EvaluationError, "not case-paired"):
+            summarize_to_evaluator_result(
+                self.root,
+                contract_path=self.contract["contract_path"],
+                results_dir=self.results_relative,
+                output=self.result_relative,
+            )
+
+    def test_actual_initial_generated_observations_must_match_across_roles(self) -> None:
+        for role in ("parent", "candidate"):
+            for seed in self.contract["seeds"]:
+                metrics, before, after = self._raw_evidence(
+                    role,
+                    seed,
+                    successes=[True, False, False, False],
+                    safety=[False, False, False, False],
+                    action_mse=1.0,
+                    generated_tag="parent" if role == "parent" else "candidate",
+                )
+                attest_outcome(
+                    self.root,
+                    contract_path=self.contract["contract_path"],
+                    role=role,
+                    seed=seed,
+                    metrics_path=metrics,
+                    renderer_before_path=before,
+                    renderer_after_path=after,
+                    image3f_run_id=evaluation_run_id(
+                        self.contract, role=role, seed=seed, attempt=1
+                    ),
+                    output=f"{self.results_relative}/{role}/seed_{seed}/outcome.json",
+                )
+        with self.assertRaisesRegex(EvaluationError, "not case-paired"):
+            summarize_to_evaluator_result(
+                self.root,
+                contract_path=self.contract["contract_path"],
+                results_dir=self.results_relative,
+                output=self.result_relative,
+            )
+
+    def test_first_episode_must_cross_generated_lag_boundary(self) -> None:
+        seed = self.contract["seeds"][0]
+        metrics, before, after = self._raw_evidence(
+            "parent",
+            seed,
+            successes=[True, False, False, False],
+            safety=[False] * 4,
+            action_mse=1.0,
+            episode_length=256,
+        )
+        with self.assertRaisesRegex(EvaluationError, "crossed the lag-256"):
+            attest_outcome(
+                self.root,
+                contract_path=self.contract["contract_path"],
+                role="parent",
+                seed=seed,
+                metrics_path=metrics,
+                renderer_before_path=before,
+                renderer_after_path=after,
+                image3f_run_id=evaluation_run_id(
+                    self.contract, role="parent", seed=seed, attempt=1
+                ),
+                output="evaluation/short/outcome.json",
+            )
+
     def test_source_corruption_after_attestation_is_detected(self) -> None:
         seed = self.contract["seeds"][0]
         metrics, before, after = self._raw_evidence(
@@ -700,7 +837,11 @@ class PairedEvaluationTest(unittest.TestCase):
 
     def test_evaluator_identity_binds_all_custom_producer_sources(self) -> None:
         bundle = evaluator_source_bundle(self.repository_root, self.gr00t)
-        self.assertEqual(len(bundle["sources"]), 8)
+        self.assertEqual(len(bundle["sources"]), 9)
+        self.assertIn(
+            "gr00t/gr00t/rl/utils/image3f_frame_client.py",
+            {item["source"] for item in bundle["sources"]},
+        )
         self.assertEqual(canonical_json_sha256(bundle), self.evaluator_code_sha)
         helper = self.gr00t / "gr00t/rl/utils/round_dagger_paired_eval.py"
         helper.write_text("# changed paired evidence semantics\n")

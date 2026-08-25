@@ -23,6 +23,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from round_dagger import (
     artifacts,
+    evaluation,
     handoff,
     image3f_lifecycle,
     policy_bundle,
@@ -903,6 +904,23 @@ class ProductionBackend:
             if not math.isfinite(numeric):
                 raise OrchestrationError("evaluation metrics must be finite numeric")
             clean_metrics[key] = numeric
+        # Recompute the paired gate from every canonical outcome and its raw
+        # source artifacts.  This check intentionally runs even when a result
+        # existed before the evaluator hook, preventing a digest-matching but
+        # semantically opaque bundle from advancing coordinator state.
+        try:
+            verified = evaluation.verify_evaluator_result_evidence(
+                self.root,
+                contract_path=path.parent / "contract.json",
+                results_dir=path.parent / "results",
+                result_path=path,
+            )
+        except (evaluation.EvaluationError, artifacts.ArtifactError, OSError) as exc:
+            raise OrchestrationError(
+                f"evaluator result failed deep evidence validation: {exc}"
+            ) from exc
+        if verified["metrics"] != clean_metrics or verified["passed"] != result["passed"]:
+            raise OrchestrationError("deep evaluator result differs from loaded result")
         return {**result, "metrics": clean_metrics, "path": str(path)}
 
     def publish_evaluation(
@@ -1403,6 +1421,14 @@ class MacroRoundOrchestrator:
             )
         candidate = self.backend.load_candidate()
         evaluation = self.backend.load_evaluation(candidate)
+        if evaluation.get("passed") is not True:
+            # Never invoke an external promotion hook for a rejected candidate.
+            # The immutable EVALUATED state remains available for diagnosis,
+            # while both external side effects and active-policy mutation are
+            # blocked fail closed.
+            raise OrchestrationError(
+                "candidate failed paired evaluation; promotion hook was not invoked"
+            )
         promote_environment = {
             **base_environment,
             "ROUND_DAGGER_CANDIDATE_MANIFEST": str(

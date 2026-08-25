@@ -241,6 +241,14 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(environment["ROUND_DAGGER_WANDB_EXPECTED_EMAIL"], "ldu@nvidia.com")
         self.assertEqual(environment["ROUND_DAGGER_WANDB_ENTITY"], "nvidia")
         self.assertEqual(
+            environment["ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256"],
+            "99081ebee907ef36c388cf62a1d134c015d289776526cacc1db114a87074e724",
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256"],
+            "1721049b8fcd8c4e0eefdbd581fcca6d77bc6cf8d5f9ffc789ae4a817d7a36ee",
+        )
+        self.assertEqual(
             environment["ROUND_DAGGER_WANDB_NETRC"],
             str(ROOT / "runtime/round_dagger_credentials/.netrc"),
         )

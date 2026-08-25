@@ -36,7 +36,7 @@ from round_dagger.promotion import load_candidate_manifest
 from round_dagger.state import _campaign_root, _internal_path, load_campaign, load_state
 
 CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v1"
-OUTCOME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_outcome.v2"
+OUTCOME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_outcome.v3"
 REPORT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_report.v1"
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_bundle.v1"
 RUNTIME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_runtime.v1"
@@ -77,6 +77,10 @@ _GR00T_EVALUATOR_SOURCES = (
     "gr00t/rl/eval_agent_trl.py",
     "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
     "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+    # This client validates the server's per-request reference provenance.  A
+    # source bundle that omitted it could claim lag-256 evaluation while using
+    # client bytes that never checked generated_t-256 responses.
+    "gr00t/rl/utils/image3f_frame_client.py",
     "gr00t/rl/utils/round_dagger_paired_eval.py",
 )
 
@@ -536,7 +540,7 @@ def _renderer_delta(
     return requests, identity_digest
 
 
-_EPISODE_KEYS = {
+_RAW_PAIRED_EPISODE_KEYS = {
     "env_index",
     "seed",
     "scenario_id",
@@ -545,6 +549,33 @@ _EPISODE_KEYS = {
     "action_imitation_mse",
     "episode_length",
     "generated_view_sha256",
+}
+_EPISODE_KEYS = _RAW_PAIRED_EPISODE_KEYS | {
+    "first_condition_sha256",
+    "first_generated_sha256",
+}
+_IMAGE3F_RUNTIME_KEYS = {
+    "schema",
+    "eval_relabel_enabled",
+    "raytraced_mix_prob",
+    "reference_lag",
+    "generation_seed",
+    "policy_views",
+    "generated_policy_steps",
+    "generated_frames",
+    "first_condition_sha256_by_env",
+    "first_generated_sha256_by_env",
+}
+_FIXED_EPISODE_KEYS = {
+    "env_index",
+    "success",
+    "reward",
+    "episode_length",
+    "object_class",
+    "seed",
+    "first_condition_sha256",
+    "first_generated_sha256",
+    "scenario_id",
 }
 _OUTCOME_KEYS = {
     "schema",
@@ -708,12 +739,105 @@ def attest_outcome(
     expected_cases = [
         item for item in contract["scenario_cases"] if item["seed"] == seed
     ]
+    if generated_frames != generated_steps * len(expected_cases):
+        raise EvaluationError(
+            "generated frame count is not one three-view request per environment step"
+        )
+
+    image3f_runtime = _exact(
+        metrics.get("_roborender_image3f_eval"),
+        _IMAGE3F_RUNTIME_KEYS,
+        "Image3F runtime evidence",
+    )
+    expected_image3f_runtime = {
+        "schema": "fast_roborender.image3f_fixed_eval_runtime.v1",
+        "eval_relabel_enabled": True,
+        "raytraced_mix_prob": RAYTRACED_MIX,
+        "reference_lag": REFERENCE_LAG,
+        "generation_seed": seed,
+        "policy_views": list(POLICY_VIEWS),
+        "generated_policy_steps": generated_steps,
+        "generated_frames": generated_frames,
+    }
+    if any(
+        image3f_runtime.get(key) != value
+        for key, value in expected_image3f_runtime.items()
+    ):
+        raise EvaluationError(
+            "Image3F runtime evidence differs from paired evaluation counters/config"
+        )
+    expected_env_keys = {str(index) for index in range(len(expected_cases))}
+    condition_hashes = image3f_runtime["first_condition_sha256_by_env"]
+    generated_hashes = image3f_runtime["first_generated_sha256_by_env"]
+    if (
+        not isinstance(condition_hashes, Mapping)
+        or set(condition_hashes) != expected_env_keys
+        or not isinstance(generated_hashes, Mapping)
+        or set(generated_hashes) != expected_env_keys
+    ):
+        raise EvaluationError(
+            "Image3F first-condition/generated identity coverage is incomplete"
+        )
+    condition_hashes = {
+        key: _sha(value, f"first condition SHA for env {key}")
+        for key, value in condition_hashes.items()
+    }
+    generated_hashes = {
+        key: _sha(value, f"first generated SHA for env {key}")
+        for key, value in generated_hashes.items()
+    }
+
+    fixed_records = metrics.get("_roborender_fixed_seed_episodes")
+    if not isinstance(fixed_records, list) or len(fixed_records) != len(expected_cases):
+        raise EvaluationError("fixed-seed first-condition evidence is incomplete")
+    fixed_by_env: dict[int, dict[str, Any]] = {}
+    for raw in fixed_records:
+        record = _exact(raw, _FIXED_EPISODE_KEYS, "fixed-seed episode")
+        env_index = _integer(record["env_index"], "fixed episode.env_index")
+        if env_index >= len(expected_cases) or env_index in fixed_by_env:
+            raise EvaluationError("fixed-seed episode env_index coverage is ambiguous")
+        if _integer(record["seed"], "fixed episode.seed") != seed:
+            raise EvaluationError("fixed-seed episode seed mismatch")
+        if type(record["success"]) is not bool:
+            raise EvaluationError("fixed-seed episode success must be boolean")
+        _number(record["reward"], "fixed episode.reward")
+        _integer(record["episode_length"], "fixed episode.episode_length", minimum=1)
+        if record["object_class"] is not None and not isinstance(
+            record["object_class"], str
+        ):
+            raise EvaluationError("fixed-seed episode object_class is malformed")
+        condition_sha = _sha(
+            record["first_condition_sha256"], "fixed episode first condition SHA"
+        )
+        generated_sha = _sha(
+            record["first_generated_sha256"], "fixed episode first generated SHA"
+        )
+        if (
+            condition_sha != condition_hashes[str(env_index)]
+            or generated_sha != generated_hashes[str(env_index)]
+        ):
+            raise EvaluationError(
+                "fixed-seed episode condition/generated identity differs from Image3F runtime"
+            )
+        scenario_payload = {
+            "seed": seed,
+            "env_index": env_index,
+            "first_condition_sha256": condition_sha,
+        }
+        if _sha(record["scenario_id"], "fixed episode scenario_id") != canonical_json_sha256(
+            scenario_payload
+        ):
+            raise EvaluationError(
+                "fixed-seed scenario identity is not derived from its initial condition"
+            )
+        fixed_by_env[env_index] = record
+
     raw_episodes = metrics.get("_roborender_paired_episodes")
     if not isinstance(raw_episodes, list) or len(raw_episodes) != len(expected_cases):
         raise EvaluationError("per-environment outcome evidence is incomplete")
     by_env: dict[int, dict[str, Any]] = {}
     for raw in raw_episodes:
-        episode = _exact(raw, _EPISODE_KEYS, "paired episode")
+        episode = _exact(raw, _RAW_PAIRED_EPISODE_KEYS, "paired episode")
         env_index = _integer(episode["env_index"], "episode.env_index")
         if env_index in by_env:
             raise EvaluationError(
@@ -736,6 +860,16 @@ def attest_outcome(
         )
         for view in POLICY_VIEWS:
             _sha(views[view], f"generated {view} SHA")
+        fixed = fixed_by_env.get(env_index)
+        if fixed is None or any(
+            fixed[key] != episode[key]
+            for key in ("seed", "env_index", "success", "episode_length")
+        ):
+            raise EvaluationError(
+                "paired episode differs from fixed-seed reset/outcome evidence"
+            )
+        episode["first_condition_sha256"] = condition_hashes[str(env_index)]
+        episode["first_generated_sha256"] = generated_hashes[str(env_index)]
         by_env[env_index] = episode
     episodes = [
         by_env[index] for index in range(len(expected_cases)) if index in by_env
@@ -750,6 +884,14 @@ def attest_outcome(
             raise EvaluationError(
                 "runtime scenario identity differs from paired contract"
             )
+    if generated_steps < max(item["episode_length"] for item in episodes):
+        raise EvaluationError(
+            "generated policy-step count is shorter than a completed first episode"
+        )
+    if not any(item["episode_length"] > REFERENCE_LAG for item in episodes):
+        raise EvaluationError(
+            "no first episode crossed the lag-256 generated-reference boundary"
+        )
 
     source_artifacts = {
         "metrics_path": metrics_relative,
@@ -945,7 +1087,13 @@ def _score(
     ):
         raise EvaluationError("paired case count is below the configured minimum")
     for left, right in zip(parent, candidate, strict=True):
-        identity = ("seed", "env_index", "scenario_id")
+        identity = (
+            "seed",
+            "env_index",
+            "scenario_id",
+            "first_condition_sha256",
+            "first_generated_sha256",
+        )
         if any(left[key] != right[key] for key in identity):
             raise EvaluationError("parent/candidate outcomes are not case-paired")
     parent_success = _mean([float(item["success"]) for item in parent])
@@ -990,6 +1138,14 @@ def _score(
         "candidate_action_imitation_mse": candidate_action,
         "paired_action_imitation_mse_delta": action_delta,
         "paired_action_imitation_mse_relative_change": action_relative_change,
+        "parent_lag_boundary_cases": float(
+            sum(item["episode_length"] > REFERENCE_LAG for item in parent)
+        ),
+        "candidate_lag_boundary_cases": float(
+            sum(item["episode_length"] > REFERENCE_LAG for item in candidate)
+        ),
+        "paired_initial_condition_matches": float(len(parent)),
+        "paired_initial_generated_matches": float(len(parent)),
         "renderer_errors": 0.0,
     }
     decision = {
@@ -1130,6 +1286,129 @@ def summarize_to_evaluator_result(
     }
 
 
+def verify_evaluator_result_evidence(
+    root: str | Path,
+    *,
+    contract_path: str | Path,
+    results_dir: str | Path,
+    result_path: str | Path,
+) -> dict[str, Any]:
+    """Recompute and verify a published evaluator result without writing.
+
+    The orchestrator calls this even when ``result.json`` already exists.  It
+    therefore cannot be bypassed by pre-creating a superficially well-formed
+    result and a digest-matching opaque bundle: every canonical outcome, its
+    source artifacts, the report, bundle, and final result are reloaded and
+    deterministically rescored before coordinator state may advance.
+    """
+
+    root = _campaign_root(root)
+    contract = load_contract(root, contract_path)
+    output_path, output_relative = _internal_path(
+        root, result_path, "orchestrator evaluator result"
+    )
+    expected_output = (
+        root
+        / "rounds"
+        / f"macro_round_{contract['macro_round']:06d}"
+        / "evaluation"
+        / "result.json"
+    )
+    if output_path != expected_output:
+        raise EvaluationError("orchestrator evaluator result path is non-canonical")
+    results_root, results_relative = _internal_path(
+        root, results_dir, "evaluation results"
+    )
+    if results_root != output_path.parent / "results":
+        raise EvaluationError("paired evaluation results path is non-canonical")
+
+    outcomes: list[dict[str, Any]] = []
+    episodes: dict[str, list[dict[str, Any]]] = {"parent": [], "candidate": []}
+    for role in ("parent", "candidate"):
+        for seed in contract["seeds"]:
+            outcome = load_outcome(
+                root,
+                results_root / role / f"seed_{seed}" / "outcome.json",
+                contract=contract,
+                expected_role=role,
+                expected_seed=seed,
+            )
+            outcomes.append(
+                {
+                    "role": role,
+                    "seed": seed,
+                    "path": outcome["outcome_path"],
+                    "sha256": outcome["outcome_sha256"],
+                }
+            )
+            episodes[role].extend(outcome["episodes"])
+    metrics, decision = _score(
+        episodes["parent"], episodes["candidate"], contract["thresholds"]
+    )
+
+    expected_report = {
+        "schema": REPORT_SCHEMA,
+        "contract_sha256": contract["contract_sha256"],
+        "campaign_id": contract["campaign_id"],
+        "macro_round": contract["macro_round"],
+        "candidate_manifest_sha256": contract["candidate_manifest_sha256"],
+        "paired_case_count": len(episodes["parent"]),
+        "thresholds": contract["thresholds"],
+        "metrics": metrics,
+        "decision": decision,
+        "outcomes": outcomes,
+    }
+    report_path = results_root / "paired_report.json"
+    actual_report = _exact(
+        load_strict_json(report_path), set(expected_report), "paired evaluation report"
+    )
+    if actual_report != expected_report:
+        raise EvaluationError("paired evaluation report differs from recomputed evidence")
+    report_sha = sha256_file(report_path)
+
+    expected_bundle = {
+        "schema": BUNDLE_SCHEMA,
+        "contract_path": contract["contract_path"],
+        "contract_sha256": contract["contract_sha256"],
+        "report_path": report_path.relative_to(root).as_posix(),
+        "report_sha256": report_sha,
+        "candidate_manifest_sha256": contract["candidate_manifest_sha256"],
+        "outcomes": outcomes,
+    }
+    bundle_path = results_root / "evaluation_bundle.json"
+    actual_bundle = _exact(
+        load_strict_json(bundle_path), set(expected_bundle), "evaluation evidence bundle"
+    )
+    if actual_bundle != expected_bundle:
+        raise EvaluationError("evaluation bundle differs from recomputed evidence")
+    bundle_sha = sha256_file(bundle_path)
+
+    expected_result = {
+        "schema": EVALUATOR_RESULT_SCHEMA,
+        "campaign_id": contract["campaign_id"],
+        "macro_round": contract["macro_round"],
+        "candidate_manifest_sha256": contract["candidate_manifest_sha256"],
+        "evaluator_config_sha256": contract["evaluation_config_sha256"],
+        "evidence_bundle_path": bundle_path.relative_to(root).as_posix(),
+        "evidence_bundle_sha256": bundle_sha,
+        "passed": decision["passed"],
+        "metrics": metrics,
+    }
+    actual_result = _exact(
+        load_strict_json(output_path), set(expected_result), "evaluator result"
+    )
+    if actual_result != expected_result:
+        raise EvaluationError("evaluator result differs from recomputed evidence")
+    return {
+        **actual_result,
+        "path": output_relative,
+        "sha256": sha256_file(output_path),
+        "results_path": results_relative,
+        "report_sha256": report_sha,
+        "evidence_bundle_sha256": bundle_sha,
+    }
+
+
 def _digest_argument(value: str) -> str:
     path = Path(value).expanduser()
     if path.is_file():
@@ -1207,6 +1486,12 @@ def _parser() -> argparse.ArgumentParser:
     summarize.add_argument("--contract", required=True)
     summarize.add_argument("--results-dir", required=True)
     summarize.add_argument("--output", required=True)
+
+    verify_result = sub.add_parser("verify-result")
+    verify_result.add_argument("--root", required=True)
+    verify_result.add_argument("--contract", required=True)
+    verify_result.add_argument("--results-dir", required=True)
+    verify_result.add_argument("--result", required=True)
 
     digest = sub.add_parser("evaluator-digest")
     digest.add_argument("--repository-root", required=True)
@@ -1300,6 +1585,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 contract_path=args.contract,
                 results_dir=args.results_dir,
                 output=args.output,
+            )
+        elif args.command == "verify-result":
+            result = verify_evaluator_result_evidence(
+                args.root,
+                contract_path=args.contract,
+                results_dir=args.results_dir,
+                result_path=args.result,
             )
         else:
             bundle = evaluator_source_bundle(args.repository_root, args.gr00t_root)
