@@ -21,6 +21,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from round_dagger.artifacts import sha256_file  # noqa: E402
+from round_dagger.learner_identity import (  # noqa: E402
+    learner_identity_sha256,
+    learner_wandb_run_id,
+)
 from round_dagger.learner import (  # noqa: E402
     JsonlTelemetry,
     LearnerBundleConfig,
@@ -105,6 +109,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-checkpoint", type=Path)
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--expected-snapshot-file-sha256")
+    parser.add_argument("--learner-identity-sha256")
+    parser.add_argument("--runtime-container-sha256")
+    parser.add_argument("--learner-contract-sha256")
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -210,10 +217,24 @@ def main(argv: list[str] | None = None) -> int:
     wandb_config = {
         "campaign_id": config.campaign_id,
         "macro_round": config.macro_round,
+        "learner_code_sha256": config.code_sha256,
         "learner_config_sha256": config.sha256,
         "model_lineage_sha256": config.model_lineage_sha256,
     }
-    if arguments.wandb_project:
+    identity_arguments = (
+        arguments.learner_identity_sha256,
+        arguments.runtime_container_sha256,
+        arguments.learner_contract_sha256,
+    )
+    if any(value is not None for value in identity_arguments) and any(
+        value is None for value in identity_arguments
+    ):
+        raise LearnerError("learner semantic identity arguments are incomplete")
+    snapshot_identity = None
+    parent_runtime_sha256 = None
+    if arguments.wandb_project or all(
+        value is not None for value in identity_arguments
+    ):
         snapshot_identity = load_snapshot(
             arguments.snapshot,
             expected_file_sha256=arguments.expected_snapshot_file_sha256,
@@ -223,9 +244,44 @@ def main(argv: list[str] | None = None) -> int:
             or snapshot_identity["through_macro_round"] != config.macro_round
         ):
             raise LearnerError("replay snapshot lineage differs from learner bundle")
+        parent_runtime_sha256 = config.to_mapping()["model_config"][
+            "runtime_policy_sha256"
+        ]
         wandb_config.update(
+            parent_runtime_policy_sha256=parent_runtime_sha256,
             replay_snapshot_file_sha256=snapshot_identity["file_sha256"],
             replay_snapshot_sha256=snapshot_identity["snapshot_sha256"],
+        )
+    if all(value is not None for value in identity_arguments):
+        assert snapshot_identity is not None and parent_runtime_sha256 is not None
+        identity_sha256 = learner_identity_sha256(
+            campaign_id=config.campaign_id,
+            macro_round=config.macro_round,
+            learner_code_sha256=config.code_sha256,
+            learner_config_sha256=config.sha256,
+            replay_snapshot_file_sha256=snapshot_identity["file_sha256"],
+            replay_snapshot_sha256=snapshot_identity["snapshot_sha256"],
+            parent_checkpoint_sha256=config.model_lineage_sha256,
+            parent_runtime_policy_sha256=parent_runtime_sha256,
+            runtime_container_sha256=arguments.runtime_container_sha256,
+            learner_contract_sha256=arguments.learner_contract_sha256,
+        )
+        if identity_sha256 != arguments.learner_identity_sha256:
+            raise LearnerError(
+                "learner identity SHA-256 does not bind the exact semantic run"
+            )
+        if arguments.wandb_project:
+            expected_run_id = learner_wandb_run_id(
+                campaign_id=config.campaign_id,
+                macro_round=config.macro_round,
+                learner_identity_sha256=identity_sha256,
+            )
+            if arguments.wandb_run_id != expected_run_id:
+                raise LearnerError("W&B run ID is not bound to learner identity")
+        wandb_config.update(
+            learner_identity_sha256=identity_sha256,
+            runtime_container_sha256=arguments.runtime_container_sha256,
+            learner_contract_sha256=arguments.learner_contract_sha256,
         )
     telemetry = JsonlTelemetry(
         arguments.telemetry_jsonl,
@@ -254,6 +310,9 @@ def main(argv: list[str] | None = None) -> int:
             save_every=save_every,
             telemetry=telemetry,
             validation_stop_at_step=arguments.validation_stop_at_step,
+            learner_identity_sha256=arguments.learner_identity_sha256,
+            runtime_container_sha256=arguments.runtime_container_sha256,
+            learner_contract_sha256=arguments.learner_contract_sha256,
         )
     finally:
         # A canonical learner result is the recovery commit point.  Close and

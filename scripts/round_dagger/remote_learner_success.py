@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-SCHEMA = "fast_roborender.round_dagger.remote_learner_success.v2"
+SCHEMA = "fast_roborender.round_dagger.remote_learner_success.v3"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _KEYS = {
@@ -23,6 +23,7 @@ _KEYS = {
     "macro_round",
     "learner_code_sha256",
     "learner_config_sha256",
+    "learner_identity_sha256",
     "result_path",
     "result_sha256",
     "completion_attestation_path",
@@ -85,12 +86,17 @@ def _expected(
     macro_round: int,
     learner_code_sha256: str,
     learner_config_sha256: str,
+    learner_identity_sha256: str,
 ) -> dict[str, Any]:
     if _TOKEN.fullmatch(campaign_id) is None:
         raise RemoteLearnerSuccessError("campaign ID is malformed")
     if type(macro_round) is not int or macro_round < 0:
         raise RemoteLearnerSuccessError("macro round is invalid")
-    for digest in (learner_code_sha256, learner_config_sha256):
+    for digest in (
+        learner_code_sha256,
+        learner_config_sha256,
+        learner_identity_sha256,
+    ):
         if _SHA256.fullmatch(digest) is None:
             raise RemoteLearnerSuccessError("learner identity digest is malformed")
     if result.name in {"", ".", ".."}:
@@ -109,6 +115,7 @@ def _expected(
         "macro_round": macro_round,
         "learner_code_sha256": learner_code_sha256,
         "learner_config_sha256": learner_config_sha256,
+        "learner_identity_sha256": learner_identity_sha256,
         "result_path": result.name,
         "result_sha256": _sha256_file(result),
         "completion_attestation_path": completion_attestation.name,
@@ -125,6 +132,7 @@ def publish(
     macro_round: int,
     learner_code_sha256: str,
     learner_config_sha256: str,
+    learner_identity_sha256: str,
 ) -> dict[str, Any]:
     result_path = _regular(result, "learner result")
     attestation_path = _regular(completion_attestation, "learner completion attestation")
@@ -135,6 +143,7 @@ def publish(
         macro_round=macro_round,
         learner_code_sha256=learner_code_sha256,
         learner_config_sha256=learner_config_sha256,
+        learner_identity_sha256=learner_identity_sha256,
     )
     marker_path = Path(os.path.abspath(Path(marker).expanduser()))
     if marker_path.is_symlink():
@@ -178,6 +187,7 @@ def verify(
     macro_round: int,
     learner_code_sha256: str,
     learner_config_sha256: str,
+    learner_identity_sha256: str,
 ) -> dict[str, Any]:
     marker_path = _regular(marker, "success marker")
     result_path = _regular(result, "learner result")
@@ -190,6 +200,7 @@ def verify(
         macro_round=macro_round,
         learner_code_sha256=learner_code_sha256,
         learner_config_sha256=learner_config_sha256,
+        learner_identity_sha256=learner_identity_sha256,
     )
     if observed != expected:
         raise RemoteLearnerSuccessError("success marker/result lineage mismatch")
@@ -210,6 +221,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--macro-round", required=True, type=int)
         command.add_argument("--learner-code-sha256", required=True)
         command.add_argument("--learner-config-sha256", required=True)
+        command.add_argument("--learner-identity-sha256", required=True)
     return parser
 
 
@@ -224,6 +236,7 @@ def main() -> int:
         macro_round=arguments.macro_round,
         learner_code_sha256=arguments.learner_code_sha256,
         learner_config_sha256=arguments.learner_config_sha256,
+        learner_identity_sha256=arguments.learner_identity_sha256,
     )
     print(json.dumps(document, sort_keys=True, separators=(",", ":")))
     return 0

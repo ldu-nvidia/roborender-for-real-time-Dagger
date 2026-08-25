@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -234,7 +235,18 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
         environment.update(plan["bridge_environment"])
         environment["DRY_RUN"] = "1"
         self.assertEqual(
+            environment["ROUND_DAGGER_PYTHON"], os.path.abspath(sys.executable)
+        )
+        self.assertEqual(
             environment["ROUND_DAGGER_LEARNER_LEARNING_RATE"], "2.5e-5"
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_WANDB_RUN_ID"],
+            f"rrd-m000000-id{environment['ROUND_DAGGER_LEARNER_IDENTITY_SHA256']}",
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_LEARNER_CONTRACT_SHA256"],
+            self.learner_contract_sha,
         )
         completed = subprocess.run(
             [str(learner_recovery.BRIDGE)],

@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import torch
+
 from round_dagger.artifacts import publish_immutable_json, sha256_file
+from round_dagger.learner_identity import (
+    learner_identity_sha256,
+    learner_wandb_run_id,
+)
 from scripts.round_dagger import learner_completion_attestation as completion
 from scripts.round_dagger import remote_learner_success
 from tests.policy_bundle_helpers import publish_policy_bundle
@@ -28,13 +34,10 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
         parent_sha = "2" * 64
         snapshot_file_sha = "3" * 64
         snapshot_sha = "4" * 64
-
-        restart = output / "restart.pt"
-        restart.write_bytes(b"complete-eight-rank-restart")
-        candidate = output / "candidate_round_000000.pt"
-        candidate.write_bytes(restart.read_bytes())
         candidate_runtime = "5" * 64
-        spec, manifest = publish_policy_bundle(candidate, candidate_runtime)
+        parent_runtime = "6" * 64
+        container_sha = "7" * 64
+        contract_sha = "8" * 64
 
         bundle = {
             "schema": completion.BUNDLE_SCHEMA,
@@ -57,10 +60,52 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
             "seed": 17,
             "partition_seed": 23,
             "initial_checkpoint_sha256": parent_sha,
-            "model_config": {},
+            "model_config": {"runtime_policy_sha256": parent_runtime},
         }
         bundle_path = output / "learner_bundle_round_000000.json"
         config_sha = publish_immutable_json(bundle_path, bundle)
+        identity_sha = learner_identity_sha256(
+            campaign_id=campaign,
+            macro_round=macro_round,
+            learner_code_sha256=code_sha,
+            learner_config_sha256=config_sha,
+            replay_snapshot_file_sha256=snapshot_file_sha,
+            replay_snapshot_sha256=snapshot_sha,
+            parent_checkpoint_sha256=parent_sha,
+            parent_runtime_policy_sha256=parent_runtime,
+            runtime_container_sha256=container_sha,
+            learner_contract_sha256=contract_sha,
+        )
+        run_id = learner_wandb_run_id(
+            campaign_id=campaign,
+            macro_round=macro_round,
+            learner_identity_sha256=identity_sha,
+        )
+        restart = output / "restart.pt"
+        torch.save(
+            {
+                "schema": completion.CHECKPOINT_SCHEMA,
+                "campaign_id": campaign,
+                "macro_round": macro_round,
+                "model_lineage_sha256": parent_sha,
+                "code_sha256": code_sha,
+                "learner_config_sha256": config_sha,
+                "learner_identity_sha256": identity_sha,
+                "runtime_container_sha256": container_sha,
+                "learner_contract_sha256": contract_sha,
+                "replay_snapshot_sha256": snapshot_sha,
+                "replay_snapshot_file_sha256": snapshot_file_sha,
+                "completed_steps": 500,
+                "world_size": 8,
+                "model_state_dict": {},
+                "optimizer_state_dict": {},
+                "rng_states": [None] * 8,
+            },
+            restart,
+        )
+        candidate = output / "candidate_round_000000.pt"
+        candidate.write_bytes(restart.read_bytes())
+        spec, manifest = publish_policy_bundle(candidate, candidate_runtime)
         telemetry = output / "telemetry.jsonl"
         telemetry.write_text("sealed telemetry\n", encoding="utf-8")
         readback = output / "wandb_learner_readback_round_000000.json"
@@ -76,12 +121,17 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "entity_is_team": True,
                 "personal": False,
                 "project": "roborender-round-dagger",
-                "run_id": f"{campaign}-learner-m000000-s{snapshot_sha[:12]}",
+                "run_id": run_id,
                 "run_state": "finished",
                 "campaign_id": campaign,
                 "macro_round": macro_round,
+                "learner_code_sha256": code_sha,
                 "learner_config_sha256": config_sha,
+                "learner_identity_sha256": identity_sha,
                 "model_lineage_sha256": parent_sha,
+                "parent_runtime_policy_sha256": parent_runtime,
+                "runtime_container_sha256": container_sha,
+                "learner_contract_sha256": contract_sha,
                 "replay_snapshot_file_sha256": snapshot_file_sha,
                 "replay_snapshot_sha256": snapshot_sha,
                 "verified_optimizer_steps": 500,
@@ -130,7 +180,11 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "macro_round": macro_round,
                 "code_sha256": code_sha,
                 "learner_config_sha256": config_sha,
+                "learner_contract_sha256": contract_sha,
+                "learner_identity_sha256": identity_sha,
                 "model_lineage_sha256": parent_sha,
+                "parent_runtime_policy_sha256": parent_runtime,
+                "runtime_container_sha256": container_sha,
                 "runtime_policy_sha256": candidate_runtime,
                 "replay_snapshot_file_sha256": snapshot_file_sha,
                 "replay_snapshot_sha256": snapshot_sha,
@@ -142,7 +196,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "wandb": {
                     "entity": "nvidia",
                     "project": "roborender-round-dagger",
-                    "run_id": f"{campaign}-learner-m000000-s{snapshot_sha[:12]}",
+                    "run_id": run_id,
                     "run_state": "finished",
                     "verified_optimizer_steps": 500,
                 },
@@ -160,6 +214,9 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
             "parent_sha256": parent_sha,
             "snapshot_file_sha256": snapshot_file_sha,
             "snapshot_sha256": snapshot_sha,
+            "runtime_container_sha256": container_sha,
+            "learner_contract_sha256": contract_sha,
+            "learner_identity_sha256": identity_sha,
         }
 
     @staticmethod
@@ -174,6 +231,9 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "parent_sha256",
                 "snapshot_file_sha256",
                 "snapshot_sha256",
+                "runtime_container_sha256",
+                "learner_contract_sha256",
+                "learner_identity_sha256",
             )
         }
 
@@ -195,6 +255,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 macro_round=fixture["macro_round"],
                 learner_code_sha256=fixture["code_sha256"],
                 learner_config_sha256=fixture["config_sha256"],
+                learner_identity_sha256=fixture["learner_identity_sha256"],
             )
             self.assertEqual(
                 remote_learner_success.verify(
@@ -205,6 +266,9 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                     macro_round=fixture["macro_round"],
                     learner_code_sha256=fixture["code_sha256"],
                     learner_config_sha256=fixture["config_sha256"],
+                    learner_identity_sha256=fixture[
+                        "learner_identity_sha256"
+                    ],
                 ),
                 first,
             )
@@ -249,6 +313,25 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                     result=fixture["result"],
                     **self._verify_args(fixture),
                 )
+
+    def test_container_contract_or_identity_argument_tamper_is_rejected(self) -> None:
+        for field in (
+            "runtime_container_sha256",
+            "learner_contract_sha256",
+            "learner_identity_sha256",
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                fixture = self._fixture(Path(temporary))
+                arguments = self._verify_args(fixture)
+                arguments[field] = "f" * 64
+                with self.assertRaisesRegex(
+                    completion.CompletionAttestationError, "lineage mismatch"
+                ):
+                    completion.verify_attestation(
+                        fixture["attestation"],
+                        result=fixture["result"],
+                        **arguments,
+                    )
 
     def test_telemetry_binds_per_rank_counts_to_snapshot_total(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

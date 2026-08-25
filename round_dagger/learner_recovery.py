@@ -17,7 +17,14 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from round_dagger import artifacts, policy_bundle, promotion, replay, state
+from round_dagger import (
+    artifacts,
+    learner_identity,
+    policy_bundle,
+    promotion,
+    replay,
+    state,
+)
 from round_dagger.orchestration import (
     COHORT_COUNT,
     ENVIRONMENTS_PER_COHORT,
@@ -156,6 +163,7 @@ def _bridge_environment(
     source_root: str,
     source_sha256: str,
     learner_config_sha256: str,
+    learner_contract_sha256: str,
     learner_contract: Mapping[str, Any],
 ) -> dict[str, str]:
     cluster = learner_contract["cluster"]
@@ -165,13 +173,29 @@ def _bridge_environment(
     allocation = learner_contract["allocation"]
     wandb = learner_contract["wandb"]
     checkpoint = campaign_root / active["checkpoint_path"]
-    run_id = (
-        f"{campaign['campaign_id']}-learner-m{macro_round:06d}-"
-        f"s{snapshot['snapshot_sha256'][:12]}"
+    identity_sha256 = learner_identity.learner_identity_sha256(
+        campaign_id=str(campaign["campaign_id"]),
+        macro_round=macro_round,
+        learner_code_sha256=source_sha256,
+        learner_config_sha256=learner_config_sha256,
+        replay_snapshot_file_sha256=str(snapshot["file_sha256"]),
+        replay_snapshot_sha256=str(snapshot["snapshot_sha256"]),
+        parent_checkpoint_sha256=str(active["checkpoint_sha256"]),
+        parent_runtime_policy_sha256=str(active["runtime_policy_sha256"]),
+        runtime_container_sha256=str(container["sha256"]),
+        learner_contract_sha256=learner_contract_sha256,
+    )
+    run_id = learner_identity.learner_wandb_run_id(
+        campaign_id=str(campaign["campaign_id"]),
+        macro_round=macro_round,
+        learner_identity_sha256=identity_sha256,
     )
     return {
         "DRY_RUN": "0",
-        "ROUND_DAGGER_PYTHON": str(Path(sys.executable).resolve()),
+        # Preserve a virtual-environment entry point.  Resolving its symlink
+        # selects the base interpreter and silently drops the validated venv's
+        # NumPy/PyTorch site-packages.
+        "ROUND_DAGGER_PYTHON": os.path.abspath(sys.executable),
         "ROUND_DAGGER_CAMPAIGN_ROOT": str(campaign_root),
         "ROUND_DAGGER_CAMPAIGN_ID": str(campaign["campaign_id"]),
         "ROUND_DAGGER_MACRO_ROUND": str(macro_round),
@@ -194,6 +218,8 @@ def _bridge_environment(
         "ROUND_DAGGER_LEARNER_RESULT": str(learner_result),
         "ROUND_DAGGER_LEARNER_CODE_SHA256": source_sha256,
         "ROUND_DAGGER_LEARNER_CONFIG_SHA256": learner_config_sha256,
+        "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": learner_contract_sha256,
+        "ROUND_DAGGER_LEARNER_IDENTITY_SHA256": identity_sha256,
         "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": str(
             active["checkpoint_sha256"]
         ),
@@ -321,6 +347,7 @@ def recover_ingested_learner(
         artifacts.canonical_json_sha256(campaign) != campaign_sha
         or current["campaign_sha256"] != campaign_sha
         or campaign_contract["campaign_id"] != campaign["campaign_id"]
+        or expected_learner_contract_sha256 != campaign["policy_config_sha256"]
     ):
         raise LearnerRecoveryError("campaign identity mismatch")
     if (
@@ -420,6 +447,7 @@ def recover_ingested_learner(
         source_root=sealed_source_root,
         source_sha256=source_sha,
         learner_config_sha256=learner_config_sha,
+        learner_contract_sha256=expected_learner_contract_sha256,
         learner_contract=learner_contract,
     )
     environment_sha = artifacts.canonical_json_sha256(environment)

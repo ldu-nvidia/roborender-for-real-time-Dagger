@@ -26,6 +26,7 @@ from round_dagger import (
     evaluation,
     handoff,
     image3f_lifecycle,
+    learner_identity,
     policy_bundle,
     promotion,
     replay,
@@ -1345,8 +1346,52 @@ class MacroRoundOrchestrator:
                 expected_file_sha256=current["replay_snapshot_sha256"]
             )
             learner_output = self.backend.learner_output_dir()
+            # Production launch exports the immutable runtime/container
+            # contract.  Generic local hooks do not have a container concept,
+            # so only attach the production learner identity when both inputs
+            # are present; the OCI bridge itself requires them and fails closed.
+            container_sha = os.environ.get(
+                "ROUND_DAGGER_REMOTE_CONTAINER_SHA256"
+            )
+            learner_contract_sha = os.environ.get(
+                "ROUND_DAGGER_LEARNER_CONTRACT_SHA256"
+            )
+            identity_environment: dict[str, str] = {}
+            if container_sha is not None or learner_contract_sha is not None:
+                if container_sha is None or learner_contract_sha is None:
+                    raise OrchestrationError(
+                        "production learner identity inputs are incomplete"
+                    )
+                container_sha = _sha256(container_sha, "runtime container SHA-256")
+                learner_contract_sha = _sha256(
+                    learner_contract_sha, "learner contract SHA-256"
+                )
+                if learner_contract_sha != campaign["policy_config_sha256"]:
+                    raise OrchestrationError(
+                        "learner contract identity differs from the campaign"
+                    )
+                learner_identity_sha256 = learner_identity.learner_identity_sha256(
+                    campaign_id=str(campaign["campaign_id"]),
+                    macro_round=self.config.macro_round,
+                    learner_code_sha256=self.config.learner_code_sha256,
+                    learner_config_sha256=self.config.learner_config_sha256,
+                    replay_snapshot_file_sha256=str(snapshot["file_sha256"]),
+                    replay_snapshot_sha256=str(snapshot["snapshot_sha256"]),
+                    parent_checkpoint_sha256=self.config.learner_model_lineage_sha256,
+                    parent_runtime_policy_sha256=str(
+                        contract["policy_runtime_sha256"]
+                    ),
+                    runtime_container_sha256=container_sha,
+                    learner_contract_sha256=learner_contract_sha,
+                )
+                identity_environment = {
+                    "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": container_sha,
+                    "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": learner_contract_sha,
+                    "ROUND_DAGGER_LEARNER_IDENTITY_SHA256": learner_identity_sha256,
+                }
             train_environment = {
                 **base_environment,
+                **identity_environment,
                 "ROUND_DAGGER_REPLAY_SNAPSHOT": str(snapshot["path"]),
                 "ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256": str(
                     snapshot["file_sha256"]
