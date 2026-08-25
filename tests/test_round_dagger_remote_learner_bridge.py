@@ -109,7 +109,13 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         bridge = BRIDGE.read_text(encoding="utf-8")
         batch = BATCH.read_text(encoding="utf-8")
         container_wrapper = CONTAINER_WRAPPER.read_text(encoding="utf-8")
+        explicit_exports = bridge.split("export_names=(", 1)[1].split(")", 1)[0]
         self.assertNotIn('exports="ALL"', bridge)
+        self.assertIn("ROUND_DAGGER_CAMPAIGN_ROOT", explicit_exports)
+        self.assertIn(
+            'ROUND_DAGGER_CAMPAIGN_ROOT == "$ROUND_DAGGER_LOCAL_CAMPAIGN_ROOT"',
+            batch,
+        )
         self.assertNotIn("WANDB_API_KEY", bridge + batch)
         self.assertIn("flock -n 9", bridge)
         self.assertIn("remote-complete", bridge)
