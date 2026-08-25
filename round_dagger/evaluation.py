@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -49,6 +50,7 @@ RAYTRACED_MIX = 0.0
 REFERENCE_LAG = 256
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_RECOVERY_ID_RE = re.compile(r"hardened-[0-9a-f]{20}")
 
 DEFAULT_THRESHOLDS: dict[str, Any] = {
     "minimum_paired_cases": 8,
@@ -168,6 +170,38 @@ def _token(value: Any, label: str) -> str:
     if not isinstance(value, str) or _TOKEN_RE.fullmatch(value) is None:
         raise EvaluationError(f"{label} must be a safe token")
     return value
+
+
+def _evaluation_root_for_contract(
+    root: Path, contract_path: str | Path, macro_round: int
+) -> Path:
+    """Return the only allowed root for canonical or hardened-recovery eval.
+
+    Normal orchestration owns ``evaluation/``.  A source-hardening recovery is
+    deliberately isolated below a deterministic ``evaluation_recovery``
+    namespace so an older immutable result is never renamed, removed, or
+    overwritten.  No other redirect is accepted.
+    """
+
+    path = Path(contract_path)
+    if not path.is_absolute():
+        path = root / path
+    path = Path(os.path.abspath(path))
+    round_root = root / "rounds" / f"macro_round_{macro_round:06d}"
+    canonical = round_root / "evaluation" / "contract.json"
+    if path == canonical:
+        return canonical.parent
+    try:
+        relative = path.relative_to(round_root / "evaluation_recovery")
+    except ValueError as exc:
+        raise EvaluationError("evaluation contract path is non-canonical") from exc
+    if (
+        len(relative.parts) != 2
+        or _RECOVERY_ID_RE.fullmatch(relative.parts[0]) is None
+        or relative.parts[1] != "contract.json"
+    ):
+        raise EvaluationError("hardened recovery contract path is non-canonical")
+    return path.parent
 
 
 def _validate_thresholds(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -361,6 +395,7 @@ def create_contract(
     }
     _validate_contract_document(root, contract, bind_state=True)
     output_path, relative = _internal_path(root, output, "evaluation contract")
+    _evaluation_root_for_contract(root, output_path, contract["macro_round"])
     digest = publish_immutable_json(output_path, contract)
     return {**contract, "contract_path": relative, "contract_sha256": digest}
 
@@ -1051,16 +1086,10 @@ def publish_case_outcome(
         expected_attempt=expected_attempt,
     )
     output_path, output_relative = _internal_path(root, output, "canonical outcome")
-    expected_output = (
-        root
-        / "rounds"
-        / f"macro_round_{contract['macro_round']:06d}"
-        / "evaluation"
-        / "results"
-        / role
-        / f"seed_{seed}"
-        / "outcome.json"
+    evaluation_root = _evaluation_root_for_contract(
+        root, contract["contract_path"], contract["macro_round"]
     )
+    expected_output = evaluation_root / "results" / role / f"seed_{seed}" / "outcome.json"
     if output_path != expected_output:
         raise EvaluationError("paired outcome publication path is non-canonical")
     document = load_strict_json(source_path)
@@ -1189,13 +1218,10 @@ def summarize_to_evaluator_result(
     output_path, output_relative = _internal_path(
         root, output, "orchestrator evaluator result"
     )
-    expected_output = (
-        root
-        / "rounds"
-        / f"macro_round_{contract['macro_round']:06d}"
-        / "evaluation"
-        / "result.json"
+    evaluation_root = _evaluation_root_for_contract(
+        root, contract["contract_path"], contract["macro_round"]
     )
+    expected_output = evaluation_root / "result.json"
     if output_path != expected_output:
         raise EvaluationError("orchestrator evaluator result path is non-canonical")
     results_root, results_relative = _internal_path(
@@ -1307,13 +1333,10 @@ def verify_evaluator_result_evidence(
     output_path, output_relative = _internal_path(
         root, result_path, "orchestrator evaluator result"
     )
-    expected_output = (
-        root
-        / "rounds"
-        / f"macro_round_{contract['macro_round']:06d}"
-        / "evaluation"
-        / "result.json"
+    evaluation_root = _evaluation_root_for_contract(
+        root, contract["contract_path"], contract["macro_round"]
     )
+    expected_output = evaluation_root / "result.json"
     if output_path != expected_output:
         raise EvaluationError("orchestrator evaluator result path is non-canonical")
     results_root, results_relative = _internal_path(

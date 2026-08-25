@@ -41,6 +41,7 @@ EVALUATION_SCHEMA = "fast_roborender.round_dagger.policy_evaluation.v2"
 PROMOTION_SCHEMA = "fast_roborender.round_dagger.policy_promotion.v1"
 SHA_RE = re.compile(r"[0-9a-f]{64}")
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_EVALUATION_RECOVERY_ID_RE = re.compile(r"hardened-[0-9a-f]{20}")
 PHASES = {
     "READY",
     "COLLECTING",
@@ -1330,7 +1331,7 @@ def transition(
         bundle_path, bundle_relative = _internal_path(
             root, evidence["evidence_bundle_path"], "evaluation evidence bundle"
         )
-        expected_bundle = (
+        canonical_bundle = (
             root
             / "rounds"
             / f"macro_round_{macro_round:06d}"
@@ -1338,8 +1339,17 @@ def transition(
             / "results"
             / "evaluation_bundle.json"
         )
+        recovery_parent = bundle_path.parent.parent
+        recovery_bundle = (
+            recovery_parent.parent.name == "evaluation_recovery"
+            and bool(_EVALUATION_RECOVERY_ID_RE.fullmatch(recovery_parent.name))
+            and bundle_path
+            == recovery_parent / "results" / "evaluation_bundle.json"
+            and recovery_parent.parent.parent
+            == root / "rounds" / f"macro_round_{macro_round:06d}"
+        )
         if (
-            bundle_path != expected_bundle
+            (bundle_path != canonical_bundle and not recovery_bundle)
             or evidence["evidence_bundle_path"] != bundle_relative
         ):
             raise StateError("evaluation evidence bundle path is non-canonical")

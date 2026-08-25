@@ -40,6 +40,7 @@ PROMOTION_SCHEMA = "fast_roborender.round_dagger.policy_promotion.v1"
 BOOTSTRAP_SCHEMA = "fast_roborender.round_dagger.bootstrap_policy.v2"
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_RECOVERY_ID_RE = re.compile(r"hardened-[0-9a-f]{20}")
 
 
 class PromotionError(ArtifactError):
@@ -579,6 +580,28 @@ def _validate_metrics(metrics: Any) -> dict[str, float]:
     return clean
 
 
+def _is_canonical_evaluation_bundle(
+    root: Path, candidate: Mapping[str, Any], bundle_path: Path
+) -> bool:
+    round_root = (
+        root
+        / "rounds"
+        / f"macro_round_{candidate['macro_round']:06d}"
+    )
+    canonical = round_root / "evaluation" / "results" / "evaluation_bundle.json"
+    if bundle_path == canonical:
+        return True
+    try:
+        relative = bundle_path.relative_to(round_root / "evaluation_recovery")
+    except ValueError:
+        return False
+    return (
+        len(relative.parts) == 3
+        and _RECOVERY_ID_RE.fullmatch(relative.parts[0]) is not None
+        and relative.parts[1:] == ("results", "evaluation_bundle.json")
+    )
+
+
 def _validate_evaluation(
     root: Path,
     document: Any,
@@ -616,16 +639,8 @@ def _validate_evaluation(
     bundle_path, bundle_relative = _internal_path(
         root, evidence["evidence_bundle_path"], "evaluation evidence bundle"
     )
-    expected_bundle = (
-        root
-        / "rounds"
-        / f"macro_round_{candidate['macro_round']:06d}"
-        / "evaluation"
-        / "results"
-        / "evaluation_bundle.json"
-    )
     if (
-        bundle_path != expected_bundle
+        not _is_canonical_evaluation_bundle(root, candidate, bundle_path)
         or evidence["evidence_bundle_path"] != bundle_relative
     ):
         raise PromotionError("evaluation evidence bundle path is non-canonical")

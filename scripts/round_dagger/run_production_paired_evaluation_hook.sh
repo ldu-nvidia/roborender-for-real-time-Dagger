@@ -57,12 +57,17 @@ IMAGE=${ROUND_DAGGER_RTX_IMAGE:?missing ROUND_DAGGER_RTX_IMAGE}
 EXPECTED_IMAGE_ID_SHA=${ROUND_DAGGER_RTX_IMAGE_ID_SHA256:?missing ROUND_DAGGER_RTX_IMAGE_ID_SHA256}
 CONTROL_PYTHON=${ROUND_DAGGER_CONTROL_PYTHON:-python3}
 DRY_RUN=${DRY_RUN:-0}
+RECOVERY_ID=${ROUND_DAGGER_EVALUATION_RECOVERY_ID:-}
 
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "campaign ID is unsafe"
 [[ $MACRO_ROUND =~ ^(0|[1-9][0-9]*)$ ]] || fatal "macro round is non-canonical"
 [[ $EXPECTED_RENDERERS =~ ^[1-9][0-9]*$ ]] || fatal "expected renderer count is invalid"
 [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be exactly 0 or 1"
+if [[ -n $RECOVERY_ID ]]; then
+    [[ $RECOVERY_ID =~ ^hardened-[0-9a-f]{20}$ ]] || \
+        fatal "ROUND_DAGGER_EVALUATION_RECOVERY_ID is non-canonical"
+fi
 require_sha "$PARENT_CHECKPOINT_SHA" ROUND_DAGGER_POLICY_SHA256
 require_sha "$PARENT_RUNTIME_SHA" ROUND_DAGGER_RUNTIME_POLICY_SHA256
 require_sha "$CANDIDATE_MANIFEST_SHA" ROUND_DAGGER_CANDIDATE_SHA256
@@ -109,7 +114,11 @@ CONTROL_PYTHON_TARGET=$(readlink -f -- "$CONTROL_PYTHON") || \
     fatal "evaluation thresholds SHA mismatch"
 
 PADDED_ROUND=$(printf '%06d' "$MACRO_ROUND")
-EVALUATION_ROOT="$CAMPAIGN_ROOT/rounds/macro_round_$PADDED_ROUND/evaluation"
+if [[ -n $RECOVERY_ID ]]; then
+    EVALUATION_ROOT="$CAMPAIGN_ROOT/rounds/macro_round_$PADDED_ROUND/evaluation_recovery/$RECOVERY_ID"
+else
+    EVALUATION_ROOT="$CAMPAIGN_ROOT/rounds/macro_round_$PADDED_ROUND/evaluation"
+fi
 CONTRACT="$EVALUATION_ROOT/contract.json"
 RESULTS_DIR="$EVALUATION_ROOT/results"
 EXPECTED_RESULT="$EVALUATION_ROOT/result.json"
