@@ -12,7 +12,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 PYTHON=${ROUND_DAGGER_PYTHON:-python3}
 REMOTE=${ROUND_DAGGER_REMOTE_HOST:-oci-nrt}
 ACCOUNT=${ROUND_DAGGER_REMOTE_ACCOUNT:-general_cs_infra__ngcsre}
-PARTITION=${ROUND_DAGGER_REMOTE_PARTITION:-batch_long}
+PARTITION=${ROUND_DAGGER_REMOTE_PARTITION:-batch_singlenode}
 QOS=${ROUND_DAGGER_REMOTE_QOS:-normal}
 STAGE_ROOT=${ROUND_DAGGER_REMOTE_STAGE_ROOT:-/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build}
 REMOTE_SOURCE=${ROUND_DAGGER_REMOTE_SOURCE_ROOT:?set the exact sealed OCI source root}
@@ -29,7 +29,8 @@ MAX_ATTEMPTS=${ROUND_DAGGER_REMOTE_MAX_ATTEMPTS:-3}
 case "$DRY_RUN" in 0|1) ;; *) fatal "DRY_RUN must be exactly 0 or 1" ;; esac
 [[ $REMOTE =~ ^[A-Za-z0-9_.-]+$ ]] || fatal "remote host is malformed"
 [[ $ACCOUNT == general_cs_infra__ngcsre ]] || fatal "OCI account is not approved"
-[[ $PARTITION == batch_long ]] || fatal "OCI partition must be batch_long"
+[[ $PARTITION == batch_singlenode ]] || \
+    fatal "OCI partition must be batch_singlenode"
 [[ $QOS == normal ]] || fatal "OCI QOS must be normal"
 [[ $REMOTE_SOURCE_INVENTORY_SHA =~ ^[0-9a-f]{64}$ ]] || \
     fatal "sealed source inventory SHA-256 is malformed"
@@ -399,7 +400,7 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
                 submission=$(ssh -o BatchMode=yes "$REMOTE" sbatch --parsable \
                 --account="$ACCOUNT" --partition="$PARTITION" --qos="$QOS" \
                 --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=64 --mem=0 \
-                --time=08:00:00 \
+                --time=04:00:00 \
                 --job-name="$JOB_NAME" \
                 --output="$REMOTE_JOB_ROOT/slurm_%j.out" \
                 --error="$REMOTE_JOB_ROOT/slurm_%j.err" --export="$exports" \

@@ -130,6 +130,13 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         for non_retryable in ("CANCELLED", "FAILED", "OUT_OF_MEMORY"):
             self.assertNotIn(f"PREEMPTED|{non_retryable}", bridge)
         self.assertIn("--gpus-per-node=8", bridge)
+        self.assertIn(
+            "PARTITION=${ROUND_DAGGER_REMOTE_PARTITION:-batch_singlenode}",
+            bridge,
+        )
+        self.assertIn("partition must be batch_singlenode", bridge)
+        self.assertIn("--time=04:00:00", bridge)
+        self.assertNotIn("--time=08:00:00", bridge)
         self.assertIn("/cm/shared/apps/slurm/current/bin", bridge)
         self.assertIn("--gpus-per-task=8", batch)
         self.assertIn("/round_dagger_job", batch)

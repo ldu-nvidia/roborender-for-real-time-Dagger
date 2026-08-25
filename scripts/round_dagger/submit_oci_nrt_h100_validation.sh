@@ -12,7 +12,7 @@ safe_path() {
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 SBATCH_BIN=${ROUND_DAGGER_VALIDATION_SBATCH_BIN:-/cm/shared/apps/slurm/current/bin/sbatch}
 ACCOUNT=${ROUND_DAGGER_VALIDATION_ACCOUNT:-general_cs_infra__ngcsre}
-PARTITION=${ROUND_DAGGER_VALIDATION_PARTITION:-batch_long}
+PARTITION=${ROUND_DAGGER_VALIDATION_PARTITION:-batch_singlenode}
 QOS=${ROUND_DAGGER_VALIDATION_QOS:-normal}
 SOURCE=${ROUND_DAGGER_VALIDATION_SOURCE_ROOT:?set sealed OCI source root}
 SOURCE_SHA=${ROUND_DAGGER_VALIDATION_SOURCE_INVENTORY_SHA256:?set sealed source inventory SHA-256}
@@ -41,7 +41,8 @@ DRY_RUN=${DRY_RUN:-0}
 
 [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be exactly 0 or 1"
 [[ $ACCOUNT == general_cs_infra__ngcsre ]] || fatal "OCI-NRT account is not approved"
-[[ $PARTITION == batch_long ]] || fatal "OCI-NRT partition must be batch_long"
+[[ $PARTITION == batch_singlenode ]] || \
+    fatal "OCI-NRT partition must be batch_singlenode"
 [[ $QOS == normal ]] || fatal "OCI-NRT QOS must be normal"
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "validation campaign ID is malformed"

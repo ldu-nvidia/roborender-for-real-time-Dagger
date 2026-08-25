@@ -582,7 +582,7 @@ def load_learner_contract(path: Path) -> dict[str, Any]:
     )
     _require_equal(cluster["host"], "oci-nrt", "learner host")
     _require_equal(cluster["account"], "general_cs_infra__ngcsre", "learner account")
-    _require_equal(cluster["partition"], "batch_long", "learner partition")
+    _require_equal(cluster["partition"], "batch_singlenode", "learner partition")
     _require_equal(cluster["qos"], "normal", "learner QOS")
     for key in ("slurm_bin", "stage_root", "wandb_netrc"):
         _absolute(cluster[key], f"cluster {key}")

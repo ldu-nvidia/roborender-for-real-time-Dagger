@@ -187,6 +187,9 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(learner["optimization"]["learning_rate"], 2.5e-5)
         self.assertEqual(learner["optimization"]["seed"], 17)
         self.assertEqual(learner["optimization"]["partition_seed"], 23)
+        self.assertEqual(learner["cluster"]["account"], "general_cs_infra__ngcsre")
+        self.assertEqual(learner["cluster"]["partition"], "batch_singlenode")
+        self.assertEqual(learner["cluster"]["qos"], "normal")
 
     def test_validate_launch_binds_campaign_source_config_and_static_environment(self) -> None:
         _, orchestration = self._campaign_and_orchestration()

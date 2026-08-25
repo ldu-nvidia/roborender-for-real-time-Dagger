@@ -56,6 +56,11 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
         wrapper = WRAPPER.read_text(encoding="utf-8")
         combined = submit + batch + wrapper
         self.assertIn("--export=NONE", submit)
+        self.assertIn(
+            "PARTITION=${ROUND_DAGGER_VALIDATION_PARTITION:-batch_singlenode}",
+            submit,
+        )
+        self.assertIn("partition must be batch_singlenode", submit)
         self.assertIn("--gpus-per-node=8", submit)
         self.assertIn("--gpus=1 --gpus-per-task=1", batch)
         self.assertIn("--gpus=8 --gpus-per-task=8", batch)

@@ -18,7 +18,7 @@
   "cluster": {
     "host": "oci-nrt",
     "account": "general_cs_infra__ngcsre",
-    "partition": "batch_long",
+    "partition": "batch_singlenode",
     "qos": "normal",
     "slurm_bin": "/cm/shared/apps/slurm/current/bin",
     "stage_root": "/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build",
