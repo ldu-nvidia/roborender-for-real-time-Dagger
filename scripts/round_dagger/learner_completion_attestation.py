@@ -41,6 +41,7 @@ READBACK_SCHEMA = "fast_roborender.round_dagger.learner_wandb_readback.v1"
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
 CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v1"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
+TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 ARTIFACT_NAMES = (
@@ -110,7 +111,12 @@ def _artifact(path: Path) -> dict[str, str]:
 
 
 def _telemetry_records(
-    path: Path, *, campaign_id: str, macro_round: int, optimizer_steps: int
+    path: Path,
+    *,
+    campaign_id: str,
+    macro_round: int,
+    optimizer_steps: int,
+    replay_transitions_global: int,
 ) -> dict[int, dict[str, Any]]:
     expected_keys = {
         "schema",
@@ -119,6 +125,8 @@ def _telemetry_records(
         "optimizer_step",
         "loss",
         "replay_transitions_rank",
+        "replay_transitions_per_rank",
+        "replay_transitions_global",
         "world_size",
     }
     by_step: dict[int, dict[str, Any]] = {}
@@ -128,6 +136,7 @@ def _telemetry_records(
         raise CompletionAttestationError("cannot read learner telemetry") from exc
     if not lines:
         raise CompletionAttestationError("learner telemetry is empty")
+    expected_counts: tuple[int, ...] | None = None
     for line in lines:
         try:
             row = json.loads(line)
@@ -137,8 +146,10 @@ def _telemetry_records(
             raise CompletionAttestationError("learner telemetry fields mismatch")
         step = row.get("optimizer_step")
         loss = row.get("loss")
+        transition_counts = row.get("replay_transitions_per_rank")
+        global_transitions = row.get("replay_transitions_global")
         if (
-            row.get("schema") != "fast_roborender.round_dagger.learner_telemetry.v1"
+            row.get("schema") != TELEMETRY_SCHEMA
             or row.get("campaign_id") != campaign_id
             or row.get("macro_round") != macro_round
             or type(step) is not int
@@ -149,8 +160,22 @@ def _telemetry_records(
             or row.get("world_size") != 8
             or type(row.get("replay_transitions_rank")) is not int
             or row["replay_transitions_rank"] < 1
+            or not isinstance(transition_counts, list)
+            or len(transition_counts) != 8
+            or any(type(value) is not int or value < 1 for value in transition_counts)
+            or row["replay_transitions_rank"] != transition_counts[0]
+            or type(global_transitions) is not int
+            or global_transitions != sum(transition_counts)
+            or global_transitions != replay_transitions_global
         ):
             raise CompletionAttestationError("learner telemetry contract mismatch")
+        observed_counts = tuple(transition_counts)
+        if expected_counts is None:
+            expected_counts = observed_counts
+        elif observed_counts != expected_counts:
+            raise CompletionAttestationError(
+                "learner telemetry replay partition changed between steps"
+            )
         normalized = dict(row)
         previous = by_step.get(step)
         # Scheduler retries can replay the at-most-four updates after the last
@@ -221,6 +246,7 @@ def _wandb_readback(
                     not isinstance(loss, bool)
                     and isinstance(loss, (int, float))
                     and math.isfinite(float(loss))
+                    and row.get("schema") == TELEMETRY_SCHEMA
                     and math.isclose(
                         float(loss), float(local["loss"]), rel_tol=1e-12, abs_tol=1e-12
                     )
@@ -229,6 +255,10 @@ def _wandb_readback(
                     and row.get("world_size") == 8
                     and row.get("replay_transitions_rank")
                     == local["replay_transitions_rank"]
+                    and row.get("replay_transitions_per_rank")
+                    == local["replay_transitions_per_rank"]
+                    and row.get("replay_transitions_global")
+                    == local["replay_transitions_global"]
                 ):
                     observed.add(step)
             if state == "finished" and observed == set(telemetry):
@@ -422,6 +452,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         campaign_id=campaign_id,
         macro_round=args.macro_round,
         optimizer_steps=500,
+        replay_transitions_global=int(snapshot["transition_count"]),
     )
     readback_document = _wandb_readback(
         telemetry=telemetry,

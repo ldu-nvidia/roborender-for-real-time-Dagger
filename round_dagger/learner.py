@@ -46,12 +46,13 @@ from round_dagger.policy_bundle import (
     PolicyBundleError,
     validate_policy_bundle_identity,
 )
-from round_dagger.replay import deterministic_partition, load_snapshot
+from round_dagger.replay import load_snapshot
 
 
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
 CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v1"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
+TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 CUDA_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
@@ -381,6 +382,78 @@ class MappingPolicyAdapter:
         return actions
 
 
+def _balanced_shard_assignments(
+    resolved_shards: Sequence[Mapping[str, Any]],
+    *,
+    world_size: int,
+    seed: int,
+) -> list[list[dict[str, Any]]]:
+    """Balance immutable shards by transition count with deterministic LPT.
+
+    The learner takes the same number of optimizer steps on every DDP rank and
+    samples uniformly inside each rank-local replay partition.  Independent
+    hash bucketing can therefore overweight transitions assigned to ranks with
+    small partitions.  Longest-processing-time-first assignment minimizes that
+    skew while retaining deterministic, input-order-independent ownership.
+    """
+
+    world_size = _true_int(world_size, "world_size", minimum=1)
+    seed = _true_int(seed, "partition seed")
+    normalized: list[tuple[int, str, str, dict[str, Any]]] = []
+    identities: set[str] = set()
+    for raw in resolved_shards:
+        if not isinstance(raw, Mapping):
+            raise LearnerError("resolved shard must be a mapping")
+        logical_id = raw.get("logical_id")
+        shard_id = raw.get("shard_id")
+        if not isinstance(logical_id, str) or not logical_id:
+            raise LearnerError("resolved shard logical_id must be a non-empty string")
+        if not isinstance(shard_id, str) or not shard_id:
+            raise LearnerError("resolved shard shard_id must be a non-empty string")
+        identity = f"{logical_id}/{shard_id}"
+        if identity in identities:
+            raise LearnerError("resolved replay contains duplicate shard identity")
+        identities.add(identity)
+        transitions = _true_int(
+            raw.get("transition_count"),
+            f"transition_count for replay shard {identity}",
+            minimum=1,
+        )
+        seeded_digest = hashlib.sha256(
+            f"{seed}:{identity}".encode("utf-8")
+        ).hexdigest()
+        normalized.append((transitions, seeded_digest, identity, dict(raw)))
+
+    # Largest shards are placed first.  The seeded digest makes ties stable
+    # without depending on manifest order or Python hash randomization.
+    normalized.sort(key=lambda item: (-item[0], item[1], item[2]))
+    assignments: list[list[dict[str, Any]]] = [[] for _ in range(world_size)]
+    transition_totals = [0 for _ in range(world_size)]
+    shard_totals = [0 for _ in range(world_size)]
+    for transitions, _digest, _identity, shard in normalized:
+        rank = min(
+            range(world_size),
+            key=lambda candidate: (
+                transition_totals[candidate],
+                shard_totals[candidate],
+                candidate,
+            ),
+        )
+        assignments[rank].append(shard)
+        transition_totals[rank] += transitions
+        shard_totals[rank] += 1
+
+    for assigned in assignments:
+        assigned.sort(
+            key=lambda item: (
+                item["macro_round"],
+                item["cohort_index"],
+                item["shard_id"],
+            )
+        )
+    return assignments
+
+
 def partition_shards(
     resolved_shards: Sequence[Mapping[str, Any]],
     *,
@@ -388,28 +461,15 @@ def partition_shards(
     world_size: int,
     seed: int,
 ) -> list[dict[str, Any]]:
-    """Assign immutable shards to ranks without Python hash randomization."""
+    """Return one rank's deterministic transition-balanced shard assignment."""
 
     rank = _true_int(rank, "rank")
     world_size = _true_int(world_size, "world_size", minimum=1)
-    seed = _true_int(seed, "partition seed")
     if rank >= world_size:
         raise LearnerError("rank must be smaller than world_size")
-    selected: list[dict[str, Any]] = []
-    identities: set[str] = set()
-    for raw in resolved_shards:
-        if not isinstance(raw, Mapping):
-            raise LearnerError("resolved shard must be a mapping")
-        identity = f"{raw.get('logical_id')}/{raw.get('shard_id')}"
-        if identity in identities:
-            raise LearnerError("resolved replay contains duplicate shard identity")
-        identities.add(identity)
-        if deterministic_partition(identity, world_size, seed=seed) == rank:
-            selected.append(dict(raw))
-    selected.sort(
-        key=lambda item: (item["macro_round"], item["cohort_index"], item["shard_id"])
-    )
-    return selected
+    return _balanced_shard_assignments(
+        resolved_shards, world_size=world_size, seed=seed
+    )[rank]
 
 
 def _read_npz_from_verified_descriptor(
@@ -485,6 +545,7 @@ class ReplayPartition:
         config: LearnerBundleConfig,
         rank: int,
         world_size: int,
+        transition_counts_by_rank: Sequence[int],
     ):
         if not shards:
             raise LearnerError(
@@ -495,6 +556,21 @@ class ReplayPartition:
         self.config = config
         self.rank = rank
         self.world_size = world_size
+        if len(transition_counts_by_rank) != world_size:
+            raise LearnerError("per-rank replay transition counts violate world size")
+        self.transition_counts_by_rank = tuple(
+            _true_int(value, "per-rank replay transitions", minimum=1)
+            for value in transition_counts_by_rank
+        )
+        self.global_transition_count = sum(self.transition_counts_by_rank)
+        if self.global_transition_count != _true_int(
+            self.snapshot.get("transition_count"),
+            "snapshot transition_count",
+            minimum=1,
+        ):
+            raise LearnerError(
+                "per-rank replay transition counts disagree with snapshot total"
+            )
         self._ends: list[int] = []
         total = 0
         obs_keys: set[str] | None = None
@@ -511,6 +587,10 @@ class ReplayPartition:
                     "policy observation keys differ across replay shards"
                 )
         self.transition_count = total
+        if self.transition_counts_by_rank[rank] != self.transition_count:
+            raise LearnerError(
+                "loaded replay transition count disagrees with rank assignment"
+            )
         self.observation_keys = tuple(sorted(obs_keys or ()))
 
     def _location(self, index: int) -> tuple[_LoadedShard, int, int]:
@@ -615,6 +695,10 @@ def load_replay_partition(
 ) -> ReplayPartition:
     """Load only the rank's shards after replay and held-FD digest validation."""
 
+    rank = _true_int(rank, "rank")
+    world_size = _true_int(world_size, "world_size", minimum=1)
+    if rank >= world_size:
+        raise LearnerError("rank must be smaller than world_size")
     try:
         snapshot = load_snapshot(
             snapshot_path, expected_file_sha256=expected_snapshot_file_sha256
@@ -643,15 +727,11 @@ def load_replay_partition(
     # Every rank computes the same coverage gate before any rank enters DDP.
     # This converts a potentially asymmetric "rank N has no data" hang into a
     # deterministic launch-time failure on all ranks.
-    assignments = [
-        partition_shards(
-            snapshot["resolved_shards"],
-            rank=candidate_rank,
-            world_size=world_size,
-            seed=config.partition_seed,
-        )
-        for candidate_rank in range(world_size)
-    ]
+    assignments = _balanced_shard_assignments(
+        snapshot["resolved_shards"],
+        world_size=world_size,
+        seed=config.partition_seed,
+    )
     empty_ranks = [
         index
         for index, assigned_shards in enumerate(assignments)
@@ -663,6 +743,10 @@ def load_replay_partition(
             f"{empty_ranks}; use fewer ranks or publish more shard parts"
         )
     assigned = assignments[rank]
+    transition_counts_by_rank = tuple(
+        sum(int(shard["transition_count"]) for shard in assigned_shards)
+        for assigned_shards in assignments
+    )
     loaded: list[_LoadedShard] = []
     for shard in assigned:
         arrays = _read_npz_from_verified_descriptor(
@@ -688,6 +772,7 @@ def load_replay_partition(
         config=config,
         rank=rank,
         world_size=world_size,
+        transition_counts_by_rank=transition_counts_by_rank,
     )
 
 
@@ -1113,12 +1198,16 @@ def train_from_replay(
         if rank == 0 and telemetry is not None:
             telemetry.log(
                 {
-                    "schema": "fast_roborender.round_dagger.learner_telemetry.v1",
+                    "schema": TELEMETRY_SCHEMA,
                     "campaign_id": config.campaign_id,
                     "macro_round": config.macro_round,
                     "optimizer_step": completed_steps,
                     "loss": loss_value,
                     "replay_transitions_rank": partition.transition_count,
+                    "replay_transitions_per_rank": list(
+                        partition.transition_counts_by_rank
+                    ),
+                    "replay_transitions_global": partition.global_transition_count,
                     "world_size": world_size,
                 }
             )

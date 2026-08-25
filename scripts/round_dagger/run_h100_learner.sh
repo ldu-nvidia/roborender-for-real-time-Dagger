@@ -213,18 +213,30 @@ if snapshot["action_contract"] != {
     raise SystemExit("replay snapshot action contract mismatch")
 if len(snapshot["resolved_shards"]) < world_size:
     raise SystemExit("fewer replay shards than distributed learner ranks")
-empty_ranks = [
-    rank
-    for rank in range(world_size)
-    if not partition_shards(
+assignments = [
+    partition_shards(
         snapshot["resolved_shards"],
         rank=rank,
         world_size=world_size,
         seed=partition_seed,
     )
+    for rank in range(world_size)
 ]
+empty_ranks = [rank for rank, assigned in enumerate(assignments) if not assigned]
 if empty_ranks:
     raise SystemExit(f"replay partition leaves ranks without data: {empty_ranks}")
+transition_counts = [
+    sum(shard["transition_count"] for shard in assigned)
+    for assigned in assignments
+]
+if sum(transition_counts) != snapshot["transition_count"]:
+    raise SystemExit("replay partition transition total differs from snapshot")
+print(
+    "H100_REPLAY_PARTITION "
+    f"transitions_by_rank={transition_counts} "
+    f"global={sum(transition_counts)}",
+    file=sys.stderr,
+)
 
 # Cumulative replay intentionally contains older policy versions.  The four
 # newly collected cohorts, however, must be demonstrations for this exact

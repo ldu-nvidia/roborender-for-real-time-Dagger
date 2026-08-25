@@ -218,6 +218,7 @@ class ReplayInputContractTest(LearnerFixture):
                 "shard_id": f"shard-{index:02d}",
                 "macro_round": index // 5,
                 "cohort_index": index % 5,
+                "transition_count": index + 1,
             }
             for index in range(20)
         ]
@@ -239,6 +240,97 @@ class ReplayInputContractTest(LearnerFixture):
         self.assertEqual(
             assignments[2], partition_shards(shards, rank=2, world_size=4, seed=91)
         )
+        reversed_assignments = [
+            partition_shards(list(reversed(shards)), rank=rank, world_size=4, seed=91)
+            for rank in range(4)
+        ]
+        self.assertEqual(assignments, reversed_assignments)
+        transition_counts = [
+            sum(item["transition_count"] for item in assigned)
+            for assigned in assignments
+        ]
+        self.assertLessEqual(max(transition_counts) - min(transition_counts), 20)
+
+    def test_attempt03_equal_shards_are_exactly_balanced(self):
+        shards = [
+            {
+                "logical_id": (
+                    "roborender-dagger-256x300-v1:"
+                    f"r000000000:c{cohort:04d}:train"
+                ),
+                "shard_id": (
+                    f"rank-{collector_rank:04d}_rollout-00000000_part-{part:04d}"
+                ),
+                "macro_round": 0,
+                "cohort_index": cohort,
+                "transition_count": 1200,
+            }
+            for cohort in range(4)
+            for collector_rank in range(2)
+            for part in range(8)
+        ]
+        assignments = [
+            partition_shards(shards, rank=rank, world_size=8, seed=23)
+            for rank in range(8)
+        ]
+        self.assertEqual([len(assigned) for assigned in assignments], [8] * 8)
+        self.assertEqual(
+            [
+                sum(item["transition_count"] for item in assigned)
+                for assigned in assignments
+            ],
+            [9600] * 8,
+        )
+
+    def test_unequal_shards_are_transition_balanced(self):
+        shards = [
+            {
+                "logical_id": "campaign:r000000000:c0000:train",
+                "shard_id": f"shard-{index:02d}",
+                "macro_round": 0,
+                "cohort_index": 0,
+                "transition_count": transitions,
+            }
+            for index, transitions in enumerate([10, 9, 8, 7, 6, 5, 4, 3, 2, 1])
+        ]
+        assignments = [
+            partition_shards(shards, rank=rank, world_size=3, seed=7)
+            for rank in range(3)
+        ]
+        self.assertEqual(
+            [
+                sum(item["transition_count"] for item in assigned)
+                for assigned in assignments
+            ],
+            [19, 18, 18],
+        )
+
+    def test_partition_rejects_missing_or_invalid_transition_count(self):
+        base = {
+            "logical_id": "campaign:r000000000:c0000:train",
+            "shard_id": "shard-00",
+            "macro_round": 0,
+            "cohort_index": 0,
+        }
+        for value in (None, True, 0, -1, 1.5):
+            shard = dict(base)
+            if value is not None:
+                shard["transition_count"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(
+                LearnerError, "transition_count"
+            ):
+                partition_shards([shard], rank=0, world_size=1, seed=0)
+
+    def test_partition_rejects_duplicate_identity(self):
+        shard = {
+            "logical_id": "campaign:r000000000:c0000:train",
+            "shard_id": "shard-00",
+            "macro_round": 0,
+            "cohort_index": 0,
+            "transition_count": 1,
+        }
+        with self.assertRaisesRegex(LearnerError, "duplicate shard identity"):
+            partition_shards([shard, dict(shard)], rank=0, world_size=1, seed=0)
 
     def test_payload_change_after_snapshot_is_rejected(self):
         payload = Path(self.snapshot["cohorts"][0]["shards"][0]["payload_path"])
@@ -519,6 +611,19 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         self.assertEqual([item["optimizer_step"] for item in records], [1, 2, 3])
         self.assertTrue(all(np.isfinite(item["loss"]) for item in records))
         self.assertTrue(all(item["macro_round"] == 0 for item in records))
+        self.assertTrue(
+            all(
+                item["schema"]
+                == "fast_roborender.round_dagger.learner_telemetry.v2"
+                for item in records
+            )
+        )
+        self.assertTrue(
+            all(item["replay_transitions_per_rank"] == [16] for item in records)
+        )
+        self.assertTrue(
+            all(item["replay_transitions_global"] == 16 for item in records)
+        )
 
     def test_resume_rejects_model_config_and_snapshot_lineage_mismatch(self):
         model = TinyPolicy()

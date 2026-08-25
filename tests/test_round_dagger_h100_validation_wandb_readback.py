@@ -66,6 +66,8 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
                 "optimizer_step": 1,
                 "loss": 1.0,
                 "replay_transitions_rank": 1,
+                "replay_transitions_per_rank": [1] * 8,
+                "replay_transitions_global": 8,
                 "world_size": 8,
             },
             {
@@ -75,6 +77,8 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
                 "optimizer_step": 2,
                 "loss": 0.75,
                 "replay_transitions_rank": 1,
+                "replay_transitions_per_rank": [1] * 8,
+                "replay_transitions_global": 8,
                 "world_size": 8,
             },
         ]
@@ -165,6 +169,35 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
             readback.H100ValidationReadbackError, "readback timed out"
         ):
             readback.readback(**self._kwargs())
+
+    def test_local_transition_balance_tampering_fails_closed(self) -> None:
+        cases = {
+            "wrong rank count": {
+                "replay_transitions_rank": 2,
+            },
+            "wrong vector length": {
+                "replay_transitions_per_rank": [1] * 7,
+            },
+            "wrong global total": {
+                "replay_transitions_global": 9,
+            },
+        }
+        for label, change in cases.items():
+            with self.subTest(label=label):
+                rows = [dict(row) for row in self.rows]
+                rows[0].update(change)
+                path = self.root / f"{label.replace(' ', '_')}.jsonl"
+                payload = "".join(
+                    json.dumps(row, sort_keys=True) + "\n" for row in rows
+                )
+                path.write_text(payload, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    readback.H100ValidationReadbackError,
+                    "transition balance is invalid",
+                ):
+                    readback._telemetry(
+                        path, campaign_id=self.campaign_id, macro_round=0
+                    )
 
     def test_remote_config_and_strict_resume_evidence_tampering_fail(self) -> None:
         self.runs[self.full_run_id].config["learner_config_sha256"] = "9" * 64

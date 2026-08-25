@@ -36,7 +36,7 @@ RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
 RESUME_EVIDENCE_SCHEMA = (
     "fast_roborender.round_dagger.h100_validation_strict_resume.v1"
 )
-TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v1"
+TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 TELEMETRY_KEYS = {
     "schema",
     "campaign_id",
@@ -44,6 +44,8 @@ TELEMETRY_KEYS = {
     "optimizer_step",
     "loss",
     "replay_transitions_rank",
+    "replay_transitions_per_rank",
+    "replay_transitions_global",
     "world_size",
 }
 
@@ -101,6 +103,7 @@ def _telemetry(
         raise H100ValidationReadbackError(
             "learner telemetry must contain exactly optimizer steps 1 and 2"
         )
+    expected_transition_counts: tuple[int, ...] | None = None
     for index, row in enumerate(rows):
         if set(row) != TELEMETRY_KEYS or row.get("schema") != TELEMETRY_SCHEMA:
             raise H100ValidationReadbackError("learner telemetry fields differ")
@@ -116,6 +119,8 @@ def _telemetry(
             )
         loss = row.get("loss")
         transitions = row.get("replay_transitions_rank")
+        transition_counts = row.get("replay_transitions_per_rank")
+        global_transitions = row.get("replay_transitions_global")
         if (
             isinstance(loss, bool)
             or not isinstance(loss, (int, float))
@@ -126,6 +131,24 @@ def _telemetry(
         if isinstance(transitions, bool) or not isinstance(transitions, int) or transitions < 1:
             raise H100ValidationReadbackError(
                 "learner telemetry replay transition count is invalid"
+            )
+        if (
+            not isinstance(transition_counts, list)
+            or len(transition_counts) != 8
+            or any(type(value) is not int or value < 1 for value in transition_counts)
+            or transitions != transition_counts[0]
+            or type(global_transitions) is not int
+            or global_transitions != sum(transition_counts)
+        ):
+            raise H100ValidationReadbackError(
+                "learner telemetry replay transition balance is invalid"
+            )
+        observed_transition_counts = tuple(transition_counts)
+        if expected_transition_counts is None:
+            expected_transition_counts = observed_transition_counts
+        elif observed_transition_counts != expected_transition_counts:
+            raise H100ValidationReadbackError(
+                "learner telemetry replay partition changed between steps"
             )
     return path, rows
 

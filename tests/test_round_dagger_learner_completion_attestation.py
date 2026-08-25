@@ -12,6 +12,13 @@ from tests.policy_bundle_helpers import publish_policy_bundle
 
 
 class LearnerCompletionAttestationTest(unittest.TestCase):
+    @staticmethod
+    def _write_telemetry(path: Path, rows: list[dict[str, object]]) -> None:
+        path.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
     def _fixture(self, root: Path) -> dict[str, object]:
         output = root / "learner"
         output.mkdir()
@@ -239,6 +246,84 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                     fixture["attestation"],
                     result=fixture["result"],
                     **self._verify_args(fixture),
+                )
+
+    def test_telemetry_binds_per_rank_counts_to_snapshot_total(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "telemetry.jsonl"
+            rows = [
+                {
+                    "schema": completion.TELEMETRY_SCHEMA,
+                    "campaign_id": "campaign",
+                    "macro_round": 0,
+                    "optimizer_step": step,
+                    "loss": 1.0 / step,
+                    "replay_transitions_rank": 1,
+                    "replay_transitions_per_rank": [1] * 8,
+                    "replay_transitions_global": 8,
+                    "world_size": 8,
+                }
+                for step in (1, 2)
+            ]
+            self._write_telemetry(path, rows)
+            observed = completion._telemetry_records(
+                path,
+                campaign_id="campaign",
+                macro_round=0,
+                optimizer_steps=2,
+                replay_transitions_global=8,
+            )
+            self.assertEqual(set(observed), {1, 2})
+
+            with self.assertRaisesRegex(
+                completion.CompletionAttestationError, "contract mismatch"
+            ):
+                completion._telemetry_records(
+                    path,
+                    campaign_id="campaign",
+                    macro_round=0,
+                    optimizer_steps=2,
+                    replay_transitions_global=9,
+                )
+
+    def test_telemetry_rejects_partition_change_between_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "telemetry.jsonl"
+            rows = [
+                {
+                    "schema": completion.TELEMETRY_SCHEMA,
+                    "campaign_id": "campaign",
+                    "macro_round": 0,
+                    "optimizer_step": 1,
+                    "loss": 1.0,
+                    "replay_transitions_rank": 9,
+                    "replay_transitions_per_rank": [9, 1, 1, 1, 1, 1, 1, 1],
+                    "replay_transitions_global": 16,
+                    "world_size": 8,
+                },
+                {
+                    "schema": completion.TELEMETRY_SCHEMA,
+                    "campaign_id": "campaign",
+                    "macro_round": 0,
+                    "optimizer_step": 2,
+                    "loss": 0.5,
+                    "replay_transitions_rank": 8,
+                    "replay_transitions_per_rank": [8, 2, 1, 1, 1, 1, 1, 1],
+                    "replay_transitions_global": 16,
+                    "world_size": 8,
+                },
+            ]
+            self._write_telemetry(path, rows)
+            with self.assertRaisesRegex(
+                completion.CompletionAttestationError,
+                "partition changed between steps",
+            ):
+                completion._telemetry_records(
+                    path,
+                    campaign_id="campaign",
+                    macro_round=0,
+                    optimizer_steps=2,
+                    replay_transitions_global=16,
                 )
 
 

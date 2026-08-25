@@ -245,12 +245,25 @@ if snapshot["action_contract"] != {"dtype": "float32", "shape": [26]}:
 shards = snapshot["resolved_shards"]
 if len(shards) < 8:
     raise SystemExit("validation replay requires at least eight shards")
-empty = [
-    rank for rank in range(8)
-    if not partition_shards(shards, rank=rank, world_size=8, seed=23)
+assignments = [
+    partition_shards(shards, rank=rank, world_size=8, seed=23)
+    for rank in range(8)
 ]
+empty = [rank for rank, assigned in enumerate(assignments) if not assigned]
 if empty:
     raise SystemExit(f"validation replay leaves NCCL ranks without data: {empty}")
+transition_counts = [
+    sum(shard["transition_count"] for shard in assigned)
+    for assigned in assignments
+]
+if sum(transition_counts) != snapshot["transition_count"]:
+    raise SystemExit("validation replay partition total differs from snapshot")
+print(
+    "H100_VALIDATION_REPLAY_PARTITION "
+    f"transitions_by_rank={transition_counts} "
+    f"global={sum(transition_counts)}",
+    file=sys.stderr,
+)
 current = [row for row in snapshot["cohorts"] if row["macro_round"] == int(macro_round)]
 if len(current) != 4:
     raise SystemExit("validation replay lacks exactly four current-round cohorts")
