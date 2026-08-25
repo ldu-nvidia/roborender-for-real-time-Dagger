@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -220,6 +222,36 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
             ),
         ):
             learner_recovery.recover_ingested_learner(**self._kwargs())
+
+    def test_generated_environment_passes_real_bridge_dry_run(self) -> None:
+        with mock.patch.object(
+            learner_recovery.replay, "load_snapshot", return_value=self.snapshot
+        ):
+            plan = learner_recovery.recover_ingested_learner(
+                **self._kwargs(), dry_run=True
+            )
+        environment = dict(os.environ)
+        environment.update(plan["bridge_environment"])
+        environment["DRY_RUN"] = "1"
+        self.assertEqual(
+            environment["ROUND_DAGGER_LEARNER_LEARNING_RATE"], "2.5e-5"
+        )
+        completed = subprocess.run(
+            [str(learner_recovery.BRIDGE)],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+        self.assertIn(
+            "OCI_NRT_ROUND_LEARNER_BRIDGE_DRY_RUN_OK", completed.stdout
+        )
 
     def test_state_revision_race_after_bridge_blocks_candidate_and_cas(self) -> None:
         def racing_bridge(
