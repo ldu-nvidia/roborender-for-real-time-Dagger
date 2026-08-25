@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
+from round_dagger.artifacts import sha256_file
+from round_dagger.learner_identity import (
+    learner_identity_sha256,
+    learner_wandb_run_id,
+)
 from scripts.round_dagger import h100_validation_wandb_readback as readback
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 def _json(path: Path, value: dict) -> None:
     path.write_text(
-        json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n",
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False),
         encoding="utf-8",
     )
 
@@ -28,57 +39,84 @@ class FakeRun:
 
 
 class FakeApi:
-    def __init__(self, runs: dict[str, FakeRun]):
+    def __init__(self, run: FakeRun):
         self.viewer = {
             "email": "ldu@nvidia.com",
             "username": "leo",
             "teams": ["nvidia"],
         }
-        self.runs = runs
+        self.expected_run = run
+        self.run_queries: list[str] = []
 
     def run(self, path: str):
-        return self.runs[path.rsplit("/", 1)[-1]]
+        self.run_queries.append(path)
+        if path != f"nvidia/validation-project/{self.expected_run.id}":
+            raise KeyError(path)
+        return self.expected_run
 
 
 class FakeWandb:
-    def __init__(self, runs: dict[str, FakeRun]):
-        self.api = FakeApi(runs)
+    def __init__(self, run: FakeRun):
+        self.api = FakeApi(run)
 
     def Api(self, timeout):
         del timeout
         return self.api
 
 
+@unittest.skipIf(torch is None, "W&B readback tests require PyTorch")
 class H100ValidationWandbReadbackTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="rr_wandb_readback_")
+        self.temporary = tempfile.TemporaryDirectory(prefix="rr_wandb_readback_v2_")
         self.root = Path(self.temporary.name)
         self.campaign_id = "validation"
-        self.config_sha = "1" * 64
-        self.lineage_sha = "2" * 64
-        self.full_run_id = "validation-full"
-        self.resumed_run_id = "validation-resumed"
+        self.macro_round = 0
+        self.code_sha = "1" * 64
+        self.config_sha = "2" * 64
+        self.lineage_sha = "3" * 64
+        self.snapshot_file_sha = "4" * 64
+        self.snapshot_sha = "5" * 64
+        self.parent_runtime_sha = "6" * 64
+        self.container_sha = "7" * 64
+        self.contract_sha = "8" * 64
+        self.identity_sha = learner_identity_sha256(
+            campaign_id=self.campaign_id,
+            macro_round=self.macro_round,
+            learner_code_sha256=self.code_sha,
+            learner_config_sha256=self.config_sha,
+            replay_snapshot_file_sha256=self.snapshot_file_sha,
+            replay_snapshot_sha256=self.snapshot_sha,
+            parent_checkpoint_sha256=self.lineage_sha,
+            parent_runtime_policy_sha256=self.parent_runtime_sha,
+            runtime_container_sha256=self.container_sha,
+            learner_contract_sha256=self.contract_sha,
+        )
+        self.run_id = learner_wandb_run_id(
+            campaign_id=self.campaign_id,
+            macro_round=self.macro_round,
+            learner_identity_sha256=self.identity_sha,
+        )
         self.rows = [
             {
                 "schema": readback.TELEMETRY_SCHEMA,
                 "campaign_id": self.campaign_id,
-                "macro_round": 0,
+                "macro_round": self.macro_round,
                 "optimizer_step": 1,
                 "loss": 1.0,
-                "replay_transitions_rank": 1,
-                "replay_transitions_per_rank": [1] * 8,
-                "replay_transitions_global": 8,
+                "replay_transitions_rank": 9600,
+                "replay_transitions_per_rank": [9600] * 8,
+                "replay_transitions_global": 76800,
                 "world_size": 8,
             },
             {
                 "schema": readback.TELEMETRY_SCHEMA,
                 "campaign_id": self.campaign_id,
-                "macro_round": 0,
+                "macro_round": self.macro_round,
                 "optimizer_step": 2,
                 "loss": 0.75,
-                "replay_transitions_rank": 1,
-                "replay_transitions_per_rank": [1] * 8,
-                "replay_transitions_global": 8,
+                "replay_transitions_rank": 9600,
+                "replay_transitions_per_rank": [9600] * 8,
+                "replay_transitions_global": 76800,
                 "world_size": 8,
             },
         ]
@@ -87,130 +125,236 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
         payload = "".join(json.dumps(row, sort_keys=True) + "\n" for row in self.rows)
         self.full_telemetry.write_text(payload, encoding="utf-8")
         self.resumed_telemetry.write_text(payload, encoding="utf-8")
-        self.full_result = self.root / "full_result.json"
-        self.resumed_result = self.root / "resumed_result.json"
-        result = {
-            "schema": "fast_roborender.round_dagger.learner_result.v2",
+
+        self.full_checkpoint = self.root / "full_restart.pt"
+        self.stopped_checkpoint = self.root / "stopped_restart.pt"
+        self.resumed_checkpoint = self.root / "resumed_restart.pt"
+        self._save_checkpoint(self.full_checkpoint, completed_steps=2)
+        shutil.copyfile(self.full_checkpoint, self.resumed_checkpoint)
+        self._save_checkpoint(self.stopped_checkpoint, completed_steps=1)
+        self.stopped_checkpoint.chmod(0o444)
+
+        self.full_result = self._publish_result(
+            "full", self.full_checkpoint, initial_loss=1.0, final_loss=0.75
+        )
+        self.resumed_result = self._publish_result(
+            "resumed", self.resumed_checkpoint, initial_loss=1.0, final_loss=0.75
+        )
+        self.resume_evidence = self.root / "strict_resume.json"
+        self._publish_resume_evidence()
+
+        self.remote_config = {
             "campaign_id": self.campaign_id,
-            "macro_round": 0,
+            "macro_round": self.macro_round,
+            "learner_code_sha256": self.code_sha,
             "learner_config_sha256": self.config_sha,
             "model_lineage_sha256": self.lineage_sha,
-            "optimizer_steps": 2,
-            "initial_loss": 1.0,
-            "final_loss": 0.5,
+            "replay_snapshot_file_sha256": self.snapshot_file_sha,
+            "replay_snapshot_sha256": self.snapshot_sha,
+            "parent_runtime_policy_sha256": self.parent_runtime_sha,
+            "learner_identity_sha256": self.identity_sha,
+            "runtime_container_sha256": self.container_sha,
+            "learner_contract_sha256": self.contract_sha,
         }
-        _json(self.full_result, result)
-        _json(self.resumed_result, result)
-        self.resume_evidence = self.root / "strict_resume.json"
+        self.remote_run = FakeRun(self.run_id, self.rows, self.remote_config)
+        self.wandb = FakeWandb(self.remote_run)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _checkpoint_document(self, completed_steps: int) -> dict:
+        policy_state = {"weight": torch.tensor([1.0], dtype=torch.float32)}
+        return {
+            "schema": "fast_roborender.round_dagger.learner_checkpoint.v2",
+            "checkpoint_schema": "gr00t.trl.full_state.v2",
+            "policy_state_dict": policy_state,
+            "policy_parameter_names": ["weight"],
+            "campaign_id": self.campaign_id,
+            "macro_round": self.macro_round,
+            "model_lineage_sha256": self.lineage_sha,
+            "code_sha256": self.code_sha,
+            "learner_config_sha256": self.config_sha,
+            "learner_identity_sha256": self.identity_sha,
+            "runtime_container_sha256": self.container_sha,
+            "learner_contract_sha256": self.contract_sha,
+            "replay_snapshot_sha256": self.snapshot_sha,
+            "replay_snapshot_file_sha256": self.snapshot_file_sha,
+            "completed_steps": completed_steps,
+            "initial_loss": 1.0,
+            "world_size": 8,
+            "model_state_dict": policy_state,
+            "optimizer_state_dict": {"state": {}, "param_groups": []},
+            "lr_scheduler_state_dict": None,
+            "value_state_dict": None,
+            "rng_states": [{} for _ in range(8)],
+        }
+
+    def _save_checkpoint(self, path: Path, *, completed_steps: int) -> None:
+        torch.save(self._checkpoint_document(completed_steps), path)
+
+    def _publish_result(
+        self,
+        name: str,
+        restart: Path,
+        *,
+        initial_loss: float,
+        final_loss: float,
+    ) -> Path:
+        directory = self.root / name
+        directory.mkdir()
+        candidate = directory / "candidate_round_000000.pt"
+        shutil.copyfile(restart, candidate)
+        policy_spec = directory / f"{candidate.name}.policy_spec.json"
+        policy_manifest = directory / f"{candidate.name}.manifest.json"
+        _json(policy_spec, {"fixture": "portable-policy-spec"})
+        _json(policy_manifest, {"fixture": "portable-policy-manifest"})
+        result = directory / "learner_result_round_000000.json"
+        _json(
+            result,
+            {
+                "schema": "fast_roborender.round_dagger.learner_result.v2",
+                "campaign_id": self.campaign_id,
+                "macro_round": self.macro_round,
+                "checkpoint_path": candidate.name,
+                "checkpoint_sha256": sha256_file(candidate),
+                "runtime_policy_sha256": "a" * 64,
+                "policy_spec_path": policy_spec.name,
+                "policy_spec_sha256": sha256_file(policy_spec),
+                "policy_bundle_manifest_path": policy_manifest.name,
+                "policy_bundle_manifest_sha256": sha256_file(policy_manifest),
+                "model_lineage_sha256": self.lineage_sha,
+                "replay_snapshot_sha256": self.snapshot_sha,
+                "code_sha256": self.code_sha,
+                "learner_config_sha256": self.config_sha,
+                "optimizer_steps": 2,
+                "initial_loss": initial_loss,
+                "final_loss": final_loss,
+            },
+        )
+        return result
+
+    def _publish_resume_evidence(self) -> None:
         _json(
             self.resume_evidence,
             {
                 "schema": readback.RESUME_EVIDENCE_SCHEMA,
                 "status": "PASS",
-                "run_id": self.resumed_run_id,
+                "run_id": self.run_id,
                 "first_invocation_resume_mode": "allow",
                 "second_invocation_resume_mode": "must",
                 "stop_step": 1,
                 "target_step": 2,
                 "learner_config_sha256": self.config_sha,
-                "stopped_checkpoint_sha256": "3" * 64,
-                "resumed_checkpoint_sha256": "4" * 64,
+                "learner_identity_sha256": self.identity_sha,
+                "learner_code_sha256": self.code_sha,
+                "replay_snapshot_file_sha256": self.snapshot_file_sha,
+                "replay_snapshot_sha256": self.snapshot_sha,
+                "parent_checkpoint_sha256": self.lineage_sha,
+                "parent_runtime_policy_sha256": self.parent_runtime_sha,
+                "runtime_container_sha256": self.container_sha,
+                "learner_contract_sha256": self.contract_sha,
+                "uninterrupted_comparator_wandb": False,
+                "canonical_wandb_lineage": True,
+                "stopped_checkpoint_sha256": sha256_file(self.stopped_checkpoint),
+                "resumed_checkpoint_sha256": sha256_file(self.resumed_checkpoint),
             },
         )
         self.resume_evidence.chmod(0o444)
-        config = {
-            "campaign_id": self.campaign_id,
-            "macro_round": 0,
-            "learner_config_sha256": self.config_sha,
-            "model_lineage_sha256": self.lineage_sha,
-        }
-        self.runs = {
-            self.full_run_id: FakeRun(self.full_run_id, self.rows, config),
-            self.resumed_run_id: FakeRun(self.resumed_run_id, self.rows, config),
-        }
-
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def _kwargs(self) -> dict:
         return {
-            "full_run_id": self.full_run_id,
-            "resumed_run_id": self.resumed_run_id,
-            "full_telemetry": self.full_telemetry,
+            "run_id": self.run_id,
+            "uninterrupted_telemetry": self.full_telemetry,
             "resumed_telemetry": self.resumed_telemetry,
-            "full_result": self.full_result,
+            "uninterrupted_result": self.full_result,
             "resumed_result": self.resumed_result,
             "resume_evidence": self.resume_evidence,
+            "uninterrupted_checkpoint": self.full_checkpoint,
+            "stopped_checkpoint": self.stopped_checkpoint,
+            "resumed_checkpoint": self.resumed_checkpoint,
             "campaign_id": self.campaign_id,
-            "macro_round": 0,
+            "macro_round": self.macro_round,
+            "learner_code_sha256": self.code_sha,
             "learner_config_sha256": self.config_sha,
             "model_lineage_sha256": self.lineage_sha,
+            "replay_snapshot_file_sha256": self.snapshot_file_sha,
+            "replay_snapshot_sha256": self.snapshot_sha,
+            "parent_runtime_policy_sha256": self.parent_runtime_sha,
+            "learner_identity_sha256": self.identity_sha,
+            "runtime_container_sha256": self.container_sha,
+            "validation_contract_sha256": self.contract_sha,
             "project": "validation-project",
             "expected_email": "ldu@nvidia.com",
             "entity": "nvidia",
             "authorization_scope": "team",
             "timeout_s": 0.02,
             "poll_interval_s": 0.001,
-            "wandb_module": FakeWandb(self.runs),
+            "wandb_module": self.wandb,
         }
 
-    def test_readback_binds_two_distinct_runs_and_contiguous_strict_resume(self) -> None:
+    def test_single_canonical_run_binds_restart_and_comparator_evidence(self) -> None:
         report = readback.readback(**self._kwargs())
         self.assertEqual(report["status"], "PASS")
-        self.assertTrue(report["runs_distinct"])
-        self.assertEqual(report["full_run"]["history_steps"], [1, 2])
-        self.assertEqual(report["resumed_run"]["history_steps"], [1, 2])
-        self.assertTrue(report["strict_resume_verified"])
-        self.assertEqual(report["strict_resume_mode"], "must")
+        self.assertEqual(report["schema"], readback.SCHEMA)
+        self.assertEqual(report["wandb_run_id"], self.run_id)
+        self.assertTrue(report["single_canonical_wandb_run"])
+        self.assertFalse(report["uninterrupted_comparator"]["wandb_enabled"])
+        self.assertTrue(report["resumed_execution"]["wandb_enabled"])
+        self.assertEqual(report["canonical_run"]["history_steps"], [1, 2])
+        self.assertEqual(
+            report["stopped_checkpoint_sha256"],
+            sha256_file(self.stopped_checkpoint),
+        )
+        self.assertEqual(
+            report["resumed_checkpoint_sha256"],
+            sha256_file(self.resumed_checkpoint),
+        )
+        self.assertEqual(
+            self.wandb.api.run_queries,
+            [f"nvidia/validation-project/{self.run_id}"],
+        )
 
-    def test_missing_remote_resumed_step_fails_closed(self) -> None:
-        self.runs[self.resumed_run_id].rows = self.rows[:1]
+    def test_tampered_semantic_identity_fails_before_remote_query(self) -> None:
+        arguments = self._kwargs()
+        arguments["learner_identity_sha256"] = "9" * 64
+        with self.assertRaisesRegex(
+            readback.H100ValidationReadbackError,
+            "does not bind the exact validation semantics",
+        ):
+            readback.readback(**arguments)
+        self.assertEqual(self.wandb.api.run_queries, [])
+
+    def test_tampered_remote_config_or_history_fails_closed(self) -> None:
+        self.remote_run.config["learner_config_sha256"] = "9" * 64
         with self.assertRaisesRegex(
             readback.H100ValidationReadbackError, "readback timed out"
         ):
             readback.readback(**self._kwargs())
 
-    def test_local_transition_balance_tampering_fails_closed(self) -> None:
-        cases = {
-            "wrong rank count": {
-                "replay_transitions_rank": 2,
-            },
-            "wrong vector length": {
-                "replay_transitions_per_rank": [1] * 7,
-            },
-            "wrong global total": {
-                "replay_transitions_global": 9,
-            },
-        }
-        for label, change in cases.items():
-            with self.subTest(label=label):
-                rows = [dict(row) for row in self.rows]
-                rows[0].update(change)
-                path = self.root / f"{label.replace(' ', '_')}.jsonl"
-                payload = "".join(
-                    json.dumps(row, sort_keys=True) + "\n" for row in rows
-                )
-                path.write_text(payload, encoding="utf-8")
-                with self.assertRaisesRegex(
-                    readback.H100ValidationReadbackError,
-                    "transition balance is invalid",
-                ):
-                    readback._telemetry(
-                        path, campaign_id=self.campaign_id, macro_round=0
-                    )
-
-    def test_remote_config_and_strict_resume_evidence_tampering_fail(self) -> None:
-        self.runs[self.full_run_id].config["learner_config_sha256"] = "9" * 64
+        self.remote_run.config["learner_config_sha256"] = self.config_sha
+        self.remote_run.rows = self.rows[:1]
         with self.assertRaisesRegex(
             readback.H100ValidationReadbackError, "readback timed out"
         ):
             readback.readback(**self._kwargs())
 
-        self.runs[self.full_run_id].config["learner_config_sha256"] = self.config_sha
-        evidence = json.loads(self.resume_evidence.read_text(encoding="utf-8"))
-        evidence["second_invocation_resume_mode"] = "allow"
+    def test_tampered_checkpoint_lineage_fails_closed(self) -> None:
+        document = torch.load(
+            self.resumed_checkpoint, map_location="cpu", weights_only=False
+        )
+        document["learner_contract_sha256"] = "9" * 64
+        torch.save(document, self.resumed_checkpoint)
+        with self.assertRaisesRegex(
+            readback.H100ValidationReadbackError,
+            "resumed checkpoint v2 lineage mismatch",
+        ):
+            readback.readback(**self._kwargs())
+
+    def test_tampered_strict_resume_evidence_fails_closed(self) -> None:
+        document = json.loads(self.resume_evidence.read_text(encoding="utf-8"))
+        document["second_invocation_resume_mode"] = "allow"
         self.resume_evidence.chmod(0o644)
-        _json(self.resume_evidence, evidence)
+        _json(self.resume_evidence, document)
         self.resume_evidence.chmod(0o444)
         with self.assertRaisesRegex(
             readback.H100ValidationReadbackError,
