@@ -21,7 +21,7 @@ safe_path() {
        $1 != */../* && $1 != */./* && $1 != */.. && $1 != */. ]]
 }
 
-[[ $# == 23 ]] || fatal "expected exactly 23 validation arguments"
+[[ $# == 27 ]] || fatal "expected exactly 27 validation arguments"
 REMOTE_SOURCE=$1
 SOURCE_SHA=$2
 CONTAINER=$3
@@ -45,6 +45,10 @@ CONFIG_SHA=${20}
 CAMPAIGN_ID=${21}
 MACRO_ROUND=${22}
 PROJECT=${23}
+REMOTE_CONTRACT=${24}
+CONTRACT_SHA=${25}
+LEARNER_IDENTITY_SHA=${26}
+WANDB_RUN_ID=${27}
 SPEC="${CHECKPOINT}.policy_spec.json"
 MANIFEST="${CHECKPOINT}.manifest.json"
 
@@ -53,11 +57,13 @@ MANIFEST="${CHECKPOINT}.manifest.json"
     fatal "validation allocation must expose eight H100s"
 for path in "$REMOTE_SOURCE" "$CONTAINER" "$REMOTE_CAMPAIGN" "$LOCAL_CAMPAIGN" \
             "$REMOTE_OUTPUT" "$LOCAL_OUTPUT" "$REMOTE_JOB" "$NETRC" \
-            "$REMOTE_LOG" "$SNAPSHOT" "$CHECKPOINT" "$SPEC" "$MANIFEST"; do
+            "$REMOTE_LOG" "$SNAPSHOT" "$CHECKPOINT" "$SPEC" "$MANIFEST" \
+            "$REMOTE_CONTRACT"; do
     safe_path "$path" || fatal "unsafe validation path: $path"
 done
 for name in SOURCE_SHA CONTAINER_SHA SNAPSHOT_FILE_SHA SNAPSHOT_SHA CHECKPOINT_SHA \
-            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA; do
+            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA \
+            LEARNER_IDENTITY_SHA; do
     [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
@@ -65,11 +71,14 @@ done
 [[ $MACRO_ROUND =~ ^[0-9]+$ ]] || fatal "macro round is invalid"
 [[ $PROJECT =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "W&B project token is malformed"
-RUN_STEM="j${SLURM_JOB_ID}-${SOURCE_SHA:0:8}-${SNAPSHOT_SHA:0:8}-${CONFIG_SHA:0:8}"
-FULL_RUN_ID="rr-h100v-${RUN_STEM}-full"
-RESUMED_RUN_ID="rr-h100v-${RUN_STEM}-resumed"
-[[ $FULL_RUN_ID != "$RESUMED_RUN_ID" ]] || fatal "validation W&B run IDs collided"
+[[ $WANDB_RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
+    fatal "canonical W&B run ID is malformed"
 [[ -d $REMOTE_SOURCE && ! -L $REMOTE_SOURCE ]] || fatal "sealed source is unsafe"
+[[ $REMOTE_CONTRACT == "$REMOTE_SOURCE/configs/round_dagger/validation_learner_1x8h100_2step.json" && \
+   -f $REMOTE_CONTRACT && ! -L $REMOTE_CONTRACT ]] || \
+    fatal "validation contract is non-canonical"
+[[ $(sha256sum "$REMOTE_CONTRACT" | awk '{print $1}') == "$CONTRACT_SHA" ]] || \
+    fatal "validation contract digest mismatch"
 [[ -f $CONTAINER && ! -L $CONTAINER ]] || fatal "container is unsafe"
 [[ $(sha256sum "$CONTAINER" | awk '{print $1}') == "$CONTAINER_SHA" ]] || \
     fatal "container digest mismatch"
@@ -112,6 +121,33 @@ VERIFY_SOURCE="$REMOTE_SOURCE/scripts/round_dagger/verify_sealed_source_snapshot
 PYTHONDONTWRITEBYTECODE=1 python3 "$VERIFY_SOURCE" --root "$REMOTE_SOURCE" \
     --expected-inventory-sha256 "$SOURCE_SHA" >/dev/null
 
+mapfile -t DERIVED_IDENTITY < <(
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REMOTE_SOURCE" python3 - \
+        "$CAMPAIGN_ID" "$MACRO_ROUND" "$SOURCE_SHA" "$CONFIG_SHA" \
+        "$SNAPSHOT_FILE_SHA" "$SNAPSHOT_SHA" "$CHECKPOINT_SHA" "$RUNTIME_SHA" \
+        "$CONTAINER_SHA" "$CONTRACT_SHA" <<'PY'
+import sys
+from round_dagger.learner_identity import learner_identity_sha256, learner_wandb_run_id
+(campaign, macro_round, code, config, replay_file, replay, parent, parent_runtime,
+ container, contract) = sys.argv[1:]
+identity = learner_identity_sha256(
+    campaign_id=campaign, macro_round=int(macro_round), learner_code_sha256=code,
+    learner_config_sha256=config, replay_snapshot_file_sha256=replay_file,
+    replay_snapshot_sha256=replay, parent_checkpoint_sha256=parent,
+    parent_runtime_policy_sha256=parent_runtime,
+    runtime_container_sha256=container, learner_contract_sha256=contract,
+)
+print(identity)
+print(learner_wandb_run_id(
+    campaign_id=campaign, macro_round=int(macro_round),
+    learner_identity_sha256=identity,
+))
+PY
+)
+[[ ${DERIVED_IDENTITY[0]:-} == "$LEARNER_IDENTITY_SHA" && \
+   ${DERIVED_IDENTITY[1]:-} == "$WANDB_RUN_ID" && \
+   ${#DERIVED_IDENTITY[@]} == 2 ]] || fatal "validation learner identity mismatch"
+
 MOUNTS="$REMOTE_SOURCE:/workspace/fast_roborender:ro"
 MOUNTS+=",$REMOTE_CAMPAIGN:$LOCAL_CAMPAIGN:ro"
 MOUNTS+=",$REMOTE_OUTPUT:$LOCAL_OUTPUT"
@@ -138,6 +174,9 @@ COMMON_ENV=(
     ROUND_DAGGER_VALIDATION_POLICY_MANIFEST_SHA256="$MANIFEST_SHA"
     ROUND_DAGGER_VALIDATION_RUNTIME_POLICY_SHA256="$RUNTIME_SHA"
     ROUND_DAGGER_VALIDATION_LEARNER_CONFIG_SHA256="$CONFIG_SHA"
+    ROUND_DAGGER_VALIDATION_CONTRACT=/workspace/fast_roborender/configs/round_dagger/validation_learner_1x8h100_2step.json
+    ROUND_DAGGER_VALIDATION_CONTRACT_SHA256="$CONTRACT_SHA"
+    ROUND_DAGGER_VALIDATION_LEARNER_IDENTITY_SHA256="$LEARNER_IDENTITY_SHA"
     ROUND_DAGGER_VALIDATION_CAMPAIGN_ID="$CAMPAIGN_ID"
     ROUND_DAGGER_VALIDATION_MACRO_ROUND="$MACRO_ROUND"
     ROUND_DAGGER_VALIDATION_CONTAINER_HOST_PATH=/round_dagger_validation_container.sqsh
@@ -146,8 +185,7 @@ COMMON_ENV=(
     ROUND_DAGGER_WANDB_ENTITY=nvidia
     ROUND_DAGGER_WANDB_EXPECTED_EMAIL=ldu@nvidia.com
     ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE=team
-    ROUND_DAGGER_VALIDATION_FULL_WANDB_RUN_ID="$FULL_RUN_ID"
-    ROUND_DAGGER_VALIDATION_RESUMED_WANDB_RUN_ID="$RESUMED_RUN_ID"
+    ROUND_DAGGER_VALIDATION_WANDB_RUN_ID="$WANDB_RUN_ID"
     CUBLAS_WORKSPACE_CONFIG=:4096:8
 )
 

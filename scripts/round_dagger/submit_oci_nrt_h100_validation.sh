@@ -34,6 +34,8 @@ SPEC_SHA=${ROUND_DAGGER_VALIDATION_POLICY_SPEC_SHA256:?set policy spec SHA-256}
 MANIFEST_SHA=${ROUND_DAGGER_VALIDATION_POLICY_MANIFEST_SHA256:?set policy manifest SHA-256}
 RUNTIME_SHA=${ROUND_DAGGER_VALIDATION_RUNTIME_POLICY_SHA256:?set runtime policy SHA-256}
 CONFIG_SHA=${ROUND_DAGGER_VALIDATION_LEARNER_CONFIG_SHA256:?set exact batch1/step2/save1 bundle SHA-256}
+CONTRACT=${ROUND_DAGGER_VALIDATION_CONTRACT:-$SOURCE/configs/round_dagger/validation_learner_1x8h100_2step.json}
+CONTRACT_SHA=${ROUND_DAGGER_VALIDATION_CONTRACT_SHA256:?set validation execution contract SHA-256}
 CAMPAIGN_ID=${ROUND_DAGGER_VALIDATION_CAMPAIGN_ID:?set the replay campaign ID}
 MACRO_ROUND=${ROUND_DAGGER_VALIDATION_MACRO_ROUND:?set the replay frontier macro round}
 PROJECT=${ROUND_DAGGER_VALIDATION_WANDB_PROJECT:-roborender-round-dagger-validation}
@@ -51,15 +53,19 @@ DRY_RUN=${DRY_RUN:-0}
     fatal "W&B project token is malformed"
 for path in "$SBATCH_BIN" "$SOURCE" "$CONTAINER" "$REMOTE_CAMPAIGN" \
             "$LOCAL_CAMPAIGN" "$REMOTE_OUTPUT" "$LOCAL_OUTPUT" "$REMOTE_JOB" \
-            "$REMOTE_LOG" "$NETRC" "$SNAPSHOT" "$CHECKPOINT"; do
+            "$REMOTE_LOG" "$NETRC" "$SNAPSHOT" "$CHECKPOINT" "$CONTRACT"; do
     safe_path "$path" || fatal "unsafe validation path: $path"
 done
 for name in SOURCE_SHA CONTAINER_SHA SNAPSHOT_FILE_SHA SNAPSHOT_SHA CHECKPOINT_SHA \
-            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA; do
+            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA; do
     [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
 [[ -x $SBATCH_BIN ]] || fatal "sbatch is unavailable"
 [[ -d $SOURCE && ! -L $SOURCE ]] || fatal "sealed source root is unsafe"
+[[ $CONTRACT == "$SOURCE/configs/round_dagger/validation_learner_1x8h100_2step.json" && \
+   -f $CONTRACT && ! -L $CONTRACT ]] || fatal "validation contract is non-canonical"
+[[ $(sha256sum "$CONTRACT" | awk '{print $1}') == "$CONTRACT_SHA" ]] || \
+    fatal "validation contract digest mismatch"
 [[ -f $CONTAINER && ! -L $CONTAINER ]] || fatal "container is unsafe"
 [[ -d $REMOTE_CAMPAIGN && ! -L $REMOTE_CAMPAIGN ]] || fatal "campaign is unsafe"
 [[ -d $REMOTE_OUTPUT && ! -L $REMOTE_OUTPUT ]] || fatal "learner output is unsafe"
@@ -102,6 +108,73 @@ done
     fatal "policy spec digest mismatch"
 [[ $(sha256sum "$REMOTE_MANIFEST" | awk '{print $1}') == "$MANIFEST_SHA" ]] || \
     fatal "policy manifest digest mismatch"
+
+python3 - "$CONTRACT" "$CONTAINER" "$CONTAINER_SHA" "$PROJECT" <<'PY'
+import json
+import sys
+
+path, container, container_sha, project = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+expected = {
+    "schema": "fast_roborender.round_dagger.validation_learner_contract.v1",
+    "purpose": "live_h100_restart_and_telemetry_gate",
+}
+if any(value.get(key) != item for key, item in expected.items()):
+    raise SystemExit("validation contract identity mismatch")
+if value.get("allocation") != {
+    "nodes": 1, "gpus_per_node": 8, "gpu_architecture": "H100-SM90",
+    "backend": "nccl", "batch_size_per_rank": 1, "global_batch_size": 8,
+}:
+    raise SystemExit("validation allocation contract mismatch")
+if value.get("optimization") != {
+    "optimizer_steps": 2, "save_every_steps": 1, "intentional_stop_step": 1,
+    "learning_rate": 2.5e-5, "weight_decay": 0.01, "seed": 17,
+    "partition_seed": 23,
+}:
+    raise SystemExit("validation optimizer contract mismatch")
+if value.get("restart_validation") != {
+    "uninterrupted_comparator": "local_only",
+    "wandb_lineage": "single_canonical_run",
+    "first_invocation_resume": "allow", "second_invocation_resume": "must",
+}:
+    raise SystemExit("validation restart contract mismatch")
+container_doc = value.get("container", {})
+if container_doc.get("path") != container or container_doc.get("sha256") != container_sha:
+    raise SystemExit("validation container differs from checked-in contract")
+if value.get("wandb", {}).get("project") != project:
+    raise SystemExit("validation W&B project differs from checked-in contract")
+PY
+
+mapfile -t IDENTITY_VALUES < <(
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SOURCE" python3 - \
+        "$CAMPAIGN_ID" "$MACRO_ROUND" "$SOURCE_SHA" \
+        "$CONFIG_SHA" "$SNAPSHOT_FILE_SHA" "$SNAPSHOT_SHA" "$CHECKPOINT_SHA" \
+        "$RUNTIME_SHA" "$CONTAINER_SHA" "$CONTRACT_SHA" <<'PY'
+import sys
+from round_dagger.learner_identity import learner_identity_sha256, learner_wandb_run_id
+
+(campaign, macro_round, code, config, replay_file, replay, parent, parent_runtime,
+ container, contract) = sys.argv[1:]
+identity = learner_identity_sha256(
+    campaign_id=campaign, macro_round=int(macro_round), learner_code_sha256=code,
+    learner_config_sha256=config, replay_snapshot_file_sha256=replay_file,
+    replay_snapshot_sha256=replay, parent_checkpoint_sha256=parent,
+    parent_runtime_policy_sha256=parent_runtime,
+    runtime_container_sha256=container, learner_contract_sha256=contract,
+)
+print(identity)
+print(learner_wandb_run_id(
+    campaign_id=campaign, macro_round=int(macro_round),
+    learner_identity_sha256=identity,
+))
+PY
+)
+[[ ${#IDENTITY_VALUES[@]} == 2 ]] || fatal "learner identity derivation failed"
+LEARNER_IDENTITY_SHA=${IDENTITY_VALUES[0]}
+WANDB_RUN_ID=${IDENTITY_VALUES[1]}
+[[ $LEARNER_IDENTITY_SHA =~ ^[0-9a-f]{64}$ ]] || fatal "learner identity is malformed"
+[[ $WANDB_RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
+    fatal "canonical W&B run ID is malformed"
 
 # The host-side raw JSON gate is intentionally independent of replay payload
 # resolution; the container repeats the full load after the campaign is mounted
@@ -149,20 +222,21 @@ COMMAND=(
     "$SBATCH_BIN" --parsable --wait --export=NONE
     --account="$ACCOUNT" --partition="$PARTITION" --qos="$QOS"
     --nodes=1 --gpus-per-node=8 --cpus-per-task=64 --mem=0
-    --time=01:00:00 --job-name="rr-h100-live-${SOURCE_SHA:0:8}-${CONFIG_SHA:0:8}"
+    --time=01:00:00 --job-name="rr-h100-live-${LEARNER_IDENTITY_SHA:0:12}"
     --output="$REMOTE_LOG/slurm_%j.out" --error="$REMOTE_LOG/slurm_%j.err"
     "$BATCH" "$SOURCE" "$SOURCE_SHA" "$CONTAINER" "$CONTAINER_SHA"
     "$REMOTE_CAMPAIGN" "$LOCAL_CAMPAIGN" "$REMOTE_OUTPUT" "$LOCAL_OUTPUT"
     "$REMOTE_JOB" "$REMOTE_LOG" "$NETRC" "$SNAPSHOT" "$SNAPSHOT_FILE_SHA" "$SNAPSHOT_SHA"
     "$CHECKPOINT" "$CHECKPOINT_SHA" "$SPEC_SHA" "$MANIFEST_SHA" "$RUNTIME_SHA"
     "$CONFIG_SHA" "$CAMPAIGN_ID" "$MACRO_ROUND" "$PROJECT"
+    "$CONTRACT" "$CONTRACT_SHA" "$LEARNER_IDENTITY_SHA" "$WANDB_RUN_ID"
 )
 
 if ((DRY_RUN)); then
     printf 'DRY_RUN'
     printf ' %q' "${COMMAND[@]}"
     printf '\n'
-    echo "OCI_NRT_H100_VALIDATION_DRY_RUN_OK gpus=8 batch_per_rank=1 steps=2 save_every=1 stop_step=1"
+    echo "OCI_NRT_H100_VALIDATION_DRY_RUN_OK identity=$LEARNER_IDENTITY_SHA wandb_run_id=$WANDB_RUN_ID contract_sha256=$CONTRACT_SHA gpus=8 batch_per_rank=1 steps=2 save_every=1 stop_step=1"
     exit 0
 fi
 

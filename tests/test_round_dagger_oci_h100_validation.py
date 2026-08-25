@@ -26,6 +26,7 @@ BATCH = ROOT / "scripts/round_dagger/oci_nrt_h100_validation.sbatch"
 WRAPPER = ROOT / "scripts/round_dagger/run_oci_nrt_h100_validation_container.sh"
 ATTEST = ROOT / "scripts/round_dagger/h100_validation_attestation.py"
 READBACK = ROOT / "scripts/round_dagger/h100_validation_wandb_readback.py"
+CONTRACT = ROOT / "configs/round_dagger/validation_learner_1x8h100_2step.json"
 
 
 def _json(path: Path, value: dict) -> None:
@@ -69,10 +70,22 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
         self.assertIn("--save-every 1", wrapper)
         self.assertIn("--validation-stop-at-step 1", wrapper)
         self.assertIn("--resume-from", wrapper)
-        self.assertIn('--wandb-run-id "$FULL_RUN_ID"', wrapper)
-        self.assertGreaterEqual(
-            wrapper.count('--wandb-run-id "$RESUMED_RUN_ID"'), 2
-        )
+        self.assertNotIn("FULL_RUN_ID", wrapper)
+        self.assertNotIn("RESUMED_RUN_ID", wrapper)
+        self.assertEqual(wrapper.count('--wandb-run-id "$WANDB_RUN_ID"'), 2)
+        comparator = wrapper[
+            wrapper.index("--master-port 29741") : wrapper.index("--master-port 29742")
+        ]
+        self.assertNotIn("--wandb-project", comparator)
+        self.assertNotIn("--wandb-run-id", comparator)
+        self.assertIn('--learner-identity-sha256 "$LEARNER_IDENTITY_SHA"', wrapper)
+        self.assertIn('--runtime-container-sha256 "$CONTAINER_SHA"', wrapper)
+        self.assertIn('--learner-contract-sha256 "$CONTRACT_SHA"', wrapper)
+        self.assertIn('--run-id "$WANDB_RUN_ID"', wrapper)
+        self.assertIn('--validation-contract "$CONTRACT"', wrapper)
+        self.assertIn("learner_identity_sha256", submit)
+        self.assertIn("learner_wandb_run_id", submit)
+        self.assertIn("validation_learner_1x8h100_2step.json", combined)
         self.assertIn("h100_validation_wandb_readback.py", wrapper)
         self.assertIn("second_invocation_resume_mode\": \"must", wrapper)
         self.assertIn("verify_learner_restart_equivalence.py", wrapper)
@@ -110,6 +123,17 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
 
             container = root / "trainer.sqsh"
             container.write_bytes(b"pinned validation container")
+            package = source / "round_dagger"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "learner_identity.py").write_bytes(
+                (ROOT / "round_dagger/learner_identity.py").read_bytes()
+            )
+            contract = source / "configs/round_dagger/validation_learner_1x8h100_2step.json"
+            contract_document = json.loads(CONTRACT.read_text(encoding="utf-8"))
+            contract_document["container"]["path"] = str(container)
+            contract_document["container"]["sha256"] = sha256_file(container)
+            _json(contract, contract_document)
             remote_campaign = root / "campaign_projection"
             inputs = remote_campaign / "inputs"
             inputs.mkdir(parents=True)
@@ -179,6 +203,7 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
                 ),
                 "ROUND_DAGGER_VALIDATION_RUNTIME_POLICY_SHA256": "4" * 64,
                 "ROUND_DAGGER_VALIDATION_LEARNER_CONFIG_SHA256": "5" * 64,
+                "ROUND_DAGGER_VALIDATION_CONTRACT_SHA256": sha256_file(contract),
                 "ROUND_DAGGER_VALIDATION_CAMPAIGN_ID": "dry-run-validation",
                 "ROUND_DAGGER_VALIDATION_MACRO_ROUND": "0",
             }
@@ -194,6 +219,23 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("--export=NONE", completed.stdout)
             self.assertIn("OCI_NRT_H100_VALIDATION_DRY_RUN_OK", completed.stdout)
+            self.assertEqual(list(output.iterdir()), [])
+            self.assertEqual(list(job.iterdir()), [])
+            self.assertEqual(list(logs.iterdir()), [])
+
+            wrong_contract = dict(environment)
+            wrong_contract["ROUND_DAGGER_VALIDATION_CONTRACT_SHA256"] = "0" * 64
+            rejected = subprocess.run(
+                [str(SUBMIT)],
+                cwd=root,
+                env=wrong_contract,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("validation contract digest mismatch", rejected.stderr)
             self.assertEqual(list(output.iterdir()), [])
             self.assertEqual(list(job.iterdir()), [])
             self.assertEqual(list(logs.iterdir()), [])

@@ -22,14 +22,17 @@ MANIFEST=${ROUND_DAGGER_VALIDATION_POLICY_MANIFEST:?missing policy manifest}
 MANIFEST_SHA=${ROUND_DAGGER_VALIDATION_POLICY_MANIFEST_SHA256:?missing policy manifest identity}
 RUNTIME_SHA=${ROUND_DAGGER_VALIDATION_RUNTIME_POLICY_SHA256:?missing runtime policy identity}
 CONFIG_SHA=${ROUND_DAGGER_VALIDATION_LEARNER_CONFIG_SHA256:?missing learner config identity}
+CONTRACT=${ROUND_DAGGER_VALIDATION_CONTRACT:?missing validation execution contract}
+CONTRACT_SHA=${ROUND_DAGGER_VALIDATION_CONTRACT_SHA256:?missing validation contract identity}
+LEARNER_IDENTITY_SHA=${ROUND_DAGGER_VALIDATION_LEARNER_IDENTITY_SHA256:?missing learner semantic identity}
 CAMPAIGN_ID=${ROUND_DAGGER_VALIDATION_CAMPAIGN_ID:?missing validation campaign ID}
 MACRO_ROUND=${ROUND_DAGGER_VALIDATION_MACRO_ROUND:?missing validation macro round}
 PROJECT=${ROUND_DAGGER_WANDB_PROJECT:?missing W&B project}
 ENTITY=${ROUND_DAGGER_WANDB_ENTITY:?missing W&B entity}
 EXPECTED_EMAIL=${ROUND_DAGGER_WANDB_EXPECTED_EMAIL:?missing W&B expected email}
 AUTH_SCOPE=${ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE:?missing W&B authorization scope}
-FULL_RUN_ID=${ROUND_DAGGER_VALIDATION_FULL_WANDB_RUN_ID:?missing full W&B run ID}
-RESUMED_RUN_ID=${ROUND_DAGGER_VALIDATION_RESUMED_WANDB_RUN_ID:?missing resumed W&B run ID}
+WANDB_RUN_ID=${ROUND_DAGGER_VALIDATION_WANDB_RUN_ID:?missing canonical W&B run ID}
+CONTAINER_SHA=${ROUND_DAGGER_VALIDATION_CONTAINER_SHA256:?missing runtime container identity}
 
 [[ -x $PYTHON ]] || fatal "H100 Python is unavailable"
 [[ $CAMPAIGN == /* && -d $CAMPAIGN && ! -L $CAMPAIGN ]] || \
@@ -41,22 +44,26 @@ RESUMED_RUN_ID=${ROUND_DAGGER_VALIDATION_RESUMED_WANDB_RUN_ID:?missing resumed W
 [[ $OUTPUT != "$JOB"* && $JOB != "$OUTPUT"* ]] || \
     fatal "job scratch must be outside returned learner output"
 for name in SOURCE_SHA SNAPSHOT_FILE_SHA SNAPSHOT_SHA CHECKPOINT_SHA SPEC_SHA \
-            MANIFEST_SHA RUNTIME_SHA CONFIG_SHA; do
+            MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA \
+            LEARNER_IDENTITY_SHA CONTAINER_SHA; do
     [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
 [[ $MACRO_ROUND =~ ^[0-9]+$ ]] || fatal "macro round is invalid"
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "validation campaign ID is malformed"
 [[ $PROJECT =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ && \
-   $FULL_RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ && \
-   $RESUMED_RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ && \
-   $FULL_RUN_ID != "$RESUMED_RUN_ID" ]] || fatal "validation W&B IDs are malformed"
+   $WANDB_RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
+    fatal "validation W&B identifiers are malformed"
 [[ $ENTITY == nvidia && $EXPECTED_EMAIL == ldu@nvidia.com && \
    $AUTH_SCOPE == team ]] || fatal "validation W&B authorization changed"
 for path in "$SNAPSHOT" "$CHECKPOINT" "$SPEC" "$MANIFEST"; do
     [[ $path == "$CAMPAIGN"/* && -f $path && ! -L $path ]] || \
         fatal "validation input is outside the read-only campaign: $path"
 done
+[[ $CONTRACT == "$ROOT/configs/round_dagger/validation_learner_1x8h100_2step.json" && \
+   -f $CONTRACT && ! -L $CONTRACT ]] || fatal "validation contract is non-canonical"
+[[ $(sha256sum "$CONTRACT" | awk '{print $1}') == "$CONTRACT_SHA" ]] || \
+    fatal "validation contract digest mismatch"
 [[ $SPEC == "${CHECKPOINT}.policy_spec.json" && \
    $MANIFEST == "${CHECKPOINT}.manifest.json" ]] || \
     fatal "policy sidecars are not canonically co-located"
@@ -88,6 +95,53 @@ PY
     --checkpoint "$CHECKPOINT" --policy-spec "$SPEC" --manifest "$MANIFEST" \
     --expected-checkpoint-sha256 "$CHECKPOINT_SHA" \
     --expected-runtime-policy-sha256 "$RUNTIME_SHA" >/dev/null
+"$PYTHON" - "$CONTRACT" "$CAMPAIGN_ID" "$MACRO_ROUND" "$SOURCE_SHA" \
+    "$CONFIG_SHA" "$SNAPSHOT_FILE_SHA" "$SNAPSHOT_SHA" "$CHECKPOINT_SHA" \
+    "$RUNTIME_SHA" "$CONTAINER_SHA" "$CONTRACT_SHA" "$LEARNER_IDENTITY_SHA" \
+    "$WANDB_RUN_ID" "$PROJECT" <<'PY'
+import json
+import sys
+from round_dagger.learner_identity import learner_identity_sha256, learner_wandb_run_id
+
+(path, campaign, macro_round, code, config, replay_file, replay, parent,
+ parent_runtime, container, contract, expected_identity, expected_run_id,
+ project) = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+if value.get("schema") != "fast_roborender.round_dagger.validation_learner_contract.v1":
+    raise SystemExit("validation contract schema mismatch")
+if value.get("allocation") != {
+    "nodes": 1, "gpus_per_node": 8, "gpu_architecture": "H100-SM90",
+    "backend": "nccl", "batch_size_per_rank": 1, "global_batch_size": 8,
+} or value.get("optimization") != {
+    "optimizer_steps": 2, "save_every_steps": 1, "intentional_stop_step": 1,
+    "learning_rate": 2.5e-5, "weight_decay": 0.01, "seed": 17,
+    "partition_seed": 23,
+}:
+    raise SystemExit("validation execution contract mismatch")
+if value.get("restart_validation") != {
+    "uninterrupted_comparator": "local_only",
+    "wandb_lineage": "single_canonical_run",
+    "first_invocation_resume": "allow", "second_invocation_resume": "must",
+}:
+    raise SystemExit("validation restart lineage contract mismatch")
+if value.get("wandb", {}).get("project") != project:
+    raise SystemExit("validation W&B project contract mismatch")
+if value.get("container", {}).get("sha256") != container:
+    raise SystemExit("validation runtime container contract mismatch")
+identity = learner_identity_sha256(
+    campaign_id=campaign, macro_round=int(macro_round), learner_code_sha256=code,
+    learner_config_sha256=config, replay_snapshot_file_sha256=replay_file,
+    replay_snapshot_sha256=replay, parent_checkpoint_sha256=parent,
+    parent_runtime_policy_sha256=parent_runtime,
+    runtime_container_sha256=container, learner_contract_sha256=contract,
+)
+run_id = learner_wandb_run_id(
+    campaign_id=campaign, macro_round=int(macro_round),
+    learner_identity_sha256=identity,
+)
+if identity != expected_identity or run_id != expected_run_id:
+    raise SystemExit("validation semantic learner identity mismatch")
+PY
 mount_gate() {
     "$PYTHON" - "$CAMPAIGN" "$OUTPUT" <<'PY'
 import json
@@ -302,6 +356,9 @@ PY
         --adapter-factory round_dagger.gr00t_policy:vision_actor_obj_pred_adapter_factory
         --initial-checkpoint "$CHECKPOINT"
         --expected-snapshot-file-sha256 "$SNAPSHOT_FILE_SHA"
+        --learner-identity-sha256 "$LEARNER_IDENTITY_SHA"
+        --runtime-container-sha256 "$CONTAINER_SHA"
+        --learner-contract-sha256 "$CONTRACT_SHA"
         --max-steps 2 --save-every 1 --device cuda
     )
 
@@ -311,15 +368,13 @@ PY
     "$PYTHON" -m torch.distributed.run --nnodes 1 --nproc-per-node 8 \
         --node-rank 0 --master-addr 127.0.0.1 --master-port 29741 \
         "${TRAINER_COMMON[@]}" --output-dir "$FULL" \
-        --telemetry-jsonl "$FULL/telemetry.jsonl" \
-        --wandb-project "$PROJECT" --wandb-entity "$ENTITY" \
-        --wandb-run-id "$FULL_RUN_ID"
+        --telemetry-jsonl "$FULL/telemetry.jsonl"
     "$PYTHON" -m torch.distributed.run --nnodes 1 --nproc-per-node 8 \
         --node-rank 0 --master-addr 127.0.0.1 --master-port 29742 \
         "${TRAINER_COMMON[@]}" --output-dir "$RESUMED" \
         --telemetry-jsonl "$RESUMED/telemetry.jsonl" \
         --wandb-project "$PROJECT" --wandb-entity "$ENTITY" \
-        --wandb-run-id "$RESUMED_RUN_ID" \
+        --wandb-run-id "$WANDB_RUN_ID" \
         --no-publish-result --validation-stop-at-step 1
     cp --reflink=auto --preserve=mode "$RESUMED/restart.pt" \
         "$OUTPUT/intentional_stop_step_1.pt"
@@ -329,12 +384,15 @@ PY
         "${TRAINER_COMMON[@]}" --output-dir "$RESUMED" \
         --telemetry-jsonl "$RESUMED/telemetry.jsonl" \
         --wandb-project "$PROJECT" --wandb-entity "$ENTITY" \
-        --wandb-run-id "$RESUMED_RUN_ID" \
+        --wandb-run-id "$WANDB_RUN_ID" \
         --resume-from "$RESUMED/restart.pt"
 
     RESUME_EVIDENCE="$JOB/evidence/strict_resume_invocation.json"
     "$PYTHON" - "$OUTPUT/intentional_stop_step_1.pt" "$RESUMED/restart.pt" \
-        "$RESUMED_RUN_ID" "$CONFIG_SHA" "$RESUME_EVIDENCE" <<'PY'
+        "$WANDB_RUN_ID" "$CONFIG_SHA" "$LEARNER_IDENTITY_SHA" \
+        "$CONTAINER_SHA" "$CONTRACT_SHA" "$SOURCE_SHA" "$SNAPSHOT_FILE_SHA" \
+        "$SNAPSHOT_SHA" "$CHECKPOINT_SHA" "$RUNTIME_SHA" \
+        "$RESUME_EVIDENCE" <<'PY'
 import os
 import stat
 import sys
@@ -343,7 +401,9 @@ import torch
 from round_dagger.artifacts import publish_immutable_json, sha256_file
 from round_dagger.learner import CHECKPOINT_SCHEMA
 
-stopped_path, resumed_path, run_id, config_sha, output = sys.argv[1:]
+(stopped_path, resumed_path, run_id, config_sha, identity_sha, container_sha,
+ contract_sha, code_sha, snapshot_file_sha, snapshot_sha, parent_sha,
+ parent_runtime_sha, output) = sys.argv[1:]
 stopped = torch.load(stopped_path, map_location="cpu", weights_only=False)
 resumed = torch.load(resumed_path, map_location="cpu", weights_only=False)
 for document, step, label in ((stopped, 1, "stopped"), (resumed, 2, "resumed")):
@@ -351,8 +411,19 @@ for document, step, label in ((stopped, 1, "stopped"), (resumed, 2, "resumed")):
         raise SystemExit(f"{label} strict-resume checkpoint mismatch")
     if document.get("learner_config_sha256") != config_sha:
         raise SystemExit(f"{label} strict-resume config mismatch")
+    expected_identity = {
+        "learner_identity_sha256": identity_sha,
+        "runtime_container_sha256": container_sha,
+        "learner_contract_sha256": contract_sha,
+        "code_sha256": code_sha,
+        "replay_snapshot_file_sha256": snapshot_file_sha,
+        "replay_snapshot_sha256": snapshot_sha,
+        "model_lineage_sha256": parent_sha,
+    }
+    if any(document.get(key) != value for key, value in expected_identity.items()):
+        raise SystemExit(f"{label} strict-resume semantic identity mismatch")
 report = {
-    "schema": "fast_roborender.round_dagger.h100_validation_strict_resume.v1",
+    "schema": "fast_roborender.round_dagger.h100_validation_strict_resume.v2",
     "status": "PASS",
     "run_id": run_id,
     "first_invocation_resume_mode": "allow",
@@ -360,6 +431,16 @@ report = {
     "stop_step": 1,
     "target_step": 2,
     "learner_config_sha256": config_sha,
+    "learner_identity_sha256": identity_sha,
+    "learner_code_sha256": code_sha,
+    "replay_snapshot_file_sha256": snapshot_file_sha,
+    "replay_snapshot_sha256": snapshot_sha,
+    "parent_checkpoint_sha256": parent_sha,
+    "parent_runtime_policy_sha256": parent_runtime_sha,
+    "runtime_container_sha256": container_sha,
+    "learner_contract_sha256": contract_sha,
+    "uninterrupted_comparator_wandb": False,
+    "canonical_wandb_lineage": True,
     "stopped_checkpoint_sha256": sha256_file(stopped_path),
     "resumed_checkpoint_sha256": sha256_file(resumed_path),
 }
@@ -383,13 +464,24 @@ PY
     # static audits cannot confuse it with the job-scratch-only W&B runtime.
     WANDB_READBACK="$OUTPUT/learner_telemetry_readback.json"
     "$PYTHON" "$ROOT/scripts/round_dagger/h100_validation_wandb_readback.py" \
-        --full-run-id "$FULL_RUN_ID" --resumed-run-id "$RESUMED_RUN_ID" \
-        --full-telemetry "$FULL/telemetry.jsonl" \
+        --run-id "$WANDB_RUN_ID" \
+        --uninterrupted-telemetry "$FULL/telemetry.jsonl" \
         --resumed-telemetry "$RESUMED/telemetry.jsonl" \
-        --full-result "$FULL_RESULT" --resumed-result "$RESUMED_RESULT" \
+        --uninterrupted-result "$FULL_RESULT" --resumed-result "$RESUMED_RESULT" \
         --resume-evidence "$RESUME_EVIDENCE" --campaign-id "$CAMPAIGN_ID" \
         --macro-round "$MACRO_ROUND" --learner-config-sha256 "$CONFIG_SHA" \
-        --model-lineage-sha256 "$CHECKPOINT_SHA" --project "$PROJECT" \
+        --learner-code-sha256 "$SOURCE_SHA" \
+        --model-lineage-sha256 "$CHECKPOINT_SHA" \
+        --replay-snapshot-file-sha256 "$SNAPSHOT_FILE_SHA" \
+        --replay-snapshot-sha256 "$SNAPSHOT_SHA" \
+        --parent-runtime-policy-sha256 "$RUNTIME_SHA" \
+        --runtime-container-sha256 "$CONTAINER_SHA" \
+        --validation-contract-sha256 "$CONTRACT_SHA" \
+        --learner-identity-sha256 "$LEARNER_IDENTITY_SHA" \
+        --uninterrupted-checkpoint "$FULL/restart.pt" \
+        --stopped-checkpoint "$OUTPUT/intentional_stop_step_1.pt" \
+        --resumed-checkpoint "$RESUMED/restart.pt" \
+        --project "$PROJECT" \
         --expected-email "$EXPECTED_EMAIL" --entity "$ENTITY" \
         --authorization-scope "$AUTH_SCOPE" --output "$WANDB_READBACK" >/dev/null
 
@@ -397,6 +489,10 @@ PY
         --source-root "$ROOT" --source-inventory-sha256 "$SOURCE_SHA" \
         --container "$ROUND_DAGGER_VALIDATION_CONTAINER_HOST_PATH" \
         --container-sha256 "$ROUND_DAGGER_VALIDATION_CONTAINER_SHA256" \
+        --validation-contract "$CONTRACT" \
+        --validation-contract-sha256 "$CONTRACT_SHA" \
+        --learner-identity-sha256 "$LEARNER_IDENTITY_SHA" \
+        --parent-runtime-policy-sha256 "$RUNTIME_SHA" \
         --campaign-root "$CAMPAIGN" --snapshot "$SNAPSHOT" \
         --snapshot-file-sha256 "$SNAPSHOT_FILE_SHA" \
         --snapshot-sha256 "$SNAPSHOT_SHA" --replay-shards "$REPLAY_SHARDS" \
@@ -408,6 +504,9 @@ PY
         --import-report "$JOB/evidence/cuda_import_gate.json" \
         --wandb-report "$JOB/evidence/wandb_preflight.json" \
         --wandb-readback "$WANDB_READBACK" \
+        --uninterrupted-telemetry "$FULL/telemetry.jsonl" \
+        --resumed-telemetry "$RESUMED/telemetry.jsonl" \
+        --resume-evidence "$RESUME_EVIDENCE" \
         --uninterrupted-checkpoint "$FULL/restart.pt" \
         --uninterrupted-result "$FULL_RESULT" \
         --interrupted-checkpoint "$OUTPUT/intentional_stop_step_1.pt" \

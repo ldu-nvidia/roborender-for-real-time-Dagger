@@ -1,0 +1,46 @@
+{
+  "schema": "fast_roborender.round_dagger.validation_learner_contract.v1",
+  "purpose": "live_h100_restart_and_telemetry_gate",
+  "allocation": {
+    "nodes": 1,
+    "gpus_per_node": 8,
+    "gpu_architecture": "H100-SM90",
+    "backend": "nccl",
+    "batch_size_per_rank": 1,
+    "global_batch_size": 8
+  },
+  "optimization": {
+    "optimizer_steps": 2,
+    "save_every_steps": 1,
+    "intentional_stop_step": 1,
+    "learning_rate": 2.5e-5,
+    "weight_decay": 0.01,
+    "seed": 17,
+    "partition_seed": 23
+  },
+  "restart_validation": {
+    "uninterrupted_comparator": "local_only",
+    "wandb_lineage": "single_canonical_run",
+    "first_invocation_resume": "allow",
+    "second_invocation_resume": "must"
+  },
+  "cluster": {
+    "host": "oci-nrt",
+    "account": "general_cs_infra__ngcsre",
+    "partition": "batch_singlenode",
+    "qos": "normal"
+  },
+  "container": {
+    "path": "/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build/containers/roborender-isaac-gr00t-x86_64-sm90-isaac5.1.sqsh",
+    "sha256": "f3391b76a66182618f9e71b67e89b0af2d758ffe16afdb164760fcbb4860ebe6",
+    "python": "/opt/viral-h100/bin/python"
+  },
+  "wandb": {
+    "mode": "online",
+    "expected_email": "ldu@nvidia.com",
+    "entity": "nvidia",
+    "authorization_scope": "team",
+    "project": "roborender-round-dagger-validation"
+  },
+  "production_target_contract_sha256": "b044ba7d5bd5e3c1645e79616f19729438d00f66e2a40b19b4e955ae8d630d90"
+}
