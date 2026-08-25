@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from round_dagger import artifacts
+from scripts.round_dagger import remote_campaign_transfer as transfer
 from tests.policy_bundle_helpers import publish_policy_bundle
 
 
@@ -31,6 +32,9 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         spec, manifest = publish_policy_bundle(checkpoint, runtime_sha)
         snapshot = snapshot_dir / "through_macro_round_000000.json"
         snapshot.write_text("{}\n", encoding="utf-8")
+        wandb = campaign / "actors/cohort_00/.wandb_media"
+        wandb.mkdir(parents=True)
+        (wandb / "latest").symlink_to(snapshot)
         checkpoint_sha = artifacts.sha256_file(checkpoint)
         environment = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -152,6 +156,194 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertNotIn('$OUTPUT/wandb', container_wrapper)
         self.assertIn('"256:4:64:300:76800"', bridge)
         self.assertIn('"256:4:64:300:76800"', batch)
+
+    def test_local_projection_filters_mutable_state_before_inventory(self) -> None:
+        bridge = BRIDGE.read_text(encoding="utf-8")
+        self.assertIn("--delete-excluded", bridge)
+        for exclusion in (
+            "--exclude='/actors/'",
+            "--exclude='/operator/'",
+            "--exclude='/.coordinator_state.lock'",
+            "--exclude='/rounds/*/orchestration_run/'",
+        ):
+            self.assertIn(exclusion, bridge)
+        self.assertNotIn(
+            'validate-structure --root "$CAMPAIGN_ROOT"', bridge
+        )
+        self.assertNotIn('validate-structure --root "$INCOMING"', bridge)
+
+        local_rsync = bridge.index(
+            "rsync --archive --links --delete --delete-excluded"
+        )
+        incoming_validation = bridge.index(
+            'validate-projection --root "$INCOMING"'
+        )
+        incoming_inventory = bridge.index(
+            'inventory --root "$INCOMING" --output "$LOCAL_INVENTORY"'
+        )
+        self.assertLess(local_rsync, incoming_validation)
+        self.assertLess(incoming_validation, incoming_inventory)
+        self.assertIn('validate-projection --root "$LOCAL_PROJECTION"', bridge)
+
+    def test_resumable_rsync_does_not_mix_append_with_delayed_updates(self) -> None:
+        bridge = BRIDGE.read_text(encoding="utf-8")
+        self.assertEqual(bridge.count("--append-verify"), 2)
+        self.assertNotIn("--delay-updates", bridge)
+        self.assertEqual(bridge.count("--delete-delay"), 2)
+        self.assertIn(
+            '--stage "$REMOTE_STAGE" --destination "$REMOTE_CAMPAIGN"',
+            bridge,
+        )
+        self.assertIn(
+            'publish --stage "$INCOMING_OUTPUT"',
+            bridge,
+        )
+
+    def test_resumable_rsync_option_set_executes_and_verifies_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            payload = b"verified-resumable-payload" * 4096
+            (source / "artifact.bin").write_bytes(payload)
+            (destination / "artifact.bin").write_bytes(payload[:8192])
+
+            completed = subprocess.run(
+                [
+                    "rsync",
+                    "--archive",
+                    "--no-links",
+                    "--partial",
+                    "--append-verify",
+                    "--delete-delay",
+                    f"{source}/",
+                    f"{destination}/",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual((destination / "artifact.bin").read_bytes(), payload)
+
+    def test_projection_rsync_removes_excluded_and_stale_mutable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign = root / "campaign"
+            incoming = root / "incoming"
+            for relative in (
+                "policies",
+                "replay",
+                "rounds/macro_round_000000/cohorts",
+                "actors/cohort_00/.wandb_media",
+                "operator",
+                "rounds/macro_round_000000/orchestration_run",
+            ):
+                (campaign / relative).mkdir(parents=True, exist_ok=True)
+            (campaign / "campaign.json").write_text("{}\n", encoding="utf-8")
+            (campaign / "coordinator_state.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            (campaign / ".coordinator_state.lock").write_text(
+                "lock\n", encoding="utf-8"
+            )
+            (campaign / "replay/snapshot.json").write_text(
+                "snapshot\n", encoding="utf-8"
+            )
+            (campaign / "actors/cohort_00/.wandb_media/latest").symlink_to(
+                campaign / "campaign.json"
+            )
+            (campaign / "operator/state.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            (campaign / "rounds/macro_round_000000/orchestration_run/log").write_text(
+                "telemetry\n", encoding="utf-8"
+            )
+
+            (incoming / "actors/stale").mkdir(parents=True)
+            (incoming / "operator").mkdir()
+            (incoming / "actors/stale/value").write_text(
+                "stale\n", encoding="utf-8"
+            )
+            completed = subprocess.run(
+                [
+                    "rsync",
+                    "--archive",
+                    "--links",
+                    "--delete",
+                    "--delete-excluded",
+                    f"--link-dest={campaign}",
+                    "--exclude=/actors/",
+                    "--exclude=/operator/",
+                    "--exclude=/.coordinator_state.lock",
+                    "--exclude=/rounds/*/orchestration_run/",
+                    f"{campaign}/",
+                    f"{incoming}/",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse((incoming / "actors").exists())
+            self.assertFalse((incoming / "operator").exists())
+            self.assertFalse((incoming / ".coordinator_state.lock").exists())
+            self.assertFalse(
+                (incoming / "rounds/macro_round_000000/orchestration_run").exists()
+            )
+            self.assertTrue((incoming / "replay/snapshot.json").is_file())
+            transfer.validate_campaign_projection(incoming)
+
+    def test_projection_rsync_preserves_included_link_for_strict_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign = root / "campaign"
+            incoming = root / "incoming"
+            for relative in (
+                "policies",
+                "replay",
+                "rounds/macro_round_000000",
+            ):
+                (campaign / relative).mkdir(parents=True, exist_ok=True)
+            (campaign / "campaign.json").write_text("{}\n", encoding="utf-8")
+            (campaign / "coordinator_state.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            (campaign / "replay/unsafe-link").symlink_to(
+                campaign / "campaign.json"
+            )
+            incoming.mkdir()
+
+            completed = subprocess.run(
+                [
+                    "rsync",
+                    "--archive",
+                    "--links",
+                    "--delete",
+                    "--delete-excluded",
+                    f"--link-dest={campaign}",
+                    "--exclude=/actors/",
+                    "--exclude=/operator/",
+                    "--exclude=/.coordinator_state.lock",
+                    "--exclude=/rounds/*/orchestration_run/",
+                    f"{campaign}/",
+                    f"{incoming}/",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((incoming / "replay/unsafe-link").is_symlink())
+            with self.assertRaisesRegex(
+                transfer.TransferInventoryError, "non-regular"
+            ):
+                transfer.validate_campaign_projection(incoming)
 
     def test_shells_parse_and_are_executable(self) -> None:
         for path in (BRIDGE, BATCH, CONTAINER_WRAPPER):

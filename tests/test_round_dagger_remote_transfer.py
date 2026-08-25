@@ -9,6 +9,13 @@ from scripts.round_dagger import remote_campaign_transfer as transfer
 
 
 class RemoteCampaignTransferTest(unittest.TestCase):
+    def _valid_projection(self, root: Path) -> None:
+        (root / "policies").mkdir(parents=True)
+        (root / "replay").mkdir()
+        (root / "rounds/macro_round_000000/cohorts").mkdir(parents=True)
+        (root / "campaign.json").write_text("{}\n", encoding="utf-8")
+        (root / "coordinator_state.json").write_text("{}\n", encoding="utf-8")
+
     def test_inventory_is_sorted_content_bound_and_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "campaign"
@@ -87,6 +94,54 @@ class RemoteCampaignTransferTest(unittest.TestCase):
                 transfer.validate_tree_structure(root),
                 {"file_count": 1, "total_bytes": 3},
             )
+
+    def test_campaign_projection_accepts_only_learner_facing_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "campaign"
+            self._valid_projection(root)
+            (root / "policies/policy.pt").write_bytes(b"policy")
+            (root / "replay/snapshot.json").write_bytes(b"snapshot")
+
+            self.assertEqual(
+                transfer.validate_campaign_projection(root),
+                {"file_count": 4, "total_bytes": 20},
+            )
+
+    def test_campaign_projection_rejects_mutable_producer_paths(self) -> None:
+        excluded = (
+            ("actors", True),
+            ("operator", True),
+            (".coordinator_state.lock", False),
+            ("rounds/macro_round_000000/orchestration_run", True),
+        )
+        for relative, is_directory in excluded:
+            with self.subTest(
+                relative=relative
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "campaign"
+                self._valid_projection(root)
+                path = root / relative
+                if is_directory:
+                    path.mkdir(parents=True, exist_ok=True)
+                    (path / "mutable.json").write_text("{}\n", encoding="utf-8")
+                else:
+                    path.write_text("lock\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    transfer.TransferInventoryError, "excluded path"
+                ):
+                    transfer.validate_campaign_projection(root)
+
+    def test_campaign_projection_preserves_strict_symlink_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "campaign"
+            self._valid_projection(root)
+            (root / "replay/link").symlink_to(root / "campaign.json")
+
+            with self.assertRaisesRegex(
+                transfer.TransferInventoryError, "non-regular"
+            ):
+                transfer.validate_campaign_projection(root)
 
     def test_publish_rejects_same_or_overlapping_stage_and_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

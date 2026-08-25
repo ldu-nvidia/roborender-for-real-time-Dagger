@@ -23,6 +23,13 @@ from typing import Any, Mapping
 
 SCHEMA = "fast_roborender.round_dagger.remote_tree_inventory.v1"
 _HEX = frozenset("0123456789abcdef")
+_PROJECTION_REQUIRED_FILES = ("campaign.json", "coordinator_state.json")
+_PROJECTION_REQUIRED_DIRECTORIES = ("policies", "replay", "rounds")
+_PROJECTION_EXCLUDED_TOP_LEVEL = (
+    ".coordinator_state.lock",
+    "actors",
+    "operator",
+)
 
 
 class TransferInventoryError(RuntimeError):
@@ -92,6 +99,44 @@ def validate_tree_structure(root: str | os.PathLike[str]) -> dict[str, int]:
         "file_count": len(files),
         "total_bytes": sum(os.lstat(path).st_size for path in files),
     }
+
+
+def validate_campaign_projection(root: str | os.PathLike[str]) -> dict[str, int]:
+    """Validate the immutable, learner-facing subset of a campaign tree.
+
+    The local actor outputs, operator state, coordinator lock, and per-round
+    orchestration telemetry are mutable producer-side state.  They are neither
+    learner inputs nor safe remote-transfer material, so a projection that
+    contains any of them must fail closed before its inventory is published.
+    """
+
+    canonical = _safe_root(root)
+    report = validate_tree_structure(canonical)
+    for relative in _PROJECTION_REQUIRED_FILES:
+        path = canonical / relative
+        if not path.is_file() or path.is_symlink():
+            raise TransferInventoryError(
+                f"campaign projection is missing required file: {relative}"
+            )
+    for relative in _PROJECTION_REQUIRED_DIRECTORIES:
+        path = canonical / relative
+        if not path.is_dir() or path.is_symlink():
+            raise TransferInventoryError(
+                f"campaign projection is missing required directory: {relative}"
+            )
+    for relative in _PROJECTION_EXCLUDED_TOP_LEVEL:
+        if os.path.lexists(canonical / relative):
+            raise TransferInventoryError(
+                f"campaign projection contains excluded path: {relative}"
+            )
+    for round_path in (canonical / "rounds").iterdir():
+        if round_path.is_dir() and os.path.lexists(round_path / "orchestration_run"):
+            relative = (round_path / "orchestration_run").relative_to(canonical)
+            raise TransferInventoryError(
+                "campaign projection contains excluded path: "
+                f"{relative.as_posix()}"
+            )
+    return report
 
 
 def build_inventory(root: str | os.PathLike[str]) -> dict[str, Any]:
@@ -284,6 +329,8 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--inventory", required=True)
     structure = sub.add_parser("validate-structure")
     structure.add_argument("--root", required=True)
+    projection = sub.add_parser("validate-projection")
+    projection.add_argument("--root", required=True)
     publish = sub.add_parser("publish")
     publish.add_argument("--stage", required=True)
     publish.add_argument("--destination", required=True)
@@ -300,6 +347,8 @@ def main() -> int:
         report = verify_inventory(arguments.root, arguments.inventory)
     elif arguments.command == "validate-structure":
         report = validate_tree_structure(arguments.root)
+    elif arguments.command == "validate-projection":
+        report = validate_campaign_projection(arguments.root)
     else:
         report = publish_tree(
             arguments.stage, arguments.destination, arguments.inventory

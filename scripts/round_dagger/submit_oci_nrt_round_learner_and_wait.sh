@@ -170,12 +170,8 @@ LOCAL_OUTPUT_INVENTORY="$LOCAL_HANDOFF/learner_output.inventory.json"
 TRANSFER_TOOL="$ROOT/scripts/round_dagger/remote_campaign_transfer.py"
 
 if ((DRY_RUN)); then
-    PYTHONPATH="$ROOT" "$PYTHON" - "$CAMPAIGN_ROOT" <<'PY'
-import sys
-from scripts.round_dagger.remote_campaign_transfer import build_inventory
-report = build_inventory(sys.argv[1])
-print(f"DRY_RUN local_campaign_files={report['file_count']} tree_sha256={report['tree_sha256']}")
-PY
+    printf 'DRY_RUN local_campaign=%q projection=learner-inputs-only\n' \
+        "$CAMPAIGN_ROOT"
     printf 'DRY_RUN remote_host=%s account=%s partition=%s gpus=8 updates=500 save_every=5\n' \
         "$REMOTE" "$ACCOUNT" "$PARTITION"
     printf 'DRY_RUN mount %q at %q read-only; mount %q at %q writable\n' \
@@ -189,20 +185,25 @@ mkdir -p "$LOCAL_HANDOFF"
 [[ -d $LOCAL_HANDOFF && ! -L $LOCAL_HANDOFF ]] || fatal "local handoff root is unsafe"
 exec 9>"$LOCAL_HANDOFF/.bridge.lock"
 flock -n 9 || fatal "another bridge process owns this campaign/round handoff"
-"$PYTHON" "$TRANSFER_TOOL" validate-structure --root "$CAMPAIGN_ROOT" >/dev/null
 if [[ ! -d $LOCAL_PROJECTION ]]; then
     INCOMING="$LOCAL_HANDOFF/.incoming-campaign-input"
     if [[ -e $INCOMING || -L $INCOMING ]]; then
         [[ -d $INCOMING && ! -L $INCOMING ]] || fatal "unsafe local incoming projection"
-        "$PYTHON" "$TRANSFER_TOOL" validate-structure --root "$INCOMING" >/dev/null
     else
         mkdir "$INCOMING"
     fi
-    rsync --archive --no-links --delete --link-dest="$CAMPAIGN_ROOT" \
-        --exclude='/rounds/*/orchestration_run/' -- "$CAMPAIGN_ROOT/" "$INCOMING/"
+    rsync --archive --links --delete --delete-excluded \
+        --link-dest="$CAMPAIGN_ROOT" \
+        --exclude='/actors/' \
+        --exclude='/operator/' \
+        --exclude='/.coordinator_state.lock' \
+        --exclude='/rounds/*/orchestration_run/' \
+        -- "$CAMPAIGN_ROOT/" "$INCOMING/"
+    "$PYTHON" "$TRANSFER_TOOL" validate-projection --root "$INCOMING" >/dev/null
     "$PYTHON" "$TRANSFER_TOOL" inventory --root "$INCOMING" --output "$LOCAL_INVENTORY"
     mv "$INCOMING" "$LOCAL_PROJECTION"
 fi
+"$PYTHON" "$TRANSFER_TOOL" validate-projection --root "$LOCAL_PROJECTION" >/dev/null
 "$PYTHON" "$TRANSFER_TOOL" verify --root "$LOCAL_PROJECTION" \
     --inventory "$LOCAL_INVENTORY" >/dev/null
 for source in "$ROUND_DAGGER_POLICY_CHECKPOINT" "$ROUND_DAGGER_POLICY_SPEC" \
@@ -238,7 +239,7 @@ else
 fi
 REMOTE_PREPARE
 rsync --archive --no-links --protect-args --partial --append-verify \
-    --delay-updates --delete-delay -- "$LOCAL_PROJECTION/" "$REMOTE:$REMOTE_STAGE/"
+    --delete-delay -- "$LOCAL_PROJECTION/" "$REMOTE:$REMOTE_STAGE/"
 rsync --archive --no-links --protect-args -- "$LOCAL_INVENTORY" \
     "$REMOTE:$REMOTE_INVENTORY"
 ssh -o BatchMode=yes "$REMOTE" env PYTHONDONTWRITEBYTECODE=1 \
@@ -486,7 +487,7 @@ else
     mkdir -p "$INCOMING_OUTPUT"
 fi
 rsync --archive --no-links --protect-args --partial --append-verify \
-    --delay-updates --delete-delay -- "$REMOTE:$REMOTE_OUTPUT/" "$INCOMING_OUTPUT/"
+    --delete-delay -- "$REMOTE:$REMOTE_OUTPUT/" "$INCOMING_OUTPUT/"
 INCOMING_OUTPUT_INVENTORY="$LOCAL_HANDOFF/.learner_output.inventory.incoming.json"
 rsync --archive --no-links --protect-args -- "$REMOTE:$REMOTE_OUTPUT_INVENTORY" \
     "$INCOMING_OUTPUT_INVENTORY"

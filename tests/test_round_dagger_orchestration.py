@@ -846,6 +846,39 @@ class MacroRoundExecutionTest(unittest.TestCase):
                 ],
             )
 
+    def test_resume_from_ingested_skips_collection_transfer_and_ingest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = FakeBackend(configuration)
+            interrupted = RecordingRunner(backend, fail_on=("train", None))
+            with self.assertRaisesRegex(OrchestrationError, "injected hook failure"):
+                MacroRoundOrchestrator(
+                    configuration, backend=backend, hook_runner=interrupted
+                ).run()
+            self.assertEqual(backend.phase, "INGESTED")
+            collection = dict(backend.collection)
+            snapshot = dict(backend.snapshot)
+
+            resumed = RecordingRunner(backend)
+            result = MacroRoundOrchestrator(
+                configuration, backend=backend, hook_runner=resumed
+            ).run()
+            identities = [
+                identity for identity, _environment, _workdir in resumed.calls
+            ]
+            self.assertEqual(
+                identities,
+                [
+                    ("train", None),
+                    ("evaluate", None),
+                    ("promote", None),
+                ],
+            )
+            self.assertEqual(backend.collection, collection)
+            self.assertEqual(backend.snapshot, snapshot)
+            self.assertEqual(result["policy_version"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
