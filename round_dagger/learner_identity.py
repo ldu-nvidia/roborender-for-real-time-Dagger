@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import re
 
@@ -79,9 +80,60 @@ def learner_wandb_run_id(
     return run_id
 
 
+def _main(argv=None) -> int:
+    """Derive an identity without importing the :mod:`round_dagger` package.
+
+    The OCI validation batch frontier deliberately executes this file by its
+    absolute path.  Importing ``round_dagger.learner_identity`` first executes
+    the package ``__init__`` and therefore pulls in NumPy-backed actor artifact
+    code, while the compute-node host Python is intentionally only a minimal
+    standard-library interpreter.  Keep this entry point standard-library-only.
+    """
+
+    parser = argparse.ArgumentParser(
+        description="derive one canonical round-DAgger learner identity"
+    )
+    parser.add_argument("campaign_id")
+    parser.add_argument("macro_round", type=int)
+    parser.add_argument("learner_code_sha256")
+    parser.add_argument("learner_config_sha256")
+    parser.add_argument("replay_snapshot_file_sha256")
+    parser.add_argument("replay_snapshot_sha256")
+    parser.add_argument("parent_checkpoint_sha256")
+    parser.add_argument("parent_runtime_policy_sha256")
+    parser.add_argument("runtime_container_sha256")
+    parser.add_argument("learner_contract_sha256")
+    arguments = parser.parse_args(argv)
+    identity = learner_identity_sha256(
+        campaign_id=arguments.campaign_id,
+        macro_round=arguments.macro_round,
+        learner_code_sha256=arguments.learner_code_sha256,
+        learner_config_sha256=arguments.learner_config_sha256,
+        replay_snapshot_file_sha256=arguments.replay_snapshot_file_sha256,
+        replay_snapshot_sha256=arguments.replay_snapshot_sha256,
+        parent_checkpoint_sha256=arguments.parent_checkpoint_sha256,
+        parent_runtime_policy_sha256=arguments.parent_runtime_policy_sha256,
+        runtime_container_sha256=arguments.runtime_container_sha256,
+        learner_contract_sha256=arguments.learner_contract_sha256,
+    )
+    print(identity)
+    print(
+        learner_wandb_run_id(
+            campaign_id=arguments.campaign_id,
+            macro_round=arguments.macro_round,
+            learner_identity_sha256=identity,
+        )
+    )
+    return 0
+
+
 __all__ = [
     "IDENTITY_SCHEMA",
     "LearnerIdentityError",
     "learner_identity_sha256",
     "learner_wandb_run_id",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

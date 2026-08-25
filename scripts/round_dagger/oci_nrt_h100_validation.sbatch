@@ -122,27 +122,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$VERIFY_SOURCE" --root "$REMOTE_SOURCE" \
     --expected-inventory-sha256 "$SOURCE_SHA" >/dev/null
 
 mapfile -t DERIVED_IDENTITY < <(
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REMOTE_SOURCE" python3 - \
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "$REMOTE_SOURCE/round_dagger/learner_identity.py" \
         "$CAMPAIGN_ID" "$MACRO_ROUND" "$SOURCE_SHA" "$CONFIG_SHA" \
         "$SNAPSHOT_FILE_SHA" "$SNAPSHOT_SHA" "$CHECKPOINT_SHA" "$RUNTIME_SHA" \
-        "$CONTAINER_SHA" "$CONTRACT_SHA" <<'PY'
-import sys
-from round_dagger.learner_identity import learner_identity_sha256, learner_wandb_run_id
-(campaign, macro_round, code, config, replay_file, replay, parent, parent_runtime,
- container, contract) = sys.argv[1:]
-identity = learner_identity_sha256(
-    campaign_id=campaign, macro_round=int(macro_round), learner_code_sha256=code,
-    learner_config_sha256=config, replay_snapshot_file_sha256=replay_file,
-    replay_snapshot_sha256=replay, parent_checkpoint_sha256=parent,
-    parent_runtime_policy_sha256=parent_runtime,
-    runtime_container_sha256=container, learner_contract_sha256=contract,
-)
-print(identity)
-print(learner_wandb_run_id(
-    campaign_id=campaign, macro_round=int(macro_round),
-    learner_identity_sha256=identity,
-))
-PY
+        "$CONTAINER_SHA" "$CONTRACT_SHA"
 )
 [[ ${DERIVED_IDENTITY[0]:-} == "$LEARNER_IDENTITY_SHA" && \
    ${DERIVED_IDENTITY[1]:-} == "$WANDB_RUN_ID" && \

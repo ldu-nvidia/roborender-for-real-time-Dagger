@@ -90,8 +90,10 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
         self.assertIn('--learner-contract-sha256 "$CONTRACT_SHA"', wrapper)
         self.assertIn('--run-id "$WANDB_RUN_ID"', wrapper)
         self.assertIn('--validation-contract "$CONTRACT"', wrapper)
-        self.assertIn("learner_identity_sha256", submit)
-        self.assertIn("learner_wandb_run_id", submit)
+        self.assertIn('$SOURCE/round_dagger/learner_identity.py', submit)
+        self.assertIn('$REMOTE_SOURCE/round_dagger/learner_identity.py', batch)
+        self.assertNotIn('PYTHONPATH="$SOURCE" python3 -', submit)
+        self.assertNotIn('PYTHONPATH="$REMOTE_SOURCE" python3 -', batch)
         self.assertIn("validation_learner_1x8h100_2step.json", combined)
         self.assertIn("h100_validation_wandb_readback.py", wrapper)
         self.assertIn("second_invocation_resume_mode\": \"must", wrapper)
@@ -108,6 +110,76 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
         self.assertNotIn("WANDB_API_KEY", combined)
         self.assertNotIn("cat \"$HOME/.netrc\"", combined)
         self.assertIn("chmod 0444", wrapper)
+
+    def test_host_identity_gate_works_when_numpy_import_is_blocked(self) -> None:
+        inputs = {
+            "campaign_id": "host-no-numpy",
+            "macro_round": 3,
+            "learner_code_sha256": "1" * 64,
+            "learner_config_sha256": "2" * 64,
+            "replay_snapshot_file_sha256": "3" * 64,
+            "replay_snapshot_sha256": "4" * 64,
+            "parent_checkpoint_sha256": "5" * 64,
+            "parent_runtime_policy_sha256": "6" * 64,
+            "runtime_container_sha256": "7" * 64,
+            "learner_contract_sha256": "8" * 64,
+        }
+        expected_identity = learner_identity_sha256(**inputs)
+        expected_run_id = learner_wandb_run_id(
+            campaign_id=inputs["campaign_id"],
+            macro_round=inputs["macro_round"],
+            learner_identity_sha256=expected_identity,
+        )
+        identity_script = ROOT / "round_dagger/learner_identity.py"
+        with tempfile.TemporaryDirectory(prefix="rr_no_numpy_") as name:
+            blocker = Path(name)
+            (blocker / "sitecustomize.py").write_text(
+                """\
+import builtins
+_original_import = builtins.__import__
+def _blocked_import(name, *args, **kwargs):
+    if name == \"numpy\" or name.startswith(\"numpy.\"):
+        raise ModuleNotFoundError(\"NumPy deliberately blocked by host-gate test\")
+    return _original_import(name, *args, **kwargs)
+builtins.__import__ = _blocked_import
+""",
+                encoding="utf-8",
+            )
+            environment = dict(os.environ, PYTHONPATH=str(blocker))
+            probe = subprocess.run(
+                [sys.executable, "-c", "import numpy"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(probe.returncode, 0)
+            self.assertIn("NumPy deliberately blocked", probe.stderr)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(identity_script),
+                    inputs["campaign_id"],
+                    str(inputs["macro_round"]),
+                    inputs["learner_code_sha256"],
+                    inputs["learner_config_sha256"],
+                    inputs["replay_snapshot_file_sha256"],
+                    inputs["replay_snapshot_sha256"],
+                    inputs["parent_checkpoint_sha256"],
+                    inputs["parent_runtime_policy_sha256"],
+                    inputs["runtime_container_sha256"],
+                    inputs["learner_contract_sha256"],
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.splitlines(), [expected_identity, expected_run_id]
+        )
 
     def test_dry_run_validates_inputs_without_submitting_or_mutating_outputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="rr_h100_gate_") as name:
