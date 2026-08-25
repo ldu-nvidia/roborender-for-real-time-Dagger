@@ -61,8 +61,21 @@ done
    $MANIFEST == "${CHECKPOINT}.manifest.json" ]] || \
     fatal "policy sidecars are not canonically co-located"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="$ROOT:${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}"
+export PYTHONPATH="$ROOT:${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}${PYTHONPATH:+:$PYTHONPATH}"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
+"$PYTHON" - <<'PY'
+import sys
+
+import numpy as np
+
+if np.__version__ != "1.26.0":
+    raise SystemExit(f"expected NumPy 1.26.0, found {np.__version__}")
+if not any(
+    "/isaac-sim/extscache/omni.kit.pip_archive-" in entry
+    for entry in sys.path
+):
+    raise SystemExit("Isaac Sim Python environment is absent from sys.path")
+PY
 [[ $(sha256sum "$SNAPSHOT" | awk '{print $1}') == "$SNAPSHOT_FILE_SHA" ]] || \
     fatal "replay snapshot file digest mismatch"
 [[ $(sha256sum "$CHECKPOINT" | awk '{print $1}') == "$CHECKPOINT_SHA" ]] || \
@@ -136,6 +149,7 @@ import sys
 from pathlib import Path
 
 import gr00t
+import numpy as np
 import torch
 from round_dagger.gr00t_policy import create_vision_actor_obj_pred
 
@@ -160,6 +174,11 @@ report = {
     "compute_capability": capability,
     "torch_version": torch.__version__,
     "torch_cuda": torch.version.cuda,
+    "numpy_version": np.__version__,
+    "isaac_pip_archive_on_sys_path": any(
+        "/isaac-sim/extscache/omni.kit.pip_archive-" in entry
+        for entry in sys.path
+    ),
     "nccl_available": True,
     "gr00t_import": getattr(gr00t, "__version__", "import-ok"),
     "gr00t_factory": f"{create_vision_actor_obj_pred.__module__}:{create_vision_actor_obj_pred.__name__}",
