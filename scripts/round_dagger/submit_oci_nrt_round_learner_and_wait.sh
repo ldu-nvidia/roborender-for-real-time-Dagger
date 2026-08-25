@@ -144,11 +144,14 @@ ROUND_DAGGER_WANDB_ENTITY=${ROUND_DAGGER_WANDB_ENTITY:-nvidia}
 ROUND_DAGGER_WANDB_EXPECTED_EMAIL=${ROUND_DAGGER_WANDB_EXPECTED_EMAIL:-ldu@nvidia.com}
 ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE=${ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE:-team}
 printf -v ROUND_PADDED '%06d' "$((10#$ROUND_DAGGER_MACRO_ROUND))"
-ROUND_DAGGER_WANDB_RUN_ID=${ROUND_DAGGER_WANDB_RUN_ID:-${ROUND_DAGGER_CAMPAIGN_ID}-learner-m${ROUND_PADDED}}
+EXPECTED_WANDB_RUN_ID=${ROUND_DAGGER_CAMPAIGN_ID}-learner-m${ROUND_PADDED}-s${ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256:0:12}
+ROUND_DAGGER_WANDB_RUN_ID=${ROUND_DAGGER_WANDB_RUN_ID:-$EXPECTED_WANDB_RUN_ID}
 [[ $ROUND_DAGGER_WANDB_ENTITY == nvidia ]] || fatal "W&B entity must be nvidia"
 [[ $ROUND_DAGGER_WANDB_EXPECTED_EMAIL == ldu@nvidia.com && \
    $ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE == team ]] || \
     fatal "W&B authorization identity changed"
+[[ $ROUND_DAGGER_WANDB_RUN_ID == "$EXPECTED_WANDB_RUN_ID" ]] || \
+    fatal "W&B run ID is not bound to the replay snapshot"
 for token in "$ROUND_DAGGER_CAMPAIGN_ID" "$ROUND_DAGGER_WANDB_PROJECT" \
              "$ROUND_DAGGER_WANDB_RUN_ID"; do
     [[ $token =~ ^[A-Za-z0-9_.-]+$ ]] || fatal "unsafe campaign/W&B token"
@@ -345,19 +348,44 @@ adopt_remote_success() {
 }
 remote_completion_state() {
     ssh -o BatchMode=yes "$REMOTE" bash -s -- \
-        "$REMOTE_SUCCESS_MARKER" "$REMOTE_OUTPUT/$REMOTE_RESULT_REL" <<'REMOTE_COMPLETION_STATE'
+        "$REMOTE_SUCCESS_MARKER" "$REMOTE_OUTPUT/$REMOTE_RESULT_REL" \
+        "$REMOTE_COMPLETION_ATTESTATION" <<'REMOTE_COMPLETION_STATE'
 set -Eeuo pipefail
-marker=$1; result=$2
+marker=$1; result=$2; attestation=$3
 if [ -e "$marker" ] || [ -L "$marker" ]; then
     [ -f "$marker" ] && [ ! -L "$marker" ] || { printf '%s\n' unsafe; exit 3; }
     printf '%s\n' marker
 elif [ -e "$result" ] || [ -L "$result" ]; then
     [ -f "$result" ] && [ ! -L "$result" ] || { printf '%s\n' unsafe; exit 3; }
-    printf '%s\n' result
+    if [ -e "$attestation" ] || [ -L "$attestation" ]; then
+        [ -f "$attestation" ] && [ ! -L "$attestation" ] || \
+            { printf '%s\n' unsafe; exit 3; }
+        printf '%s\n' attested-result
+    else
+        printf '%s\n' result-only
+    fi
+elif [ -e "$attestation" ] || [ -L "$attestation" ]; then
+    # An attestation without its bound result is never recoverable.
+    printf '%s\n' unsafe
+    exit 3
 else
     printf '%s\n' empty
 fi
 REMOTE_COMPLETION_STATE
+}
+remote_restart_state() {
+    ssh -o BatchMode=yes "$REMOTE" bash -s -- \
+        "$REMOTE_OUTPUT/restart.pt" <<'REMOTE_RESTART_STATE'
+set -Eeuo pipefail
+restart=$1
+if [ -e "$restart" ] || [ -L "$restart" ]; then
+    [ -f "$restart" ] && [ ! -L "$restart" ] || \
+        { printf '%s\n' unsafe; exit 3; }
+    printf '%s\n' durable
+else
+    printf '%s\n' missing
+fi
+REMOTE_RESTART_STATE
 }
 
 remote_result_complete=0
@@ -387,7 +415,7 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
                 echo "OCI-NRT learner success marker verified; resuming artifact return"
                 break
                 ;;
-            result)
+            attested-result)
                 adopt_remote_success || \
                     fatal "remote learner result lacks a valid completion attestation; refusing rerun or adoption"
                 verify_remote_success || \
@@ -398,7 +426,15 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
                 echo "OCI-NRT learner completion attestation adopted; resuming artifact return"
                 break
                 ;;
-            empty)
+            result-only)
+                # Training has already committed its immutable result, which
+                # is published only after W&B finish.  Resubmit the same sealed
+                # job as a finalizer: the container verifies the final restart
+                # and result, performs authenticated W&B readback, and publishes
+                # the missing completion attestation without another update.
+                echo "OCI-NRT learner result found without completion attestation; submitting finalization recovery" >&2
+                ;;&
+            empty|result-only)
                 submission=$(ssh -o BatchMode=yes "$REMOTE" sbatch --parsable \
                 --account="$ACCOUNT" --partition="$PARTITION" --qos="$QOS" \
                 --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=64 --mem=0 \
@@ -441,10 +477,43 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
     done
     [[ -n $accounting ]] || fatal "remote accounting did not resolve job $job_id"
     state=${accounting%%|*}; state=${state%%+*}; exit_code=${accounting#*|}
-    if [[ $state == COMPLETED && $exit_code == 0:0 ]]; then
-        verify_remote_success || fatal "completed allocation lacks a valid success marker"
+    completion_state=$(remote_completion_state) || \
+        fatal "cannot determine post-allocation learner completion state"
+    if [[ $completion_state == marker ]]; then
+        verify_remote_success || fatal "post-allocation success marker is invalid"
         remote_result_complete=1
         break
+    fi
+    if [[ $completion_state == attested-result ]]; then
+        adopt_remote_success || \
+            fatal "post-allocation completion attestation is invalid"
+        verify_remote_success || \
+            fatal "post-allocation adopted success marker is invalid"
+        remote_result_complete=1
+        break
+    fi
+    if [[ $state == COMPLETED && $exit_code == 0:0 ]]; then
+        fatal "completed allocation lacks a valid learner completion marker"
+    fi
+    if [[ $completion_state == result-only && $attempt -lt $MAX_ATTEMPTS ]] &&
+       [[ $state == FAILED || $state =~ $retryable ]]; then
+        echo "OCI-NRT learner finalization incomplete state=$state; retrying finalizer" >&2
+        attempt=$((attempt + 1))
+        continue
+    fi
+    if [[ $state == FAILED && $completion_state == empty && \
+          $attempt -lt $MAX_ATTEMPTS ]]; then
+        restart_state=$(remote_restart_state) || \
+            fatal "cannot determine remote durable restart state"
+        if [[ $restart_state == durable ]]; then
+            # A W&B SDK/network failure exits the batch step as FAILED rather
+            # than TIMEOUT even though the last save-every frontier is valid.
+            # Bound this recovery by MAX_ATTEMPTS; the next sealed allocation
+            # validates full restart lineage before running another update.
+            echo "OCI-NRT learner FAILED after durable restart; retrying bounded resume" >&2
+            attempt=$((attempt + 1))
+            continue
+        fi
     fi
     if [[ $state =~ $retryable && $attempt -lt $MAX_ATTEMPTS ]]; then
         echo "OCI-NRT learner state=$state; resubmitting from durable restart" >&2

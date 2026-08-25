@@ -105,8 +105,12 @@ BUNDLE="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/learner_bundle_round_${ROUND_PADDED}.js
 EXPECTED_RESULT="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/learner_result_round_${ROUND_PADDED}.json"
 [[ $ROUND_DAGGER_LEARNER_RESULT == "$EXPECTED_RESULT" ]] || \
     fatal "orchestrator learner result path is non-canonical"
-[[ ! -e $ROUND_DAGGER_LEARNER_RESULT && ! -L $ROUND_DAGGER_LEARNER_RESULT ]] || \
-    fatal "learner result already exists; coordinator should verify it instead"
+RECOVER_EXISTING_RESULT=0
+if [[ -e $ROUND_DAGGER_LEARNER_RESULT || -L $ROUND_DAGGER_LEARNER_RESULT ]]; then
+    [[ -f $ROUND_DAGGER_LEARNER_RESULT && ! -L $ROUND_DAGGER_LEARNER_RESULT ]] || \
+        fatal "existing learner result is unsafe"
+    RECOVER_EXISTING_RESULT=1
+fi
 
 PREPARE=(
     "$H100_PYTHON" "$ROOT/scripts/round_dagger/prepare_gr00t_learner_bundle.py"
@@ -131,6 +135,38 @@ if [[ $DRY_RUN == 1 ]]; then
     "${PREPARE[@]}" --dry-run >/dev/null
 else
     mkdir -p "$ROUND_DAGGER_LEARNER_OUTPUT_DIR"
+    # SIGKILL can strand same-directory temporary files created by atomic
+    # checkpoint/JSONL publication.  They are never committed artifacts and a
+    # large partial restart can otherwise be copied back by the bridge.  Remove
+    # only the exact known temporary prefixes, and fail closed on non-files.
+    "$H100_PYTHON" - "$ROUND_DAGGER_LEARNER_OUTPUT_DIR" "$ROUND_PADDED" <<'PY'
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+round_padded = sys.argv[2]
+targets = (
+    "restart.pt",
+    "telemetry.jsonl",
+    f"learner_bundle_round_{round_padded}.json",
+    f"candidate_round_{round_padded}.pt",
+    f"candidate_round_{round_padded}.pt.policy_spec.json",
+    f"candidate_round_{round_padded}.pt.manifest.json",
+    f"learner_result_round_{round_padded}.json",
+    f"wandb_learner_readback_round_{round_padded}.json",
+    f"learner_completion_round_{round_padded}.json",
+)
+removed = []
+for child in output.iterdir():
+    if not any(child.name.startswith(f".{target}.") for target in targets):
+        continue
+    if child.is_symlink() or not child.is_file():
+        raise SystemExit(f"unsafe learner temporary: {child.name}")
+    child.unlink()
+    removed.append(child.name)
+if removed:
+    print(f"H100_LEARNER_RECOVERY_CLEANUP files={len(removed)}", file=sys.stderr)
+PY
     "${PREPARE[@]}" >/dev/null
 fi
 
@@ -336,9 +372,12 @@ WANDB_RUN_ID=${ROUND_DAGGER_WANDB_RUN_ID:-}
 if [[ -n $WANDB_PROJECT ]]; then
     COMMAND+=(--wandb-project "$WANDB_PROJECT")
     [[ -z $WANDB_ENTITY ]] || COMMAND+=(--wandb-entity "$WANDB_ENTITY")
+    EXPECTED_WANDB_RUN_ID="${ROUND_DAGGER_CAMPAIGN_ID}-learner-m${ROUND_PADDED}-s${ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256:0:12}"
     if [[ -z $WANDB_RUN_ID ]]; then
-        WANDB_RUN_ID="${ROUND_DAGGER_CAMPAIGN_ID}-learner-m${ROUND_PADDED}"
+        WANDB_RUN_ID=$EXPECTED_WANDB_RUN_ID
     fi
+    [[ $WANDB_RUN_ID == "$EXPECTED_WANDB_RUN_ID" ]] || \
+        fatal "W&B run ID is not bound to the replay snapshot"
     COMMAND+=(--wandb-run-id "$WANDB_RUN_ID")
 elif [[ -n $WANDB_ENTITY || -n $WANDB_RUN_ID ]]; then
     fatal "W&B entity/run ID requires ROUND_DAGGER_WANDB_PROJECT"
@@ -352,7 +391,24 @@ if [[ $DRY_RUN == 1 ]]; then
     exit 0
 fi
 
-"${COMMAND[@]}"
+if [[ $RECOVER_EXISTING_RESULT == 1 ]]; then
+    [[ -n $RESUME_PATH ]] || \
+        fatal "existing learner result has no matching durable restart"
+    "$H100_PYTHON" - "$RESUME_PATH" "$ROUND_DAGGER_LEARNER_MAX_STEPS" <<'PY'
+import sys
+from collections.abc import Mapping
+
+import torch
+
+path, expected_steps = sys.argv[1:]
+document = torch.load(path, map_location="cpu", weights_only=False)
+if not isinstance(document, Mapping) or document.get("completed_steps") != int(expected_steps):
+    raise SystemExit("existing learner result restart is not at the final frontier")
+PY
+    echo "H100_LEARNER_FINALIZATION_RECOVERY result=$ROUND_DAGGER_LEARNER_RESULT" >&2
+else
+    "${COMMAND[@]}"
+fi
 
 "$H100_PYTHON" - \
     "$ROUND_DAGGER_LEARNER_RESULT" "$ROUND_DAGGER_CAMPAIGN_ID" \
@@ -433,10 +489,26 @@ PY
 
 COMPLETION_ATTESTATION="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/learner_completion_round_${ROUND_PADDED}.json"
 WANDB_READBACK="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/wandb_learner_readback_round_${ROUND_PADDED}.json"
-[[ ! -e $COMPLETION_ATTESTATION && ! -L $COMPLETION_ATTESTATION ]] || \
-    fatal "learner completion attestation already exists"
-[[ ! -e $WANDB_READBACK && ! -L $WANDB_READBACK ]] || \
-    fatal "learner W&B readback already exists"
+if [[ -e $COMPLETION_ATTESTATION || -L $COMPLETION_ATTESTATION ]]; then
+    [[ -f $COMPLETION_ATTESTATION && ! -L $COMPLETION_ATTESTATION ]] || \
+        fatal "existing learner completion attestation is unsafe"
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT" \
+    "$H100_PYTHON" "$ROOT/scripts/round_dagger/learner_completion_attestation.py" verify \
+        --attestation "$COMPLETION_ATTESTATION" \
+        --result "$ROUND_DAGGER_LEARNER_RESULT" \
+        --campaign-id "$ROUND_DAGGER_CAMPAIGN_ID" \
+        --macro-round "$ROUND_DAGGER_MACRO_ROUND" \
+        --code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
+        --config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
+        --parent-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
+        --snapshot-file-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
+        --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" >/dev/null
+    echo "H100_LEARNER_COMPLETE result=$ROUND_DAGGER_LEARNER_RESULT recovered=attested"
+    exit 0
+fi
+[[ ! -L $WANDB_READBACK ]] || fatal "learner W&B readback is a symlink"
+[[ ! -e $WANDB_READBACK || -f $WANDB_READBACK ]] || \
+    fatal "learner W&B readback is unsafe"
 "$H100_PYTHON" "$ROOT/scripts/round_dagger/learner_completion_attestation.py" publish \
     --attestation "$COMPLETION_ATTESTATION" \
     --result "$ROUND_DAGGER_LEARNER_RESULT" \
@@ -453,9 +525,9 @@ WANDB_READBACK="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/wandb_learner_readback_round_${
     --code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
     --config-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256" \
     --wandb-readback "$WANDB_READBACK" \
-    --wandb-entity "$ROUND_DAGGER_WANDB_ENTITY" \
-    --wandb-project "$ROUND_DAGGER_WANDB_PROJECT" \
-    --wandb-run-id "$ROUND_DAGGER_WANDB_RUN_ID" \
+    --wandb-entity "$WANDB_ENTITY" \
+    --wandb-project "$WANDB_PROJECT" \
+    --wandb-run-id "$WANDB_RUN_ID" \
     --wandb-expected-email "$ROUND_DAGGER_WANDB_EXPECTED_EMAIL" \
     --wandb-timeout-seconds "${ROUND_DAGGER_WANDB_READBACK_TIMEOUT_SECONDS:-300}" \
     >/dev/null

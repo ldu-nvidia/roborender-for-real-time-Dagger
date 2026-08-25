@@ -37,7 +37,7 @@ from scripts.round_dagger import remote_learner_success  # noqa: E402
 
 
 SCHEMA = "fast_roborender.round_dagger.learner_completion.v1"
-READBACK_SCHEMA = "fast_roborender.round_dagger.learner_wandb_readback.v1"
+READBACK_SCHEMA = "fast_roborender.round_dagger.learner_wandb_readback.v2"
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
 CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v1"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
@@ -108,6 +108,15 @@ def _output_file(output: Path, name: str, label: str) -> Path:
 
 def _artifact(path: Path) -> dict[str, str]:
     return {"path": path.name, "sha256": sha256_file(path)}
+
+
+def _expected_wandb_run_id(
+    campaign_id: str, macro_round: int, snapshot_sha256: str
+) -> str:
+    return (
+        f"{campaign_id}-learner-m{macro_round:06d}-"
+        f"s{_sha(snapshot_sha256, 'snapshot SHA-256')[:12]}"
+    )
 
 
 def _telemetry_records(
@@ -196,6 +205,8 @@ def _wandb_readback(
     macro_round: int,
     config_sha256: str,
     parent_sha256: str,
+    snapshot_file_sha256: str,
+    snapshot_sha256: str,
     entity: str,
     project: str,
     run_id: str,
@@ -233,6 +244,10 @@ def _wandb_readback(
                 raise CompletionAttestationError("W&B learner config identity mismatch")
             if config.get("model_lineage_sha256") != parent_sha256:
                 raise CompletionAttestationError("W&B model lineage mismatch")
+            if config.get("replay_snapshot_file_sha256") != snapshot_file_sha256:
+                raise CompletionAttestationError("W&B replay snapshot file identity mismatch")
+            if config.get("replay_snapshot_sha256") != snapshot_sha256:
+                raise CompletionAttestationError("W&B replay snapshot identity mismatch")
             observed = set()
             for row in run.scan_history(page_size=500):
                 if not isinstance(row, Mapping):
@@ -289,6 +304,8 @@ def _wandb_readback(
         "macro_round": macro_round,
         "learner_config_sha256": config_sha256,
         "model_lineage_sha256": parent_sha256,
+        "replay_snapshot_file_sha256": snapshot_file_sha256,
+        "replay_snapshot_sha256": snapshot_sha256,
         "verified_optimizer_steps": len(observed),
         "first_optimizer_step": min(observed),
         "last_optimizer_step": max(observed),
@@ -302,6 +319,8 @@ def _validate_readback(
     macro_round: int,
     config_sha256: str,
     parent_sha256: str,
+    snapshot_file_sha256: str,
+    snapshot_sha256: str,
     entity: str,
     project: str,
     run_id: str,
@@ -322,6 +341,8 @@ def _validate_readback(
         "macro_round": macro_round,
         "learner_config_sha256": config_sha256,
         "model_lineage_sha256": parent_sha256,
+        "replay_snapshot_file_sha256": snapshot_file_sha256,
+        "replay_snapshot_sha256": snapshot_sha256,
         "verified_optimizer_steps": 500,
         "first_optimizer_step": 1,
         "last_optimizer_step": 500,
@@ -354,6 +375,12 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         or snapshot["through_macro_round"] != args.macro_round
     ):
         raise CompletionAttestationError("replay snapshot lineage mismatch")
+    if args.wandb_run_id != _expected_wandb_run_id(
+        campaign_id, args.macro_round, snapshot_sha
+    ):
+        raise CompletionAttestationError(
+            "W&B run ID is not bound to the replay snapshot"
+        )
 
     bundle_path = _output_file(output, args.bundle, "learner bundle")
     bundle = LearnerBundleConfig.load(bundle_path)
@@ -460,6 +487,8 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         macro_round=args.macro_round,
         config_sha256=config_sha,
         parent_sha256=parent_sha,
+        snapshot_file_sha256=snapshot_file_sha,
+        snapshot_sha256=snapshot_sha,
         entity=args.wandb_entity,
         project=args.wandb_project,
         run_id=args.wandb_run_id,
@@ -476,6 +505,8 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         macro_round=args.macro_round,
         config_sha256=config_sha,
         parent_sha256=parent_sha,
+        snapshot_file_sha256=snapshot_file_sha,
+        snapshot_sha256=snapshot_sha,
         entity=args.wandb_entity,
         project=args.wandb_project,
         run_id=args.wandb_run_id,
@@ -634,6 +665,8 @@ def verify_attestation(
         or wandb.get("verified_optimizer_steps") != 500
         or TOKEN_RE.fullmatch(str(wandb.get("project", ""))) is None
         or TOKEN_RE.fullmatch(str(wandb.get("run_id", ""))) is None
+        or wandb.get("run_id")
+        != _expected_wandb_run_id(campaign_id, macro_round, snapshot_sha256)
     ):
         raise CompletionAttestationError("W&B completion summary mismatch")
     _validate_readback(
@@ -642,6 +675,8 @@ def verify_attestation(
         macro_round=macro_round,
         config_sha256=config_sha256,
         parent_sha256=parent_sha256,
+        snapshot_file_sha256=snapshot_file_sha256,
+        snapshot_sha256=snapshot_sha256,
         entity=str(wandb["entity"]),
         project=str(wandb["project"]),
         run_id=str(wandb["run_id"]),

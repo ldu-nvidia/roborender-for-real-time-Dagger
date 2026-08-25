@@ -625,6 +625,37 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             all(item["replay_transitions_global"] == 16 for item in records)
         )
 
+    def test_jsonl_telemetry_append_is_atomic_across_replace_failure(self):
+        path = self.root / "atomic-telemetry" / "learner.jsonl"
+        telemetry = JsonlTelemetry(path, enabled=True)
+        telemetry.log({"optimizer_step": 1, "loss": 1.0})
+        durable = path.read_bytes()
+        with (
+            mock.patch(
+                "round_dagger.learner.os.replace",
+                side_effect=OSError("simulated scheduler interruption"),
+            ),
+            self.assertRaisesRegex(OSError, "scheduler interruption"),
+        ):
+            telemetry.log({"optimizer_step": 2, "loss": 0.5})
+        self.assertEqual(path.read_bytes(), durable)
+        self.assertEqual(list(path.parent.glob(".learner.jsonl.*")), [])
+
+    def test_jsonl_telemetry_rejects_unsafe_or_torn_existing_log(self):
+        root = self.root / "unsafe-telemetry"
+        root.mkdir()
+        target = root / "target.jsonl"
+        target.write_text("{}\n", encoding="utf-8")
+        link = root / "learner.jsonl"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(LearnerError, "must not be a symlink"):
+            JsonlTelemetry(link, enabled=True).log({"optimizer_step": 1})
+
+        link.unlink()
+        link.write_text('{"optimizer_step":', encoding="utf-8")
+        with self.assertRaisesRegex(LearnerError, "torn final record"):
+            JsonlTelemetry(link, enabled=True).log({"optimizer_step": 1})
+
     def test_resume_rejects_model_config_and_snapshot_lineage_mismatch(self):
         model = TinyPolicy()
         partial = train_from_replay(

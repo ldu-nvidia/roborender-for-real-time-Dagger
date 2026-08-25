@@ -1020,7 +1020,9 @@ class JsonlTelemetry:
         wandb_config: Mapping[str, Any] | None = None,
     ):
         self.path = (
-            Path(path).expanduser().resolve() if path is not None and enabled else None
+            Path(os.path.abspath(Path(path).expanduser()))
+            if path is not None and enabled
+            else None
         )
         self.wandb_run = None
         if self.path is not None:
@@ -1049,14 +1051,57 @@ class JsonlTelemetry:
 
     def log(self, record: Mapping[str, Any]) -> None:
         clean = dict(record)
-        payload = json.dumps(
-            clean, sort_keys=True, allow_nan=False, separators=(",", ":")
-        )
+        payload = (
+            json.dumps(
+                clean, sort_keys=True, allow_nan=False, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("utf-8")
         if self.path is not None:
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(payload + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            # A scheduler can deliver SIGKILL while telemetry is being
+            # persisted.  Appending directly to JSONL can then leave a torn
+            # final line, permanently wedging completion attestation even
+            # though the last durable restart is valid.  The production log is
+            # small (500 scalar rows), so rewrite it through a same-directory
+            # temporary and atomically replace the old inode.  A crash exposes
+            # either the complete previous log or the complete new log.
+            if self.path.is_symlink():
+                raise LearnerError("telemetry path must not be a symlink")
+            existing = b""
+            if self.path.exists():
+                if not self.path.is_file():
+                    raise LearnerError("telemetry path must be a regular file")
+                existing = self.path.read_bytes()
+                if existing and not existing.endswith(b"\n"):
+                    raise LearnerError("telemetry log has a torn final record")
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.", dir=self.path.parent
+            )
+            temporary = Path(name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(existing)
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.path)
+                os.chmod(
+                    self.path,
+                    stat.S_IRUSR
+                    | stat.S_IWUSR
+                    | stat.S_IRGRP
+                    | stat.S_IROTH,
+                )
+                directory = os.open(
+                    self.path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                temporary.unlink(missing_ok=True)
         if self.wandb_run is not None:
             step = int(clean.get("optimizer_step", 0))
             self.wandb_run.log(clean, step=step)

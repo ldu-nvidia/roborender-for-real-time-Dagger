@@ -31,6 +31,7 @@ from round_dagger.learner import (  # noqa: E402
     publish_learner_result,
     train_from_replay,
 )
+from round_dagger.replay import load_snapshot  # noqa: E402
 
 
 def _symbol(specification: str) -> Any:
@@ -206,6 +207,26 @@ def main(argv: list[str] | None = None) -> int:
 
     device = _distributed_device(arguments.device)
     rank = _rank()
+    wandb_config = {
+        "campaign_id": config.campaign_id,
+        "macro_round": config.macro_round,
+        "learner_config_sha256": config.sha256,
+        "model_lineage_sha256": config.model_lineage_sha256,
+    }
+    if arguments.wandb_project:
+        snapshot_identity = load_snapshot(
+            arguments.snapshot,
+            expected_file_sha256=arguments.expected_snapshot_file_sha256,
+        )
+        if (
+            snapshot_identity["campaign_id"] != config.campaign_id
+            or snapshot_identity["through_macro_round"] != config.macro_round
+        ):
+            raise LearnerError("replay snapshot lineage differs from learner bundle")
+        wandb_config.update(
+            replay_snapshot_file_sha256=snapshot_identity["file_sha256"],
+            replay_snapshot_sha256=snapshot_identity["snapshot_sha256"],
+        )
     telemetry = JsonlTelemetry(
         arguments.telemetry_jsonl,
         enabled=rank == 0,
@@ -216,12 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             arguments.resume_from is not None
             and arguments.wandb_run_id is not None
         ),
-        wandb_config={
-            "campaign_id": config.campaign_id,
-            "macro_round": config.macro_round,
-            "learner_config_sha256": config.sha256,
-            "model_lineage_sha256": config.model_lineage_sha256,
-        },
+        wandb_config=wandb_config,
     )
     result = None
     try:

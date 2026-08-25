@@ -109,6 +109,13 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("policy spec SHA mismatch", completed.stderr)
 
+            bad_wandb_run = dict(
+                environment, ROUND_DAGGER_WANDB_RUN_ID="reused-unbound-run"
+            )
+            completed = self._run(bad_wandb_run, cwd=root)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("not bound to the replay snapshot", completed.stderr)
+
     def test_scripts_pin_restart_security_and_topology_contracts(self) -> None:
         bridge = BRIDGE.read_text(encoding="utf-8")
         batch = BATCH.read_text(encoding="utf-8")
@@ -126,6 +133,14 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn("adopt_remote_success", bridge)
         self.assertIn("learner_completion_attestation.py", bridge)
         self.assertIn("refusing rerun or adoption", bridge)
+        self.assertIn("attested-result", bridge)
+        self.assertIn("result-only", bridge)
+        self.assertIn("submitting finalization recovery", bridge)
+        self.assertIn("retrying finalizer", bridge)
+        self.assertIn("$state == FAILED || $state =~ $retryable", bridge)
+        self.assertIn("remote_restart_state", bridge)
+        self.assertIn("FAILED after durable restart", bridge)
+        self.assertIn("$state == FAILED && $completion_state == empty", bridge)
         self.assertIn("--completion-attestation", bridge)
         self.assertIn("remote_learner_success.py\" verify", bridge)
         self.assertIn("remote_completion_state", bridge)
@@ -156,6 +171,20 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertNotIn('$OUTPUT/wandb', container_wrapper)
         self.assertIn('"256:4:64:300:76800"', bridge)
         self.assertIn('"256:4:64:300:76800"', batch)
+        self.assertIn(
+            '-s${ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256:0:12}', bridge
+        )
+
+    def test_container_launcher_supports_idempotent_finalization_recovery(self) -> None:
+        launcher = (
+            ROOT / "scripts/round_dagger/run_h100_learner.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("RECOVER_EXISTING_RESULT=1", launcher)
+        self.assertIn("H100_LEARNER_FINALIZATION_RECOVERY", launcher)
+        self.assertIn("existing learner result has no matching durable restart", launcher)
+        self.assertIn("existing learner result restart is not at the final frontier", launcher)
+        self.assertIn("H100_LEARNER_RECOVERY_CLEANUP", launcher)
+        self.assertIn("recovered=attested", launcher)
 
     def test_local_projection_filters_mutable_state_before_inventory(self) -> None:
         bridge = BRIDGE.read_text(encoding="utf-8")
