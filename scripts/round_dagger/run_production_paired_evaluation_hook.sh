@@ -275,7 +275,8 @@ require_regular "$EVALUATOR_RESULT" "orchestrator evaluator result"
 # Validate the hook's exact output lineage and its digest-bound canonical bundle
 # before returning success to the coordinator.
 "$CONTROL_PYTHON" - "$EVALUATOR_RESULT" "$CAMPAIGN_ID" "$MACRO_ROUND" \
-    "$CANDIDATE_MANIFEST_SHA" "$EVALUATOR_CONFIG_SHA" "$RESULTS_DIR" <<'PY'
+    "$CANDIDATE_MANIFEST_SHA" "$EVALUATOR_CONFIG_SHA" "$RESULTS_DIR" \
+    "$CAMPAIGN_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
@@ -303,7 +304,7 @@ if any(document.get(key) != value for key, value in expected.items()):
 bundle = Path(sys.argv[6]) / "evaluation_bundle.json"
 if bundle.is_symlink() or not bundle.is_file():
     raise SystemExit("canonical evaluation evidence bundle is missing or unsafe")
-if document["evidence_bundle_path"] != bundle.relative_to(path.parents[3]).as_posix():
+if document["evidence_bundle_path"] != bundle.relative_to(Path(sys.argv[7])).as_posix():
     raise SystemExit("evaluation evidence bundle path is non-canonical")
 if sha256_file(bundle) != document["evidence_bundle_sha256"]:
     raise SystemExit("evaluation evidence bundle SHA mismatch")

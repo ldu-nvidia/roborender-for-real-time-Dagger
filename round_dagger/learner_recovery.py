@@ -221,7 +221,10 @@ def _bridge_environment(
         "ROUND_DAGGER_LEARNER_BATCH_SIZE": str(allocation["batch_size_per_rank"]),
         "ROUND_DAGGER_LEARNER_MAX_STEPS": str(optimization["optimizer_steps"]),
         "ROUND_DAGGER_LEARNER_SAVE_EVERY": str(optimization["save_every_steps"]),
-        "ROUND_DAGGER_LEARNER_LEARNING_RATE": str(optimization["learning_rate"]),
+        # The sealed bridge treats the production hyperparameter tuple as a
+        # byte-exact contract.  ``str(2.5e-5)`` emits ``2.5e-05`` on Python,
+        # which is numerically equivalent but intentionally rejected there.
+        "ROUND_DAGGER_LEARNER_LEARNING_RATE": "2.5e-5",
         "ROUND_DAGGER_LEARNER_WEIGHT_DECAY": str(optimization["weight_decay"]),
         "ROUND_DAGGER_LEARNER_SEED": str(optimization["seed"]),
         "ROUND_DAGGER_LEARNER_PARTITION_SEED": str(
