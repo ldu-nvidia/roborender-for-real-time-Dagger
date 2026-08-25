@@ -19,6 +19,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from reference_history import LaggedReferenceStore
+from renderer_identity import (
+    REFERENCE_PROVENANCE_SCHEMA,
+    canonical_json_sha256,
+    describe_renderer_identity,
+)
 from runtime_identity import describe_runtime_identity
 from shutdown_control import StopController
 
@@ -36,6 +41,26 @@ DROID_PARAMS = {
     "hand_left": dict(raw_clip=(0.0, 5.0), inv_clip=(1.0, 100.0), raw_pct=(1, 99)),
     "hand_right": dict(raw_clip=(0.0, 5.0), inv_clip=(1.0, 100.0), raw_pct=(1, 99)),
 }
+
+
+def reference_provenance(*, step: int, lag: int, source: str) -> dict[str, object]:
+    """Build a strict proof of the RGB reference selected by the history store."""
+
+    step = int(step)
+    lag = int(lag)
+    expected_source = "anchor" if step < lag else f"generated_t-{lag}"
+    if source != expected_source:
+        raise RuntimeError(
+            "reference history/source mismatch: "
+            f"step={step} lag={lag} expected={expected_source!r} got={source!r}"
+        )
+    return {
+        "schema": REFERENCE_PROVENANCE_SCHEMA,
+        "request_step": step,
+        "configured_lag": lag,
+        "kind": "anchor" if step < lag else "generated",
+        "source_step": 0 if step < lag else step - lag,
+    }
 
 
 def h5v4(d, raw_clip, inv_clip, raw_pct=None, invalid_fill="far"):
@@ -166,6 +191,8 @@ def handle_conn(
     references,
     metrics,
     runtime_identity,
+    renderer_identity,
+    renderer_identity_sha256,
     connections,
 ):
     print(f"tcp client {addr}", flush=True)
@@ -188,6 +215,8 @@ def handle_conn(
                         "output_stacked_shape_hwc": [len(VIEW_MAP) * H, W, 3],
                     },
                     "runtime_identity": runtime_identity,
+                    "renderer_identity": renderer_identity,
+                    "renderer_identity_sha256": renderer_identity_sha256,
                     "history": references.stats(),
                     "metrics": metrics.snapshot(),
                 })
@@ -219,21 +248,29 @@ def handle_conn(
                         raise ValueError(
                             f"reference_lag {reference_lag} exceeds server maximum {max_lag}"
                         )
-                    replay = references.replay(
+                    replay = references.replay_with_source(
                         stream_id=stream_id,
                         episode_id=episode_id,
                         step=step,
                         request_id=request_id,
                     )
                     if replay is not None:
+                        replay_views, replay_source = replay
+                        provenance = reference_provenance(
+                            step=step, lag=reference_lag, source=replay_source
+                        )
                         metrics.record_replay()
                         _send_msg(sock, {
                             "ok": True,
-                            "views": {v: encode_array(image) for v, image in replay.items()},
+                            "views": {
+                                v: encode_array(image) for v, image in replay_views.items()
+                            },
                             "ms": 0.0,
                             "queue_ms": 0.0,
                             "inference_ms": 0.0,
-                            "reference_source": "idempotent_replay",
+                            "reference_source": replay_source,
+                            "reference_provenance": provenance,
+                            "renderer_identity_sha256": renderer_identity_sha256,
                             "stream_step": step,
                             "replayed": True,
                         })
@@ -284,6 +321,13 @@ def handle_conn(
                 out = {v: encode_array(image) for v, image in out_arrays.items()}
                 ms = (time.perf_counter() - t0) * 1000
                 metrics.record(ms=ms, queue_ms=queue_ms, inference_ms=inference_ms)
+                provenance = (
+                    reference_provenance(
+                        step=step, lag=reference_lag, source=reference_source
+                    )
+                    if reference_lag
+                    else None
+                )
                 _send_msg(sock, {
                     "ok": True,
                     "views": out,
@@ -291,6 +335,8 @@ def handle_conn(
                     "queue_ms": queue_ms,
                     "inference_ms": inference_ms,
                     "reference_source": reference_source,
+                    "reference_provenance": provenance,
+                    "renderer_identity_sha256": renderer_identity_sha256,
                     "stream_step": step if reference_lag else None,
                 })
             except Exception as exc:
@@ -419,6 +465,8 @@ def tcp_listener(
     references,
     metrics,
     runtime_identity,
+    renderer_identity,
+    renderer_identity_sha256,
     stopped,
     connections,
 ):
@@ -444,6 +492,8 @@ def tcp_listener(
                 references,
                 metrics,
                 runtime_identity,
+                renderer_identity,
+                renderer_identity_sha256,
                 connections,
             ),
             daemon=True,
@@ -482,6 +532,14 @@ def main():
     session = Image3FSession(memory_mode="auto", vae_mode="untiled",
                              model_root=os.environ["ROBORENDER_MODEL_BASE"])
     runtime_identity = describe_runtime_identity(session)
+    renderer_identity = describe_renderer_identity(
+        runtime_identity,
+        server_script=Path(__file__),
+        expected_server_script_sha256=os.environ.get(
+            "IMAGE3F_EXPECT_SERVER_SCRIPT_SHA256"
+        ),
+    )
+    renderer_identity_sha256 = canonical_json_sha256(renderer_identity)
     session_lock = threading.Lock()
     references = LaggedReferenceStore(
         max_streams=int(os.environ.get("IMAGE3F_MAX_STREAMS", "64"))
@@ -505,6 +563,8 @@ def main():
             references,
             metrics,
             runtime_identity,
+            renderer_identity,
+            renderer_identity_sha256,
             stopped,
             connections,
         ),

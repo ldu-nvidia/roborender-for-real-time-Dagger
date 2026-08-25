@@ -293,6 +293,7 @@ class WandbRunWatcherTest(unittest.TestCase):
             self.assertTrue(payload["entity_is_team"])
             self.assertFalse(payload["personal"])
             self.assertEqual(payload["project"], "dagger")
+            self.assertEqual(payload["telemetry_scope"], "production")
             self.assertEqual(payload["wandb_run_id"], "stable_run_1")
             self.assertNotIn("key", json.dumps(payload).lower())
 
@@ -394,12 +395,192 @@ class WandbRunWatcherTest(unittest.TestCase):
                 first["id"],
             )
             for call in (first, second):
+                self.assertEqual(call["job_type"], "dagger-observability-sidecar")
+                self.assertEqual(call["config"]["telemetry_scope"], "production")
                 self.assertEqual(call["config"]["account_email"], "ldu@nvidia.com")
                 self.assertEqual(call["config"]["entity"], "nvidia")
                 self.assertEqual(call["config"]["authorization_scope"], "team")
                 self.assertTrue(call["config"]["team_member"])
                 self.assertTrue(call["config"]["entity_is_team"])
                 self.assertFalse(call["config"]["personal"])
+
+    def test_precreated_id_without_initialized_marker_recovers_with_allow(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_id_file = root / "telemetry" / "WANDB_SIDECAR_RUN_ID"
+            state_file = root / "telemetry" / ".wandb_upload_state.json"
+            run_id_file.parent.mkdir(parents=True)
+            run_id_file.write_text("interrupted_local_id\n", encoding="utf-8")
+            watcher.save_state(
+                state_file,
+                {"telemetry/images/stale.png": "1:2"},
+                run_id="interrupted_local_id",
+            )
+            fake_wandb = FakeWandb()
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
+            arguments = [
+                "--run-dir", str(root), "--project", "dagger",
+                "--expected-email", "ldu@nvidia.com", "--entity", "nvidia",
+                "--authorization-scope", "team", "--min-age-s", "0", "--once",
+            ]
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), \
+                 mock.patch.object(watcher, "_load_wandb", return_value=fake_wandb), \
+                 mock.patch.object(watcher, "query_identity", return_value=identity):
+                self.assertEqual(watcher.main(arguments), 0)
+
+            self.assertEqual(fake_wandb.init_calls[0]["id"], "interrupted_local_id")
+            self.assertEqual(fake_wandb.init_calls[0]["resume"], "allow")
+            self.assertEqual(
+                watcher.load_state(
+                    state_file, expected_run_id="interrupted_local_id"
+                ),
+                {},
+            )
+            marker = root / "telemetry" / "WANDB_SIDECAR_INITIALIZED.json"
+            self.assertTrue(
+                watcher.load_initialized_marker(
+                    marker, expected_run_id="interrupted_local_id"
+                )
+            )
+
+    def test_remote_initialization_failure_is_sanitized_and_not_acknowledged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            secret = "wandb_v1_never_print_me"
+            fake_wandb = FakeWandb()
+            fake_wandb.init = mock.Mock(side_effect=RuntimeError(secret))
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), \
+                 mock.patch.object(watcher, "_load_wandb", return_value=fake_wandb), \
+                 mock.patch.object(watcher, "query_identity", return_value=identity), \
+                 contextlib.redirect_stderr(stderr):
+                code = watcher.main([
+                    "--run-dir", str(root), "--project", "dagger",
+                    "--expected-email", "ldu@nvidia.com", "--entity", "nvidia",
+                    "--authorization-scope", "team", "--once",
+                ])
+            self.assertEqual(code, 2)
+            self.assertIn("remote initialization failed (RuntimeError)", stderr.getvalue())
+            self.assertNotIn(secret, stderr.getvalue())
+            self.assertFalse(
+                (root / "telemetry" / "WANDB_SIDECAR_INITIALIZED.json").exists()
+            )
+
+    def test_initialized_marker_cannot_cross_project_or_telemetry_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "initialized.json"
+            watcher.write_initialized_marker(
+                marker,
+                run_id="stable_run",
+                telemetry_scope="production",
+                project="production-project",
+                entity="nvidia",
+            )
+            self.assertTrue(
+                watcher.load_initialized_marker(
+                    marker,
+                    expected_run_id="stable_run",
+                    telemetry_scope="production",
+                    project="production-project",
+                    entity="nvidia",
+                )
+            )
+            for scope, project, entity in (
+                ("bounded-validation", "production-project", "nvidia"),
+                ("production", "other-project", "nvidia"),
+                ("production", "production-project", "other-team"),
+            ):
+                with self.subTest(scope=scope, project=project, entity=entity):
+                    with self.assertRaisesRegex(
+                        watcher.ArtifactError, "does not match"
+                    ):
+                        watcher.load_initialized_marker(
+                            marker,
+                            expected_run_id="stable_run",
+                            telemetry_scope=scope,
+                            project=project,
+                            entity=entity,
+                        )
+
+    def test_bounded_validation_is_labeled_and_rejects_production_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            default_production = root / "telemetry" / "WANDB_PUBLIC_CONFIG.json"
+            default_production.parent.mkdir(parents=True)
+            # Bounded validation must neither validate nor import a production
+            # topology projection accidentally left in the same run tree.
+            default_production.write_text(
+                '{"production_only":true}\n', encoding="utf-8"
+            )
+            fake_wandb = FakeWandb()
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
+            arguments = [
+                "--run-dir",
+                str(root),
+                "--project",
+                "dagger-validation",
+                "--expected-email",
+                "ldu@nvidia.com",
+                "--entity",
+                "nvidia",
+                "--authorization-scope",
+                "team",
+                "--telemetry-scope",
+                "bounded-validation",
+                "--min-age-s",
+                "0",
+                "--once",
+            ]
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), \
+                 mock.patch.object(watcher, "_load_wandb", return_value=fake_wandb), \
+                 mock.patch.object(watcher, "query_identity", return_value=identity):
+                self.assertEqual(watcher.main(arguments), 0)
+
+            call = fake_wandb.init_calls[0]
+            self.assertEqual(
+                call["job_type"], "dagger-bounded-validation-sidecar"
+            )
+            self.assertEqual(call["config"]["telemetry_scope"], "bounded-validation")
+            ready = json.loads(
+                (root / "telemetry" / "WANDB_WATCHER_READY.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(ready["telemetry_scope"], "bounded-validation")
+
+            forbidden = root / "telemetry" / "production.json"
+            forbidden.write_text("{}\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), mock.patch.object(
+                watcher, "_load_wandb", side_effect=AssertionError("must fail first")
+            ):
+                self.assertEqual(
+                    watcher.main(arguments[:-1] + ["--config-json", str(forbidden), "--once"]),
+                    2,
+                )
+            self.assertIn("cannot use production public config", stderr.getvalue())
 
     def test_final_drain_waits_a_full_stability_window(self):
         deadline, complete = watcher.update_final_drain(

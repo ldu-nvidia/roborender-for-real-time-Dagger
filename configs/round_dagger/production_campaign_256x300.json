@@ -1,0 +1,126 @@
+{
+  "schema": "fast_roborender.round_dagger.production_campaign_contract.v1",
+  "campaign_id": "roborender-dagger-256x300-v1",
+  "topology": {
+    "target_environments": 256,
+    "active_environments": 64,
+    "cohort_count": 4,
+    "environments_per_actor_rank": 32,
+    "actor_ranks_per_cohort": 2,
+    "steps_per_environment": 300,
+    "transitions_per_cohort": 19200,
+    "transitions_per_macro_round": 76800
+  },
+  "observation_contract": {
+    "primary_view": "head_color",
+    "policy_views": [
+      "head_color",
+      "hand_left",
+      "hand_right"
+    ],
+    "policy_image_shape": [
+      324,
+      192,
+      3
+    ],
+    "policy_view_layout": "vertical",
+    "reference_lag_frames": 256
+  },
+  "action_contract": {
+    "policy_action_dim": 11,
+    "homie_action_dim": 15,
+    "replay_action_dim": 26,
+    "simulator_action_dim": 31,
+    "train_action_slice": [
+      0,
+      11
+    ]
+  },
+  "beta_schedule": {
+    "kind": "linear",
+    "start": 1.0,
+    "end": 0.0,
+    "decay_rounds": 10,
+    "rate": 1.0
+  },
+  "artifacts": {
+    "bootstrap_bundle": {
+      "checkpoint_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v5_20260825T0456Z/student-v0.pt",
+      "checkpoint_sha256": "3b3a9ac168eaf163a566772679a5bb4b8ec73c9947c9b51668ac08f9a014abae",
+      "runtime_policy_sha256": "fd1fd8f290fd603e05251f3798f40fd29b8028041e701e6240ac1ae4541f67b6",
+      "policy_spec_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v5_20260825T0456Z/student-v0.pt.policy_spec.json",
+      "policy_spec_sha256": "216cf3a2802ede98bf208ff7fb3925163973e2e32d823c1d6b1efa4dfeec24cb",
+      "manifest_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v5_20260825T0456Z/student-v0.pt.manifest.json",
+      "manifest_sha256": "ca103a67843c004dd2293a3b96927807e951ac477847023d646ffb091ff20379"
+    },
+    "teacher": {
+      "checkpoint_path": "/mnt/data1/ldu/research/fast_roborender/GR00T-VisualSim2Real/logs_rl/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q9_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--3500.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251105_004910/model_step_044500.pt",
+      "checkpoint_sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38"
+    },
+    "renderer": {
+      "cohort_identity_sha256": "a82f639a9038789db220793475dfce3eb5651ff3145287be748f387a20caeb9f",
+      "runtime_identity_sha256": "8a172fc0819cdeb6f047ca60605c7f2a00920c88ce8ef202b40a4ab43e656809"
+    },
+    "endpoint_manifest": {
+      "path": "/mnt/data2/ldu/roborender_round_dagger_validation/fleet_two_gpu_provenance_v2/endpoint_manifest.txt",
+      "sha256": "d075c02b3e8aace7c1a4b2ef1e0b694738052da66bea6300299a7c4fd6956be6",
+      "endpoint_directory": "/mnt/data2/ldu/roborender_round_dagger_validation/fleet_two_gpu_provenance_v2/endpoints",
+      "renderer_count": 2
+    },
+    "anchor_pool": {
+      "path": "/mnt/data1/ldu/research/fast_roborender/runtime/hsg_stage_transfer/anchor_pool_2048",
+      "anchor_count": 2048,
+      "inventory_sha256": "ee358a97581512a5d03730d06efd5804e53844f517112dc0a845ed86b6dae46f",
+      "inventory_algorithm": "len64be(path_utf8)+path_utf8+size64be+sha256_binary"
+    },
+    "camera_acceptance": {
+      "path": "/mnt/data2/ldu/roborender_round_dagger_validation/production_inputs_v1/camera/camera_calibration_acceptance.json",
+      "sha256": "53234dfe2eab9b1ae02df21e143f996ecde831aadb8aacb2e5f2df632d3d8d27",
+      "reviewer": "ldu@nvidia.com"
+    },
+    "actor_image": {
+      "name": "roborender-round-actor:isaaclab2.3.0-local-v2",
+      "image_id": "sha256:65a0cbe64eb71ee2edb672bed3ec7bdaa8adfeb22298c0e99af8b91d74dc78f8"
+    }
+  },
+  "actor_runtime": {
+    "docker_bin": "/usr/bin/docker",
+    "gr00t_root": "/mnt/data1/ldu/research/fast_roborender/GR00T-VisualSim2Real",
+    "gr00t_python": "/opt/round-dagger-rtx/bin/python",
+    "pair_executor": "/mnt/data1/ldu/research/fast_roborender/scripts/round_dagger/run_actor_rank_docker.sh",
+    "pair_rank_script": "/mnt/data1/ldu/research/fast_roborender/scripts/round_dagger/run_actor_cohort_with_wandb.sh",
+    "gpu_ids": "0,1",
+    "ipc": "private",
+    "shm_size": "32g",
+    "mount_roots": "/mnt/data1,/mnt/data2",
+    "rank_stagger_seconds": 10,
+    "environments_per_shard": 4,
+    "rollout_id": 0
+  },
+  "telemetry": {
+    "required": true,
+    "require_video": true,
+    "scalar_every_steps": 10,
+    "image_every_steps": 300,
+    "clip_every_steps": 300,
+    "clip_frames": 32,
+    "clip_fps": 10
+  },
+  "wandb": {
+    "enabled": true,
+    "expected_email": "ldu@nvidia.com",
+    "entity": "nvidia",
+    "authorization_scope": "team",
+    "project": "roborender-round-dagger",
+    "python": "/opt/round-dagger-rtx/bin/python",
+    "netrc": "/mnt/data1/ldu/research/fast_roborender/runtime/round_dagger_credentials/.netrc"
+  },
+  "evaluation": {
+    "hydra_config_path": "/mnt/data2/ldu/roborender_round_dagger_validation/actor_train_smoke_4cohort_1env_2step_v1/cohort_00/run/config.yaml",
+    "hydra_config_sha256": "e29857c6e4b51bc2241c6e1101c0bff12204ca6dc8d81070169d6b8927fe7933",
+    "scenario_contract": "configs/round_dagger/production_paired_scenarios_2x8.json",
+    "scenario_contract_sha256": "99081ebee907ef36c388cf62a1d134c015d289776526cacc1db114a87074e724",
+    "threshold_contract": "configs/round_dagger/production_paired_thresholds.json",
+    "threshold_contract_sha256": "1721049b8fcd8c4e0eefdbd581fcca6d77bc6cf8d5f9ffc789ae4a817d7a36ee"
+  }
+}

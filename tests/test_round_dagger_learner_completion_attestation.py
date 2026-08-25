@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from round_dagger.artifacts import publish_immutable_json, sha256_file
+from scripts.round_dagger import learner_completion_attestation as completion
+from scripts.round_dagger import remote_learner_success
+from tests.policy_bundle_helpers import publish_policy_bundle
+
+
+class LearnerCompletionAttestationTest(unittest.TestCase):
+    def _fixture(self, root: Path) -> dict[str, object]:
+        output = root / "learner"
+        output.mkdir()
+        campaign = "completion-crash-window"
+        macro_round = 0
+        code_sha = "1" * 64
+        parent_sha = "2" * 64
+        snapshot_file_sha = "3" * 64
+        snapshot_sha = "4" * 64
+
+        restart = output / "restart.pt"
+        restart.write_bytes(b"complete-eight-rank-restart")
+        candidate = output / "candidate_round_000000.pt"
+        candidate.write_bytes(restart.read_bytes())
+        candidate_runtime = "5" * 64
+        spec, manifest = publish_policy_bundle(candidate, candidate_runtime)
+
+        bundle = {
+            "schema": completion.BUNDLE_SCHEMA,
+            "campaign_id": campaign,
+            "macro_round": macro_round,
+            "model_lineage_sha256": parent_sha,
+            "code_sha256": code_sha,
+            "rgb_mean": [0.485, 0.456, 0.406],
+            "rgb_std": [0.229, 0.224, 0.225],
+            "rgb_input_key": "vision_obs",
+            "rgb_layout": "NHWC",
+            "output_key": "actions",
+            "observation_key_map": {},
+            "train_action_slice": [0, 11],
+            "batch_size": 8,
+            "max_steps": 500,
+            "save_every": 5,
+            "learning_rate": 2.5e-5,
+            "weight_decay": 0.01,
+            "seed": 17,
+            "partition_seed": 23,
+            "initial_checkpoint_sha256": parent_sha,
+            "model_config": {},
+        }
+        bundle_path = output / "learner_bundle_round_000000.json"
+        config_sha = publish_immutable_json(bundle_path, bundle)
+        telemetry = output / "telemetry.jsonl"
+        telemetry.write_text("sealed telemetry\n", encoding="utf-8")
+        readback = output / "wandb_learner_readback_round_000000.json"
+        publish_immutable_json(
+            readback,
+            {
+                "schema": completion.READBACK_SCHEMA,
+                "status": "PASS",
+                "account_email": "ldu@nvidia.com",
+                "entity": "nvidia",
+                "authorization_scope": "team",
+                "team_member": True,
+                "entity_is_team": True,
+                "personal": False,
+                "project": "roborender-round-dagger",
+                "run_id": f"{campaign}-learner-m000000",
+                "run_state": "finished",
+                "campaign_id": campaign,
+                "macro_round": macro_round,
+                "learner_config_sha256": config_sha,
+                "model_lineage_sha256": parent_sha,
+                "verified_optimizer_steps": 500,
+                "first_optimizer_step": 1,
+                "last_optimizer_step": 500,
+            },
+        )
+        result = output / "learner_result_round_000000.json"
+        result_doc = {
+            "schema": completion.RESULT_SCHEMA,
+            "campaign_id": campaign,
+            "macro_round": macro_round,
+            "checkpoint_path": candidate.name,
+            "checkpoint_sha256": sha256_file(candidate),
+            "runtime_policy_sha256": candidate_runtime,
+            "policy_spec_path": spec.name,
+            "policy_spec_sha256": sha256_file(spec),
+            "policy_bundle_manifest_path": manifest.name,
+            "policy_bundle_manifest_sha256": sha256_file(manifest),
+            "model_lineage_sha256": parent_sha,
+            "replay_snapshot_sha256": snapshot_sha,
+            "code_sha256": code_sha,
+            "learner_config_sha256": config_sha,
+            "optimizer_steps": 500,
+            "initial_loss": 1.0,
+            "final_loss": 0.5,
+        }
+        publish_immutable_json(result, result_doc)
+        artifacts = {
+            "bundle": {"path": bundle_path.name, "sha256": sha256_file(bundle_path)},
+            "result": {"path": result.name, "sha256": sha256_file(result)},
+            "restart": {"path": restart.name, "sha256": sha256_file(restart)},
+            "candidate": {"path": candidate.name, "sha256": sha256_file(candidate)},
+            "policy_spec": {"path": spec.name, "sha256": sha256_file(spec)},
+            "policy_manifest": {"path": manifest.name, "sha256": sha256_file(manifest)},
+            "telemetry": {"path": telemetry.name, "sha256": sha256_file(telemetry)},
+            "wandb_readback": {"path": readback.name, "sha256": sha256_file(readback)},
+        }
+        attestation = output / "learner_completion_round_000000.json"
+        publish_immutable_json(
+            attestation,
+            {
+                "schema": completion.SCHEMA,
+                "status": "PASS",
+                "campaign_id": campaign,
+                "macro_round": macro_round,
+                "code_sha256": code_sha,
+                "learner_config_sha256": config_sha,
+                "model_lineage_sha256": parent_sha,
+                "runtime_policy_sha256": candidate_runtime,
+                "replay_snapshot_file_sha256": snapshot_file_sha,
+                "replay_snapshot_sha256": snapshot_sha,
+                "world_size": 8,
+                "batch_size_per_rank": 8,
+                "optimizer_steps": 500,
+                "save_every": 5,
+                "artifacts": artifacts,
+                "wandb": {
+                    "entity": "nvidia",
+                    "project": "roborender-round-dagger",
+                    "run_id": f"{campaign}-learner-m000000",
+                    "run_state": "finished",
+                    "verified_optimizer_steps": 500,
+                },
+            },
+        )
+        return {
+            "output": output,
+            "attestation": attestation,
+            "result": result,
+            "restart": restart,
+            "campaign_id": campaign,
+            "macro_round": macro_round,
+            "code_sha256": code_sha,
+            "config_sha256": config_sha,
+            "parent_sha256": parent_sha,
+            "snapshot_file_sha256": snapshot_file_sha,
+            "snapshot_sha256": snapshot_sha,
+        }
+
+    @staticmethod
+    def _verify_args(fixture: dict[str, object]) -> dict[str, object]:
+        return {
+            key: fixture[key]
+            for key in (
+                "campaign_id",
+                "macro_round",
+                "code_sha256",
+                "config_sha256",
+                "parent_sha256",
+                "snapshot_file_sha256",
+                "snapshot_sha256",
+            )
+        }
+
+    def test_exact_crash_window_is_adopted_without_training(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            verified = completion.verify_attestation(
+                fixture["attestation"],
+                result=fixture["result"],
+                **self._verify_args(fixture),
+            )
+            self.assertEqual(verified["status"], "PASS")
+            marker = Path(temporary) / "job/learner_success.json"
+            first = remote_learner_success.publish(
+                marker,
+                fixture["result"],
+                fixture["attestation"],
+                campaign_id=fixture["campaign_id"],
+                macro_round=fixture["macro_round"],
+                learner_code_sha256=fixture["code_sha256"],
+                learner_config_sha256=fixture["config_sha256"],
+            )
+            self.assertEqual(
+                remote_learner_success.verify(
+                    marker,
+                    fixture["result"],
+                    fixture["attestation"],
+                    campaign_id=fixture["campaign_id"],
+                    macro_round=fixture["macro_round"],
+                    learner_code_sha256=fixture["code_sha256"],
+                    learner_config_sha256=fixture["config_sha256"],
+                ),
+                first,
+            )
+
+    def test_restart_or_readback_tamper_is_rejected(self) -> None:
+        for artifact in ("restart", "wandb_learner_readback_round_000000.json"):
+            with self.subTest(artifact=artifact), tempfile.TemporaryDirectory() as temporary:
+                fixture = self._fixture(Path(temporary))
+                path = (
+                    fixture["restart"]
+                    if artifact == "restart"
+                    else fixture["output"] / artifact
+                )
+                path.chmod(0o644)
+                path.write_bytes(path.read_bytes() + b"tamper")
+                with self.assertRaisesRegex(
+                    completion.CompletionAttestationError, "changed after completion"
+                ):
+                    completion.verify_attestation(
+                        fixture["attestation"],
+                        result=fixture["result"],
+                        **self._verify_args(fixture),
+                    )
+
+    def test_wrong_snapshot_or_missing_attestation_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            arguments = self._verify_args(fixture)
+            arguments["snapshot_sha256"] = "f" * 64
+            with self.assertRaisesRegex(
+                completion.CompletionAttestationError, "lineage mismatch"
+            ):
+                completion.verify_attestation(
+                    fixture["attestation"], result=fixture["result"], **arguments
+                )
+            fixture["attestation"].unlink()
+            with self.assertRaisesRegex(
+                completion.CompletionAttestationError, "missing or unsafe"
+            ):
+                completion.verify_attestation(
+                    fixture["attestation"],
+                    result=fixture["result"],
+                    **self._verify_args(fixture),
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

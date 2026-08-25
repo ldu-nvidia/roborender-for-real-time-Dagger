@@ -27,6 +27,23 @@ import numpy as np
 
 
 PROTOCOL_VERSION = 2
+REFERENCE_PROVENANCE_SCHEMA = "image3f.reference_provenance.v1"
+
+
+def _logical_actor_rank() -> int:
+    """Return the actor rank, including independent non-DDP collectors."""
+
+    raw = os.environ.get(
+        "ROUND_DAGGER_ACTOR_RANK",
+        os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")),
+    )
+    try:
+        rank = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid actor rank {raw!r}") from exc
+    if rank < 0:
+        raise ValueError(f"invalid actor rank {rank}")
+    return rank
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -97,6 +114,54 @@ def _validate_output_views(views: dict[str, np.ndarray]) -> None:
             )
 
 
+def _validate_reference_provenance(
+    response: Mapping[str, object], *, step: int, lag: int
+) -> dict[str, object]:
+    """Fail closed unless the server attests the exact effective RGB reference."""
+
+    step = int(step)
+    lag = int(lag)
+    expected_source = "anchor" if step < lag else f"generated_t-{lag}"
+    expected = {
+        "schema": REFERENCE_PROVENANCE_SCHEMA,
+        "request_step": step,
+        "configured_lag": lag,
+        "kind": "anchor" if step < lag else "generated",
+        "source_step": 0 if step < lag else step - lag,
+    }
+    observed = response.get("reference_provenance")
+    if observed != expected:
+        raise RuntimeError(
+            "Image3F reference provenance mismatch: "
+            f"expected {expected!r}, got {observed!r}"
+        )
+    if response.get("reference_source") != expected_source:
+        raise RuntimeError(
+            "Image3F reference source mismatch: "
+            f"expected {expected_source!r}, got {response.get('reference_source')!r}"
+        )
+    if response.get("stream_step") != step:
+        raise RuntimeError(
+            "Image3F stream step mismatch: "
+            f"expected {step}, got {response.get('stream_step')!r}"
+        )
+    return expected
+
+
+def _validate_renderer_identity(response: Mapping[str, object]) -> None:
+    """Bind every DAgger render response to the cohort's renderer identity."""
+
+    expected = os.environ.get("ROUND_DAGGER_RENDERER_SHA256")
+    if expected is None:
+        return
+    observed = response.get("renderer_identity_sha256")
+    if observed != expected:
+        raise RuntimeError(
+            "Image3F renderer identity mismatch: "
+            f"expected {expected!r}, got {observed!r}"
+        )
+
+
 def _read_endpoint(path: str | os.PathLike[str]) -> tuple[str, int]:
     fields = Path(path).read_text(encoding="utf-8").split()
     if len(fields) != 2:
@@ -124,7 +189,7 @@ class Image3FFrameClient:
         self._socket: socket.socket | None = None
         self._lock = threading.Lock()
         self._stream_slot = int(stream_slot or 0)
-        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+        rank = _logical_actor_rank()
         run_id = os.environ.get("IMAGE3F_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
         self._stream_id = f"{run_id}:rank{rank}:env{self._stream_slot}"
         self._auto_episode = -1
@@ -161,7 +226,7 @@ class Image3FFrameClient:
                 raise FileNotFoundError(
                     f"no selected Image3F endpoints in {endpoint_manifest or endpoint_dir}"
                 )
-            rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+            rank = _logical_actor_rank()
             if local_envs < 1:
                 raise ValueError("IMAGE3F_LOCAL_ENVS must be set with IMAGE3F_ENDPOINT_DIR")
             global_slot = rank * local_envs + local_slot
@@ -309,9 +374,16 @@ class Image3FFrameClient:
             payload["trainer_step"] = int(trainer_step)
         started = time.perf_counter()
         response = self._request(payload)
+        _validate_renderer_identity(response)
+        if reference_lag > 0:
+            _validate_reference_provenance(
+                response, step=int(step), lag=reference_lag
+            )
         self.last_metadata = {
             key: value for key, value in response.items() if key not in ("ok", "views")
         }
+        if reference_lag > 0:
+            self.last_metadata["reference_provenance_valid"] = True
         self.last_metadata["client_wall_ms"] = (time.perf_counter() - started) * 1000.0
         if using_auto_metadata:
             self._auto_step += 1

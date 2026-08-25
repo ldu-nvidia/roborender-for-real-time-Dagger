@@ -32,6 +32,28 @@ class StoreBackedServer:
         self.server.close()
         self.thread.join(timeout=2)
 
+    @staticmethod
+    def _reference_metadata(*, step, lag, source):
+        """Mirror the production server's exact lag-reference attestation."""
+
+        expected_source = "anchor" if step < lag else f"generated_t-{lag}"
+        if source != expected_source:
+            raise RuntimeError(
+                "reference history/source mismatch: "
+                f"step={step} lag={lag} expected={expected_source!r} got={source!r}"
+            )
+        return {
+            "reference_source": source,
+            "reference_provenance": {
+                "schema": protocol.REFERENCE_PROVENANCE_SCHEMA,
+                "request_step": step,
+                "configured_lag": lag,
+                "kind": "anchor" if step < lag else "generated",
+                "source_step": 0 if step < lag else step - lag,
+            },
+            "stream_step": step,
+        }
+
     def _run(self):
         while not self.stop_event.is_set():
             try:
@@ -53,18 +75,20 @@ class StoreBackedServer:
                 stream = request["stream_id"]
                 episode = request["episode_id"]
                 step = request["step"]
+                lag = request["reference_lag"]
                 request_id = request["request_id"]
                 anchor = {
                     view: protocol._decode_array(image)
                     for view, image in request["prev"].items()
                 }
-                replay = self.store.replay(
+                replay = self.store.replay_with_source(
                     stream_id=stream,
                     episode_id=episode,
                     step=step,
                     request_id=request_id,
                 )
                 if replay is not None:
+                    replay_views, reference_source = replay
                     self.replays += 1
                     protocol._send_msg(
                         conn,
@@ -72,19 +96,24 @@ class StoreBackedServer:
                             "ok": True,
                             "views": {
                                 view: protocol._encode_array(image)
-                                for view, image in replay.items()
+                                for view, image in replay_views.items()
                             },
                             "replayed": True,
+                            **self._reference_metadata(
+                                step=step,
+                                lag=lag,
+                                source=reference_source,
+                            ),
                         },
                     )
                     continue
                 prepared = False
                 try:
-                    reference, _ = self.store.prepare(
+                    reference, reference_source = self.store.prepare(
                         stream_id=stream,
                         episode_id=episode,
                         step=step,
-                        lag=request["reference_lag"],
+                        lag=lag,
                         anchor=anchor,
                         request_id=request_id,
                     )
@@ -115,6 +144,11 @@ class StoreBackedServer:
                                 view: protocol._encode_array(image)
                                 for view, image in generated.items()
                             },
+                            **self._reference_metadata(
+                                step=step,
+                                lag=lag,
+                                source=reference_source,
+                            ),
                         },
                     )
                 except Exception as exc:
@@ -132,6 +166,7 @@ class ProtocolIntegrationTest(unittest.TestCase):
         condition = {"head_color": np.zeros((2, 3), dtype=np.uint8)}
         mask = {"head_color": np.zeros((2, 3, 3), dtype=np.uint8)}
         try:
+            metadata = []
             for step in range(4):
                 output = client.render_frame(
                     condition,
@@ -144,8 +179,16 @@ class ProtocolIntegrationTest(unittest.TestCase):
                     reference_lag=3,
                 )
                 self.assertEqual(int(output["head_color"][0, 0, 0]), step + 10)
+                metadata.append(dict(client.last_metadata))
             self.assertGreaterEqual(server.replays, 1)
             self.assertEqual(server.reference_values[:4], [99, 99, 99, 10])
+            self.assertTrue(metadata[0]["replayed"])
+            self.assertEqual(metadata[0]["reference_source"], "anchor")
+            self.assertEqual(metadata[0]["reference_provenance"]["source_step"], 0)
+            self.assertEqual(metadata[2]["reference_source"], "anchor")
+            self.assertEqual(metadata[3]["reference_source"], "generated_t-3")
+            self.assertEqual(metadata[3]["reference_provenance"]["kind"], "generated")
+            self.assertEqual(metadata[3]["reference_provenance"]["source_step"], 0)
 
             with self.assertRaisesRegex(RuntimeError, "anchor changed"):
                 client.render_frame(
@@ -170,6 +213,8 @@ class ProtocolIntegrationTest(unittest.TestCase):
                 reference_lag=3,
             )
             self.assertEqual(int(output["head_color"][0, 0, 0]), 10)
+            self.assertEqual(client.last_metadata["reference_source"], "anchor")
+            self.assertEqual(client.last_metadata["stream_step"], 0)
         finally:
             client.close()
             server.stop()

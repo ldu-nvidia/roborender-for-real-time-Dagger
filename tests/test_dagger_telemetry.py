@@ -75,6 +75,14 @@ class DaggerTelemetryTest(unittest.TestCase):
                     "bad_nan": float("nan"),
                     "bad_inf": float("inf"),
                     "reference_source": "anchor",
+                    "reference_provenance_valid": True,
+                    "reference_provenance": {
+                        "schema": "image3f.reference_provenance.v1",
+                        "request_step": 0,
+                        "configured_lag": 256,
+                        "kind": "anchor",
+                        "source_step": 0,
+                    },
                 },
                 **common,
             )
@@ -95,6 +103,13 @@ class DaggerTelemetryTest(unittest.TestCase):
             self.assertNotIn("renderer/reference_source", document["metrics"])
             self.assertEqual(document["metrics"]["renderer/reference_source_anchor"], 1)
             self.assertEqual(document["metrics"]["renderer/reference_source_generated_lag"], 0)
+            self.assertEqual(document["metrics"]["renderer/reference_provenance_valid"], 1)
+            self.assertEqual(
+                document["metrics"]["renderer/reference_provenance/request_step"], 0
+            )
+            self.assertEqual(
+                document["metrics"]["renderer/reference_provenance/source_step"], 0
+            )
             self.assertEqual(document["metrics"]["rollout_frame_step"], 0)
             self.assertEqual(document["metrics"]["policy_update_index"], 0)
             json.dumps(document, allow_nan=False)

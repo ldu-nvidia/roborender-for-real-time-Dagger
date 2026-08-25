@@ -1,8 +1,10 @@
 import json
+import os
 import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts.eval import fixed_seed_gate as gate
@@ -231,13 +233,21 @@ if __name__ == "__main__":
                 encoding="utf-8",
             )
             output = root / "result" / "metrics.json"
-            metrics_adapter.execute_evaluator(evaluator, output, ["+seed=17"])
+            with mock.patch.dict(
+                os.environ,
+                {"IMAGE3F_RUN_ID": "rde-deadbeef-parent-s17-a000001"},
+            ):
+                metrics_adapter.execute_evaluator(evaluator, output, ["+seed=17"])
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(payload["collected_episodes"], 2)
             self.assertEqual(payload["argv"], ["+seed=17"])
             self.assertEqual(
                 payload["_roborender_eval_adapter"]["schema_version"],
                 metrics_adapter.ADAPTER_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                payload["_roborender_eval_adapter"]["image3f_run_id"],
+                "rde-deadbeef-parent-s17-a000001",
             )
 
     def test_adapter_fails_closed_on_source_drift_or_missing_metrics(self):

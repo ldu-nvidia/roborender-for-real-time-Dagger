@@ -290,7 +290,11 @@ def _scan_scalar_points(
             point.relative_path, []
         ).append(point)
     verified_identities: set[tuple[str, int, str]] = set()
-    for row in remote_run.scan_history(page_size=page_size, use_cache=False):
+    # Fetch a fresh ``Api.run`` object on every outer polling attempt instead
+    # of relying on SDK-specific cache controls here.  W&B 0.27 removed the
+    # ``use_cache`` keyword from ``Run.scan_history``; the unprojected,
+    # exhaustive scan remains identical and is portable across supported SDKs.
+    for row in remote_run.scan_history(page_size=page_size):
         if not isinstance(row, dict):
             continue
         step = _history_step(row.get(axis))
@@ -507,7 +511,6 @@ def _verify_remote_media(
     }
     for row in remote_run.scan_history(  # type: ignore[attr-defined]
         page_size=HISTORY_PAGE_SIZE,
-        use_cache=False,
     ):
         if not isinstance(row, dict):
             continue

@@ -52,13 +52,14 @@ class RemoteRun:
         self.history_options = []
         self.sampled_history_calls = []
 
-    def scan_history(self, *, page_size, keys=None, use_cache=True):
+    # Deliberately match W&B 0.27's strict public signature.  Passing removed
+    # SDK-specific keywords such as ``use_cache`` must fail this test double.
+    def scan_history(self, *, page_size, keys=None):
         self.history_calls.append(None if keys is None else tuple(keys))
         self.history_options.append(
             {
                 "page_size": page_size,
                 "keys": None if keys is None else tuple(keys),
-                "use_cache": use_cache,
             }
         )
         if keys is None:
@@ -385,7 +386,7 @@ class WandbTrainingReadbackTest(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                call == {"page_size": 500, "keys": None, "use_cache": False}
+                call == {"page_size": 500, "keys": None}
                 for call in sidecar_remote.history_options
             )
         )
@@ -600,7 +601,7 @@ class WandbTrainingReadbackTest(unittest.TestCase):
         )
         self.assertEqual(
             remote.history_options,
-            [{"page_size": 500, "keys": None, "use_cache": False}],
+            [{"page_size": 500, "keys": None}],
         )
         self.assertEqual(remote.sampled_history_calls, [])
 
@@ -722,7 +723,9 @@ class WandbTrainingReadbackTest(unittest.TestCase):
 
         self.assertEqual(verified, expected)
         self.assertEqual(remote.history_calls, [None])
-        self.assertFalse(remote.history_options[0]["use_cache"])
+        self.assertEqual(
+            remote.history_options, [{"page_size": 500, "keys": None}]
+        )
 
         for bad_value in (None, float("nan"), float("inf")):
             with self.subTest(value=bad_value):
@@ -766,14 +769,11 @@ class WandbTrainingReadbackTest(unittest.TestCase):
         )
 
         class ProjectionDefectiveRun(RemoteRun):
-            def scan_history(
-                self, *, page_size, keys=None, use_cache=True
-            ):
+            def scan_history(self, *, page_size, keys=None):
                 if keys is not None:
                     rows = super().scan_history(
                         page_size=page_size,
                         keys=keys,
-                        use_cache=use_cache,
                     )
                     missing = set(keys[-4:])
                     return iter(
@@ -787,7 +787,6 @@ class WandbTrainingReadbackTest(unittest.TestCase):
                     )
                 return super().scan_history(
                     page_size=page_size,
-                    use_cache=use_cache,
                 )
 
         remote = ProjectionDefectiveRun(
@@ -810,7 +809,9 @@ class WandbTrainingReadbackTest(unittest.TestCase):
         self.assertEqual(verified, expected)
         self.assertEqual(len(verified), 600)
         self.assertEqual(remote.history_calls, [None])
-        self.assertFalse(remote.history_options[0]["use_cache"])
+        self.assertEqual(
+            remote.history_options, [{"page_size": 500, "keys": None}]
+        )
 
     def test_trainer_marker_maps_update_one_to_wandb_step_zero(self):
         with tempfile.TemporaryDirectory() as temporary:

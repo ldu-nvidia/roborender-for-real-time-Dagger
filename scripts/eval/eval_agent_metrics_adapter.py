@@ -29,6 +29,7 @@ from typing import Any
 
 
 ADAPTER_SCHEMA_VERSION = 1
+SAFE_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 EVAL_CALL_RE = re.compile(
     r"^(?P<indent>[ \t]*)trainer\.eval\(\)[ \t]*$", re.MULTILINE
 )
@@ -124,11 +125,21 @@ def write_metrics_atomic(
     if not isinstance(metrics, Mapping):
         raise AdapterError("trainer.eval() must return a metrics mapping")
     payload = _json_value(metrics)
-    payload["_roborender_eval_adapter"] = {
+    adapter = {
         "schema_version": ADAPTER_SCHEMA_VERSION,
         "evaluator_path": str(evaluator_path),
         "evaluator_sha256": evaluator_sha256,
     }
+    # Paired evaluation assigns a fresh stream namespace to every immutable
+    # attempt.  Capture the namespace in the evaluator-produced metrics so the
+    # final outcome can prove which stream identity the Image3F clients used.
+    # Other users of this generic adapter need not set IMAGE3F_RUN_ID.
+    image3f_run_id = os.environ.get("IMAGE3F_RUN_ID")
+    if image3f_run_id is not None:
+        if SAFE_RUN_ID_RE.fullmatch(image3f_run_id) is None:
+            raise AdapterError("IMAGE3F_RUN_ID is not a safe runtime token")
+        adapter["image3f_run_id"] = image3f_run_id
+    payload["_roborender_eval_adapter"] = adapter
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp.{os.getpid()}")
     try:

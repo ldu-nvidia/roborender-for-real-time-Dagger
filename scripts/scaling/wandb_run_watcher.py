@@ -25,6 +25,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import sys
 import tempfile
 import time
@@ -45,14 +46,141 @@ except ModuleNotFoundError:  # Support direct execution by absolute script path.
 STEP_RE = re.compile(r"(?:^|[_-])step[_-]?(\d+)(?:[_-]|$)", re.IGNORECASE)
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 STATE_SCHEMA_VERSION = 2
+INITIALIZED_MARKER_SCHEMA = "fast_roborender.wandb_sidecar_initialized.v2"
+PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v1"
+PUBLIC_CONFIG_KEYS = {
+    "round_dagger/campaign_id",
+    "round_dagger/macro_round",
+    "round_dagger/cohort_index",
+    "round_dagger/cohort_count",
+    "round_dagger/environments_per_cohort",
+    "round_dagger/target_environments",
+    "round_dagger/steps_per_environment",
+    "round_dagger/transitions_per_cohort",
+    "round_dagger/transitions_per_macro_round",
+    "round_dagger/policy_version",
+    "round_dagger/policy_checkpoint_sha256",
+    "round_dagger/runtime_policy_sha256",
+    "round_dagger/teacher_sha256",
+    "round_dagger/renderer_sha256",
+    "round_dagger/camera_mapping_sha256",
+    "round_dagger/training_config_sha256",
+    "round_dagger/beta",
+    "round_dagger/beta_sha256",
+    "round_dagger/orchestration_config_sha256",
+}
+PUBLIC_CONFIG_SHA_KEYS = {
+    key for key in PUBLIC_CONFIG_KEYS if key.endswith("_sha256")
+}
+PUBLIC_CONFIG_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PUBLIC_CONFIG_EXACT_INTS = {
+    "round_dagger/cohort_count": 4,
+    "round_dagger/environments_per_cohort": 64,
+    "round_dagger/target_environments": 256,
+    "round_dagger/steps_per_environment": 300,
+    "round_dagger/transitions_per_cohort": 64 * 300,
+    "round_dagger/transitions_per_macro_round": 256 * 300,
+}
 MEDIA_SUFFIXES = {
     "image": {".png", ".jpg", ".jpeg", ".webp"},
     "video": {".mp4", ".webm", ".mov"},
+}
+TELEMETRY_SCOPES = {
+    "production": "dagger-observability-sidecar",
+    "bounded-validation": "dagger-bounded-validation-sidecar",
 }
 
 
 class ArtifactError(RuntimeError):
     """An artifact did not satisfy the telemetry contract."""
+
+
+def _strict_public_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ArtifactError(f"duplicate public W&B config key {key!r}")
+        result[key] = value
+    return result
+
+
+def load_public_config(path: Path) -> dict[str, str | int | float]:
+    """Load the explicit non-secret config projection emitted by orchestration.
+
+    Arbitrary user mappings are intentionally unsupported: accepting only the
+    round contract's fixed allowlist prevents credentials, hook argv, paths, or
+    inherited environment values from being copied into W&B config.
+    """
+
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ArtifactError(
+                    "public W&B config must be a regular non-symlink file"
+                )
+            if info.st_size > 64 * 1024:
+                raise ArtifactError("public W&B config exceeds 64 KiB")
+            payload = handle.read(64 * 1024 + 1)
+        document = json.loads(
+            payload,
+            object_pairs_hook=_strict_public_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ArtifactError(f"non-finite JSON constant {value}")
+            ),
+        )
+    except ArtifactError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(
+            f"cannot load public W&B config ({type(exc).__name__})"
+        ) from None
+    if not isinstance(document, dict) or set(document) != {"schema", "config"}:
+        raise ArtifactError("public W&B config wrapper has unexpected fields")
+    if document["schema"] != PUBLIC_CONFIG_SCHEMA:
+        raise ArtifactError("public W&B config schema mismatch")
+    values = document["config"]
+    if not isinstance(values, dict) or set(values) != PUBLIC_CONFIG_KEYS:
+        actual = set(values) if isinstance(values, dict) else set()
+        raise ArtifactError(
+            "public W&B config keys differ from the non-secret allowlist: "
+            f"missing={sorted(PUBLIC_CONFIG_KEYS - actual)} "
+            f"unknown={sorted(actual - PUBLIC_CONFIG_KEYS)}"
+        )
+
+    clean: dict[str, str | int | float] = {}
+    for key, value in values.items():
+        if key in PUBLIC_CONFIG_SHA_KEYS:
+            if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+                raise ArtifactError(f"public W&B config {key} is not a SHA-256")
+            clean[key] = value
+        elif key == "round_dagger/campaign_id":
+            if not isinstance(value, str) or PUBLIC_CONFIG_TOKEN_RE.fullmatch(value) is None:
+                raise ArtifactError("public W&B campaign_id is not a safe token")
+            clean[key] = value
+        elif key == "round_dagger/beta":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise ArtifactError("public W&B beta must be finite and in [0,1]")
+            clean[key] = float(value)
+        else:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ArtifactError(f"public W&B config {key} must be an integer")
+            if key in PUBLIC_CONFIG_EXACT_INTS and value != PUBLIC_CONFIG_EXACT_INTS[key]:
+                raise ArtifactError(f"public W&B config {key} violates production topology")
+            if key in {"round_dagger/macro_round", "round_dagger/policy_version"} and value < 0:
+                raise ArtifactError(f"public W&B config {key} must be non-negative")
+            if key == "round_dagger/cohort_index" and value not in {-1, 0, 1, 2, 3}:
+                raise ArtifactError("public W&B cohort_index must be -1 or 0..3")
+            clean[key] = value
+    return clean
 
 
 @dataclass(frozen=True)
@@ -399,6 +527,79 @@ def bind_state_to_run(path: Path, run_id: str) -> None:
         save_state(path, {}, run_id=run_id)
 
 
+def load_initialized_marker(
+    path: Path,
+    *,
+    expected_run_id: str,
+    telemetry_scope: str = "production",
+    project: str = "dagger",
+    entity: str = "nvidia",
+) -> bool:
+    """Return whether remote initialization was durably acknowledged locally."""
+
+    if not path.exists() and not path.is_symlink():
+        return False
+    if path.is_symlink() or not path.is_file():
+        raise ArtifactError("W&B initialized marker must be a regular non-symlink file")
+    try:
+        def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            payload: dict[str, object] = {}
+            for key, value in pairs:
+                if key in payload:
+                    raise ArtifactError("W&B initialized marker has duplicate fields")
+                payload[key] = value
+            return payload
+
+        payload = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=strict_object
+        )
+    except (OSError, json.JSONDecodeError):
+        raise ArtifactError("W&B initialized marker is malformed") from None
+    if payload != {
+        "schema": INITIALIZED_MARKER_SCHEMA,
+        "wandb_run_id": _validate_run_id(expected_run_id),
+        "telemetry_scope": telemetry_scope,
+        "project": project,
+        "entity": entity,
+    }:
+        raise ArtifactError("W&B initialized marker does not match the sidecar run")
+    return True
+
+
+def write_initialized_marker(
+    path: Path,
+    *,
+    run_id: str,
+    telemetry_scope: str = "production",
+    project: str = "dagger",
+    entity: str = "nvidia",
+) -> None:
+    """Atomically record that W&B accepted initialization of this exact run ID."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema": INITIALIZED_MARKER_SCHEMA,
+                    "wandb_run_id": _validate_run_id(run_id),
+                    "telemetry_scope": telemetry_scope,
+                    "project": project,
+                    "entity": entity,
+                },
+                handle,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 class WandbArtifactWatcher:
     """Incrementally upload stable telemetry files to an initialized W&B run."""
 
@@ -496,8 +697,12 @@ def write_ready_marker(
     entity_is_team: bool,
     personal: bool,
     run_id: str | None = None,
+    telemetry_scope: str = "production",
 ) -> None:
     """Publish watcher readiness atomically after W&B initialization succeeds."""
+
+    if telemetry_scope not in TELEMETRY_SCOPES:
+        raise ArtifactError("W&B telemetry scope is invalid")
 
     payload = {
         "status": "ready",
@@ -508,6 +713,7 @@ def write_ready_marker(
         "entity_is_team": entity_is_team,
         "personal": personal,
         "project": project,
+        "telemetry_scope": telemetry_scope,
         "pid": os.getpid(),
         "ready_unix_s": time.time(),
     }
@@ -531,6 +737,15 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--project", required=True)
+    parser.add_argument(
+        "--telemetry-scope",
+        choices=tuple(TELEMETRY_SCOPES),
+        default="production",
+        help=(
+            "label the remote run as production observability or a bounded "
+            "validation gate; bounded validation never imports production config"
+        ),
+    )
     parser.add_argument("--name", default=None)
     parser.add_argument("--group", default=None)
     parser.add_argument("--expected-email", default=os.environ.get("WANDB_EXPECTED_EMAIL"))
@@ -545,6 +760,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-video-mib", type=float, default=250.0)
     parser.add_argument("--state-file", type=Path, default=None)
     parser.add_argument("--run-id-file", type=Path, default=None)
+    parser.add_argument(
+        "--config-json",
+        type=Path,
+        default=None,
+        help=(
+            "optional strict round_dagger W&B public config; defaults to "
+            "RUN_DIR/telemetry/WANDB_PUBLIC_CONFIG.json when present"
+        ),
+    )
     parser.add_argument("--ready-marker", type=Path, default=None)
     parser.add_argument("--finish-marker", default="RUN_DONE")
     parser.add_argument("--max-consecutive-error-scans", type=int, default=4)
@@ -576,12 +800,42 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     state_file = args.state_file or run_dir / "telemetry" / ".wandb_upload_state.json"
     run_id_file = args.run_id_file or run_dir / "telemetry" / "WANDB_SIDECAR_RUN_ID"
-    for label, path in (("state file", state_file), ("run ID file", run_id_file)):
+    initialized_marker = run_dir / "telemetry" / "WANDB_SIDECAR_INITIALIZED.json"
+    default_public_config = run_dir / "telemetry" / "WANDB_PUBLIC_CONFIG.json"
+    public_config_path = args.config_json
+    if args.telemetry_scope == "bounded-validation":
+        if public_config_path is not None:
+            print(
+                "W&B artifact watcher: bounded validation cannot use production "
+                "public config",
+                file=sys.stderr,
+            )
+            return 2
+        public_config_path = None
+    elif public_config_path is None and default_public_config.exists():
+        public_config_path = default_public_config
+    managed_paths = [
+        ("state file", state_file),
+        ("run ID file", run_id_file),
+        ("initialized marker", initialized_marker),
+    ]
+    if public_config_path is not None:
+        managed_paths.append(("public config", public_config_path))
+    for label, path in managed_paths:
         try:
             path.resolve().relative_to(run_dir)
         except ValueError:
             print(f"W&B artifact watcher: {label} must be inside run-dir", file=sys.stderr)
             return 2
+    try:
+        public_config = (
+            load_public_config(public_config_path)
+            if public_config_path is not None
+            else {}
+        )
+    except ArtifactError as exc:
+        print(f"W&B artifact watcher: {exc}", file=sys.stderr)
+        return 2
     try:
         wandb = _load_wandb()
         identity = query_identity(
@@ -595,41 +849,74 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        run_id_preexisting = run_id_file.exists()
         run_id = load_or_create_run_id(run_id_file)
         bind_state_to_run(state_file, run_id)
+        remote_initialized = load_initialized_marker(
+            initialized_marker,
+            expected_run_id=run_id,
+            telemetry_scope=args.telemetry_scope,
+            project=args.project,
+            entity=identity.entity,
+        )
+        if not remote_initialized:
+            # ``allow`` can safely recover a crash between local ID creation
+            # and remote initialization.  Re-uploading all artifacts prevents
+            # a legacy/local state file from suppressing missing remote data.
+            save_state(state_file, {}, run_id=run_id)
     except ArtifactError as exc:
         print(f"W&B artifact watcher: {exc}", file=sys.stderr)
         return 2
 
     wandb_dir = run_dir / ".wandb_media"
     wandb_dir.mkdir(parents=True, exist_ok=True)
-    run = wandb.init(
-        project=args.project,
-        entity=identity.entity,
-        name=args.name or f"{run_dir.name}-media",
-        group=args.group,
-        job_type="dagger-observability-sidecar",
-        id=run_id,
-        # A persisted ID must already exist remotely.  Using ``must`` on a
-        # restart prevents a deleted/missing remote run from being recreated
-        # while local upload state silently suppresses its earlier history.
-        resume="must" if run_id_preexisting else "allow",
-        dir=str(wandb_dir),
-        config={
-            "source_run_dir": str(run_dir),
-            "artifact_schema": STATE_SCHEMA_VERSION,
-            "expected_account": identity.email,
-            "account_email": identity.email,
-            "entity": identity.entity,
-            "authorization_scope": identity.authorization_scope,
-            "team_member": identity.team_member,
-            "entity_is_team": identity.entity_is_team,
-            "personal": identity.personal,
-        },
-    )
-    run.define_metric("trainer_step")
-    run.define_metric("*", step_metric="trainer_step")
+    run = None
+    try:
+        run = wandb.init(
+            project=args.project,
+            entity=identity.entity,
+            name=args.name or f"{run_dir.name}-media",
+            group=args.group,
+            job_type=TELEMETRY_SCOPES[args.telemetry_scope],
+            id=run_id,
+            # Once initialization is durably acknowledged, ``must`` prevents
+            # a deleted remote run from being silently recreated while local
+            # upload state suppresses its prior history.
+            resume="must" if remote_initialized else "allow",
+            dir=str(wandb_dir),
+            config={
+                "source_run_dir": str(run_dir),
+                "artifact_schema": STATE_SCHEMA_VERSION,
+                "telemetry_scope": args.telemetry_scope,
+                "expected_account": identity.email,
+                "account_email": identity.email,
+                "entity": identity.entity,
+                "authorization_scope": identity.authorization_scope,
+                "team_member": identity.team_member,
+                "entity_is_team": identity.entity_is_team,
+                "personal": identity.personal,
+                **public_config,
+            },
+        )
+        run.define_metric("trainer_step")
+        run.define_metric("*", step_metric="trainer_step")
+        write_initialized_marker(
+            initialized_marker,
+            run_id=run_id,
+            telemetry_scope=args.telemetry_scope,
+            project=args.project,
+            entity=identity.entity,
+        )
+    except Exception as exc:
+        if run is not None:
+            try:
+                run.finish(exit_code=2)
+            except Exception:
+                pass
+        print(
+            f"W&B artifact watcher: remote initialization failed ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return 2
     ready_marker = args.ready_marker or run_dir / "telemetry" / "WANDB_WATCHER_READY.json"
     ready_marker = ready_marker.resolve()
     try:
@@ -648,6 +935,7 @@ def main(argv: list[str] | None = None) -> int:
         entity_is_team=identity.entity_is_team,
         personal=identity.personal,
         run_id=run_id,
+        telemetry_scope=args.telemetry_scope,
     )
     watcher = WandbArtifactWatcher(
         run_dir=run_dir,
@@ -707,7 +995,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"W&B artifact watcher failed: {exc}", file=sys.stderr)
         exit_code = 2
     finally:
-        run.finish(exit_code=exit_code)
+        try:
+            run.finish(exit_code=exit_code)
+        except Exception as exc:
+            print(
+                f"W&B artifact watcher: remote finish failed ({type(exc).__name__})",
+                file=sys.stderr,
+            )
+            exit_code = 2
     return exit_code
 
 

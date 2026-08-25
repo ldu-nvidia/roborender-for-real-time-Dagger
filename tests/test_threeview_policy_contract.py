@@ -17,6 +17,7 @@ TRAINER = (
     ROOT
     / "GR00T-VisualSim2Real/gr00t/rl/trl/trainer/distill_trainer_videogen.py"
 )
+SIMULATOR = ROOT / "GR00T-VisualSim2Real/gr00t/rl/simulator/isaacsim/isaacsim.py"
 GR00T = ROOT / "GR00T-VisualSim2Real"
 EXPECTED_VIEWS = ("head_color", "hand_left", "hand_right")
 
@@ -64,6 +65,19 @@ def load_trainer_method(name, namespace):
     )
     module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
     exec(compile(module, str(TRAINER), "exec"), namespace)
+    return namespace[name]
+
+
+def load_simulator_method(name, namespace):
+    tree = ast.parse(SIMULATOR.read_text(encoding="utf-8"), filename=str(SIMULATOR))
+    simulator = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "IsaacSim"
+    )
+    method = next(
+        node for node in simulator.body if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    exec(compile(module, str(SIMULATOR), "exec"), namespace)
     return namespace[name]
 
 
@@ -164,6 +178,63 @@ class FakeAccelerator:
 
 
 class ThreeViewPolicyContractTest(unittest.TestCase):
+    def test_conditioning_render_is_shared_by_policy_and_renderer_inputs(self):
+        refresh = load_simulator_method("refresh_conditioning_render", {})
+
+        class Sim:
+            def __init__(self):
+                self.renders = 0
+
+            def has_gui(self):
+                return True
+
+            def has_rtx_sensors(self):
+                return False
+
+            def render(self):
+                self.renders += 1
+
+        class Scene:
+            def __init__(self):
+                self.updates = 0
+
+            def update(self, dt):
+                self.updates += 1
+
+        target = SimpleNamespace(
+            conditioning_cameras={"head_color": object()},
+            _conditioning_render_epoch=3,
+            _conditioning_rendered_epoch=-1,
+            sim=Sim(),
+            scene=Scene(),
+            simulator_config=SimpleNamespace(sim=SimpleNamespace(fps=120)),
+        )
+        refresh(target)
+        refresh(target)
+        self.assertEqual(target.sim.renders, 2)
+        self.assertEqual(target.scene.updates, 1)
+        target._conditioning_render_epoch += 1
+        refresh(target)
+        self.assertEqual(target.sim.renders, 4)
+        self.assertEqual(target.scene.updates, 2)
+
+    def test_generated_policy_observation_is_installed_for_rollout_storage(self):
+        helper = load_functions(
+            {"_install_relabelled_vision_obs"}, {}
+        )["_install_relabelled_vision_obs"]
+        simulated = SimpleNamespace(shape=(2, 324, 192, 3), source="sim")
+        generated = SimpleNamespace(shape=(2, 324, 192, 3), source="generated")
+        original = {"vision_obs": simulated, "actor_obs": object()}
+
+        returned = helper(original, {"vision_obs": generated})
+
+        self.assertIs(returned, original)
+        self.assertIs(original["vision_obs"], generated)
+
+        mismatched = SimpleNamespace(shape=(2, 108, 192, 3))
+        with self.assertRaisesRegex(RuntimeError, "changed the policy observation shape"):
+            helper(original, {"vision_obs": mismatched})
+
     @classmethod
     def setUpClass(cls):
         cls.enforce = staticmethod(load_contract_helpers())
@@ -224,8 +295,64 @@ class ThreeViewPolicyContractTest(unittest.TestCase):
         self.assertTrue(report["trainer_runtime_gates_integrated"])
         self.assertTrue(report["trainer_ddp_sync_gate_integrated"])
         self.assertTrue(report["trainer_finite_bc_loss_gate_integrated"])
+        self.assertTrue(report["trainer_round_actor_integrated"])
+        self.assertTrue(report["conditioning_render_cache_integrated"])
+        self.assertTrue(report["round_actor_config_valid"])
         self.assertEqual(installer.validate_base(report, allow_dirty=True), [])
         self.assertEqual(installer.validate_trainer_integration(report), [])
+
+    def test_installer_rejects_accelerate_only_actor_identity(self):
+        source = TRAINER.read_text(encoding="utf-8")
+        source = source.replace(
+            "from round_dagger.actor_identity import actor_process_identity, renderer_slot\n",
+            "",
+            1,
+        )
+        authoritative = '''            _actor_identity = actor_process_identity()
+            self._id_rank = (
+                _actor_identity.rank
+                if _actor_identity is not None
+                else int(getattr(self.accelerator, "process_index", 0))
+            )
+            self._id_world_size = (
+                _actor_identity.world_size
+                if _actor_identity is not None
+                else int(getattr(self.accelerator, "num_processes", 1))
+            )
+'''
+        accelerate_only = '''            self._id_rank = int(
+                getattr(self.accelerator, "process_index", 0)
+            )
+            self._id_world_size = int(
+                getattr(self.accelerator, "num_processes", 1)
+            )
+'''
+        self.assertIn(authoritative, source)
+        source = source.replace(authoritative, accelerate_only, 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trainer = root / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
+            trainer.parent.mkdir(parents=True)
+            trainer.write_text(source, encoding="utf-8")
+            report = installer.inspect(
+                root,
+                ROOT / "integrations/gr00t/image3f_frame_client.py",
+                ROOT / "integrations/gr00t/dagger_telemetry.py",
+            )
+
+        self.assertFalse(report["trainer_scaling_integrated"])
+        self.assertIn(
+            "_actor_identity = actor_process_identity()",
+            report["missing_trainer_scaling_markers"],
+        )
+        errors = installer.validate_trainer_integration(report)
+        self.assertTrue(
+            any(
+                error.startswith("explicit episode/step trainer integration is incomplete")
+                for error in errors
+            )
+        )
 
     def test_sim_rgb_camera_diagnostic_is_explicitly_opt_in(self):
         source = TRAINER.read_text(encoding="utf-8")

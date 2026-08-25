@@ -101,6 +101,11 @@ class LaggedReferenceStoreTest(unittest.TestCase):
         )
         self.assertIsNotNone(replay)
         self.assertEqual(int(replay["head_color"][0, 0, 0]), 10)
+        replay_with_source = store.replay_with_source(
+            stream_id="env0", episode_id=0, step=0, request_id="request-0"
+        )
+        self.assertIsNotNone(replay_with_source)
+        self.assertEqual(replay_with_source[1], "anchor")
         self.assertIsNone(
             store.replay(
                 stream_id="env0", episode_id=0, step=0, request_id="different"

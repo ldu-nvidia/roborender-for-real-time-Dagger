@@ -30,7 +30,19 @@ SCALING_MARKER = "FAST_ROBORENDER_SCALING_V1"
 SCALING_TRAINER_MARKERS = (
     "FAST_ROBORENDER_SCALING_V1: explicit ordered stream metadata",
     'self.vg_reference_lag = int(vg.get("reference_lag", 0))',
-    'self._id_rank = int(getattr(self.accelerator, "process_index", 0))',
+    # Production actors are launched outside Accelerate's normal process
+    # bootstrap, so their authoritative distributed identity comes from the
+    # explicit round-actor environment.  Keep both the authoritative path and
+    # the Accelerate fallback in the installer contract: accepting only the
+    # fallback can silently route multiple actors as rank zero.
+    "from round_dagger.actor_identity import actor_process_identity, renderer_slot",
+    "_actor_identity = actor_process_identity()",
+    "self._id_rank = (",
+    "_actor_identity.rank",
+    'else int(getattr(self.accelerator, "process_index", 0))',
+    "self._id_world_size = (",
+    "_actor_identity.world_size",
+    'else int(getattr(self.accelerator, "num_processes", 1))',
     "self._id_episode_ids = np.zeros(B, dtype=np.int64)",
     "self._id_episode_steps = np.zeros(B, dtype=np.int64)",
     "self._id_episode_ids[b] += 1",
@@ -97,6 +109,23 @@ FINITE_BC_LOSS_TRAINER_MARKERS = (
     '"schema": "fast_roborender.dagger_bc_loss.v1"',
     '"finite_verified": True',
     "finite_bc_metrics = self._verify_dagger_bc_loss()",
+)
+ROUND_ACTOR_TRAINER_MARKERS = (
+    '"round_actor",',
+    '"student_actions", shape=(self.num_act,), dtype=torch.float',
+    '"expert_mask", shape=(1,), dtype=torch.bool',
+    'policy_state_dict["round_global_env_ids"] = global_ids[:, None]',
+    'policy_state_dict["round_episode_ids"] = episode_ids[:, None]',
+    'policy_state_dict["round_episode_steps"] = episode_steps[:, None]',
+    'policy_state_dict["round_observation_is_raytraced"] = raytraced[:, None]',
+    'initial_runtime_sha = runtime_policy_sha256(policy_module)',
+    'published = export_trainer_rollout(',
+)
+CONDITIONING_RENDER_CACHE_MARKERS = (
+    "self._conditioning_render_epoch = 0",
+    "self._conditioning_rendered_epoch = -1",
+    'getattr(self, "_conditioning_rendered_epoch", -1)',
+    "self._conditioning_rendered_epoch = epoch",
 )
 
 
@@ -187,11 +216,22 @@ def inspect(
     telemetry_source = telemetry_source or source.with_name("dagger_telemetry.py")
     trainer = gr00t_root / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
     config = gr00t_root / "gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml"
+    round_actor_config = (
+        gr00t_root
+        / "gr00t/rl/config/exp/loco_manip/wsdpt_round_actor_3view.yaml"
+    )
+    simulator = gr00t_root / "gr00t/rl/simulator/isaacsim/isaacsim.py"
     target = gr00t_root / "gr00t/rl/utils/image3f_frame_client.py"
     telemetry_target = gr00t_root / "gr00t/rl/utils/dagger_telemetry.py"
     revision, dirty = git_revision(gr00t_root)
     trainer_text = trainer.read_text(encoding="utf-8") if trainer.is_file() else ""
     config_text = config.read_text(encoding="utf-8") if config.is_file() else ""
+    round_actor_config_text = (
+        round_actor_config.read_text(encoding="utf-8")
+        if round_actor_config.is_file()
+        else ""
+    )
+    simulator_text = simulator.read_text(encoding="utf-8") if simulator.is_file() else ""
     missing_markers = [marker for marker in REQUIRED_TRAINER_MARKERS if marker not in trainer_text]
     missing_scaling_markers = [
         marker for marker in SCALING_TRAINER_MARKERS if trainer_text.count(marker) != 1
@@ -210,6 +250,32 @@ def inspect(
         for marker in FINITE_BC_LOSS_TRAINER_MARKERS
         if trainer_text.count(marker) != 1
     ]
+    missing_round_actor_markers = [
+        marker for marker in ROUND_ACTOR_TRAINER_MARKERS if trainer_text.count(marker) != 1
+    ]
+    missing_render_cache_markers = [
+        marker
+        for marker in CONDITIONING_RENDER_CACHE_MARKERS
+        if simulator_text.count(marker) != 1
+    ]
+    round_mode = yaml_plain_scalar(round_actor_config_text, "mode")
+    round_steps = yaml_numeric_scalar(round_actor_config_text, "num_steps_per_env")
+    round_action_source = yaml_plain_scalar(
+        round_actor_config_text, "rollout_action_source"
+    )
+    round_beta_schedule = yaml_plain_scalar(round_actor_config_text, "beta_schedule")
+    round_learning_epochs = yaml_numeric_scalar(
+        round_actor_config_text, "num_learning_epochs"
+    )
+    round_reference_lag = yaml_numeric_scalar(round_actor_config_text, "reference_lag")
+    round_actor_config_valid = (
+        round_mode == "round_actor"
+        and round_steps == 300.0
+        and round_action_source == "beta"
+        and round_beta_schedule == "constant"
+        and round_learning_epochs == 0.0
+        and round_reference_lag == 256.0
+    )
     value_loss_coef = yaml_numeric_scalar(config_text, "value_loss_coef")
     entropy_coef = yaml_numeric_scalar(config_text, "entropy_coef")
     pure_bc = value_loss_coef == 0.0 and entropy_coef == 0.0
@@ -269,6 +335,10 @@ def inspect(
         "missing_trainer_ddp_sync_gate_markers": missing_ddp_sync_markers,
         "trainer_finite_bc_loss_gate_integrated": not missing_finite_bc_loss_markers,
         "missing_trainer_finite_bc_loss_gate_markers": missing_finite_bc_loss_markers,
+        "trainer_round_actor_integrated": not missing_round_actor_markers,
+        "missing_trainer_round_actor_markers": missing_round_actor_markers,
+        "conditioning_render_cache_integrated": not missing_render_cache_markers,
+        "missing_conditioning_render_cache_markers": missing_render_cache_markers,
         "trainer_telemetry_integrated": not missing_telemetry_markers,
         "missing_trainer_telemetry_markers": missing_telemetry_markers,
         "config": str(config),
@@ -283,6 +353,9 @@ def inspect(
         "policy_view_layout": policy_view_layout,
         "camera_resolution": camera_resolution,
         "policy_image_shape": policy_image_shape,
+        "round_actor_config": str(round_actor_config),
+        "round_actor_config_exists": round_actor_config.is_file(),
+        "round_actor_config_valid": round_actor_config_valid,
         "client": str(target),
         "client_exists": target.is_file(),
         "client_source_sha256": source_hash,
@@ -339,6 +412,20 @@ def validate_trainer_integration(report: dict[str, object]) -> list[str]:
         errors.append("finite/nonnegative DAgger BC loss gate is not installed")
     if not report["trainer_telemetry_integrated"]:
         errors.append("rank-zero DAgger telemetry integration is not installed")
+    if not report["trainer_round_actor_integrated"]:
+        errors.append(
+            "frozen round actor trainer integration is incomplete: "
+            + ", ".join(report["missing_trainer_round_actor_markers"])
+        )
+    if not report["conditioning_render_cache_integrated"]:
+        errors.append(
+            "conditioning render cache integration is incomplete: "
+            + ", ".join(report["missing_conditioning_render_cache_markers"])
+        )
+    if not report["round_actor_config_exists"]:
+        errors.append("wsdpt_round_actor_3view.yaml is missing")
+    elif not report["round_actor_config_valid"]:
+        errors.append("round actor config is not frozen 300-step/zero-update/lag-256")
     return errors
 
 

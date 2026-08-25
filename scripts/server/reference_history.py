@@ -35,9 +35,11 @@ class _StreamState:
     next_step: int = 0
     pending_step: int | None = None
     pending_request_id: str | None = None
+    pending_reference_source: str | None = None
     frames: deque[dict[str, np.ndarray]] = field(default_factory=deque)
     last_request_id: str | None = None
     last_generated: dict[str, np.ndarray] | None = None
+    last_reference_source: str | None = None
     last_access: float = field(default_factory=time.monotonic)
 
 
@@ -160,8 +162,32 @@ class LaggedReferenceStore:
                 source = f"generated_t-{lag}"
             state.pending_step = step
             state.pending_request_id = str(request_id)
+            state.pending_reference_source = source
             state.last_access = time.monotonic()
             return reference, source
+
+    def replay_with_source(
+        self,
+        *,
+        stream_id: str,
+        episode_id: str | int,
+        step: int,
+        request_id: str,
+    ) -> tuple[dict[str, np.ndarray], str] | None:
+        """Return a committed retry together with its effective reference source."""
+        with self._lock:
+            state = self._streams.get(stream_id)
+            if (
+                state is not None
+                and state.episode_id == str(episode_id)
+                and state.next_step == int(step) + 1
+                and state.last_request_id == str(request_id)
+                and state.last_generated is not None
+                and state.last_reference_source is not None
+            ):
+                state.last_access = time.monotonic()
+                return state.last_generated, state.last_reference_source
+            return None
 
     def replay(
         self,
@@ -172,18 +198,13 @@ class LaggedReferenceStore:
         request_id: str,
     ) -> dict[str, np.ndarray] | None:
         """Return the last committed output for an idempotent network retry."""
-        with self._lock:
-            state = self._streams.get(stream_id)
-            if (
-                state is not None
-                and state.episode_id == str(episode_id)
-                and state.next_step == int(step) + 1
-                and state.last_request_id == str(request_id)
-                and state.last_generated is not None
-            ):
-                state.last_access = time.monotonic()
-                return state.last_generated
-            return None
+        replay = self.replay_with_source(
+            stream_id=stream_id,
+            episode_id=episode_id,
+            step=step,
+            request_id=request_id,
+        )
+        return replay[0] if replay is not None else None
 
     def commit(
         self,
@@ -213,8 +234,10 @@ class LaggedReferenceStore:
             state.frames.append(committed)
             state.last_generated = committed
             state.last_request_id = str(request_id)
+            state.last_reference_source = state.pending_reference_source
             state.pending_step = None
             state.pending_request_id = None
+            state.pending_reference_source = None
             state.next_step = step + 1
             state.last_access = time.monotonic()
 
@@ -229,6 +252,7 @@ class LaggedReferenceStore:
             ):
                 state.pending_step = None
                 state.pending_request_id = None
+                state.pending_reference_source = None
                 state.last_access = time.monotonic()
 
     def reset(self, stream_id: str) -> bool:
