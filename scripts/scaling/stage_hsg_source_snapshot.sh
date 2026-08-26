@@ -32,6 +32,8 @@ done
 PUBLISH_COMPLETE=0
 REMOTE_PREPARED=0
 LOCAL_TEMPORARY=
+LOCAL_PUBLICATION_TEMP=
+LOCAL_PUBLICATION=
 LOCAL_DESTINATION=
 LOCAL_ATTESTATION_TEMP=
 LOCAL_ATTESTATION=
@@ -89,9 +91,6 @@ if [ ! -e "$destination" ]; then
 fi
 REMOTE_CLEANUP
         fi
-        for path in "$LOCAL_ATTESTATION_TEMP" "$LOCAL_INVENTORY_TEMP"; do
-            [ -z "$path" ] || [ ! -e "$path" ] || unlink "$path"
-        done
         if [ "$LOCAL_ATTESTATION_OWNED" -eq 1 ] && [ -e "$LOCAL_ATTESTATION" ]; then
             unlink "$LOCAL_ATTESTATION"
         fi
@@ -101,11 +100,10 @@ REMOTE_CLEANUP
         for path in "${INDEX_LISTS[@]}"; do
             [ ! -e "$path" ] || unlink "$path"
         done
-        for directory in "$LOCAL_TEMPORARY"; do
+        for directory in "$LOCAL_PUBLICATION_TEMP"; do
             [ -z "$directory" ] && continue
             case "$directory" in
-                "$LOCAL_OUTPUT_ROOT"/.fast_roborender_*_sealed.staging.*|\
-                "$LOCAL_OUTPUT_ROOT"/fast_roborender_*_sealed) ;;
+                "$LOCAL_OUTPUT_ROOT"/.fast_roborender_*_sealed.publication.staging.*) ;;
                 *) continue ;;
             esac
             if [ -d "$directory" ] && [ ! -L "$directory" ]; then
@@ -114,9 +112,9 @@ REMOTE_CLEANUP
             fi
         done
         if [ "$LOCAL_DESTINATION_OWNED" -eq 1 ] && \
-           [ -d "$LOCAL_DESTINATION" ] && [ ! -L "$LOCAL_DESTINATION" ]; then
-            chmod -R u+w "$LOCAL_DESTINATION"
-            find "$LOCAL_DESTINATION" -xdev -depth -delete
+           [ -d "$LOCAL_PUBLICATION" ] && [ ! -L "$LOCAL_PUBLICATION" ]; then
+            chmod -R u+w "$LOCAL_PUBLICATION"
+            find "$LOCAL_PUBLICATION" -xdev -depth -delete
         fi
         if [ "$LOCAL_LOCK_OWNED" -eq 1 ] && \
            [ -d "$LOCAL_LOCK" ] && [ ! -L "$LOCAL_LOCK" ]; then
@@ -195,16 +193,20 @@ mkdir -p "$LOCAL_OUTPUT_ROOT"
 LOCAL_OUTPUT_ROOT=$(realpath -e "$LOCAL_OUTPUT_ROOT")
 SNAPSHOT_NAME=fast_roborender_${FAST_REVISION:0:7}_${GR00T_REVISION:0:7}_sealed
 LOCAL_LOCK=$LOCAL_OUTPUT_ROOT/.${SNAPSHOT_NAME}.publish.lock
-LOCAL_DESTINATION=$LOCAL_OUTPUT_ROOT/$SNAPSHOT_NAME
-LOCAL_ATTESTATION=$LOCAL_OUTPUT_ROOT/${SNAPSHOT_NAME}.snapshot_attestation.json
-LOCAL_INVENTORY=$LOCAL_OUTPUT_ROOT/${SNAPSHOT_NAME}.inventory.json
+LOCAL_PUBLICATION=$LOCAL_OUTPUT_ROOT/${SNAPSHOT_NAME}.publication
+LOCAL_DESTINATION=$LOCAL_PUBLICATION/$SNAPSHOT_NAME
+LOCAL_ATTESTATION=$LOCAL_PUBLICATION/${SNAPSHOT_NAME}.snapshot_attestation.json
+LOCAL_INVENTORY=$LOCAL_PUBLICATION/${SNAPSHOT_NAME}.inventory.json
 mkdir "$LOCAL_LOCK" 2>/dev/null || fatal "another local publisher owns $SNAPSHOT_NAME"
 LOCAL_LOCK_OWNED=1
-[ ! -e "$LOCAL_DESTINATION" ] && [ ! -e "$LOCAL_ATTESTATION" ] && \
-[ ! -e "$LOCAL_INVENTORY" ] || fatal "refusing to replace an existing local snapshot"
-LOCAL_TEMPORARY=$(mktemp -d "$LOCAL_OUTPUT_ROOT/.${SNAPSHOT_NAME}.staging.XXXXXX")
-LOCAL_ATTESTATION_TEMP=$LOCAL_OUTPUT_ROOT/.${SNAPSHOT_NAME}.attestation.$$.json
-LOCAL_INVENTORY_TEMP=$LOCAL_OUTPUT_ROOT/.${SNAPSHOT_NAME}.inventory.$$.json
+[ ! -e "$LOCAL_PUBLICATION" ] || \
+    fatal "refusing to replace an existing local snapshot publication"
+LOCAL_PUBLICATION_TEMP=$(mktemp -d \
+    "$LOCAL_OUTPUT_ROOT/.${SNAPSHOT_NAME}.publication.staging.XXXXXX")
+LOCAL_TEMPORARY=$LOCAL_PUBLICATION_TEMP/$SNAPSHOT_NAME
+mkdir "$LOCAL_TEMPORARY"
+LOCAL_ATTESTATION_TEMP=$LOCAL_PUBLICATION_TEMP/${SNAPSHOT_NAME}.snapshot_attestation.json
+LOCAL_INVENTORY_TEMP=$LOCAL_PUBLICATION_TEMP/${SNAPSHOT_NAME}.inventory.json
 
 LFS_FILE_COUNT=0
 LFS_TOTAL_BYTES=0
@@ -430,11 +432,9 @@ with path.open("x", encoding="utf-8") as handle:
     os.fsync(handle.fileno())
 PY
 chmod 0444 "$LOCAL_ATTESTATION_TEMP" "$LOCAL_INVENTORY_TEMP"
-mv "$LOCAL_INVENTORY_TEMP" "$LOCAL_INVENTORY"
-LOCAL_INVENTORY_OWNED=1
-mv "$LOCAL_ATTESTATION_TEMP" "$LOCAL_ATTESTATION"
-LOCAL_ATTESTATION_OWNED=1
-mv "$LOCAL_TEMPORARY" "$LOCAL_DESTINATION"
+chmod 0555 "$LOCAL_PUBLICATION_TEMP"
+mv "$LOCAL_PUBLICATION_TEMP" "$LOCAL_PUBLICATION"
+LOCAL_PUBLICATION_TEMP=
 LOCAL_DESTINATION_OWNED=1
 
 if [ "$LOCAL_ONLY" -eq 1 ]; then

@@ -36,14 +36,15 @@ from round_dagger.artifacts import (
 from round_dagger.promotion import load_candidate_manifest
 from round_dagger.state import _campaign_root, _internal_path, load_campaign, load_state
 
-CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v1"
-OUTCOME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_outcome.v3"
-REPORT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_report.v1"
-BUNDLE_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_bundle.v1"
+LEGACY_CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v1"
+CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v2"
+OUTCOME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_outcome.v4"
+REPORT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_report.v2"
+BUNDLE_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_bundle.v2"
 RUNTIME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_runtime.v1"
 EVALUATOR_RESULT_SCHEMA = "fast_roborender.round_dagger.evaluator_result.v2"
 EVALUATOR_SOURCE_BUNDLE_SCHEMA = (
-    "fast_roborender.round_dagger.evaluator_source_bundle.v1"
+    "fast_roborender.round_dagger.evaluator_source_bundle.v2"
 )
 POLICY_VIEWS = ("head_color", "hand_left", "hand_right")
 RAYTRACED_MIX = 0.0
@@ -70,16 +71,30 @@ class EvaluationError(ArtifactError):
 
 
 _REPOSITORY_EVALUATOR_SOURCES = (
+    "round_dagger/artifacts.py",
     "round_dagger/evaluation.py",
     "round_dagger/evaluation_inputs.py",
+    "round_dagger/gr00t_policy.py",
+    "round_dagger/policy_bundle.py",
+    "round_dagger/promotion.py",
+    "round_dagger/replay.py",
+    "round_dagger/state.py",
     "scripts/eval/eval_agent_metrics_adapter.py",
+    "scripts/eval/fixed_seed_gate.py",
+    "scripts/scaling/image3f_probe.py",
     "scripts/round_dagger/run_paired_evaluation.sh",
     "scripts/round_dagger/run_production_paired_evaluation_hook.sh",
+    "scripts/round_dagger/verify_anchor_pool.py",
+    "scripts/round_dagger/verify_sealed_source_snapshot.py",
 )
 _GR00T_EVALUATOR_SOURCES = (
     "gr00t/rl/eval_agent_trl.py",
+    "gr00t/rl/trl/trainer/anchor_io.py",
+    "gr00t/rl/trl/trainer/checkpoint_io.py",
+    "gr00t/rl/trl/trainer/distill_trainer.py",
     "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
     "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+    "gr00t/rl/trl/trainer/ppo_trainer.py",
     # This client validates the server's per-request reference provenance.  A
     # source bundle that omitted it could claim lag-256 evaluation while using
     # client bytes that never checked generated_t-256 responses.
@@ -89,7 +104,9 @@ _GR00T_EVALUATOR_SOURCES = (
 
 
 def evaluator_source_bundle(
-    repository_root: str | Path, gr00t_root: str | Path
+    repository_root: str | Path,
+    gr00t_root: str | Path,
+    evaluation_source_inventory_sha256: str,
 ) -> dict[str, Any]:
     """Return a content manifest for every custom paired-evaluation producer.
 
@@ -123,15 +140,31 @@ def evaluator_source_bundle(
                     "sha256": sha256_file(source),
                 }
             )
-    return {"schema": EVALUATOR_SOURCE_BUNDLE_SCHEMA, "sources": entries}
+    inventory_sha = _sha(
+        evaluation_source_inventory_sha256,
+        "evaluation source inventory SHA-256",
+    )
+    return {
+        "schema": EVALUATOR_SOURCE_BUNDLE_SCHEMA,
+        "evaluation_source_inventory_sha256": inventory_sha,
+        "sources": entries,
+    }
 
 
 def evaluator_source_bundle_sha256(
-    repository_root: str | Path, gr00t_root: str | Path
+    repository_root: str | Path,
+    gr00t_root: str | Path,
+    evaluation_source_inventory_sha256: str,
 ) -> str:
     """Hash the exact paired-evaluation source bundle."""
 
-    return canonical_json_sha256(evaluator_source_bundle(repository_root, gr00t_root))
+    return canonical_json_sha256(
+        evaluator_source_bundle(
+            repository_root,
+            gr00t_root,
+            evaluation_source_inventory_sha256,
+        )
+    )
 
 
 def _exact(value: Any, keys: set[str], label: str) -> dict[str, Any]:
@@ -273,7 +306,7 @@ _POLICY_KEYS = {
     "manifest_sha256",
     "runtime_policy_sha256",
 }
-_CONTRACT_KEYS = {
+_LEGACY_CONTRACT_KEYS = {
     "schema",
     "campaign_id",
     "campaign_sha256",
@@ -292,6 +325,13 @@ _CONTRACT_KEYS = {
     "num_envs_per_seed",
     "scenario_cases",
     "thresholds",
+}
+_CONTRACT_KEYS = _LEGACY_CONTRACT_KEYS | {"anchor_pool"}
+_ANCHOR_POOL_KEYS = {
+    "path",
+    "anchor_count",
+    "anchor_index",
+    "inventory_sha256",
 }
 
 
@@ -318,6 +358,10 @@ def create_contract(
     evaluation_config_sha256: str,
     evaluator_code_sha256: str,
     expected_renderer_count: int,
+    anchor_pool_path: str | Path,
+    anchor_count: int,
+    anchor_index: int,
+    anchor_inventory_sha256: str,
     output: str | Path,
     thresholds: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -368,6 +412,25 @@ def create_contract(
         "training_enabled": False,
         "one_episode_per_environment": True,
     }
+    anchor_path = Path(anchor_pool_path)
+    if (
+        not anchor_path.is_absolute()
+        or any(part in {".", ".."} for part in anchor_path.parts)
+    ):
+        raise EvaluationError("anchor pool path must be normalized and absolute")
+    normalized_anchor_count = _integer(anchor_count, "anchor_count", minimum=1)
+    normalized_anchor_index = _integer(anchor_index, "anchor_index")
+    if normalized_anchor_index >= normalized_anchor_count:
+        raise EvaluationError("anchor_index must be smaller than anchor_count")
+    anchor_pool = {
+        "path": str(anchor_path),
+        "anchor_count": normalized_anchor_count,
+        "anchor_index": normalized_anchor_index,
+        "inventory_sha256": _sha(
+            anchor_inventory_sha256,
+            "anchor_inventory_sha256",
+        ),
+    }
     contract = {
         "schema": CONTRACT_SCHEMA,
         "campaign_id": campaign["campaign_id"],
@@ -388,6 +451,7 @@ def create_contract(
         "expected_renderer_count": _integer(
             expected_renderer_count, "expected_renderer_count", minimum=1
         ),
+        "anchor_pool": anchor_pool,
         "runtime": runtime,
         "seeds": seeds,
         "num_envs_per_seed": envs_per_seed,
@@ -404,8 +468,18 @@ def create_contract(
 def _validate_contract_document(
     root: Path, document: Any, *, bind_state: bool
 ) -> dict[str, Any]:
-    contract = _exact(document, _CONTRACT_KEYS, "paired evaluation contract")
-    if contract["schema"] != CONTRACT_SCHEMA:
+    if not isinstance(document, Mapping):
+        raise EvaluationError("paired evaluation contract must be a mapping")
+    schema = document.get("schema")
+    if schema == CONTRACT_SCHEMA:
+        contract = _exact(document, _CONTRACT_KEYS, "paired evaluation contract")
+    elif schema == LEGACY_CONTRACT_SCHEMA:
+        contract = _exact(
+            document,
+            _LEGACY_CONTRACT_KEYS,
+            "legacy paired evaluation contract",
+        )
+    else:
         raise EvaluationError("paired evaluation contract schema mismatch")
     campaign = load_campaign(root)
     if contract["campaign_id"] != campaign["campaign_id"] or contract[
@@ -455,7 +529,11 @@ def _validate_contract_document(
         "checkpoint_sha256": active["checkpoint_sha256"],
         "manifest_sha256": active["manifest_sha256"],
     }
-    if any(parent[key] != value for key, value in expected_parent.items()):
+    # During an idempotent recovery retry the candidate has already become the
+    # active policy, so the historical parent cannot still equal active_policy.
+    # The caller disables mutable-state binding in that narrow READY retry;
+    # immutable policy identities and checkpoint bytes remain verified below.
+    if bind_state and any(parent[key] != value for key, value in expected_parent.items()):
         raise EvaluationError("parent policy identity mismatch")
     for policy in (parent, candidate_policy):
         checkpoint, _ = _internal_path(
@@ -485,6 +563,26 @@ def _validate_contract_document(
     if contract["num_envs_per_seed"] != envs:
         raise EvaluationError("num_envs_per_seed differs from scenario cases")
     _integer(contract["expected_renderer_count"], "expected_renderer_count", minimum=1)
+    if contract["schema"] == CONTRACT_SCHEMA:
+        anchor = _exact(
+            contract["anchor_pool"],
+            _ANCHOR_POOL_KEYS,
+            "evaluation anchor pool",
+        )
+        anchor_path = Path(anchor["path"])
+        if (
+            not isinstance(anchor["path"], str)
+            or not anchor_path.is_absolute()
+            or any(part in {".", ".."} for part in anchor_path.parts)
+        ):
+            raise EvaluationError("evaluation anchor pool path is unsafe")
+        validated_anchor_count = _integer(
+            anchor["anchor_count"], "anchor_count", minimum=1
+        )
+        validated_anchor_index = _integer(anchor["anchor_index"], "anchor_index")
+        if validated_anchor_index >= validated_anchor_count:
+            raise EvaluationError("anchor_index must be smaller than anchor_count")
+        _sha(anchor["inventory_sha256"], "anchor inventory SHA-256")
     contract["thresholds"] = _validate_thresholds(contract["thresholds"])
     return contract
 
@@ -627,6 +725,7 @@ _OUTCOME_KEYS = {
     "renderer_runtime_sha256",
     "evaluation_config_sha256",
     "evaluator_code_sha256",
+    "anchor_pool",
     "image3f_run_id",
     "runtime",
     "renderer_errors",
@@ -710,6 +809,8 @@ def attest_outcome(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
+    if contract["schema"] != CONTRACT_SCHEMA:
+        raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     seed = _integer(seed, "seed")
     if seed not in contract["seeds"]:
         raise EvaluationError("seed is not in the immutable evaluation contract")
@@ -951,6 +1052,7 @@ def attest_outcome(
         "renderer_runtime_sha256": runtime_digest,
         "evaluation_config_sha256": contract["evaluation_config_sha256"],
         "evaluator_code_sha256": contract["evaluator_code_sha256"],
+        "anchor_pool": contract["anchor_pool"],
         "image3f_run_id": image3f_run_id,
         "runtime": contract["runtime"],
         "renderer_errors": 0,
@@ -994,6 +1096,7 @@ def load_outcome(
         "renderer_runtime_sha256": contract["renderer_runtime_sha256"],
         "evaluation_config_sha256": contract["evaluation_config_sha256"],
         "evaluator_code_sha256": contract["evaluator_code_sha256"],
+        "anchor_pool": contract["anchor_pool"],
         "runtime": contract["runtime"],
         "renderer_errors": 0,
         "renderer_replays": 0,
@@ -1076,6 +1179,8 @@ def publish_case_outcome(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
+    if contract["schema"] != CONTRACT_SCHEMA:
+        raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     seed = _integer(seed, "seed")
     source_path, _ = _internal_path(root, source, "attempt outcome")
     loaded = load_outcome(
@@ -1216,6 +1321,8 @@ def summarize_to_evaluator_result(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
+    if contract["schema"] != CONTRACT_SCHEMA:
+        raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     output_path, output_relative = _internal_path(
         root, output, "orchestrator evaluator result"
     )
@@ -1261,6 +1368,7 @@ def summarize_to_evaluator_result(
         "campaign_id": contract["campaign_id"],
         "macro_round": contract["macro_round"],
         "candidate_manifest_sha256": contract["candidate_manifest_sha256"],
+        "anchor_pool": contract["anchor_pool"],
         "paired_case_count": len(episodes["parent"]),
         "thresholds": contract["thresholds"],
         "metrics": metrics,
@@ -1276,6 +1384,7 @@ def summarize_to_evaluator_result(
         "report_path": report_path.relative_to(root).as_posix(),
         "report_sha256": report_sha,
         "candidate_manifest_sha256": contract["candidate_manifest_sha256"],
+        "anchor_pool": contract["anchor_pool"],
         "outcomes": outcomes,
     }
     bundle_path = results_root / "evaluation_bundle.json"
@@ -1331,6 +1440,8 @@ def verify_evaluator_result_evidence(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
+    if contract["schema"] != CONTRACT_SCHEMA:
+        raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     output_path, output_relative = _internal_path(
         root, result_path, "orchestrator evaluator result"
     )
@@ -1376,6 +1487,7 @@ def verify_evaluator_result_evidence(
         "campaign_id": contract["campaign_id"],
         "macro_round": contract["macro_round"],
         "candidate_manifest_sha256": contract["candidate_manifest_sha256"],
+        "anchor_pool": contract["anchor_pool"],
         "paired_case_count": len(episodes["parent"]),
         "thresholds": contract["thresholds"],
         "metrics": metrics,
@@ -1397,6 +1509,7 @@ def verify_evaluator_result_evidence(
         "report_path": report_path.relative_to(root).as_posix(),
         "report_sha256": report_sha,
         "candidate_manifest_sha256": contract["candidate_manifest_sha256"],
+        "anchor_pool": contract["anchor_pool"],
         "outcomes": outcomes,
     }
     bundle_path = results_root / "evaluation_bundle.json"
@@ -1455,6 +1568,10 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--evaluation-config", type=_digest_argument, required=True)
     prepare.add_argument("--evaluator-code", type=_digest_argument, required=True)
     prepare.add_argument("--expected-renderer-count", type=int, required=True)
+    prepare.add_argument("--anchor-pool-path", required=True)
+    prepare.add_argument("--anchor-count", type=int, required=True)
+    prepare.add_argument("--anchor-index", type=int, required=True)
+    prepare.add_argument("--anchor-inventory-sha256", required=True)
     prepare.add_argument("--thresholds")
     prepare.add_argument("--output", required=True)
 
@@ -1520,6 +1637,7 @@ def _parser() -> argparse.ArgumentParser:
     digest = sub.add_parser("evaluator-digest")
     digest.add_argument("--repository-root", required=True)
     digest.add_argument("--gr00t-root", required=True)
+    digest.add_argument("--evaluation-source-inventory-sha256", required=True)
     return parser
 
 
@@ -1539,6 +1657,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 evaluation_config_sha256=args.evaluation_config,
                 evaluator_code_sha256=args.evaluator_code,
                 expected_renderer_count=args.expected_renderer_count,
+                anchor_pool_path=args.anchor_pool_path,
+                anchor_count=args.anchor_count,
+                anchor_index=args.anchor_index,
+                anchor_inventory_sha256=args.anchor_inventory_sha256,
                 output=args.output,
                 thresholds=thresholds,
             )
@@ -1618,7 +1740,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result_path=args.result,
             )
         else:
-            bundle = evaluator_source_bundle(args.repository_root, args.gr00t_root)
+            bundle = evaluator_source_bundle(
+                args.repository_root,
+                args.gr00t_root,
+                args.evaluation_source_inventory_sha256,
+            )
             result = {
                 **bundle,
                 "sha256": canonical_json_sha256(bundle),

@@ -12,10 +12,15 @@ exactly 256 environments and 76,800 transitions per macro-round.
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
+import hashlib
 import math
 import os
 import re
+import stat
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -32,6 +37,7 @@ from round_dagger import (
     replay,
     state,
 )
+from scripts.round_dagger import verify_sealed_source_snapshot as source_seal
 
 
 ORCHESTRATION_CONFIG_SCHEMA = "fast_roborender.round_dagger.orchestration_config.v1"
@@ -49,6 +55,21 @@ EXPECTED_ACTOR_RANKS = (0, 1)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _HOOK_NAMES = ("collect", "transfer", "ingest", "train", "evaluate", "promote")
 _REQUIRED_HOOKS = {"collect", "train", "evaluate"}
+_EVALUATION_HOOK_RELATIVE = Path(
+    "scripts/round_dagger/run_production_paired_evaluation_hook.sh"
+)
+# Linux UAPI values are stable across supported architectures.  Python builds
+# predating their stdlib exposure still run on kernels that provide memfd and
+# file seals, so use the libc entry point plus audited UAPI constants rather
+# than weakening dispatch to a mutable temporary file.
+_MFD_CLOEXEC = getattr(os, "MFD_CLOEXEC", 0x0001)
+_MFD_ALLOW_SEALING = getattr(os, "MFD_ALLOW_SEALING", 0x0002)
+_F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+_F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+_F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+_F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+_F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+_F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
 _SENSITIVE_ARGUMENT_RE = re.compile(
     r"(?i)(?:^--?(?:api[_-]?key|authorization|credential|password|secret|token)"
     r"(?:$|[=:])|(?:api[_-]?key|authorization|credential|password|secret|token)"
@@ -325,6 +346,185 @@ class HookRunner(Protocol):
     ) -> None: ...
 
 
+def _create_sealable_memfd(name: str) -> int:
+    """Create a CLOEXEC, sealable Linux memfd on old and new CPython builds."""
+
+    flags = _MFD_CLOEXEC | _MFD_ALLOW_SEALING
+    native = getattr(os, "memfd_create", None)
+    if callable(native):
+        return native(name, flags)
+    if not sys.platform.startswith("linux"):
+        raise OrchestrationError("sealed in-memory dispatch requires Linux")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        memfd_create = libc.memfd_create
+    except (AttributeError, OSError) as exc:
+        raise OrchestrationError(
+            "sealed in-memory dispatch has no memfd_create entry point"
+        ) from exc
+    memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    memfd_create.restype = ctypes.c_int
+    descriptor = int(memfd_create(name.encode("ascii"), flags))
+    if descriptor < 0:
+        error_number = ctypes.get_errno()
+        raise OrchestrationError(
+            f"sealed in-memory dispatch memfd_create failed (errno={error_number})"
+        )
+    return descriptor
+
+
+def _verified_evaluation_hook(
+    hook: HookSpec,
+    environment: Mapping[str, str],
+) -> tuple[int, list[str]]:
+    """Verify and snapshot the evaluation hook before any seal code executes.
+
+    The verifier is imported when the coordinator starts, from the
+    coordinator's own contracted source.  It is intentionally not imported
+    from the later evaluation seal.  Bash consumes a sealed anonymous-memory
+    snapshot, never the still-mutable source inode, so neither replacement nor
+    in-place mutation can change the bytes after verification.
+    """
+
+    raw_root = environment.get("ROUND_DAGGER_EVALUATION_SOURCE_ROOT")
+    inventory_sha256 = environment.get(
+        "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256"
+    )
+    if not raw_root or not inventory_sha256:
+        raise OrchestrationError(
+            "evaluate hook requires an explicit sealed evaluation source contract"
+        )
+    root = Path(os.path.abspath(raw_root))
+    try:
+        resolved = root.resolve(strict=True)
+        root_info = root.lstat()
+        parent_info = root.parent.lstat()
+    except OSError as exc:
+        raise OrchestrationError("sealed evaluation source is unavailable") from exc
+    if (
+        resolved != root
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_IMODE(root_info.st_mode) != 0o555
+    ):
+        raise OrchestrationError("sealed evaluation source root is unsafe")
+    if (
+        stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_IMODE(parent_info.st_mode) != 0o555
+    ):
+        raise OrchestrationError(
+            "sealed evaluation source parent must be an immutable 0555 directory"
+        )
+    expected_hook = root / _EVALUATION_HOOK_RELATIVE
+    if hook.argv != (str(expected_hook),):
+        raise OrchestrationError(
+            "evaluate hook path is not derived from the sealed evaluation source"
+        )
+    try:
+        report = source_seal.verify(root, inventory_sha256)
+        inventory_path = Path(report["inventory_path"])
+        inventory_bytes, _ = source_seal._regular_file_bytes(  # noqa: SLF001
+            inventory_path, "evaluation source inventory"
+        )
+        if hashlib.sha256(inventory_bytes).hexdigest() != inventory_sha256:
+            raise source_seal.VerificationError(
+                "evaluation source inventory changed after verification"
+            )
+        inventory = source_seal._parse_json(  # noqa: SLF001
+            inventory_bytes, "evaluation source inventory"
+        )
+        records = source_seal._validate_inventory(inventory)  # noqa: SLF001
+    except (KeyError, OSError, source_seal.VerificationError) as exc:
+        raise OrchestrationError(
+            "sealed evaluation source failed coordinator-side verification"
+        ) from exc
+    expected_record = next(
+        (
+            record
+            for record in records
+            if record["path"] == _EVALUATION_HOOK_RELATIVE.as_posix()
+        ),
+        None,
+    )
+    if expected_record is None or expected_record["mode"] != "0o555":
+        raise OrchestrationError(
+            "evaluation hook is absent from the sealed source inventory"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_descriptor = os.open(expected_hook, flags)
+    except OSError as exc:
+        raise OrchestrationError("cannot safely open sealed evaluation hook") from exc
+    snapshot_descriptor: int | None = None
+    try:
+        snapshot_descriptor = _create_sealable_memfd(
+            "round-dagger-evaluation-hook"
+        )
+        before = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o555
+            or before.st_nlink != 1
+        ):
+            raise OrchestrationError("sealed evaluation hook metadata is unsafe")
+        digest = hashlib.sha256()
+        observed = 0
+        while True:
+            block = os.read(source_descriptor, 1024 * 1024)
+            if not block:
+                break
+            observed += len(block)
+            digest.update(block)
+            offset = 0
+            while offset < len(block):
+                written = os.write(snapshot_descriptor, block[offset:])
+                if written <= 0:
+                    raise OrchestrationError(
+                        "cannot snapshot sealed evaluation hook bytes"
+                    )
+                offset += written
+        after = os.fstat(source_descriptor)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(before) != identity(after) or observed != before.st_size:
+            raise OrchestrationError("sealed evaluation hook changed while opened")
+        if (
+            digest.hexdigest() != expected_record["sha256"]
+            or observed != expected_record["bytes"]
+        ):
+            raise OrchestrationError(
+                "sealed evaluation hook bytes differ from verified inventory"
+            )
+        seals = _F_SEAL_WRITE | _F_SEAL_GROW | _F_SEAL_SHRINK | _F_SEAL_SEAL
+        fcntl.fcntl(snapshot_descriptor, _F_ADD_SEALS, seals)
+        observed_seals = fcntl.fcntl(snapshot_descriptor, _F_GET_SEALS)
+        if observed_seals & seals != seals:
+            raise OrchestrationError(
+                "evaluation hook snapshot could not be made immutable"
+            )
+        os.lseek(snapshot_descriptor, 0, os.SEEK_SET)
+        os.close(source_descriptor)
+        source_descriptor = -1
+        return snapshot_descriptor, [
+            "/bin/bash",
+            f"/proc/self/fd/{snapshot_descriptor}",
+        ]
+    except Exception:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if snapshot_descriptor is not None:
+            os.close(snapshot_descriptor)
+        raise
+
+
 class SubprocessHookRunner:
     """Run hooks without a shell and without echoing argv or environment."""
 
@@ -336,25 +536,40 @@ class SubprocessHookRunner:
         environment: Mapping[str, str],
         workdir: Path,
     ) -> None:
-        executable = Path(hook.argv[0])
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise OrchestrationError(f"{name} hook executable is missing or not executable")
         child_environment = dict(os.environ)
         child_environment.update(environment)
-        try:
-            completed = subprocess.run(
-                list(hook.argv),
-                cwd=workdir,
-                env=child_environment,
-                check=False,
-                timeout=hook.timeout_seconds,
+        verified_descriptor: int | None = None
+        if name == "evaluate":
+            verified_descriptor, argv = _verified_evaluation_hook(
+                hook, child_environment
             )
+            child_environment["ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH"] = "1"
+        else:
+            executable = Path(hook.argv[0])
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                raise OrchestrationError(
+                    f"{name} hook executable is missing or not executable"
+                )
+            argv = list(hook.argv)
+        try:
+            options: dict[str, Any] = {
+                "cwd": workdir,
+                "env": child_environment,
+                "check": False,
+                "timeout": hook.timeout_seconds,
+            }
+            if verified_descriptor is not None:
+                options["pass_fds"] = (verified_descriptor,)
+            completed = subprocess.run(argv, **options)
         except subprocess.TimeoutExpired as exc:
             raise OrchestrationError(f"{name} hook timed out") from exc
         except OSError as exc:
             raise OrchestrationError(
                 f"{name} hook could not start ({type(exc).__name__})"
             ) from exc
+        finally:
+            if verified_descriptor is not None:
+                os.close(verified_descriptor)
         if completed.returncode != 0:
             raise OrchestrationError(
                 f"{name} hook failed with exit status {completed.returncode}"

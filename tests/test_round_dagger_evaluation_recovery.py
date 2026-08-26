@@ -15,6 +15,7 @@ from round_dagger.artifacts import (
     sha256_file,
 )
 from round_dagger.state import load_campaign, load_state
+from scripts.round_dagger.verify_anchor_pool import AnchorRecord, inventory_sha256
 
 try:
     from test_round_dagger_state import _campaign, _sha, _stage_and_bind, _to_ingested
@@ -36,6 +37,9 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=scratch)
         self.tmp = Path(self.temporary.name)
         self.repository_root = Path(__file__).parents[1]
+        self.evaluation_source_inventory_sha = _sha(
+            "evaluation-source-inventory"
+        )
         self.root = _campaign(self.tmp)
         _to_ingested(self.root)
         self.candidate = _stage_and_bind(self.root, self.tmp)
@@ -45,14 +49,31 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         self.gr00t = self.tmp / "gr00t"
         for relative in (
             "gr00t/rl/eval_agent_trl.py",
+            "gr00t/rl/trl/trainer/anchor_io.py",
+            "gr00t/rl/trl/trainer/checkpoint_io.py",
+            "gr00t/rl/trl/trainer/distill_trainer.py",
             "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
             "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+            "gr00t/rl/trl/trainer/ppo_trainer.py",
             "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
         ):
             source = self.gr00t / relative
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(f"# recovery fixture: {relative}\n", encoding="utf-8")
+        self.anchor_pool = self.tmp / "anchors"
+        self.anchor_pool.mkdir()
+        anchor = self.anchor_pool / "anchor_000000.npz"
+        anchor.write_bytes(b"recovery anchor fixture")
+        self.anchor_inventory_sha = inventory_sha256(
+            [
+                AnchorRecord(
+                    relative_path=anchor.name,
+                    size=anchor.stat().st_size,
+                    sha256=sha256_file(anchor),
+                )
+            ]
+        )
         self.config = self.tmp / "evaluation.yaml"
         self.config.write_text("fixed_seed: true\n", encoding="utf-8")
         self.scenarios = self.tmp / "scenarios.json"
@@ -138,6 +159,13 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
             expected_renderer_count=1,
             learner_recovery_receipt_path=self.receipt["path"],
             expected_learner_recovery_receipt_sha256=self.receipt["sha256"],
+            evaluation_source_inventory_sha256=(
+                self.evaluation_source_inventory_sha
+            ),
+            anchor_pool_path=self.anchor_pool,
+            anchor_count=1,
+            anchor_index=0,
+            anchor_inventory_sha256=self.anchor_inventory_sha,
         )
 
     def _produce_result(self, plan: dict, *, passing: bool) -> dict:
@@ -333,6 +361,24 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         self.assertEqual(inventory["files"], [])
         self.assertIsNone(plan["legacy_contract_sha256"])
         self.assertIsNone(plan["legacy_result_sha256"])
+        self.assertEqual(
+            plan["learner_source_inventory_sha256"],
+            self.receipt["sealed_source_inventory_sha256"],
+        )
+        self.assertEqual(
+            plan["evaluation_source_inventory_sha256"],
+            self.evaluation_source_inventory_sha,
+        )
+        self.assertNotEqual(
+            plan["learner_source_inventory_sha256"],
+            plan["evaluation_source_inventory_sha256"],
+        )
+        self.assertEqual(plan["anchor_pool_path"], str(self.anchor_pool))
+        self.assertEqual(plan["anchor_count"], 1)
+        self.assertEqual(plan["anchor_index"], 0)
+        self.assertEqual(
+            plan["anchor_inventory_sha256"], self.anchor_inventory_sha
+        )
         self.assertFalse(legacy.exists())
         self._produce_result(plan, passing=True)
         completed = self._finalize(plan)

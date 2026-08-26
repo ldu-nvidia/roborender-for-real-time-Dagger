@@ -16,20 +16,27 @@ from typing import Any
 
 import yaml
 
+from scripts.eval.fixed_seed_gate import (
+    EVALUATION_PROVENANCE_SCHEMA,
+    GateError,
+    checkpoint_semantic_sha256,
+    load_checkpoint_file,
+    minimal_evaluation_checkpoint,
+    validate_evaluation_checkpoint,
+)
+
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 PROVENANCE_KEYS = {
+    "schema",
     "source",
     "source_sha256",
     "output",
     "output_sha256",
+    "output_semantic_sha256",
+    "retained_keys",
     "removed_keys",
     "environment_state_restored",
-}
-REMOVABLE_CHECKPOINT_KEYS = {
-    "env_state_dict",
-    "optimizer_state_dict",
-    "lr_scheduler_state_dict",
 }
 
 
@@ -82,48 +89,6 @@ def _read_regular(path: Path, label: str) -> tuple[bytes, os.stat_result]:
         if identity_before != identity_after or len(payload) != before.st_size:
             raise EvaluationInputError(f"{label} changed while it was read")
         return payload, before
-    finally:
-        os.close(descriptor)
-
-
-def _digest_regular(path: Path, label: str) -> tuple[str, os.stat_result]:
-    """Digest a potentially large regular file without retaining it in memory."""
-
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise EvaluationInputError(f"cannot safely open {label}: {path}") from exc
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise EvaluationInputError(f"{label} is not a regular file")
-        digest = hashlib.sha256()
-        observed_bytes = 0
-        with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                observed_bytes += len(chunk)
-                digest.update(chunk)
-        after = os.fstat(descriptor)
-        identity_before = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        identity_after = (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if identity_before != identity_after or observed_bytes != before.st_size:
-            raise EvaluationInputError(f"{label} changed while it was read")
-        return digest.hexdigest(), before
     finally:
         os.close(descriptor)
 
@@ -200,22 +165,48 @@ def verify_staged_inputs(
     )
     config_sha = _sha(expected_config_sha256, "expected config SHA-256")
 
-    source_sha, _ = _digest_regular(source, "checkpoint source")
-    staged_sha, _ = _digest_regular(staged, "staged checkpoint")
-    provenance_bytes, _ = _read_regular(
+    try:
+        source_checkpoint, source_sha, _ = load_checkpoint_file(
+            source,
+            expected_sha256=checkpoint_sha,
+            weights_only=False,
+            label="checkpoint source",
+        )
+        expected_stage, retained_keys, removed_keys = minimal_evaluation_checkpoint(
+            source_checkpoint
+        )
+        source_semantic_sha = checkpoint_semantic_sha256(expected_stage)
+        staged_checkpoint_value, staged_sha, staged_stat = load_checkpoint_file(
+            staged,
+            expected_sha256=None,
+            weights_only=True,
+            label="staged checkpoint",
+        )
+        validate_evaluation_checkpoint(staged_checkpoint_value)
+        staged_semantic_sha = checkpoint_semantic_sha256(staged_checkpoint_value)
+    except GateError as exc:
+        raise EvaluationInputError(str(exc)) from exc
+    provenance_bytes, provenance_stat = _read_regular(
         provenance_path, "staged checkpoint provenance"
     )
     config_source_bytes, _ = _read_regular(config_source, "evaluation config")
     config_staged_bytes, config_staged_stat = _read_regular(
         config_staged, "staged evaluation config"
     )
-    if stat.S_IMODE(config_staged_stat.st_mode) != 0o444:
-        raise EvaluationInputError(
-            "staged evaluation config mode must be exactly 0444"
-        )
+    for observed, label in (
+        (staged_stat, "staged checkpoint"),
+        (provenance_stat, "staged checkpoint provenance"),
+        (config_staged_stat, "staged evaluation config"),
+    ):
+        if stat.S_IMODE(observed.st_mode) != 0o444:
+            raise EvaluationInputError(f"{label} mode must be exactly 0444")
+        if observed.st_nlink != 1:
+            raise EvaluationInputError(f"{label} must have exactly one hard link")
 
-    if source_sha != checkpoint_sha:
-        raise EvaluationInputError("checkpoint source SHA-256 mismatch")
+    if staged_semantic_sha != source_semantic_sha:
+        raise EvaluationInputError(
+            "staged checkpoint semantics differ from the contracted source"
+        )
     if _digest(config_source_bytes) != config_sha:
         raise EvaluationInputError("evaluation config source SHA-256 mismatch")
     if _digest(config_staged_bytes) != config_sha:
@@ -233,26 +224,23 @@ def verify_staged_inputs(
     except OSError as exc:
         raise EvaluationInputError("cannot resolve checkpoint source") from exc
     expected = {
+        "schema": EVALUATION_PROVENANCE_SCHEMA,
         "source": resolved_source,
         "source_sha256": checkpoint_sha,
         "output": str(staged),
         "output_sha256": staged_sha,
+        "output_semantic_sha256": source_semantic_sha,
+        "retained_keys": retained_keys,
+        "removed_keys": removed_keys,
         "environment_state_restored": False,
     }
     if any(row.get(key) != value for key, value in expected.items()):
         raise EvaluationInputError("staged checkpoint provenance mismatch")
-    removed = row.get("removed_keys")
-    if (
-        not isinstance(removed, list)
-        or any(not isinstance(key, str) for key in removed)
-        or len(removed) != len(set(removed))
-        or any(key not in REMOVABLE_CHECKPOINT_KEYS for key in removed)
-    ):
-        raise EvaluationInputError("staged checkpoint removed_keys are invalid")
     return {
         "status": "PASS",
         "checkpoint_source_sha256": checkpoint_sha,
         "staged_checkpoint_sha256": staged_sha,
+        "staged_checkpoint_semantic_sha256": staged_semantic_sha,
         "evaluation_config_sha256": config_sha,
         "teacher_checkpoint": str(teacher),
     }

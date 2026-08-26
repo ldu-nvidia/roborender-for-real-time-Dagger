@@ -60,14 +60,11 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
         )
 
     def test_publication_is_atomic_and_never_overwrites(self):
-        self.assertIn('[ ! -e "$LOCAL_DESTINATION" ]', self.script)
+        self.assertIn('[ ! -e "$LOCAL_PUBLICATION" ]', self.script)
         self.assertIn('for path in "$destination" "$temporary"', self.script)
-        self.assertIn('mv "$LOCAL_TEMPORARY" "$LOCAL_DESTINATION"', self.script)
+        self.assertIn('mv "$LOCAL_PUBLICATION_TEMP" "$LOCAL_PUBLICATION"', self.script)
+        self.assertIn('chmod 0555 "$LOCAL_PUBLICATION_TEMP"', self.script)
         self.assertIn('mv "$temporary" "$destination"', self.script)
-        self.assertLess(
-            self.script.index('mv "$LOCAL_ATTESTATION_TEMP" "$LOCAL_ATTESTATION"'),
-            self.script.index('mv "$LOCAL_TEMPORARY" "$LOCAL_DESTINATION"'),
-        )
         self.assertLess(
             self.script.index('mv "$attestation_temporary" "$attestation"'),
             self.script.index('mv "$temporary" "$destination"'),
@@ -96,12 +93,13 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
             fast_sha = subprocess.check_output(["git", "-C", str(fast), "rev-parse", "HEAD"], text=True).strip()
             gr00t_sha = subprocess.check_output(["git", "-C", str(gr00t), "rev-parse", "HEAD"], text=True).strip()
             name = f"fast_roborender_{fast_sha[:7]}_{gr00t_sha[:7]}_sealed"
-            destination = output / name
+            publication = output / f"{name}.publication"
+            destination = publication / name
             destination.mkdir(parents=True)
             sentinel = destination / "sentinel"
             sentinel.write_text("do-not-delete\n")
-            attestation = output / f"{name}.snapshot_attestation.json"
-            inventory = output / f"{name}.inventory.json"
+            attestation = publication / f"{name}.snapshot_attestation.json"
+            inventory = publication / f"{name}.inventory.json"
             attestation.write_text("existing-attestation\n")
             inventory.write_text("existing-inventory\n")
             environment = os.environ.copy()
@@ -127,9 +125,7 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
             lock = output / f".{name}.publish.lock"
             self.assertFalse(lock.exists(), "this invocation must release only its own lock")
 
-            shutil.rmtree(destination)
-            attestation.unlink()
-            inventory.unlink()
+            shutil.rmtree(publication)
             lock.mkdir()
             lock_sentinel = lock / "owner"
             lock_sentinel.write_text("other-publisher\n")
@@ -220,9 +216,15 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
                 ["git", "-C", str(gr00t), "rev-parse", "HEAD"], text=True
             ).strip()
             snapshot = output / (
+                f"fast_roborender_{fast_sha[:7]}_{gr00t_sha[:7]}_sealed.publication"
+            ) / (
                 f"fast_roborender_{fast_sha[:7]}_{gr00t_sha[:7]}_sealed"
             )
             self.assertEqual((snapshot / "normal.txt").read_text(), normal_blob)
+            self.assertEqual(snapshot.parent.stat().st_mode & 0o777, 0o555)
+            self.assertTrue(
+                (snapshot.parent / f"{snapshot.name}.inventory.json").is_file()
+            )
 
 
 if __name__ == "__main__":

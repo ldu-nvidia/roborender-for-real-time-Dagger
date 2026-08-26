@@ -33,11 +33,11 @@ from round_dagger.artifacts import (
     sha256_file,
 )
 
-PLAN_SCHEMA = "fast_roborender.round_dagger.hardened_evaluation_recovery.v1"
+PLAN_SCHEMA = "fast_roborender.round_dagger.hardened_evaluation_recovery.v2"
 INVENTORY_SCHEMA = (
     "fast_roborender.round_dagger.legacy_evaluation_inventory.v1"
 )
-SOURCE_SCHEMA = "fast_roborender.round_dagger.recovery_source_bundle.v1"
+SOURCE_SCHEMA = "fast_roborender.round_dagger.recovery_source_bundle.v2"
 COMPLETION_SCHEMA = (
     "fast_roborender.round_dagger.hardened_evaluation_recovery_completion.v1"
 )
@@ -74,6 +74,12 @@ _PLAN_KEYS = {
     "promotion_hold_attestation_sha256",
     "learner_recovery_receipt_path",
     "learner_recovery_receipt_sha256",
+    "learner_source_inventory_sha256",
+    "evaluation_source_inventory_sha256",
+    "anchor_pool_path",
+    "anchor_count",
+    "anchor_index",
+    "anchor_inventory_sha256",
     "recovery_id",
     "recovery_root",
     "evaluator_contract_path",
@@ -214,11 +220,27 @@ def _require_source_root(value: str | Path, label: str) -> Path:
 
 
 def recovery_source_bundle(
-    repository_root: str | Path, gr00t_root: str | Path
+    repository_root: str | Path,
+    gr00t_root: str | Path,
+    *,
+    learner_source_inventory_sha256: str,
+    evaluation_source_inventory_sha256: str,
 ) -> dict[str, Any]:
     repository = _require_source_root(repository_root, "repository root")
     gr00t = _require_source_root(gr00t_root, "GR00T root")
-    evaluator = evaluation.evaluator_source_bundle(repository, gr00t)
+    learner_inventory_sha = _sha(
+        learner_source_inventory_sha256,
+        "learner source inventory SHA-256",
+    )
+    evaluation_inventory_sha = _sha(
+        evaluation_source_inventory_sha256,
+        "evaluation source inventory SHA-256",
+    )
+    evaluator = evaluation.evaluator_source_bundle(
+        repository,
+        gr00t,
+        evaluation_inventory_sha,
+    )
     entries = list(evaluator["sources"])
     known = {entry["source"] for entry in entries}
     for relative in _RECOVERY_REPOSITORY_SOURCES:
@@ -232,7 +254,12 @@ def recovery_source_bundle(
             )
         entries.append({"source": name, "sha256": sha256_file(source)})
     entries.sort(key=lambda item: item["source"])
-    return {"schema": SOURCE_SCHEMA, "sources": entries}
+    return {
+        "schema": SOURCE_SCHEMA,
+        "learner_source_inventory_sha256": learner_inventory_sha,
+        "evaluation_source_inventory_sha256": evaluation_inventory_sha,
+        "sources": entries,
+    }
 
 
 def _legacy_result(
@@ -626,6 +653,11 @@ def prepare_recovery(
     expected_renderer_count: int,
     learner_recovery_receipt_path: str | Path,
     expected_learner_recovery_receipt_sha256: str,
+    evaluation_source_inventory_sha256: str,
+    anchor_pool_path: str | Path,
+    anchor_count: int,
+    anchor_index: int,
+    anchor_inventory_sha256: str,
 ) -> dict[str, Any]:
     """Inventory the legacy result and publish an isolated hardened contract."""
 
@@ -656,12 +688,6 @@ def prepare_recovery(
         legacy_contract = evaluation.load_contract(root, legacy_contract_path)
         _legacy_result(root, legacy_root=legacy_root, contract=legacy_contract)
 
-    repository = _require_source_root(repository_root, "repository root")
-    gr00t = _require_source_root(gr00t_root, "GR00T root")
-    evaluator_bundle = evaluation.evaluator_source_bundle(repository, gr00t)
-    evaluator_sha = canonical_json_sha256(evaluator_bundle)
-    recovery_bundle = recovery_source_bundle(repository, gr00t)
-    recovery_sha = canonical_json_sha256(recovery_bundle)
     candidate = promotion.load_candidate_manifest(
         root,
         current["candidate_policy"]["manifest_path"],
@@ -676,13 +702,54 @@ def prepare_recovery(
         candidate=candidate,
         require_held_mode=True,
     )
-    _load_learner_recovery_receipt(
+    learner_receipt = _load_learner_recovery_receipt(
         root,
         path=learner_recovery_receipt_path,
         expected_sha256=expected_learner_recovery_receipt_sha256,
         current=current,
         candidate=candidate,
     )
+    learner_inventory_sha = _sha(
+        learner_receipt["sealed_source_inventory_sha256"],
+        "learner source inventory SHA-256",
+    )
+    evaluation_inventory_sha = _sha(
+        evaluation_source_inventory_sha256,
+        "evaluation source inventory SHA-256",
+    )
+    anchor_path = Path(anchor_pool_path)
+    if (
+        not anchor_path.is_absolute()
+        or any(part in {".", ".."} for part in anchor_path.parts)
+    ):
+        raise EvaluationRecoveryError(
+            "anchor pool path must be normalized and absolute"
+        )
+    if type(anchor_count) is not int or anchor_count <= 0:
+        raise EvaluationRecoveryError("anchor count must be positive")
+    if type(anchor_index) is not int or anchor_index < 0:
+        raise EvaluationRecoveryError("anchor index must be non-negative")
+    if anchor_index >= anchor_count:
+        raise EvaluationRecoveryError("anchor index must be smaller than anchor count")
+    anchor_inventory_sha = _sha(
+        anchor_inventory_sha256,
+        "anchor inventory SHA-256",
+    )
+    repository = _require_source_root(repository_root, "repository root")
+    gr00t = _require_source_root(gr00t_root, "GR00T root")
+    evaluator_bundle = evaluation.evaluator_source_bundle(
+        repository,
+        gr00t,
+        evaluation_inventory_sha,
+    )
+    evaluator_sha = canonical_json_sha256(evaluator_bundle)
+    recovery_bundle = recovery_source_bundle(
+        repository,
+        gr00t,
+        learner_source_inventory_sha256=learner_inventory_sha,
+        evaluation_source_inventory_sha256=evaluation_inventory_sha,
+    )
+    recovery_sha = canonical_json_sha256(recovery_bundle)
     external_inputs: list[tuple[Path, str]] = []
     for raw, label in (
         (scenario_cases_path, "scenario cases"),
@@ -715,6 +782,12 @@ def prepare_recovery(
             "learner_recovery_receipt_sha256": (
                 expected_learner_recovery_receipt_sha256
             ),
+            "learner_source_inventory_sha256": learner_inventory_sha,
+            "evaluation_source_inventory_sha256": evaluation_inventory_sha,
+            "anchor_pool_path": str(anchor_path),
+            "anchor_count": anchor_count,
+            "anchor_index": anchor_index,
+            "anchor_inventory_sha256": anchor_inventory_sha,
             "scenario_cases_sha256": sha256_file(scenario_path),
             "thresholds_sha256": sha256_file(threshold_path),
             "evaluation_config_sha256": sha256_file(config_path),
@@ -753,6 +826,10 @@ def prepare_recovery(
         evaluation_config_sha256=sha256_file(config_path),
         evaluator_code_sha256=evaluator_sha,
         expected_renderer_count=expected_renderer_count,
+        anchor_pool_path=anchor_path,
+        anchor_count=anchor_count,
+        anchor_index=anchor_index,
+        anchor_inventory_sha256=anchor_inventory_sha,
         output=recovery_root / "contract.json",
         thresholds=thresholds,
     )
@@ -784,6 +861,12 @@ def prepare_recovery(
             expected_learner_recovery_receipt_sha256,
             "learner recovery receipt SHA",
         ),
+        "learner_source_inventory_sha256": learner_inventory_sha,
+        "evaluation_source_inventory_sha256": evaluation_inventory_sha,
+        "anchor_pool_path": str(anchor_path),
+        "anchor_count": anchor_count,
+        "anchor_index": anchor_index,
+        "anchor_inventory_sha256": anchor_inventory_sha,
         "recovery_id": recovery_id,
         "recovery_root": _relative(root, recovery_root, "recovery root"),
         "evaluator_contract_path": hardened_contract["contract_path"],
@@ -890,17 +973,21 @@ def _verify_plan_evidence(
             plan[sha_key], f"{label} SHA"
         ):
             raise EvaluationRecoveryError(f"{label} changed")
-    actual_evaluator = evaluation.evaluator_source_bundle(
-        repository_root, gr00t_root
+    hardened_contract = evaluation.load_contract(
+        root,
+        root / plan["evaluator_contract_path"],
+        bind_state=current["phase"] != "READY",
     )
-    actual_recovery = recovery_source_bundle(repository_root, gr00t_root)
-    evaluator_path = root / plan["evaluator_source_bundle_path"]
-    recovery_path = root / plan["recovery_source_bundle_path"]
-    if load_strict_json(evaluator_path) != actual_evaluator:
-        raise EvaluationRecoveryError("evaluator source bytes changed after preparation")
-    if load_strict_json(recovery_path) != actual_recovery:
-        raise EvaluationRecoveryError("recovery source bytes changed after preparation")
-
+    expected_anchor_pool = {
+        "path": plan["anchor_pool_path"],
+        "anchor_count": plan["anchor_count"],
+        "anchor_index": plan["anchor_index"],
+        "inventory_sha256": plan["anchor_inventory_sha256"],
+    }
+    if hardened_contract.get("anchor_pool") != expected_anchor_pool:
+        raise EvaluationRecoveryError(
+            "hardened evaluator anchor contract differs from recovery plan"
+        )
     inventory_path = root / plan["legacy_inventory_path"]
     expected_inventory = load_strict_json(inventory_path)
     legacy_root = root / plan["legacy_evaluation_root"]
@@ -930,13 +1017,42 @@ def _verify_plan_evidence(
         candidate=candidate,
         require_held_mode=current["phase"] in {"TRAINED", "EVALUATED"},
     )
-    _load_learner_recovery_receipt(
+    learner_receipt = _load_learner_recovery_receipt(
         root,
         path=plan["learner_recovery_receipt_path"],
         expected_sha256=plan["learner_recovery_receipt_sha256"],
         current=current,
         candidate=candidate,
     )
+    learner_inventory_sha = _sha(
+        plan["learner_source_inventory_sha256"],
+        "planned learner source inventory SHA-256",
+    )
+    if learner_receipt["sealed_source_inventory_sha256"] != learner_inventory_sha:
+        raise EvaluationRecoveryError(
+            "learner source inventory differs from recovery receipt"
+        )
+    evaluation_inventory_sha = _sha(
+        plan["evaluation_source_inventory_sha256"],
+        "planned evaluation source inventory SHA-256",
+    )
+    actual_evaluator = evaluation.evaluator_source_bundle(
+        repository_root,
+        gr00t_root,
+        evaluation_inventory_sha,
+    )
+    actual_recovery = recovery_source_bundle(
+        repository_root,
+        gr00t_root,
+        learner_source_inventory_sha256=learner_inventory_sha,
+        evaluation_source_inventory_sha256=evaluation_inventory_sha,
+    )
+    evaluator_path = root / plan["evaluator_source_bundle_path"]
+    recovery_path = root / plan["recovery_source_bundle_path"]
+    if load_strict_json(evaluator_path) != actual_evaluator:
+        raise EvaluationRecoveryError("evaluator source bytes changed after preparation")
+    if load_strict_json(recovery_path) != actual_recovery:
+        raise EvaluationRecoveryError("recovery source bytes changed after preparation")
     return current
 
 
@@ -1122,6 +1238,13 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--expected-learner-recovery-receipt-sha256", required=True
     )
+    prepare.add_argument(
+        "--evaluation-source-inventory-sha256", required=True
+    )
+    prepare.add_argument("--anchor-pool-path", required=True)
+    prepare.add_argument("--anchor-count", type=int, required=True)
+    prepare.add_argument("--anchor-index", type=int, required=True)
+    prepare.add_argument("--anchor-inventory-sha256", required=True)
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--root", required=True)
     finalize.add_argument("--plan", required=True)
@@ -1158,6 +1281,13 @@ def main(argv: list[str] | None = None) -> int:
                 expected_learner_recovery_receipt_sha256=(
                     args.expected_learner_recovery_receipt_sha256
                 ),
+                evaluation_source_inventory_sha256=(
+                    args.evaluation_source_inventory_sha256
+                ),
+                anchor_pool_path=args.anchor_pool_path,
+                anchor_count=args.anchor_count,
+                anchor_index=args.anchor_index,
+                anchor_inventory_sha256=args.anchor_inventory_sha256,
             )
         else:
             result = finalize_recovery(

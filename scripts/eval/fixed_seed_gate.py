@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
 import random
 import re
+import stat
+import struct
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +35,11 @@ SCHEMA_VERSION = 1
 CHECKPOINT_RE = re.compile(r"^model_step_(\d+)\.pt$")
 DEFAULT_SEEDS = (1729, 3253, 4519, 5987, 7411, 8863, 10193, 12203)
 ROLE_ORDER = ("baseline", "early", "mid", "final")
+EVALUATION_CHECKPOINT_SCHEMA = "fast_roborender.eval_checkpoint.v1"
+EVALUATION_PROVENANCE_SCHEMA = "fast_roborender.eval_checkpoint_provenance.v1"
+POLICY_STATE_KEYS = ("actor_model_state_dict", "policy_state_dict")
+AUXILIARY_STATE_KEYS = ("value_state_dict", "homie_state_dict")
+EVALUATION_STATE_KEYS = frozenset((*POLICY_STATE_KEYS, *AUXILIARY_STATE_KEYS))
 
 
 class GateError(RuntimeError):
@@ -70,57 +78,218 @@ def sha256_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def load_checkpoint_file(
+    path: Path,
+    *,
+    expected_sha256: str | None,
+    weights_only: bool,
+    label: str,
+) -> tuple[Mapping[str, Any], str, os.stat_result]:
+    """Hash and load one checkpoint from the same race-checked descriptor.
+
+    Untrusted staged checkpoints must use ``weights_only=True``.  A contracted
+    source is hashed before its legacy pickle is allowed to execute.
+    """
+
+    try:
+        import torch
+    except ImportError:
+        raise GateError("torch is required to inspect an evaluation checkpoint") from None
+    candidate = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError as exc:
+        raise GateError(f"cannot safely open {label}: {candidate}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise GateError(f"{label} is not a regular file")
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        observed_bytes = 0
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                observed_bytes += len(chunk)
+                digest.update(chunk)
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after or observed_bytes != before.st_size:
+            raise GateError(f"{label} changed while it was inspected")
+        payload = b"".join(chunks)
+        actual_sha256 = digest.hexdigest()
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise GateError(f"{label} SHA-256 differs from the contract")
+    finally:
+        os.close(descriptor)
+    # Deserialize only the immutable byte snapshot whose complete digest and
+    # descriptor identity were accepted above.  Loading from the still-live
+    # file descriptor would permit an in-place write between hash and pickle
+    # execution, even if a later fstat detected the change.
+    try:
+        checkpoint = torch.load(
+            io.BytesIO(payload),
+            map_location="cpu",
+            weights_only=weights_only,
+        )
+    except TypeError as exc:
+        if weights_only:
+            raise GateError(
+                "safe staged checkpoint loading requires PyTorch weights_only"
+            ) from exc
+        checkpoint = torch.load(io.BytesIO(payload), map_location="cpu")
+    except Exception as exc:
+        mode = "safe" if weights_only else "contracted"
+        raise GateError(
+            f"cannot {mode}-load {label}: {type(exc).__name__}: {exc}"
+        ) from None
+    if not isinstance(checkpoint, Mapping):
+        raise GateError(f"{label} must contain a checkpoint mapping")
+    return checkpoint, actual_sha256, before
+
+
+def minimal_evaluation_checkpoint(
+    checkpoint: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Extract only model state consumed by the evaluation loader."""
+
+    if any(not isinstance(key, str) for key in checkpoint):
+        raise GateError("checkpoint top-level keys must be strings")
+    policy_keys = [key for key in POLICY_STATE_KEYS if key in checkpoint]
+    if len(policy_keys) != 1:
+        raise GateError(
+            "checkpoint must contain exactly one supported policy state dict"
+        )
+    retained = [policy_keys[0]]
+    for key in AUXILIARY_STATE_KEYS:
+        if checkpoint.get(key) is not None:
+            retained.append(key)
+    minimal = {key: checkpoint[key] for key in retained}
+    validate_evaluation_checkpoint(minimal)
+    retained.sort()
+    removed = sorted(set(checkpoint) - set(retained))
+    return minimal, retained, removed
+
+
+def validate_evaluation_checkpoint(checkpoint: Mapping[str, Any]) -> None:
+    """Require the exact tensor-only structure accepted for evaluation."""
+
+    try:
+        import torch
+    except ImportError:
+        raise GateError("torch is required to inspect an evaluation checkpoint") from None
+    keys = set(checkpoint)
+    if any(not isinstance(key, str) for key in checkpoint) or not keys <= EVALUATION_STATE_KEYS:
+        raise GateError("evaluation checkpoint contains an unsupported top-level key")
+    if len(keys.intersection(POLICY_STATE_KEYS)) != 1:
+        raise GateError("evaluation checkpoint policy state is missing or ambiguous")
+    for section, state_dict in checkpoint.items():
+        if not isinstance(state_dict, Mapping) or not state_dict:
+            raise GateError(f"evaluation checkpoint {section} must be a non-empty mapping")
+        if any(not isinstance(name, str) or not name for name in state_dict):
+            raise GateError(f"evaluation checkpoint {section} has an unsafe tensor name")
+        for name, tensor in state_dict.items():
+            if not isinstance(tensor, torch.Tensor):
+                raise GateError(
+                    f"evaluation checkpoint {section}.{name} is not a tensor"
+                )
+            if (
+                tensor.layout != torch.strided
+                or tensor.is_sparse
+                or tensor.is_quantized
+                or tensor.device.type == "meta"
+            ):
+                raise GateError(
+                    f"evaluation checkpoint {section}.{name} has unsupported tensor storage"
+                )
+
+
+def _semantic_field(digest: Any, payload: bytes) -> None:
+    digest.update(struct.pack(">Q", len(payload)))
+    digest.update(payload)
+
+
+def checkpoint_semantic_sha256(checkpoint: Mapping[str, Any]) -> str:
+    """Hash named tensor values independent of torch.save container bytes."""
+
+    try:
+        import torch
+    except ImportError:
+        raise GateError("torch is required to inspect an evaluation checkpoint") from None
+    validate_evaluation_checkpoint(checkpoint)
+    digest = hashlib.sha256()
+    digest.update(EVALUATION_CHECKPOINT_SCHEMA.encode("ascii") + b"\0")
+    for section in sorted(checkpoint):
+        _semantic_field(digest, section.encode("utf-8"))
+        state_dict = checkpoint[section]
+        for name in sorted(state_dict):
+            tensor = state_dict[name].detach().to(device="cpu").contiguous()
+            _semantic_field(digest, name.encode("utf-8"))
+            _semantic_field(digest, str(tensor.dtype).encode("ascii"))
+            digest.update(struct.pack(">Q", tensor.ndim))
+            for dimension in tensor.shape:
+                digest.update(struct.pack(">q", int(dimension)))
+            byte_view = tensor.reshape(-1).view(torch.uint8)
+            digest.update(struct.pack(">Q", byte_view.numel()))
+            digest.update(memoryview(byte_view.numpy()))
+    return digest.hexdigest()
+
+
 def sanitize_checkpoint(source: Path, output: Path, expected_sha256: str) -> dict[str, Any]:
-    """Create an evaluation-only checkpoint without checkpoint-specific env RNG/state.
+    """Create a tensor-only evaluation checkpoint bound to the source semantics.
 
     GR00T checkpoints contain ``env_state_dict`` and its loader restores that state after
     Isaac has been seeded.  Leaving it in would make nominally fixed-seed comparisons use
-    checkpoint-dependent simulator state.  Optimizer/scheduler state is also unnecessary
-    for evaluation and is removed from the staged copy.
+    checkpoint-dependent simulator state.  All non-model state is omitted, making the
+    result safe to independently load with ``weights_only=True``.
     """
 
-    source = source.resolve()
-    if not source.is_file():
-        raise GateError(f"checkpoint does not exist: {source}")
-    actual_sha256 = sha256_file(source)
-    if actual_sha256 != expected_sha256:
-        raise GateError("checkpoint hash changed after evaluation manifest creation")
+    source = Path(os.path.abspath(source))
+    checkpoint, actual_sha256, _ = load_checkpoint_file(
+        source,
+        expected_sha256=expected_sha256,
+        weights_only=False,
+        label="checkpoint source",
+    )
+    minimal, retained_keys, removed_keys = minimal_evaluation_checkpoint(checkpoint)
+    semantic_sha256 = checkpoint_semantic_sha256(minimal)
     try:
         import torch
     except ImportError:
         raise GateError("torch is required to sanitize an evaluation checkpoint") from None
-    try:
-        try:
-            checkpoint = torch.load(source, map_location="cpu", weights_only=False)
-        except TypeError:
-            # PyTorch releases before weights_only was added.
-            checkpoint = torch.load(source, map_location="cpu")
-    except Exception as exc:
-        raise GateError(f"cannot load checkpoint {source}: {type(exc).__name__}: {exc}") from None
-    if not isinstance(checkpoint, dict) or not {
-        "policy_state_dict",
-        "actor_model_state_dict",
-    }.intersection(checkpoint):
-        raise GateError("checkpoint does not contain a supported policy state dict")
-
-    removed_keys = []
-    for key in ("env_state_dict", "optimizer_state_dict", "lr_scheduler_state_dict"):
-        if key in checkpoint:
-            checkpoint.pop(key)
-            removed_keys.append(key)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp.{os.getpid()}")
     try:
-        torch.save(checkpoint, temporary)
+        torch.save(minimal, temporary)
+        os.chmod(temporary, 0o444)
         os.replace(temporary, output)
     except Exception as exc:
         temporary.unlink(missing_ok=True)
         raise GateError(f"cannot write sanitized checkpoint {output}: {exc}") from None
     return {
+        "schema": EVALUATION_PROVENANCE_SCHEMA,
         "source": str(source),
         "source_sha256": actual_sha256,
         "output": str(output),
         "output_sha256": sha256_file(output),
+        "output_semantic_sha256": semantic_sha256,
+        "retained_keys": retained_keys,
         "removed_keys": removed_keys,
         "environment_state_restored": False,
     }
@@ -691,7 +860,9 @@ def _sanitize_command(args: argparse.Namespace) -> int:
         Path(args.checkpoint), Path(args.output), args.expected_sha256
     )
     if args.provenance:
-        _atomic_json(Path(args.provenance), provenance)
+        provenance_path = Path(args.provenance)
+        _atomic_json(provenance_path, provenance)
+        os.chmod(provenance_path, 0o444)
     return 0
 
 

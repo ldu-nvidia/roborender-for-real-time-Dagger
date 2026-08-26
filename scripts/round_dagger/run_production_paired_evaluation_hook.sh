@@ -23,8 +23,19 @@ print_command() {
     printf '\n'
 }
 
-REPOSITORY_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-export PYTHONPATH="$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+# Production execution is permitted only through the coordinator-resident
+# dispatcher.  That dispatcher verifies the complete seal, latches this script
+# on an O_NOFOLLOW descriptor, and executes /proc/self/fd/N.  BASH_SOURCE is
+# therefore intentionally not a repository pathname; derive every source path
+# from the independently pinned and verified evaluation root.
+TRUSTED_DISPATCH=${ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH:?missing ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH}
+[[ $TRUSTED_DISPATCH == 1 ]] || \
+    fatal "ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH must be exactly 1"
+EVALUATION_SOURCE_ROOT=${ROUND_DAGGER_EVALUATION_SOURCE_ROOT:?missing ROUND_DAGGER_EVALUATION_SOURCE_ROOT}
+require_directory "$EVALUATION_SOURCE_ROOT" "sealed evaluation source root"
+REPOSITORY_ROOT=$(cd "$EVALUATION_SOURCE_ROOT" && pwd -P)
+[[ $REPOSITORY_ROOT == "$EVALUATION_SOURCE_ROOT" ]] || \
+    fatal "sealed evaluation source root must be canonical"
 
 # Dynamic identities are provided by MacroRoundOrchestrator.  They are checked
 # here again so a standalone or stale hook invocation cannot evaluate a
@@ -50,10 +61,10 @@ THRESHOLDS_SHA=${ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256:?missing ROUND_DAGGER
 TEACHER_CHECKPOINT=${ROUND_DAGGER_TEACHER_CHECKPOINT:?missing ROUND_DAGGER_TEACHER_CHECKPOINT}
 TEACHER_SHA=${ROUND_DAGGER_TEACHER_SHA256:?missing ROUND_DAGGER_TEACHER_SHA256}
 SEALED_TEACHER=${ROUND_DAGGER_EVALUATION_SEALED_TEACHER:?missing ROUND_DAGGER_EVALUATION_SEALED_TEACHER}
+EVALUATION_SOURCE_INVENTORY_SHA=${ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256:?missing ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256}
 ENDPOINT_DIR=${ROUND_DAGGER_EVALUATION_ENDPOINT_DIR:?missing ROUND_DAGGER_EVALUATION_ENDPOINT_DIR}
 RENDERER_RUNTIME_SHA=${ROUND_DAGGER_RENDERER_RUNTIME_SHA256:?missing ROUND_DAGGER_RENDERER_RUNTIME_SHA256}
 EXPECTED_RENDERERS=${ROUND_DAGGER_EXPECTED_RENDERERS:?missing ROUND_DAGGER_EXPECTED_RENDERERS}
-GR00T_SOURCE_ROOT=${GR00T_ROOT:?missing GR00T_ROOT}
 CONTAINER_PYTHON=${GR00T_PYTHON:?missing GR00T_PYTHON}
 DOCKER=${ROUND_DAGGER_DOCKER_BIN:?missing ROUND_DAGGER_DOCKER_BIN}
 IMAGE=${ROUND_DAGGER_RTX_IMAGE:?missing ROUND_DAGGER_RTX_IMAGE}
@@ -61,6 +72,10 @@ EXPECTED_IMAGE_ID_SHA=${ROUND_DAGGER_RTX_IMAGE_ID_SHA256:?missing ROUND_DAGGER_R
 CONTROL_PYTHON=${ROUND_DAGGER_CONTROL_PYTHON:-python3}
 DRY_RUN=${DRY_RUN:-0}
 RECOVERY_ID=${ROUND_DAGGER_EVALUATION_RECOVERY_ID:-}
+ANCHOR_POOL=${ANCHORS:?missing ANCHORS}
+ANCHOR_COUNT=${ROUND_DAGGER_MIN_ANCHORS:?missing ROUND_DAGGER_MIN_ANCHORS}
+ANCHOR_INDEX=${ROUND_DAGGER_ANCHOR_INDEX:?missing ROUND_DAGGER_ANCHOR_INDEX}
+ANCHOR_INVENTORY_SHA=${ROUND_DAGGER_ANCHOR_INVENTORY_SHA256:?missing ROUND_DAGGER_ANCHOR_INVENTORY_SHA256}
 
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "campaign ID is unsafe"
@@ -78,11 +93,21 @@ require_sha "$EVALUATOR_CONFIG_SHA" ROUND_DAGGER_EVALUATOR_CONFIG_SHA256
 require_sha "$SCENARIO_CASES_SHA" ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256
 require_sha "$THRESHOLDS_SHA" ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256
 require_sha "$TEACHER_SHA" ROUND_DAGGER_TEACHER_SHA256
+require_sha "$EVALUATION_SOURCE_INVENTORY_SHA" ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256
+require_sha "$ANCHOR_INVENTORY_SHA" ROUND_DAGGER_ANCHOR_INVENTORY_SHA256
 require_sha "$RENDERER_RUNTIME_SHA" ROUND_DAGGER_RENDERER_RUNTIME_SHA256
 require_sha "$EXPECTED_IMAGE_ID_SHA" ROUND_DAGGER_RTX_IMAGE_ID_SHA256
 require_directory "$CAMPAIGN_ROOT" "campaign root"
-require_directory "$GR00T_SOURCE_ROOT" "GR00T root"
+[[ $REPOSITORY_ROOT == "$EVALUATION_SOURCE_ROOT" ]] || \
+    fatal "production evaluation hook is not executing from the sealed source root"
+GR00T_SOURCE_ROOT="$EVALUATION_SOURCE_ROOT/GR00T-VisualSim2Real"
+require_directory "$GR00T_SOURCE_ROOT" "sealed GR00T root"
 require_directory "$ENDPOINT_DIR" "renderer endpoint directory"
+require_directory "$ANCHOR_POOL" "anchor pool"
+[[ $ANCHOR_COUNT =~ ^[1-9][0-9]*$ ]] || fatal "anchor count is invalid"
+[[ $ANCHOR_INDEX =~ ^(0|[1-9][0-9]*)$ ]] || fatal "anchor index is invalid"
+((10#$ANCHOR_INDEX < 10#$ANCHOR_COUNT)) || \
+    fatal "anchor index must be smaller than anchor count"
 require_regular "$PARENT_CHECKPOINT" "parent checkpoint"
 require_regular "$CANDIDATE_MANIFEST" "candidate manifest"
 require_regular "$EVALUATION_CONFIG" "evaluation config"
@@ -131,12 +156,36 @@ CONTROL_PYTHON_TARGET=$(readlink -f -- "$CONTROL_PYTHON") || \
     fatal "configured teacher checkpoint SHA mismatch"
 [[ $(sha256sum "$SEALED_TEACHER" | awk '{print $1}') == "$TEACHER_SHA" ]] || \
     fatal "sealed teacher checkpoint SHA mismatch"
+EXPECTED_SEALED_TEACHER="$EVALUATION_SOURCE_ROOT/${ROUND_DAGGER_TEACHER_CHECKPOINT_RELATIVE:?missing ROUND_DAGGER_TEACHER_CHECKPOINT_RELATIVE}"
+[[ $SEALED_TEACHER == "$EXPECTED_SEALED_TEACHER" ]] || \
+    fatal "sealed teacher path was not derived from the evaluation source"
+
+SOURCE_INVENTORY="$(dirname "$EVALUATION_SOURCE_ROOT")/$(basename "$EVALUATION_SOURCE_ROOT").inventory.json"
+SOURCE_ATTESTATION="$(dirname "$EVALUATION_SOURCE_ROOT")/$(basename "$EVALUATION_SOURCE_ROOT").snapshot_attestation.json"
+require_regular "$SOURCE_INVENTORY" "evaluation source inventory"
+require_regular "$SOURCE_ATTESTATION" "evaluation source attestation"
+export PYTHONPATH="$EVALUATION_SOURCE_ROOT:$GR00T_SOURCE_ROOT"
+
+verify_evaluation_source() {
+    "$CONTROL_PYTHON" "$EVALUATION_SOURCE_ROOT/scripts/round_dagger/verify_sealed_source_snapshot.py" \
+        --root "$EVALUATION_SOURCE_ROOT" \
+        --expected-inventory-sha256 "$EVALUATION_SOURCE_INVENTORY_SHA" \
+        >/dev/null || fatal "sealed evaluation source verification failed"
+}
+verify_anchor_pool() {
+    "$CONTROL_PYTHON" "$EVALUATION_SOURCE_ROOT/scripts/round_dagger/verify_anchor_pool.py" \
+        --root "$ANCHOR_POOL" --expected-count "$ANCHOR_COUNT" \
+        --expected-sha256 "$ANCHOR_INVENTORY_SHA" \
+        >/dev/null || fatal "evaluation anchor pool verification failed"
+}
+verify_evaluation_source
+verify_anchor_pool
 
 # The pinned Hydra config must name the host path that will be shadowed by the
 # more-specific read-only file bind below.  Parsing the exact, digest-checked
 # config prevents a valid teacher from being mounted at a path the evaluator
 # never consumes.
-CONFIGURED_TEACHER=$($CONTROL_PYTHON - "$EVALUATION_CONFIG" <<'PY'
+mapfile -t CONFIGURED_INPUTS < <($CONTROL_PYTHON - "$EVALUATION_CONFIG" <<'PY'
 import sys
 from pathlib import Path
 
@@ -149,11 +198,48 @@ if not isinstance(document, dict):
 teacher = document.get("teacher_actor_path")
 if not isinstance(teacher, str) or not Path(teacher).is_absolute():
     raise SystemExit("evaluation config teacher_actor_path must be absolute")
+videogen = document.get("algo", {}).get("config", {}).get("videogen", {})
+anchor = videogen.get("anchor_pool_dir")
+index = videogen.get("anchor_index")
+if not isinstance(anchor, str) or not Path(anchor).is_absolute():
+    raise SystemExit("evaluation config anchor_pool_dir must be absolute")
+if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+    raise SystemExit("evaluation config anchor_index must be non-negative")
 print(teacher)
+print(anchor)
+print(index)
 PY
-) || fatal "cannot read teacher path from the pinned evaluation config"
+) || fatal "cannot read teacher/anchor paths from the pinned evaluation config"
+[[ ${#CONFIGURED_INPUTS[@]} -eq 3 ]] || fatal "pinned config input parse is incomplete"
+CONFIGURED_TEACHER=${CONFIGURED_INPUTS[0]}
+CONFIGURED_ANCHOR_POOL=${CONFIGURED_INPUTS[1]}
+CONFIGURED_ANCHOR_INDEX=${CONFIGURED_INPUTS[2]}
 [[ $CONFIGURED_TEACHER == "$TEACHER_CHECKPOINT" ]] || \
     fatal "pinned evaluation config teacher path mismatch"
+[[ $CONFIGURED_ANCHOR_POOL == "$ANCHOR_POOL" ]] || \
+    fatal "pinned evaluation config anchor pool path mismatch"
+[[ $CONFIGURED_ANCHOR_INDEX == "$ANCHOR_INDEX" ]] || \
+    fatal "pinned evaluation config anchor index mismatch"
+
+SEALED_CAMPAIGN_CONTRACT="$EVALUATION_SOURCE_ROOT/configs/round_dagger/production_campaign_256x300.json"
+require_regular "$SEALED_CAMPAIGN_CONTRACT" "sealed production campaign contract"
+$CONTROL_PYTHON - "$SEALED_CAMPAIGN_CONTRACT" "$ANCHOR_POOL" \
+    "$ANCHOR_COUNT" "$ANCHOR_INVENTORY_SHA" <<'PY' || \
+    fatal "sealed campaign anchor contract mismatch"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    anchor = json.load(handle)["artifacts"]["anchor_pool"]
+expected = {
+    "path": sys.argv[2],
+    "anchor_count": int(sys.argv[3]),
+    "inventory_sha256": sys.argv[4],
+    "inventory_algorithm": "len64be(path_utf8)+path_utf8+size64be+sha256_binary",
+}
+if anchor != expected:
+    raise SystemExit(1)
+PY
 
 PADDED_ROUND=$(printf '%06d' "$MACRO_ROUND")
 if [[ -n $RECOVERY_ID ]]; then
@@ -167,20 +253,22 @@ EXPECTED_RESULT="$EVALUATION_ROOT/result.json"
 [[ $EVALUATOR_RESULT == "$EXPECTED_RESULT" ]] || \
     fatal "orchestrator evaluator result path is non-canonical"
 
-# All files consumed inside Docker must live below one of the two explicit
-# read/write mounts.  This prevents a host-only path from silently becoming a
-# different file inside the actor image.
+# Every host input must be representable by an exact narrow Docker bind.  The
+# source, evidence, config, endpoint, anchor, and teacher binds are read-only;
+# only the campaign root is writable for staged inputs and evaluation results.
 for path in "$REPOSITORY_ROOT" "$CAMPAIGN_ROOT" "$GR00T_SOURCE_ROOT" \
     "$EVALUATION_CONFIG" "$SCENARIO_CASES" "$THRESHOLDS" "$ENDPOINT_DIR" \
-    "$TEACHER_CHECKPOINT" "$SEALED_TEACHER"; do
+    "$TEACHER_CHECKPOINT" "$SEALED_TEACHER" "$ANCHOR_POOL" \
+    "$SOURCE_INVENTORY" "$SOURCE_ATTESTATION"; do
     case "$path" in
         /mnt/data1|/mnt/data1/*|/mnt/data2|/mnt/data2/*) ;;
         *) fatal "container input is outside /mnt/data1 and /mnt/data2: $path" ;;
     esac
 done
-for mount_root in /mnt/data1 /mnt/data2; do
-    require_directory "$mount_root" "Docker mount root"
-done
+case "$SCENARIO_CASES:$THRESHOLDS" in
+    "$EVALUATION_SOURCE_ROOT"/*:"$EVALUATION_SOURCE_ROOT"/*) ;;
+    *) fatal "scenario and threshold contracts must come from the sealed source" ;;
+esac
 
 mapfile -t ENDPOINT_FILES < <(find "$ENDPOINT_DIR" -maxdepth 1 -type f \
     -name 'renderer_*.txt' -print | LC_ALL=C sort)
@@ -235,7 +323,8 @@ PY
 require_sha "$CANDIDATE_RUNTIME_SHA" "candidate runtime policy identity"
 
 EVALUATOR_DIGEST_JSON=$($CONTROL_PYTHON -m round_dagger.evaluation evaluator-digest \
-    --repository-root "$REPOSITORY_ROOT" --gr00t-root "$GR00T_SOURCE_ROOT") || \
+    --repository-root "$REPOSITORY_ROOT" --gr00t-root "$GR00T_SOURCE_ROOT" \
+    --evaluation-source-inventory-sha256 "$EVALUATION_SOURCE_INVENTORY_SHA") || \
     fatal "evaluator source digest failed"
 EVALUATOR_CODE_SHA=$(printf '%s' "$EVALUATOR_DIGEST_JSON" | \
     $CONTROL_PYTHON -c 'import json,sys; print(json.load(sys.stdin)["sha256"])') || \
@@ -252,6 +341,10 @@ PREPARE=("$CONTROL_PYTHON" -m round_dagger.evaluation prepare
     --evaluation-config "$EVALUATION_CONFIG"
     --evaluator-code "$EVALUATOR_CODE_SHA"
     --expected-renderer-count "$EXPECTED_RENDERERS"
+    --anchor-pool-path "$ANCHOR_POOL"
+    --anchor-count "$ANCHOR_COUNT"
+    --anchor-index "$ANCHOR_INDEX"
+    --anchor-inventory-sha256 "$ANCHOR_INVENTORY_SHA"
     --thresholds "$THRESHOLDS"
     --output "$CONTRACT")
 
@@ -261,7 +354,7 @@ CONTAINER_NAME="rde-${CAMPAIGN_ID}-m${MACRO_ROUND}"
 ENV_ARGS=()
 while IFS= read -r name; do
     case "$name" in
-        ROUND_DAGGER_*|IMAGE3F_*|IMAGE_DAGGER_*|ROBORENDER_*|GR00T_ROOT|GR00T_PYTHON|PYTHONPATH)
+        ROUND_DAGGER_*|IMAGE3F_*|IMAGE_DAGGER_*|ROBORENDER_*|GR00T_PYTHON)
             ENV_ARGS+=(--env "$name")
             ;;
     esac
@@ -273,10 +366,20 @@ DOCKER_RUN=("$DOCKER" run --rm
     --shm-size=32g
     --network=host
     --workdir "$REPOSITORY_ROOT"
-    --mount type=bind,src=/mnt/data1,dst=/mnt/data1
-    --mount type=bind,src=/mnt/data2,dst=/mnt/data2
+    --mount "type=bind,src=$EVALUATION_SOURCE_ROOT,dst=$EVALUATION_SOURCE_ROOT,readonly"
+    --mount "type=bind,src=$SOURCE_INVENTORY,dst=$SOURCE_INVENTORY,readonly"
+    --mount "type=bind,src=$SOURCE_ATTESTATION,dst=$SOURCE_ATTESTATION,readonly"
+    --mount "type=bind,src=$CAMPAIGN_ROOT,dst=$CAMPAIGN_ROOT,readonly"
+    --mount "type=bind,src=$EVALUATION_ROOT,dst=$EVALUATION_ROOT"
+    --mount "type=bind,src=$CONTRACT,dst=$CONTRACT,readonly"
+    --mount "type=bind,src=$EVALUATION_CONFIG,dst=$EVALUATION_CONFIG,readonly"
+    --mount "type=bind,src=$ENDPOINT_DIR,dst=$ENDPOINT_DIR,readonly"
+    --mount "type=bind,src=$ANCHOR_POOL,dst=$ANCHOR_POOL,readonly"
     --mount "type=bind,src=$SEALED_TEACHER,dst=$SEALED_TEACHER,readonly"
     --mount "type=bind,src=$SEALED_TEACHER,dst=$TEACHER_CHECKPOINT,readonly"
+    --tmpfs /run/round-dagger-eval:rw,nosuid,nodev,noexec,size=1g
+    --env "PYTHONPATH=$EVALUATION_SOURCE_ROOT:$GR00T_SOURCE_ROOT"
+    --env "GR00T_ROOT=$GR00T_SOURCE_ROOT"
     "${ENV_ARGS[@]}"
     "$IMAGE"
     /usr/bin/env bash "$RUNNER"
@@ -289,6 +392,12 @@ DOCKER_RUN=("$DOCKER" run --rm
     --teacher-checkpoint "$TEACHER_CHECKPOINT"
     --teacher-sha256 "$TEACHER_SHA"
     --sealed-teacher-checkpoint "$SEALED_TEACHER"
+    --evaluation-source-inventory-sha256 "$EVALUATION_SOURCE_INVENTORY_SHA"
+    --anchor-pool-dir "$ANCHOR_POOL"
+    --anchor-count "$ANCHOR_COUNT"
+    --anchor-index "$ANCHOR_INDEX"
+    --anchor-inventory-sha256 "$ANCHOR_INVENTORY_SHA"
+    --scratch-root /run/round-dagger-eval
     --require-teacher-readonly-mount
     --orchestrator-result "$EVALUATOR_RESULT"
     --python "$CONTAINER_PYTHON")
@@ -310,6 +419,8 @@ fi
 
 "${PREPARE[@]}" >/dev/null || fatal "paired evaluation contract preparation failed"
 "${DOCKER_RUN[@]}" || fatal "paired evaluation container failed"
+verify_anchor_pool
+verify_evaluation_source
 # Re-read every outcome, renderer attestation, and raw metrics digest on the
 # host and deterministically re-score it.  Immutable publication makes this an
 # exact retry when the container already summarized the run; a fabricated or

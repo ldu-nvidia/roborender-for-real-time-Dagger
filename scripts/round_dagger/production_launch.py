@@ -17,6 +17,7 @@ import netrc
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -82,6 +83,9 @@ TEACHER_CHECKPOINT_RELATIVE = Path(
     "during_pick--1000.0-20251105_004910/model_step_044500.pt"
 )
 TEACHER_CHECKPOINT = REPOSITORY_ROOT / TEACHER_CHECKPOINT_RELATIVE
+PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE = Path(
+    "configs/round_dagger/production_campaign_256x300.json"
+)
 ANCHOR_POOL = REPOSITORY_ROOT / "runtime/hsg_stage_transfer/anchor_pool_2048"
 EVALUATION_CONFIG = (
     VALIDATION_ROOT
@@ -836,16 +840,14 @@ def _verify_local_evaluation_seal(
     root: str | Path,
     inventory_sha256: str,
     *,
-    remote_report: Mapping[str, Any],
     campaign_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Bind the RTX evaluator to the local twin of the OCI source seal.
+    """Bind the RTX evaluator to an independently versioned local source seal.
 
-    The remote path is intentionally unusable by the RTX Docker daemon.  The
-    caller therefore supplies the local publication produced by the same
-    snapshot operation, and this function proves that it has the exact remote
-    inventory identity before deriving the tracked teacher path.  No caller may
-    supply the teacher path independently.
+    The learner may have completed from an older OCI snapshot.  Evaluation has
+    its own explicit inventory identity so a later hardening commit can execute
+    without rewriting learner lineage.  No caller may supply the teacher or
+    evaluator path independently from this verified root.
     """
 
     local_root = _absolute(str(root), "local sealed source root")
@@ -859,6 +861,20 @@ def _verify_local_evaluation_seal(
         raise ProductionLaunchError(
             "local sealed source root must be an exact real path"
         )
+    try:
+        publication_info = local_root.parent.lstat()
+    except OSError as exc:
+        raise ProductionLaunchError(
+            "local sealed source publication parent is unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(publication_info.st_mode)
+        or not stat.S_ISDIR(publication_info.st_mode)
+        or stat.S_IMODE(publication_info.st_mode) != 0o555
+    ):
+        raise ProductionLaunchError(
+            "local sealed source publication parent must be exactly 0555"
+        )
     if not any(
         local_root == mount or mount in local_root.parents
         for mount in (Path("/mnt/data1"), Path("/mnt/data2"))
@@ -867,16 +883,8 @@ def _verify_local_evaluation_seal(
             "local sealed source root is outside the RTX Docker mount roots"
         )
 
-    remote_root = _absolute(remote_report.get("root"), "remote sealed source root")
-    if local_root.name != remote_root.name:
-        raise ProductionLaunchError(
-            "local and remote sealed source snapshot names differ"
-        )
-    if remote_report.get("snapshot_name") not in (None, remote_root.name):
-        raise ProductionLaunchError("remote sealed source snapshot name is inconsistent")
-
     expected_inventory = _require_sha(
-        inventory_sha256, "sealed source inventory SHA-256"
+        inventory_sha256, "evaluation source inventory SHA-256"
     )
     try:
         local_report = verify_sealed_source_snapshot(
@@ -897,21 +905,15 @@ def _verify_local_evaluation_seal(
         str(local_root),
         "local sealed source report root",
     )
-    for key in ("fast_roborender_revision", "gr00t_revision"):
-        _require_equal(
-            local_report.get(key),
-            remote_report.get(key),
-            f"local/remote sealed source {key}",
-        )
     _require_equal(
         local_report.get("inventory_sha256"),
         expected_inventory,
-        "local sealed source inventory",
+        "evaluation sealed source inventory",
     )
     _require_equal(
         local_report.get("snapshot_name"),
-        remote_root.name,
-        "local sealed source snapshot name",
+        local_root.name,
+        "evaluation sealed source snapshot name",
     )
 
     sealed_teacher = local_root / TEACHER_CHECKPOINT_RELATIVE
@@ -940,6 +942,29 @@ def _verify_local_evaluation_seal(
     ):
         raise ProductionLaunchError(
             "local sealed teacher and configured target must be distinct files"
+        )
+    evaluation = campaign_contract["evaluation"]
+    for relative_key, sha_key, label in (
+        ("scenario_contract", "scenario_contract_sha256", "evaluation scenarios"),
+        ("threshold_contract", "threshold_contract_sha256", "evaluation thresholds"),
+    ):
+        _file_identity(
+            local_root / evaluation[relative_key],
+            evaluation[sha_key],
+            f"sealed {label}",
+        )
+    sealed_campaign_contract = artifacts.load_strict_json(
+        _regular(
+            local_root / PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE,
+            "sealed production campaign contract",
+        )
+    )
+    if (
+        sealed_campaign_contract.get("artifacts", {}).get("anchor_pool")
+        != campaign_contract["artifacts"]["anchor_pool"]
+    ):
+        raise ProductionLaunchError(
+            "sealed evaluation anchor contract differs from launch contract"
         )
     return {
         **local_report,
@@ -1217,6 +1242,7 @@ def _validate_orchestration_and_campaign(
     learner_contract: Mapping[str, Any],
     learner_deployment_contract_sha256: str,
     source_inventory_sha256: str,
+    evaluation_source_root: Path,
 ) -> tuple[MacroRoundConfig, dict[str, Any], dict[str, Any], str]:
     _regular(orchestration_path, "orchestration config")
     if orchestration_path.stat().st_mode & 0o222:
@@ -1238,7 +1264,13 @@ def _validate_orchestration_and_campaign(
         "transfer": None,
         "ingest": None,
         "train": (str(REPOSITORY_ROOT / "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"), 172800),
-        "evaluate": (str(REPOSITORY_ROOT / "scripts/round_dagger/run_production_paired_evaluation_hook.sh"), 28800),
+        "evaluate": (
+            str(
+                evaluation_source_root
+                / "scripts/round_dagger/run_production_paired_evaluation_hook.sh"
+            ),
+            28800,
+        ),
         "promote": None,
     }
     for name, expected in expected_hooks.items():
@@ -1326,6 +1358,8 @@ def build_environment(
     *,
     sealed_source_root: str,
     sealed_source_inventory_sha256: str,
+    evaluation_source_root: str,
+    evaluation_source_inventory_sha256: str,
     sealed_teacher_checkpoint: str,
     learner_contract_sha256: str,
 ) -> dict[str, str]:
@@ -1341,11 +1375,17 @@ def build_environment(
     return {
         "ROUND_DAGGER_TEACHER_CHECKPOINT": artifact["teacher"]["checkpoint_path"],
         "ROUND_DAGGER_TEACHER_SHA256": artifact["teacher"]["checkpoint_sha256"],
+        "ROUND_DAGGER_TEACHER_CHECKPOINT_RELATIVE": TEACHER_CHECKPOINT_RELATIVE.as_posix(),
         "ROUND_DAGGER_EVALUATION_SEALED_TEACHER": sealed_teacher_checkpoint,
+        "ROUND_DAGGER_EVALUATION_SOURCE_ROOT": evaluation_source_root,
+        "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256": evaluation_source_inventory_sha256,
+        "ROUND_DAGGER_LEARNER_SOURCE_INVENTORY_SHA256": sealed_source_inventory_sha256,
         "ROUND_DAGGER_RENDERER_SHA256": artifact["renderer"]["cohort_identity_sha256"],
         "ROUND_DAGGER_RENDERER_RUNTIME_SHA256": artifact["renderer"]["runtime_identity_sha256"],
         "IMAGE3F_ENDPOINT_MANIFEST": artifact["endpoint_manifest"]["path"],
         "ANCHORS": artifact["anchor_pool"]["path"],
+        "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256": artifact["anchor_pool"]["inventory_sha256"],
+        "ROUND_DAGGER_ANCHOR_INDEX": "0",
         "ROUND_DAGGER_CAMERA_ACCEPTANCE": artifact["camera_acceptance"]["path"],
         "ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256": artifact["camera_acceptance"]["sha256"],
         "ROUND_DAGGER_RTX_IMAGE": artifact["actor_image"]["name"],
@@ -1379,9 +1419,9 @@ def build_environment(
         "ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE": wandb["authorization_scope"],
         "ROUND_DAGGER_WANDB_NETRC": wandb["netrc"],
         "ROUND_DAGGER_EVALUATION_CONFIG": evaluation["hydra_config_path"],
-        "ROUND_DAGGER_EVALUATION_SCENARIOS": str(REPOSITORY_ROOT / evaluation["scenario_contract"]),
+        "ROUND_DAGGER_EVALUATION_SCENARIOS": str(Path(evaluation_source_root) / evaluation["scenario_contract"]),
         "ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256": evaluation["scenario_contract_sha256"],
-        "ROUND_DAGGER_EVALUATION_THRESHOLDS": str(REPOSITORY_ROOT / evaluation["threshold_contract"]),
+        "ROUND_DAGGER_EVALUATION_THRESHOLDS": str(Path(evaluation_source_root) / evaluation["threshold_contract"]),
         "ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256": evaluation["threshold_contract_sha256"],
         "ROUND_DAGGER_EVALUATION_ENDPOINT_DIR": artifact["endpoint_manifest"]["endpoint_directory"],
         "ROUND_DAGGER_CONTROL_PYTHON": "/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python",
@@ -1420,7 +1460,8 @@ def validate_launch(
     learner_contract_path: Path,
     sealed_source_root: str,
     sealed_source_inventory_sha256: str,
-    local_sealed_source_root: str | Path,
+    evaluation_sealed_source_root: str | Path,
+    evaluation_sealed_source_inventory_sha256: str,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     campaign_contract_sha = artifacts.sha256_file(campaign_contract_path)
     learner_deployment_contract_sha = artifacts.sha256_file(learner_contract_path)
@@ -1435,9 +1476,8 @@ def validate_launch(
         learner_contract_path=learner_contract_path,
     )
     local_seal_report = _verify_local_evaluation_seal(
-        local_sealed_source_root,
-        sealed_source_inventory_sha256,
-        remote_report=source_report,
+        evaluation_sealed_source_root,
+        evaluation_sealed_source_inventory_sha256,
         campaign_contract=campaign_contract,
     )
     (
@@ -1451,12 +1491,15 @@ def validate_launch(
         learner_contract,
         learner_deployment_contract_sha,
         sealed_source_inventory_sha256,
+        Path(local_seal_report["root"]),
     )
     environment = build_environment(
         campaign_contract,
         learner_contract,
         sealed_source_root=sealed_source_root,
         sealed_source_inventory_sha256=sealed_source_inventory_sha256,
+        evaluation_source_root=local_seal_report["root"],
+        evaluation_source_inventory_sha256=evaluation_sealed_source_inventory_sha256,
         sealed_teacher_checkpoint=local_seal_report[
             "sealed_teacher_checkpoint"
         ],
@@ -1469,11 +1512,10 @@ def validate_launch(
         raise ProductionLaunchError("learner contract changed during preflight")
     if artifacts.sha256_file(orchestration_config) != orchestration_sha:
         raise ProductionLaunchError("orchestration config changed during preflight")
-    # This is intentionally the final expensive gate: actor/evaluator Docker
-    # mounts the live RTX checkout, whereas the learner mounts the sealed OCI
-    # snapshot.  Require both local repositories to be the exact clean commits
-    # attested by that remote snapshot immediately before handing control to
-    # the orchestrator.
+    # Actor collection still uses the live RTX checkout, whereas learner code
+    # uses the sealed OCI snapshot and evaluation uses its independent local
+    # seal.  Preserve the actor/learner compatibility check immediately before
+    # handing control to the orchestrator.
     local_source = _verify_local_source_checkout(source_report)
     environment["ROUND_DAGGER_FAST_ROBORENDER_REVISION"] = local_source[
         "fast_roborender"
@@ -1495,13 +1537,17 @@ def validate_launch(
         "transitions_per_macro_round": TRANSITIONS_PER_MACRO_ROUND,
         "reference_lag_frames": 256,
         "active_policy_sha256": coordinator["active_policy"]["checkpoint_sha256"],
-        "sealed_source_root": sealed_source_root,
-        "local_sealed_source_root": local_seal_report["root"],
-        "sealed_source_inventory_sha256": sealed_source_inventory_sha256,
+        "learner_sealed_source_root": sealed_source_root,
+        "learner_source_inventory_sha256": sealed_source_inventory_sha256,
+        "evaluation_sealed_source_root": local_seal_report["root"],
+        "evaluation_source_inventory_sha256": evaluation_sealed_source_inventory_sha256,
         "evaluation_sealed_teacher_sha256": local_seal_report[
             "sealed_teacher_sha256"
         ],
-        "sealed_source_revision": source_report.get("fast_roborender_revision"),
+        "learner_source_revision": source_report.get("fast_roborender_revision"),
+        "evaluation_source_revision": local_seal_report.get(
+            "fast_roborender_revision"
+        ),
         "local_source": local_source,
         "learner_deployment_contract_sha256": learner_deployment_contract_sha,
         "derived_learner_bundle_sha256": derived_learner_bundle_sha,
@@ -1540,7 +1586,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--learner-contract", type=Path, required=True)
     parser.add_argument("--sealed-source-root", required=True)
     parser.add_argument("--sealed-source-inventory-sha256", required=True)
-    parser.add_argument("--local-sealed-source-root", type=Path, required=True)
+    parser.add_argument("--evaluation-sealed-source-root", type=Path, required=True)
+    parser.add_argument(
+        "--evaluation-sealed-source-inventory-sha256", required=True
+    )
     parser.add_argument("--env-output", type=Path, required=True)
     return parser
 
@@ -1554,7 +1603,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             learner_contract_path=arguments.learner_contract,
             sealed_source_root=arguments.sealed_source_root,
             sealed_source_inventory_sha256=arguments.sealed_source_inventory_sha256,
-            local_sealed_source_root=arguments.local_sealed_source_root,
+            evaluation_sealed_source_root=arguments.evaluation_sealed_source_root,
+            evaluation_sealed_source_inventory_sha256=(
+                arguments.evaluation_sealed_source_inventory_sha256
+            ),
         )
         _write_nul_environment(arguments.env_output, environment)
     except ProductionLaunchError as exc:

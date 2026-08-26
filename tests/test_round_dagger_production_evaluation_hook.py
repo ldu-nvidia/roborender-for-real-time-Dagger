@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from pathlib import Path
 from round_dagger.artifacts import sha256_file
 from round_dagger.evaluation import DEFAULT_THRESHOLDS
 from round_dagger.state import load_campaign, load_state
+from scripts.round_dagger.production_launch import TEACHER_CHECKPOINT_RELATIVE
 
 try:
     from test_round_dagger_state import _campaign, _sha, _stage_and_bind, _to_ingested
@@ -33,7 +35,15 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=scratch)
         self.tmp = Path(self.temporary.name)
-        self.repository_root = Path(__file__).parents[1]
+        self.live_repository_root = Path(__file__).parents[1]
+        self.repository_root = self.tmp / "evaluation-seal"
+        for directory in ("round_dagger", "scripts", "configs"):
+            shutil.copytree(
+                self.live_repository_root / directory,
+                self.repository_root / directory,
+            )
+        (self.tmp / "evaluation-seal.inventory.json").write_text("{}\n")
+        (self.tmp / "evaluation-seal.snapshot_attestation.json").write_text("{}\n")
         self.root = _campaign(self.tmp)
         _to_ingested(self.root)
         self.candidate = _stage_and_bind(self.root, self.tmp)
@@ -41,30 +51,57 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.campaign = load_campaign(self.root)
 
         self.teacher_checkpoint = self.tmp / "configured-teacher.pt"
-        self.sealed_teacher = self.tmp / "sealed-teacher.pt"
+        self.sealed_teacher = self.repository_root / TEACHER_CHECKPOINT_RELATIVE
         # _campaign pins sha256(b"teacher") as the expert identity.
         teacher_bytes = b"teacher"
         self.teacher_checkpoint.write_bytes(teacher_bytes)
+        self.sealed_teacher.parent.mkdir(parents=True, exist_ok=True)
         self.sealed_teacher.write_bytes(teacher_bytes)
         self.teacher_checkpoint.chmod(0o600)
         self.sealed_teacher.chmod(0o444)
         self.teacher_sha = sha256_file(self.teacher_checkpoint)
+        self.anchor_pool = self.tmp / "anchors"
+        self.anchor_pool.mkdir()
+        (self.anchor_pool / "anchor_000000.npz").write_bytes(b"anchor fixture")
+        self.anchor_inventory_sha = _sha("anchor-inventory")
         self.config = self.tmp / "evaluation_config.yaml"
         self.config.write_text(
-            f"teacher_actor_path: {self.teacher_checkpoint}\nfixed_seed: true\n",
+            f"teacher_actor_path: {self.teacher_checkpoint}\n"
+            "algo:\n"
+            "  config:\n"
+            "    videogen:\n"
+            f"      anchor_pool_dir: {self.anchor_pool}\n"
+            "      anchor_index: 0\n"
+            "fixed_seed: true\n",
             encoding="utf-8",
         )
-        self.gr00t = self.tmp / "GR00T-VisualSim2Real"
+        self.gr00t = self.repository_root / "GR00T-VisualSim2Real"
         for relative in (
             "gr00t/rl/eval_agent_trl.py",
+            "gr00t/rl/trl/trainer/anchor_io.py",
+            "gr00t/rl/trl/trainer/checkpoint_io.py",
+            "gr00t/rl/trl/trainer/distill_trainer.py",
             "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
             "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+            "gr00t/rl/trl/trainer/ppo_trainer.py",
             "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
         ):
             source = self.gr00t / relative
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(f"# fixture: {relative}\n", encoding="utf-8")
+        sealed_campaign_path = (
+            self.repository_root
+            / "configs/round_dagger/production_campaign_256x300.json"
+        )
+        sealed_campaign = json.loads(sealed_campaign_path.read_text(encoding="utf-8"))
+        sealed_campaign["artifacts"]["anchor_pool"] = {
+            "path": str(self.anchor_pool),
+            "anchor_count": 1,
+            "inventory_sha256": self.anchor_inventory_sha,
+            "inventory_algorithm": "len64be(path_utf8)+path_utf8+size64be+sha256_binary",
+        }
+        sealed_campaign_path.write_text(json.dumps(sealed_campaign), encoding="utf-8")
         self.endpoints = self.tmp / "endpoints"
         self.endpoints.mkdir()
         for rank in range(2):
@@ -93,6 +130,19 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             self.repository_root
             / "scripts/round_dagger/run_production_paired_evaluation_hook.sh"
         )
+        self.control_python = self.tmp / "control-python"
+        self.control_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            "for value in \"$@\"; do\n"
+            "  case \"$value\" in\n"
+            "    *verify_sealed_source_snapshot.py|*verify_anchor_pool.py) exit 0 ;;\n"
+            "  esac\n"
+            "done\n"
+            f"exec {sys.executable} \"$@\"\n",
+            encoding="utf-8",
+        )
+        self.control_python.chmod(0o755)
         self.environment = {
             **os.environ,
             "ROUND_DAGGER_CAMPAIGN_ROOT": str(self.root),
@@ -131,17 +181,24 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "ROUND_DAGGER_TEACHER_CHECKPOINT": str(self.teacher_checkpoint),
             "ROUND_DAGGER_TEACHER_SHA256": self.teacher_sha,
             "ROUND_DAGGER_EVALUATION_SEALED_TEACHER": str(self.sealed_teacher),
+            "ROUND_DAGGER_TEACHER_CHECKPOINT_RELATIVE": TEACHER_CHECKPOINT_RELATIVE.as_posix(),
+            "ROUND_DAGGER_EVALUATION_SOURCE_ROOT": str(self.repository_root),
+            "ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH": "1",
+            "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256": _sha("evaluation-inventory"),
             "ROUND_DAGGER_EVALUATION_ENDPOINT_DIR": str(self.endpoints),
             "ROUND_DAGGER_RENDERER_RUNTIME_SHA256": _sha("renderer-runtime"),
             "ROUND_DAGGER_EXPECTED_RENDERERS": "2",
-            "GR00T_ROOT": str(self.gr00t),
             "GR00T_PYTHON": "/opt/round-dagger-rtx/bin/python",
             "ROUND_DAGGER_DOCKER_BIN": str(self.docker),
             "ROUND_DAGGER_RTX_IMAGE": "round-dagger:test",
             "ROUND_DAGGER_RTX_IMAGE_ID_SHA256": self.image_id_sha,
             # Preserve the virtual-environment entry point.  Resolving this
             # symlink would execute the base interpreter without its packages.
-            "ROUND_DAGGER_CONTROL_PYTHON": sys.executable,
+            "ROUND_DAGGER_CONTROL_PYTHON": str(self.control_python),
+            "ANCHORS": str(self.anchor_pool),
+            "ROUND_DAGGER_MIN_ANCHORS": "1",
+            "ROUND_DAGGER_ANCHOR_INDEX": "0",
+            "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256": self.anchor_inventory_sha,
             "DOCKER_LOG": str(self.docker_log),
         }
 
@@ -180,6 +237,21 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             DEFAULT_THRESHOLDS,
         )
 
+    def test_direct_execution_without_trusted_dispatch_fails_closed(self) -> None:
+        trusted = self.environment.pop(
+            "ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH"
+        )
+        try:
+            completed = self._run(dry_run=True)
+        finally:
+            self.environment["ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH"] = trusted
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "missing ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH",
+            completed.stderr,
+        )
+        self.assertFalse(self.contract.exists())
+
     def test_dry_run_validates_lineage_without_publishing_contract(self) -> None:
         completed = self._run(dry_run=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -204,10 +276,21 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         unescaped_stdout = completed.stdout.replace("\\,", ",")
         self.assertIn(seal_mount, unescaped_stdout)
         self.assertIn(teacher_mount, unescaped_stdout)
-        self.assertLess(
-            unescaped_stdout.index("type=bind,src=/mnt/data2,dst=/mnt/data2"),
-            unescaped_stdout.index(seal_mount),
+        campaign_mount = (
+            f"type=bind,src={self.root},dst={self.root},readonly"
         )
+        evaluation_mount = (
+            f"type=bind,src={self.contract.parent},dst={self.contract.parent}"
+        )
+        contract_mount = (
+            f"type=bind,src={self.contract},dst={self.contract},readonly"
+        )
+        self.assertIn(campaign_mount, unescaped_stdout)
+        self.assertIn(evaluation_mount, unescaped_stdout)
+        self.assertIn(contract_mount, unescaped_stdout)
+        self.assertIn("--tmpfs", unescaped_stdout)
+        self.assertIn("/run/round-dagger-eval:rw,nosuid,nodev,noexec,size=1g", unescaped_stdout)
+        self.assertNotIn("type=bind,src=/mnt/data2,dst=/mnt/data2", unescaped_stdout)
         self.assertLess(
             unescaped_stdout.index(seal_mount),
             unescaped_stdout.index(teacher_mount),
@@ -243,10 +326,19 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         )
         self.assertIn(seal_mount, invocation)
         self.assertIn(teacher_mount, invocation)
-        self.assertLess(
-            invocation.index("type=bind,src=/mnt/data2,dst=/mnt/data2"),
-            invocation.index(seal_mount),
+        self.assertIn(
+            f"type=bind,src={self.root},dst={self.root},readonly",
+            invocation,
         )
+        self.assertIn(
+            f"type=bind,src={self.contract.parent},dst={self.contract.parent}",
+            invocation,
+        )
+        self.assertIn(
+            f"type=bind,src={self.contract},dst={self.contract},readonly",
+            invocation,
+        )
+        self.assertNotIn("type=bind,src=/mnt/data2,dst=/mnt/data2", invocation)
         self.assertLess(
             invocation.index(seal_mount),
             invocation.index(teacher_mount),
@@ -369,6 +461,11 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
     def test_pinned_config_must_name_mounted_teacher_target(self) -> None:
         self.config.write_text(
             f"teacher_actor_path: {self.tmp / 'other-teacher.pt'}\n"
+            "algo:\n"
+            "  config:\n"
+            "    videogen:\n"
+            f"      anchor_pool_dir: {self.anchor_pool}\n"
+            "      anchor_index: 0\n"
             "fixed_seed: true\n",
             encoding="utf-8",
         )
@@ -381,6 +478,29 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "pinned evaluation config teacher path mismatch", completed.stderr
         )
         self.assertFalse(self.contract.exists())
+
+    def test_pinned_config_must_name_mounted_anchor_pool_and_index(self) -> None:
+        for anchor, index, expected in (
+            (self.tmp / "other-anchors", 0, "anchor pool path mismatch"),
+            (self.anchor_pool, 1, "anchor index mismatch"),
+        ):
+            with self.subTest(expected=expected):
+                self.config.write_text(
+                    f"teacher_actor_path: {self.teacher_checkpoint}\n"
+                    "algo:\n"
+                    "  config:\n"
+                    "    videogen:\n"
+                    f"      anchor_pool_dir: {anchor}\n"
+                    f"      anchor_index: {index}\n",
+                    encoding="utf-8",
+                )
+                self.environment["ROUND_DAGGER_EVALUATOR_CONFIG_SHA256"] = (
+                    sha256_file(self.config)
+                )
+                completed = self._run(dry_run=True)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected, completed.stderr)
+                self.assertFalse(self.contract.exists())
 
 
 if __name__ == "__main__":

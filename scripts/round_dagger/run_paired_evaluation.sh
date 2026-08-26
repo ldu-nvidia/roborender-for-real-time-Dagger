@@ -8,6 +8,9 @@ Usage: run_paired_evaluation.sh --root DIR --contract FILE --results-dir DIR
        --gr00t-root DIR --evaluation-config FILE --endpoint-dir DIR
        --teacher-checkpoint FILE --teacher-sha256 SHA256
        --sealed-teacher-checkpoint FILE
+       --evaluation-source-inventory-sha256 SHA256
+       --anchor-pool-dir DIR --anchor-count N --anchor-index N
+       --anchor-inventory-sha256 SHA256 --scratch-root DIR
        [--require-teacher-readonly-mount]
        [--orchestrator-result FILE] [--python PYTHON] [--dry-run]
 
@@ -29,6 +32,12 @@ ENDPOINT_DIR=
 TEACHER_CHECKPOINT=
 TEACHER_SHA=
 SEALED_TEACHER=
+EVALUATION_SOURCE_INVENTORY_SHA=
+ANCHOR_POOL=
+ANCHOR_COUNT=
+ANCHOR_INDEX=
+ANCHOR_INVENTORY_SHA=
+SCRATCH_ROOT=
 REQUIRE_TEACHER_READONLY_MOUNT=0
 ORCHESTRATOR_RESULT=${ROUND_DAGGER_EVALUATOR_RESULT:-}
 PYTHON_BIN=python3
@@ -44,6 +53,13 @@ while (($#)); do
         --teacher-checkpoint) TEACHER_CHECKPOINT=${2:?}; shift 2 ;;
         --teacher-sha256) TEACHER_SHA=${2:?}; shift 2 ;;
         --sealed-teacher-checkpoint) SEALED_TEACHER=${2:?}; shift 2 ;;
+        --evaluation-source-inventory-sha256)
+            EVALUATION_SOURCE_INVENTORY_SHA=${2:?}; shift 2 ;;
+        --anchor-pool-dir) ANCHOR_POOL=${2:?}; shift 2 ;;
+        --anchor-count) ANCHOR_COUNT=${2:?}; shift 2 ;;
+        --anchor-index) ANCHOR_INDEX=${2:?}; shift 2 ;;
+        --anchor-inventory-sha256) ANCHOR_INVENTORY_SHA=${2:?}; shift 2 ;;
+        --scratch-root) SCRATCH_ROOT=${2:?}; shift 2 ;;
         --require-teacher-readonly-mount)
             REQUIRE_TEACHER_READONLY_MOUNT=1
             shift
@@ -58,7 +74,9 @@ done
 
 fatal() { echo "FATAL: $*" >&2; exit 2; }
 for value in ROOT CONTRACT RESULTS_DIR GR00T_ROOT EVALUATION_CONFIG ENDPOINT_DIR \
-    TEACHER_CHECKPOINT TEACHER_SHA SEALED_TEACHER ORCHESTRATOR_RESULT; do
+    TEACHER_CHECKPOINT TEACHER_SHA SEALED_TEACHER EVALUATION_SOURCE_INVENTORY_SHA \
+    ANCHOR_POOL ANCHOR_COUNT ANCHOR_INDEX ANCHOR_INVENTORY_SHA SCRATCH_ROOT \
+    ORCHESTRATOR_RESULT; do
     [[ -n ${!value} ]] || fatal "missing --${value,,}"
 done
 [[ -d $ROOT && ! -L $ROOT ]] || fatal "unsafe/missing campaign root"
@@ -77,7 +95,60 @@ EVALUATOR="$GR00T_ROOT/gr00t/rl/eval_agent_trl.py"
 [[ -f $EVALUATOR && ! -L $EVALUATOR ]] || fatal "unsafe/missing GR00T evaluator"
 
 REPOSITORY_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-export PYTHONPATH="$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -n ${ROUND_DAGGER_EVALUATION_SOURCE_ROOT:-} ]]; then
+    [[ $ROUND_DAGGER_EVALUATION_SOURCE_ROOT == "$REPOSITORY_ROOT" ]] || \
+        fatal "paired evaluator is not executing from the sealed evaluation source"
+    [[ $GR00T_ROOT == "$REPOSITORY_ROOT/GR00T-VisualSim2Real" ]] || \
+        fatal "GR00T evaluator root is not inside the sealed evaluation source"
+fi
+[[ $EVALUATION_SOURCE_INVENTORY_SHA =~ ^[0-9a-f]{64}$ ]] || \
+    fatal "evaluation source inventory SHA must be lowercase SHA-256"
+[[ $ANCHOR_POOL == /* && -d $ANCHOR_POOL && ! -L $ANCHOR_POOL ]] || \
+    fatal "anchor pool must be an absolute, non-symlink directory"
+[[ $ANCHOR_COUNT =~ ^[1-9][0-9]*$ ]] || fatal "anchor count must be positive"
+[[ $ANCHOR_INDEX =~ ^(0|[1-9][0-9]*)$ ]] || \
+    fatal "anchor index must be non-negative"
+((10#$ANCHOR_INDEX < 10#$ANCHOR_COUNT)) || \
+    fatal "anchor index must be smaller than anchor count"
+[[ $ANCHOR_INVENTORY_SHA =~ ^[0-9a-f]{64}$ ]] || \
+    fatal "anchor inventory SHA must be lowercase SHA-256"
+export PYTHONPATH="$REPOSITORY_ROOT:$GR00T_ROOT"
+[[ $SCRATCH_ROOT == /* && -d $SCRATCH_ROOT && ! -L $SCRATCH_ROOT ]] || \
+    fatal "scratch root must be an absolute, non-symlink directory"
+if [[ -n ${ROUND_DAGGER_EVALUATION_SOURCE_ROOT:-} ]]; then
+    "$PYTHON_BIN" - "$SCRATCH_ROOT" <<'PY' || \
+        fatal "production evaluator scratch root is not an exact hardened tmpfs"
+import re
+import sys
+
+target = sys.argv[1]
+found = []
+with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+    for raw in handle:
+        left, right = raw.rstrip("\n").split(" - ", 1)
+        fields = left.split()
+        mountpoint = re.sub(
+            r"\\([0-7]{3})",
+            lambda match: chr(int(match.group(1), 8)),
+            fields[4],
+        )
+        if mountpoint == target:
+            found.append((set(fields[5].split(",")), right.split()[0]))
+if len(found) != 1:
+    raise SystemExit(1)
+options, filesystem = found[0]
+if filesystem != "tmpfs" or not {"rw", "nosuid", "nodev", "noexec"} <= options:
+    raise SystemExit(1)
+PY
+fi
+
+verify_anchor_pool() {
+    "$PYTHON_BIN" "$REPOSITORY_ROOT/scripts/round_dagger/verify_anchor_pool.py" \
+        --root "$ANCHOR_POOL" --expected-count "$ANCHOR_COUNT" \
+        --expected-sha256 "$ANCHOR_INVENTORY_SHA" \
+        >/dev/null || fatal "evaluation anchor pool verification failed"
+}
+verify_anchor_pool
 
 "$PYTHON_BIN" -m round_dagger.evaluation verify-contract \
     --root "$ROOT" --contract "$CONTRACT" >/dev/null || fatal "contract verification failed"
@@ -92,14 +163,27 @@ print(d["evaluator_code_sha256"])
 print(d["expected_renderer_count"])
 print(d["num_envs_per_seed"])
 print(load_campaign(sys.argv[2])["teacher_sha256"])
+print(d["anchor_pool"]["path"])
+print(d["anchor_pool"]["anchor_count"])
+print(d["anchor_pool"]["anchor_index"])
+print(d["anchor_pool"]["inventory_sha256"])
 PY
 )
-[[ ${#CONTRACT_FIELDS[@]} -eq 5 ]] || fatal "cannot read evaluation contract"
+[[ ${#CONTRACT_FIELDS[@]} -eq 9 ]] || fatal "cannot read evaluation contract"
 EXPECTED_CONFIG_SHA=${CONTRACT_FIELDS[0]}
 EXPECTED_EVALUATOR_SHA=${CONTRACT_FIELDS[1]}
 EXPECTED_RENDERERS=${CONTRACT_FIELDS[2]}
 NUM_ENVS=${CONTRACT_FIELDS[3]}
 EXPECTED_TEACHER_SHA=${CONTRACT_FIELDS[4]}
+EXPECTED_ANCHOR_POOL=${CONTRACT_FIELDS[5]}
+EXPECTED_ANCHOR_COUNT=${CONTRACT_FIELDS[6]}
+EXPECTED_ANCHOR_INDEX=${CONTRACT_FIELDS[7]}
+EXPECTED_ANCHOR_INVENTORY_SHA=${CONTRACT_FIELDS[8]}
+[[ $ANCHOR_POOL == "$EXPECTED_ANCHOR_POOL" && \
+   $ANCHOR_COUNT == "$EXPECTED_ANCHOR_COUNT" && \
+   $ANCHOR_INDEX == "$EXPECTED_ANCHOR_INDEX" && \
+   $ANCHOR_INVENTORY_SHA == "$EXPECTED_ANCHOR_INVENTORY_SHA" ]] || \
+    fatal "anchor inputs differ from the immutable evaluation contract"
 [[ $TEACHER_SHA == "$EXPECTED_TEACHER_SHA" ]] || \
     fatal "teacher checkpoint SHA differs from campaign"
 [[ $(sha256sum "$EVALUATION_CONFIG" | awk '{print $1}') == "$EXPECTED_CONFIG_SHA" ]] || \
@@ -108,11 +192,12 @@ if [[ -n ${ROUND_DAGGER_EVALUATOR_CONFIG_SHA256:-} ]]; then
     [[ $ROUND_DAGGER_EVALUATOR_CONFIG_SHA256 == "$EXPECTED_CONFIG_SHA" ]] || \
         fatal "orchestrator evaluator config SHA differs from paired contract"
 fi
-ACTUAL_EVALUATOR_SHA=$("$PYTHON_BIN" - "$REPOSITORY_ROOT" "$GR00T_ROOT" <<'PY'
+ACTUAL_EVALUATOR_SHA=$("$PYTHON_BIN" - "$REPOSITORY_ROOT" "$GR00T_ROOT" \
+    "$EVALUATION_SOURCE_INVENTORY_SHA" <<'PY'
 import sys
 from round_dagger.evaluation import evaluator_source_bundle_sha256
 
-print(evaluator_source_bundle_sha256(sys.argv[1], sys.argv[2]))
+print(evaluator_source_bundle_sha256(sys.argv[1], sys.argv[2], sys.argv[3]))
 PY
 )
 [[ $ACTUAL_EVALUATOR_SHA == "$EXPECTED_EVALUATOR_SHA" ]] || \
@@ -132,10 +217,25 @@ teacher = document.get("teacher_actor_path")
 if not isinstance(teacher, str) or not Path(teacher).is_absolute():
     raise SystemExit("evaluation config teacher_actor_path must be absolute")
 print(teacher)
+videogen = document.get("algo", {}).get("config", {}).get("videogen", {})
+anchor = videogen.get("anchor_pool_dir")
+index = videogen.get("anchor_index")
+if not isinstance(anchor, str) or not Path(anchor).is_absolute():
+    raise SystemExit("evaluation config anchor_pool_dir must be absolute")
+if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+    raise SystemExit("evaluation config anchor_index must be non-negative")
+print(anchor)
+print(index)
 PY
 ) || fatal "cannot read teacher path from the pinned evaluation config"
-[[ $CONFIGURED_TEACHER == "$TEACHER_CHECKPOINT" ]] || \
+mapfile -t CONFIGURED_INPUTS <<<"$CONFIGURED_TEACHER"
+[[ ${#CONFIGURED_INPUTS[@]} -eq 3 ]] || fatal "pinned config input parse is incomplete"
+[[ ${CONFIGURED_INPUTS[0]} == "$TEACHER_CHECKPOINT" ]] || \
     fatal "pinned evaluation config teacher path mismatch"
+[[ ${CONFIGURED_INPUTS[1]} == "$ANCHOR_POOL" ]] || \
+    fatal "pinned evaluation config anchor pool path mismatch"
+[[ ${CONFIGURED_INPUTS[2]} == "$ANCHOR_INDEX" ]] || \
+    fatal "pinned evaluation config anchor index mismatch"
 
 verify_teacher() {
     [[ -f $TEACHER_CHECKPOINT && ! -L $TEACHER_CHECKPOINT ]] || \
@@ -232,6 +332,35 @@ if ((!DRY_RUN)); then
         mkdir -p "$RESULTS_DIR"
     fi
 fi
+
+# Staged checkpoints are execution inputs, not durable evidence.  Only one
+# role/seed attempt may occupy the bounded tmpfs at a time.  Clean the active
+# namespace after the canonical outcome has been verified, and also from the
+# EXIT trap on every failure/signal path.  Attempts and evaluator evidence live
+# under RESULTS_DIR and are never removed here.
+ACTIVE_STAGE_ROLE_DIR=
+cleanup_stage_dir() {
+    local target=$1
+    [[ -n $target && $target == "$SCRATCH_ROOT"/* ]] || \
+        fatal "refusing to clean an unsafe evaluation scratch path"
+    if [[ ! -e $target ]]; then
+        return 0
+    fi
+    [[ -d $target && ! -L $target ]] || \
+        fatal "evaluation scratch attempt became unsafe"
+    find "$target" -xdev -depth -delete || \
+        fatal "cannot clean evaluation scratch attempt"
+    [[ ! -e $target ]] || fatal "evaluation scratch attempt cleanup was incomplete"
+}
+cleanup_active_stage_on_exit() {
+    local rc=$?
+    trap - EXIT
+    if [[ -n $ACTIVE_STAGE_ROLE_DIR ]]; then
+        cleanup_stage_dir "$ACTIVE_STAGE_ROLE_DIR"
+    fi
+    exit "$rc"
+}
+trap cleanup_active_stage_on_exit EXIT
 
 while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_SHA; do
     [[ $ROLE == parent || $ROLE == candidate ]] || fatal "invalid role from contract"
@@ -333,7 +462,14 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
             --seed "$SEED" --attempt "$ATTEMPT"
     ) || fatal "cannot derive Image3F evaluation run ID"
     RESULT_DIR="$ATTEMPT_DIR"
-    STAGED="$RESULTS_DIR/stage/$ROLE/checkpoint.pt"
+    # The evaluator may materialize loader-derived sibling checkpoints (for
+    # example model_step_000000.pt).  Keep every writable loader namespace
+    # inside this one immutable attempt so no seed or policy role can consume
+    # another case's uncontracted byproduct.
+    STAGE_ROLE_DIR="$SCRATCH_ROOT/$ROLE/seed_$SEED/attempt_$(printf '%06d' "$ATTEMPT")"
+    STAGED="$STAGE_ROLE_DIR/checkpoint.pt"
+    STAGE_PROVENANCE="$STAGE_ROLE_DIR/provenance.json"
+    STAGE_CONFIG="$STAGE_ROLE_DIR/config.yaml"
     BEFORE="$RESULT_DIR/renderer_before.json"
     AFTER="$RESULT_DIR/renderer_after.json"
     METRICS="$RESULT_DIR/metrics.json"
@@ -341,15 +477,15 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
 
     SANITIZE=("$PYTHON_BIN" "$REPOSITORY_ROOT/scripts/eval/fixed_seed_gate.py" sanitize-checkpoint
         --checkpoint "$CHECKPOINT" --expected-sha256 "$CHECKPOINT_SHA"
-        --output "$STAGED" --provenance "$RESULTS_DIR/stage/$ROLE/provenance.json")
-    CONFIG_COPY=(install -m 0444 "$EVALUATION_CONFIG" "$RESULTS_DIR/stage/$ROLE/config.yaml")
+        --output "$STAGED" --provenance "$STAGE_PROVENANCE")
+    CONFIG_COPY=(install -m 0444 "$EVALUATION_CONFIG" "$STAGE_CONFIG")
     VERIFY_STAGE=("$PYTHON_BIN" -m round_dagger.evaluation_inputs
         --checkpoint-source "$CHECKPOINT"
         --expected-checkpoint-sha256 "$CHECKPOINT_SHA"
         --staged-checkpoint "$STAGED"
-        --provenance "$RESULTS_DIR/stage/$ROLE/provenance.json"
+        --provenance "$STAGE_PROVENANCE"
         --evaluation-config "$EVALUATION_CONFIG"
-        --staged-config "$RESULTS_DIR/stage/$ROLE/config.yaml"
+        --staged-config "$STAGE_CONFIG"
         --expected-config-sha256 "$EXPECTED_CONFIG_SHA"
         --teacher-checkpoint "$TEACHER_CHECKPOINT")
     PROBE_BEFORE=("$PYTHON_BIN" "$REPOSITORY_ROOT/scripts/scaling/image3f_probe.py"
@@ -376,6 +512,8 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         ++algo.config.videogen.reference_lag=256
         ++algo.config.videogen.primary_view=head_color
         ++algo.config.videogen.seed="$SEED"
+        algo.config.videogen.anchor_pool_dir="$ANCHOR_POOL"
+        algo.config.videogen.anchor_index="$ANCHOR_INDEX"
         'simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]'
         ++env.config.image_dagger_policy_view_count=3
         ++algo.config.eval.training_enabled=false
@@ -402,7 +540,9 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         print_command "${VERIFY_STAGE[@]}"
         print_command "${PROBE_BEFORE[@]}"
         print_command "${VERIFY_STAGE[@]}"
-        print_command "${EVAL[@]}"
+        print_command env \
+            EXPECTED_TRAIN_CHECKPOINT_SHA256='<sha256-of-sanitized-checkpoint>' \
+            "${EVAL[@]}"
         print_command "${VERIFY_STAGE[@]}"
         print_command "${PROBE_AFTER[@]}"
         print_command "${ATTEST[@]}"
@@ -411,52 +551,44 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
     else
         mkdir -p "$ATTEMPT_BASE"
         mkdir "$RESULT_DIR" || fatal "attempt allocation collision at $RESULT_DIR"
-        # Stage once.  Retries validate all staged bytes and their source
-        # provenance rather than overwriting them.
-        STAGE_ROLE_DIR="$RESULTS_DIR/stage/$ROLE"
-        STAGE_PROVENANCE="$STAGE_ROLE_DIR/provenance.json"
-        STAGE_CONFIG="$STAGE_ROLE_DIR/config.yaml"
-        if [[ -e $STAGE_ROLE_DIR ]]; then
-            [[ -d $STAGE_ROLE_DIR && ! -L $STAGE_ROLE_DIR ]] || \
-                fatal "unsafe staged role directory"
-            [[ -z $(find "$STAGE_ROLE_DIR" -maxdepth 1 -type l -print -quit) ]] || \
-                fatal "staged role directory contains a symlink"
-        fi
-        if [[ -e $STAGED && -e $STAGE_PROVENANCE && -e $STAGE_CONFIG ]]; then
-            "${VERIFY_STAGE[@]}" >/dev/null || \
-                fatal "staged evaluation inputs changed"
-        else
-            if [[ -e $STAGED || -e $STAGE_PROVENANCE || -e $STAGE_CONFIG ]]; then
-                STAGE_PARTIAL_BASE="$RESULTS_DIR/stage_partial/$ROLE"
-                STAGE_PARTIAL_ATTEMPT=$(next_attempt "$STAGE_PARTIAL_BASE")
-                STAGE_PARTIAL=$(printf '%s/attempt_%06d' \
-                    "$STAGE_PARTIAL_BASE" "$STAGE_PARTIAL_ATTEMPT")
-                mkdir -p "$STAGE_PARTIAL_BASE"
-                [[ ! -e $STAGE_PARTIAL ]] || fatal "stage partial allocation collision"
-                mv -- "$STAGE_ROLE_DIR" "$STAGE_PARTIAL"
-                echo "PAIRED_EVALUATION_STAGE_PARTIAL_PRESERVED role=$ROLE attempt=$STAGE_PARTIAL_ATTEMPT"
-            fi
-            mkdir -p "$STAGE_ROLE_DIR"
-            "${SANITIZE[@]}"
-            "${CONFIG_COPY[@]}"
-            "${VERIFY_STAGE[@]}" >/dev/null || \
-                fatal "new staged evaluation inputs failed verification"
-        fi
-        "${PROBE_BEFORE[@]}" >/dev/null
+        mkdir -p "$(dirname "$STAGE_ROLE_DIR")"
+        ACTIVE_STAGE_ROLE_DIR=$STAGE_ROLE_DIR
+        mkdir "$STAGE_ROLE_DIR" || fatal "attempt input allocation collision"
+        "${SANITIZE[@]}"
+        "${CONFIG_COPY[@]}"
         "${VERIFY_STAGE[@]}" >/dev/null || \
+            fatal "new staged evaluation inputs failed verification"
+        "${PROBE_BEFORE[@]}" >/dev/null
+        VERIFIED_STAGE=$("${VERIFY_STAGE[@]}") || \
             fatal "staged evaluation inputs changed before evaluator launch"
+        STAGED_SHA=$(printf '%s' "$VERIFIED_STAGE" | "$PYTHON_BIN" -c '
+import json,re,sys
+d=json.load(sys.stdin)
+v=d.get("staged_checkpoint_sha256")
+if d.get("status") != "PASS" or not isinstance(v, str) or re.fullmatch(r"[0-9a-f]{64}", v) is None:
+    raise SystemExit(2)
+print(v)
+') || fatal "verified staged checkpoint report is malformed"
+        [[ $STAGED_SHA =~ ^[0-9a-f]{64}$ ]] || \
+            fatal "verified staged checkpoint SHA-256 is malformed"
+        verify_anchor_pool
         verify_teacher
-        "${EVAL[@]}"
+        EXPECTED_TRAIN_CHECKPOINT_SHA256="$STAGED_SHA" "${EVAL[@]}"
         verify_teacher
+        verify_anchor_pool
         "${VERIFY_STAGE[@]}" >/dev/null || \
             fatal "staged evaluation inputs changed during evaluator run"
         "${PROBE_AFTER[@]}" >/dev/null
         "${ATTEST[@]}" >/dev/null
         "${PUBLISH[@]}" >/dev/null
         "${VERIFY[@]}" >/dev/null
+        cleanup_stage_dir "$STAGE_ROLE_DIR"
+        ACTIVE_STAGE_ROLE_DIR=
         echo "PAIRED_EVALUATION_CASE_COMPLETE role=$ROLE seed=$SEED attempt=$ATTEMPT run_id=$IMAGE3F_EVAL_RUN_ID"
     fi
 done < <("$PYTHON_BIN" -m round_dagger.evaluation list-cases --root "$ROOT" --contract "$CONTRACT")
+
+verify_anchor_pool
 
 SUMMARY=("$PYTHON_BIN" -m round_dagger.evaluation summarize
     --root "$ROOT" --contract "$CONTRACT" --results-dir "$RESULTS_DIR"

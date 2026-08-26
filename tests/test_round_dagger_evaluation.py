@@ -29,6 +29,7 @@ from round_dagger.evaluation import (
 from round_dagger.orchestration import ProductionBackend
 from round_dagger.promotion import PromotionError, promote_candidate
 from round_dagger.state import load_state, transition
+from scripts.round_dagger.verify_anchor_pool import AnchorRecord, inventory_sha256
 
 try:
     from test_round_dagger_state import _campaign, _sha, _stage_and_bind, _to_ingested
@@ -52,8 +53,12 @@ class PairedEvaluationTest(unittest.TestCase):
         self.gr00t = self.tmp / "gr00t"
         fixture_sources = (
             "gr00t/rl/eval_agent_trl.py",
+            "gr00t/rl/trl/trainer/anchor_io.py",
+            "gr00t/rl/trl/trainer/checkpoint_io.py",
+            "gr00t/rl/trl/trainer/distill_trainer.py",
             "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
             "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+            "gr00t/rl/trl/trainer/ppo_trainer.py",
             "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
         )
@@ -62,8 +67,24 @@ class PairedEvaluationTest(unittest.TestCase):
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(f"# deterministic fixture: {relative}\n")
         self.evaluator = self.gr00t / fixture_sources[0]
+        self.evaluation_inventory_sha = _sha("evaluation-source-inventory")
         self.evaluator_code_sha = evaluator_source_bundle_sha256(
-            self.repository_root, self.gr00t
+            self.repository_root,
+            self.gr00t,
+            self.evaluation_inventory_sha,
+        )
+        self.anchor_pool = self.tmp / "anchors"
+        self.anchor_pool.mkdir()
+        anchor = self.anchor_pool / "anchor_000000.npz"
+        anchor.write_bytes(b"deterministic anchor fixture")
+        self.anchor_inventory_sha = inventory_sha256(
+            [
+                AnchorRecord(
+                    relative_path=anchor.name,
+                    size=anchor.stat().st_size,
+                    sha256=sha256_file(anchor),
+                )
+            ]
         )
         self.teacher_checkpoint = self.tmp / "teacher.pt"
         # _campaign pins sha256(b"teacher") as the expert identity.
@@ -75,8 +96,16 @@ class PairedEvaluationTest(unittest.TestCase):
         self.teacher_sha = sha256_file(self.teacher_checkpoint)
         self.config = self.tmp / "evaluation_config.yaml"
         self.config.write_text(
-            f"teacher_actor_path: {self.teacher_checkpoint}\nfixed_seed: true\n"
+            f"teacher_actor_path: {self.teacher_checkpoint}\n"
+            "algo:\n"
+            "  config:\n"
+            "    videogen:\n"
+            f"      anchor_pool_dir: {self.anchor_pool}\n"
+            "      anchor_index: 0\n"
+            "fixed_seed: true\n"
         )
+        self.scratch = self.tmp / "evaluation-scratch"
+        self.scratch.mkdir()
         self.renderer_identity = {
             "schema_version": 1,
             "release_id": "fixture",
@@ -103,6 +132,10 @@ class PairedEvaluationTest(unittest.TestCase):
             evaluation_config_sha256=sha256_file(self.config),
             evaluator_code_sha256=self.evaluator_code_sha,
             expected_renderer_count=1,
+            anchor_pool_path=self.anchor_pool,
+            anchor_count=1,
+            anchor_index=0,
+            anchor_inventory_sha256=self.anchor_inventory_sha,
             output="rounds/macro_round_000000/evaluation/contract.json",
         )
         self.results_relative = "rounds/macro_round_000000/evaluation/results"
@@ -338,6 +371,9 @@ class PairedEvaluationTest(unittest.TestCase):
         require_teacher_readonly_mount: bool = False,
         dry_run: bool = False,
         extra_environment: dict[str, str] | None = None,
+        anchor_pool: Path | None = None,
+        anchor_inventory_sha: str | None = None,
+        python_bin: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         endpoints = self.tmp / "launcher-endpoints"
         endpoints.mkdir(exist_ok=True)
@@ -371,9 +407,23 @@ class PairedEvaluationTest(unittest.TestCase):
             teacher_sha or self.teacher_sha,
             "--sealed-teacher-checkpoint",
             str(self.sealed_teacher),
+            "--evaluation-source-inventory-sha256",
+            self.evaluation_inventory_sha,
+            "--anchor-pool-dir",
+            str(anchor_pool or self.anchor_pool),
+            "--anchor-count",
+            "1",
+            "--anchor-index",
+            "0",
+            "--anchor-inventory-sha256",
+            anchor_inventory_sha or self.anchor_inventory_sha,
+            "--scratch-root",
+            str(self.scratch),
         ]
         if require_teacher_readonly_mount:
             command.append("--require-teacher-readonly-mount")
+        if python_bin is not None:
+            command.extend(("--python", str(python_bin)))
         if dry_run:
             command.append("--dry-run")
         return subprocess.run(
@@ -391,6 +441,32 @@ class PairedEvaluationTest(unittest.TestCase):
                 ],
                 **(extra_environment or {}),
             },
+        )
+
+    def test_alternate_valid_anchor_pool_is_rejected_by_contract(self) -> None:
+        alternate = self.tmp / "alternate-anchors"
+        alternate.mkdir()
+        anchor = alternate / "anchor_000000.npz"
+        anchor.write_bytes(b"different but internally valid anchor")
+        alternate_sha = inventory_sha256(
+            [
+                AnchorRecord(
+                    relative_path=anchor.name,
+                    size=anchor.stat().st_size,
+                    sha256=sha256_file(anchor),
+                )
+            ]
+        )
+        completed = self._run_launcher(
+            self.root / self.results_relative,
+            dry_run=True,
+            anchor_pool=alternate,
+            anchor_inventory_sha=alternate_sha,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "anchor inputs differ from the immutable evaluation contract",
+            completed.stderr,
         )
 
     def test_launcher_rejects_teacher_digest_and_mount_mismatches(self) -> None:
@@ -469,6 +545,15 @@ class PairedEvaluationTest(unittest.TestCase):
         self.assertEqual(loaded["runtime"]["raytraced_mix_prob"], 0.0)
         self.assertEqual(loaded["runtime"]["policy_views"], list(POLICY_VIEWS))
         self.assertFalse(loaded["runtime"]["training_enabled"])
+        self.assertEqual(
+            loaded["anchor_pool"],
+            {
+                "path": str(self.anchor_pool),
+                "anchor_count": 1,
+                "anchor_index": 0,
+                "inventory_sha256": self.anchor_inventory_sha,
+            },
+        )
 
         incomplete = self.cases[:-1]
         with self.assertRaisesRegex(EvaluationError, "same environment"):
@@ -482,7 +567,30 @@ class PairedEvaluationTest(unittest.TestCase):
                 evaluation_config_sha256=sha256_file(self.config),
                 evaluator_code_sha256=self.evaluator_code_sha,
                 expected_renderer_count=1,
+                anchor_pool_path=self.anchor_pool,
+                anchor_count=1,
+                anchor_index=0,
+                anchor_inventory_sha256=self.anchor_inventory_sha,
                 output="evaluation/bad-contract.json",
+            )
+        with self.assertRaisesRegex(
+            EvaluationError, "anchor_index must be smaller than anchor_count"
+        ):
+            create_contract(
+                self.root,
+                candidate_manifest=self.candidate["manifest_path"],
+                scenario_cases=self.cases,
+                parent_runtime_policy_sha256=_sha("p"),
+                candidate_runtime_policy_sha256=_sha("c"),
+                renderer_runtime_sha256=self.renderer_runtime_sha,
+                evaluation_config_sha256=sha256_file(self.config),
+                evaluator_code_sha256=self.evaluator_code_sha,
+                expected_renderer_count=1,
+                anchor_pool_path=self.anchor_pool,
+                anchor_count=1,
+                anchor_index=1,
+                anchor_inventory_sha256=self.anchor_inventory_sha,
+                output="evaluation/bad-anchor-index-contract.json",
             )
 
     def test_role_seed_and_retry_stream_namespaces_are_disjoint(self) -> None:
@@ -700,6 +808,18 @@ class PairedEvaluationTest(unittest.TestCase):
                 self.teacher_sha,
                 "--sealed-teacher-checkpoint",
                 str(self.sealed_teacher),
+                "--evaluation-source-inventory-sha256",
+                self.evaluation_inventory_sha,
+                "--anchor-pool-dir",
+                str(self.anchor_pool),
+                "--anchor-count",
+                "1",
+                "--anchor-index",
+                "0",
+                "--anchor-inventory-sha256",
+                self.anchor_inventory_sha,
+                "--scratch-root",
+                str(self.scratch),
             ],
             text=True,
             capture_output=True,
@@ -938,8 +1058,16 @@ class PairedEvaluationTest(unittest.TestCase):
             )
 
     def test_evaluator_identity_binds_all_custom_producer_sources(self) -> None:
-        bundle = evaluator_source_bundle(self.repository_root, self.gr00t)
-        self.assertEqual(len(bundle["sources"]), 10)
+        bundle = evaluator_source_bundle(
+            self.repository_root,
+            self.gr00t,
+            self.evaluation_inventory_sha,
+        )
+        self.assertEqual(len(bundle["sources"]), 24)
+        self.assertIn(
+            "gr00t/gr00t/rl/trl/trainer/anchor_io.py",
+            {item["source"] for item in bundle["sources"]},
+        )
         self.assertIn(
             "gr00t/gr00t/rl/utils/image3f_frame_client.py",
             {item["source"] for item in bundle["sources"]},
@@ -948,7 +1076,21 @@ class PairedEvaluationTest(unittest.TestCase):
         helper = self.gr00t / "gr00t/rl/utils/round_dagger_paired_eval.py"
         helper.write_text("# changed paired evidence semantics\n")
         self.assertNotEqual(
-            evaluator_source_bundle_sha256(self.repository_root, self.gr00t),
+            evaluator_source_bundle_sha256(
+                self.repository_root,
+                self.gr00t,
+                self.evaluation_inventory_sha,
+            ),
+            self.evaluator_code_sha,
+        )
+
+    def test_evaluator_identity_binds_full_evaluation_inventory(self) -> None:
+        self.assertNotEqual(
+            evaluator_source_bundle_sha256(
+                self.repository_root,
+                self.gr00t,
+                _sha("different-evaluation-source-inventory"),
+            ),
             self.evaluator_code_sha,
         )
 
@@ -1033,6 +1175,18 @@ class PairedEvaluationTest(unittest.TestCase):
                 self.teacher_sha,
                 "--sealed-teacher-checkpoint",
                 str(self.sealed_teacher),
+                "--evaluation-source-inventory-sha256",
+                self.evaluation_inventory_sha,
+                "--anchor-pool-dir",
+                str(self.anchor_pool),
+                "--anchor-count",
+                "1",
+                "--anchor-index",
+                "0",
+                "--anchor-inventory-sha256",
+                self.anchor_inventory_sha,
+                "--scratch-root",
+                str(self.scratch),
             ],
             text=True,
             capture_output=True,
@@ -1049,6 +1203,7 @@ class PairedEvaluationTest(unittest.TestCase):
         self.assertIn("PAIRED_EVALUATION_DRY_RUN_OK", completed.stdout)
         self.assertIn("reference_lag=256", completed.stdout)
         self.assertIn("IMAGE_DAGGER_EVAL_RELABEL=1", completed.stdout)
+        self.assertIn("EXPECTED_TRAIN_CHECKPOINT_SHA256=", completed.stdout)
         self.assertIn("algo.config.videogen.view_names", completed.stdout)
         self.assertIn("--output", completed.stdout)
         self.assertIn(str(orchestrator_result), completed.stdout)
@@ -1065,6 +1220,219 @@ class PairedEvaluationTest(unittest.TestCase):
             len({f"{run_id}:rank0:env0" for run_id in run_ids}), 4
         )
         self.assertFalse(results.exists())
+
+    def test_sequential_sixteen_invocations_bound_and_clean_scratch(self) -> None:
+        """One staged checkpoint namespace is retained at a time.
+
+        The fake evaluator creates both a staged checkpoint and the loader's
+        sibling checkpoint for 16 sequential role/seed invocations.  It fails
+        immediately if any prior invocation remains in scratch, records the
+        high-water mark, and verifies the loader receives the SHA returned by
+        the final staged-input verification.
+        """
+
+        fake_python = self.tmp / "fake-evaluation-python"
+        fake_python.write_text(
+            r'''#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+scratch = Path(os.environ["FAKE_EVAL_SCRATCH"])
+high_water_path = Path(os.environ["FAKE_EVAL_HIGH_WATER"])
+invocations_path = Path(os.environ["FAKE_EVAL_INVOCATIONS"])
+
+def scratch_bytes():
+    return sum(path.stat().st_size for path in scratch.rglob("*") if path.is_file())
+
+def record_high_water():
+    observed = scratch_bytes()
+    previous = int(high_water_path.read_text()) if high_water_path.exists() else 0
+    high_water_path.write_text(str(max(previous, observed)))
+    if observed > 2 * 1024 * 1024 + 4096:
+        raise SystemExit("scratch high-water exceeded one checkpoint pair")
+
+def option(name):
+    return args[args.index(name) + 1]
+
+if args and args[0] == "-c":
+    document = json.load(sys.stdin)
+    print(document["staged_checkpoint_sha256"])
+    raise SystemExit(0)
+
+if args and args[0] == "-":
+    if len(args) == 4:
+        print(os.environ["FAKE_EVALUATOR_SHA"])
+    elif len(args) == 3:
+        for value in (
+            os.environ["FAKE_CONFIG_SHA"],
+            os.environ["FAKE_EVALUATOR_SHA"],
+            "1", "4", os.environ["FAKE_TEACHER_SHA"],
+            os.environ["FAKE_ANCHOR_POOL"], "1", "0",
+            os.environ["FAKE_ANCHOR_SHA"],
+        ):
+            print(value)
+    elif len(args) == 2:
+        print(os.environ["FAKE_TEACHER"])
+        print(os.environ["FAKE_ANCHOR_POOL"])
+        print("0")
+    else:
+        raise SystemExit("unexpected inline Python invocation")
+    raise SystemExit(0)
+
+if len(args) >= 2 and args[:2] == ["-m", "round_dagger.evaluation_inputs"]:
+    staged = Path(option("--staged-checkpoint"))
+    digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+    print(json.dumps({
+        "status": "PASS",
+        "staged_checkpoint_sha256": digest,
+    }))
+    raise SystemExit(0)
+
+if len(args) >= 2 and args[:2] == ["-m", "round_dagger.evaluation"]:
+    command = args[2]
+    if command == "verify-contract" or command == "verify-outcome":
+        raise SystemExit(0)
+    if command == "list-cases":
+        print(Path(os.environ["FAKE_EVAL_CASES"]).read_text(), end="")
+        raise SystemExit(0)
+    if command == "run-id":
+        role = option("--role")
+        seed = option("--seed")
+        attempt = int(option("--attempt"))
+        print(f"rde-0123456789abcdef-{role}-s{seed}-a{attempt:06d}")
+        raise SystemExit(0)
+    if command == "attest":
+        output = Path(option("--output"))
+        output.write_text("{}\n")
+        raise SystemExit(0)
+    if command == "publish-outcome":
+        source = Path(option("--source"))
+        output = Path(option("--output"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, output)
+        raise SystemExit(0)
+    if command == "summarize":
+        output = Path(option("--output"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("{}\n")
+        raise SystemExit(0)
+    raise SystemExit(f"unexpected evaluation command: {command}")
+
+program = args[0] if args else ""
+if program.endswith("verify_anchor_pool.py"):
+    raise SystemExit(0)
+if program.endswith("fixed_seed_gate.py"):
+    if "sanitize-checkpoint" not in args:
+        raise SystemExit("unexpected fixed-seed command")
+    if scratch_bytes() != 0:
+        raise SystemExit("previous staged invocation was not cleaned")
+    output = Path(option("--output"))
+    provenance = Path(option("--provenance"))
+    if not output.parent.is_dir():
+        raise SystemExit("launcher did not allocate isolated stage directory")
+    output.write_bytes(b"S" * (1024 * 1024))
+    provenance.write_text("{}\n")
+    output.chmod(0o444)
+    provenance.chmod(0o444)
+    record_high_water()
+    raise SystemExit(0)
+if program.endswith("image3f_probe.py"):
+    output = Path(option("--write-report"))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("{}\n")
+    raise SystemExit(0)
+if program.endswith("eval_agent_metrics_adapter.py"):
+    checkpoint_arg = next(value for value in args if value.startswith("+checkpoint="))
+    checkpoint = Path(checkpoint_arg.split("=", 1)[1])
+    expected = os.environ.get("EXPECTED_TRAIN_CHECKPOINT_SHA256")
+    actual = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    if expected != actual:
+        raise SystemExit("actual loader did not receive verified staged SHA")
+    checkpoint.with_name("model_step_000000.pt").write_bytes(b"L" * (1024 * 1024))
+    record_high_water()
+    metrics = Path(option("--metrics-output"))
+    metrics.parent.mkdir(parents=True, exist_ok=True)
+    metrics.write_text("{}\n")
+    count = int(invocations_path.read_text()) if invocations_path.exists() else 0
+    next_count = count + 1
+    invocations_path.write_text(str(next_count))
+    if int(os.environ.get("FAKE_EVAL_FAIL_AT", "0")) == next_count:
+        raise SystemExit("injected evaluator failure after scratch allocation")
+    raise SystemExit(0)
+raise SystemExit(f"unexpected fake Python invocation: {args!r}")
+''',
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+
+        rows = []
+        for policy in self.contract["policies"]:
+            for seed in range(100, 108):
+                rows.append(
+                    "\t".join(
+                        (
+                            policy["role"],
+                            str(seed),
+                            policy["checkpoint_path"],
+                            policy["checkpoint_sha256"],
+                            policy["runtime_policy_sha256"],
+                        )
+                    )
+                )
+        cases_path = self.tmp / "fake-sixteen-cases.tsv"
+        cases_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        high_water = self.tmp / "fake-scratch-high-water.txt"
+        invocations = self.tmp / "fake-evaluator-invocations.txt"
+        fake_environment = {
+            "FAKE_EVAL_SCRATCH": str(self.scratch),
+            "FAKE_EVAL_HIGH_WATER": str(high_water),
+            "FAKE_EVAL_INVOCATIONS": str(invocations),
+            "FAKE_EVAL_CASES": str(cases_path),
+            "FAKE_EVALUATOR_SHA": self.evaluator_code_sha,
+            "FAKE_CONFIG_SHA": self.contract["evaluation_config_sha256"],
+            "FAKE_TEACHER_SHA": self.teacher_sha,
+            "FAKE_TEACHER": str(self.teacher_checkpoint),
+            "FAKE_ANCHOR_POOL": str(self.anchor_pool),
+            "FAKE_ANCHOR_SHA": self.anchor_inventory_sha,
+        }
+        completed = self._run_launcher(
+            self.root / self.results_relative,
+            python_bin=fake_python,
+            extra_environment=fake_environment,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(int(invocations.read_text()), 16)
+        self.assertLessEqual(int(high_water.read_text()), 2 * 1024 * 1024 + 4096)
+        self.assertEqual(
+            [path for path in self.scratch.rglob("*") if path.is_file()], []
+        )
+
+        # A failure after both checkpoint-sized files exist must take the same
+        # bounded cleanup path while preserving the durable failed attempt.
+        failed_cases = self.tmp / "fake-failed-case.tsv"
+        failed_cases.write_text(rows[0].replace("\t100\t", "\t900\t") + "\n")
+        failed_invocations = self.tmp / "fake-failed-invocations.txt"
+        failed = self._run_launcher(
+            self.root / "rounds/macro_round_000000/evaluation/failure-results",
+            python_bin=fake_python,
+            extra_environment={
+                **fake_environment,
+                "FAKE_EVAL_CASES": str(failed_cases),
+                "FAKE_EVAL_INVOCATIONS": str(failed_invocations),
+                "FAKE_EVAL_FAIL_AT": "1",
+            },
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("injected evaluator failure", failed.stderr)
+        self.assertEqual(int(failed_invocations.read_text()), 1)
+        self.assertEqual(
+            [path for path in self.scratch.rglob("*") if path.is_file()], []
+        )
 
     def test_shell_launcher_preserves_partial_case_and_allocates_fresh_retry(self) -> None:
         endpoints = self.tmp / "retry-endpoints"
@@ -1101,6 +1469,18 @@ class PairedEvaluationTest(unittest.TestCase):
             self.teacher_sha,
             "--sealed-teacher-checkpoint",
             str(self.sealed_teacher),
+            "--evaluation-source-inventory-sha256",
+            self.evaluation_inventory_sha,
+            "--anchor-pool-dir",
+            str(self.anchor_pool),
+            "--anchor-count",
+            "1",
+            "--anchor-index",
+            "0",
+            "--anchor-inventory-sha256",
+            self.anchor_inventory_sha,
+            "--scratch-root",
+            str(self.scratch),
         ]
         environment = {
             **os.environ,

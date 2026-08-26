@@ -10,6 +10,11 @@ from pathlib import Path
 from scripts.eval import fixed_seed_gate as gate
 from scripts.eval import eval_agent_metrics_adapter as metrics_adapter
 
+try:
+    import torch
+except ImportError:  # pragma: no cover - exercised in the production venv
+    torch = None
+
 
 class FixedSeedGateTest(unittest.TestCase):
     def setUp(self):
@@ -101,40 +106,56 @@ class FixedSeedGateTest(unittest.TestCase):
             )
 
     def test_sanitized_checkpoint_drops_environment_and_optimizer_state(self):
+        if torch is None:
+            self.skipTest("torch is required for checkpoint sanitization")
         source = self.root / "source.pt"
         output = self.root / "staged.pt"
-        saved = {}
-        fake_torch = types.SimpleNamespace()
-        fake_torch.load = lambda *args, **kwargs: {
-            "policy_state_dict": {"weight": 1},
+        torch.save({
+            "policy_state_dict": {"weight": torch.ones(2, 2)},
             "env_state_dict": {"rng": 99},
             "optimizer_state_dict": {"momentum": 1},
             "lr_scheduler_state_dict": {"step": 10},
             "state": {"global_step": 10},
-        }
-
-        def fake_save(payload, path):
-            saved.update(payload)
-            Path(path).write_bytes(b"sanitized")
-
-        fake_torch.save = fake_save
-        source.write_bytes(b"source")
-        previous = sys.modules.get("torch")
-        sys.modules["torch"] = fake_torch
-        try:
-            provenance = gate.sanitize_checkpoint(
-                source, output, gate.sha256_file(source)
-            )
-        finally:
-            if previous is None:
-                sys.modules.pop("torch", None)
-            else:
-                sys.modules["torch"] = previous
+        }, source)
+        provenance = gate.sanitize_checkpoint(
+            source, output, gate.sha256_file(source)
+        )
+        saved = torch.load(output, map_location="cpu", weights_only=True)
         self.assertTrue(output.is_file())
         self.assertIn("policy_state_dict", saved)
         self.assertNotIn("env_state_dict", saved)
         self.assertNotIn("optimizer_state_dict", saved)
         self.assertFalse(provenance["environment_state_restored"])
+
+    def test_checkpoint_loader_deserializes_immutable_accepted_snapshot(self):
+        if torch is None:
+            self.skipTest("torch is required for checkpoint latching")
+        checkpoint = self.root / "latched.pt"
+        torch.save(
+            {"policy_state_dict": {"weight": torch.tensor([1.0])}},
+            checkpoint,
+        )
+        expected = gate.sha256_file(checkpoint)
+        original_load = torch.load
+        consumed: list[bytes] = []
+
+        def mutate_path_then_load(handle, *args, **kwargs):
+            self.assertTrue(hasattr(handle, "getvalue"))
+            consumed.append(handle.getvalue())
+            checkpoint.write_bytes(b"attacker replacement after accepted read")
+            return original_load(handle, *args, **kwargs)
+
+        with mock.patch.object(torch, "load", side_effect=mutate_path_then_load):
+            loaded, observed, _ = gate.load_checkpoint_file(
+                checkpoint,
+                expected_sha256=expected,
+                weights_only=True,
+                label="latched fixture",
+            )
+        self.assertEqual(observed, expected)
+        self.assertEqual(len(consumed), 1)
+        self.assertEqual(float(loaded["policy_state_dict"]["weight"][0]), 1.0)
+        self.assertEqual(checkpoint.read_bytes(), b"attacker replacement after accepted read")
 
     def _write_results(self, success_counts, rewards):
         results = self.root / "eval" / "results"
