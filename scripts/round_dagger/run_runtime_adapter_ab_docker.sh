@@ -233,6 +233,12 @@ for ARM in "${ARMS[@]}"; do
     }
     case "$ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE" in
         live-isaac-v1|canonical-zero-robot-mask-v1) ;;
+        canonical-zero-robot-mask-deterministic-cuda-v1)
+            [[ ${CUBLAS_WORKSPACE_CONFIG:-} == :4096:8 ]] || {
+                echo "deterministic runtime A/B requires CUBLAS_WORKSPACE_CONFIG=:4096:8" >&2
+                exit 2
+            }
+            ;;
         *) echo "runtime A/B input profile is outside the bounded contract" >&2; exit 2 ;;
     esac
     PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \

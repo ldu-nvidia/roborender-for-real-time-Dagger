@@ -167,6 +167,14 @@ class RuntimeModeTest(unittest.TestCase):
             runtime_adapter_validation_input_profile(live, required=True),
             "live-isaac-v1",
         )
+        deterministic = dict(valid)
+        deterministic["ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"] = (
+            "canonical-zero-robot-mask-deterministic-cuda-v1"
+        )
+        self.assertEqual(
+            runtime_adapter_validation_input_profile(deterministic, required=True),
+            "canonical-zero-robot-mask-deterministic-cuda-v1",
+        )
         with self.assertRaisesRegex(RuntimeAdapterError, "validation-only"):
             runtime_adapter_validation_input_profile(
                 {

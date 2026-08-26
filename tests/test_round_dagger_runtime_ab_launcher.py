@@ -422,6 +422,27 @@ class RuntimeABDockerLauncherTest(unittest.TestCase):
         runs = [event for event in self._events() if event["event"] == "docker_run"]
         self.assertEqual([event["arm"] for event in runs], ["legacy"])
 
+    def test_deterministic_profile_requires_and_forwards_cublas_contract(self) -> None:
+        for arm in ("legacy", "shadow"):
+            self.control["environments"][arm][
+                "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"
+            ] = "canonical-zero-robot-mask-deterministic-cuda-v1"
+        self._save_control()
+        rejected = self._run("legacy")
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("requires CUBLAS_WORKSPACE_CONFIG=:4096:8", rejected.stderr)
+        self.assertFalse(any(event["event"] == "docker_run" for event in self._events()))
+
+        for arm in ("legacy", "shadow"):
+            self.control["environments"][arm]["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        self._save_control()
+        accepted = self._run("legacy")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        run = next(event for event in self._events() if event["event"] == "docker_run")
+        self.assertEqual(
+            run["environment_values"]["CUBLAS_WORKSPACE_CONFIG"], ":4096:8"
+        )
+
     def test_repository_binding_mismatch_cannot_run_or_publish_warmup(self) -> None:
         self.control["source_repository_root"] = str(self.root / "other-source")
         self._save_control()

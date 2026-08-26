@@ -16,7 +16,9 @@ from round_dagger.artifacts import (
     sha256_file,
 )
 from round_dagger.runtime import (
+    RUNTIME_ADAPTER_CUBLAS_WORKSPACE_CONFIG,
     RUNTIME_ADAPTER_EVIDENCE_ENV,
+    RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA,
     RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
     RUNTIME_ADAPTER_INPUT_PROFILE_ENV,
     RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
@@ -272,7 +274,7 @@ class RuntimeAdapterABTest(unittest.TestCase):
         seal_cohort(document["cohort_dir"])
 
     @staticmethod
-    def runtime_evidence_document(arm):
+    def runtime_evidence_document(arm, *, policy_input_delta=0):
         cuda = {
             "enabled": True,
             "device": "cuda:0",
@@ -306,6 +308,29 @@ class RuntimeAdapterABTest(unittest.TestCase):
             "rank": 0,
             "world_size": 1,
             "dimensions": {"local_num_envs": 1, "rollout_steps": 2},
+            "cuda_determinism": {
+                "cublas_workspace_config": None,
+                "cudnn_allow_tf32": True,
+                "cudnn_benchmark": True,
+                "cudnn_deterministic": False,
+                "deterministic_algorithms": False,
+                "deterministic_warn_only": False,
+                "enabled": False,
+                "matmul_allow_tf32": True,
+                "matmul_precision": "highest",
+            },
+            "policy_inputs": {
+                "key": "vision_obs",
+                "records": [
+                    {
+                        "dtype": "torch.float32",
+                        "sha256": digest(f"policy-input-{step + policy_input_delta}"),
+                        "shape": [1, 324, 192, 3],
+                        "step": step,
+                    }
+                    for step in range(2)
+                ],
+            },
             "rollout": {
                 "wall_seconds": 1.25 if arm == "legacy" else 0.75,
                 "synchronized": True,
@@ -315,14 +340,19 @@ class RuntimeAdapterABTest(unittest.TestCase):
             "replay_export": {"successful": True, "published_shard_parts": 1},
         }
 
-    def publish_observability(self, arm, *, replay=0, extra_step=False):
+    def publish_observability(
+        self, arm, *, replay=0, extra_step=False, policy_input_delta=0
+    ):
         _, arms = self.documents()
         document = arms[arm]
         run_dir = Path(document["run_dir"])
         scalar_dir = run_dir / "telemetry" / "scalars"
         scalar_dir.mkdir(parents=True)
         publish_immutable_json(
-            document["runtime_evidence_path"], self.runtime_evidence_document(arm)
+            document["runtime_evidence_path"],
+            self.runtime_evidence_document(
+                arm, policy_input_delta=policy_input_delta
+            ),
         )
         for step in range(2 + int(extra_step)):
             publish_immutable_json(
@@ -339,8 +369,9 @@ class RuntimeAdapterABTest(unittest.TestCase):
                 },
             )
 
-    def publish_warmup(self, **overrides):
-        plan, _ = self.documents()
+    def publish_warmup(self, plan_path=None, **overrides):
+        selected_plan = Path(plan_path) if plan_path is not None else self.plan_path
+        plan = json.loads(selected_plan.read_text(encoding="utf-8"))
         document = {
             "schema": WARMUP_SCHEMA,
             "endpoint": plan["selected_endpoint_descriptor"],
@@ -496,6 +527,7 @@ class RuntimeAdapterABTest(unittest.TestCase):
             report["input_profile"],
             RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
         )
+
         self.assertEqual(
             plan["input_profile"],
             RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
@@ -536,6 +568,34 @@ class RuntimeAdapterABTest(unittest.TestCase):
             RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
         )
 
+    def test_deterministic_cuda_profile_is_plan_bound_and_exports_cublas(self):
+        deterministic_root = self.base / "deterministic"
+        report = self.prepare(
+            deterministic_root,
+            input_profile=RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA,
+        )
+        deterministic_plan = deterministic_root / "plan.json"
+        self.publish_warmup(plan_path=deterministic_plan)
+        environment = runtime_ab_environment(deterministic_plan, "legacy")
+        self.assertEqual(
+            environment["ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"],
+            RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA,
+        )
+        self.assertEqual(
+            environment["CUBLAS_WORKSPACE_CONFIG"],
+            RUNTIME_ADAPTER_CUBLAS_WORKSPACE_CONFIG,
+        )
+        authorized = authorize_runtime_ab(
+            deterministic_plan,
+            "legacy",
+            report["plan_sha256"],
+            environment=environment,
+        )
+        self.assertEqual(
+            authorized["input_profile"],
+            RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA,
+        )
+
     def test_noncanonical_root_and_mutated_input_fail_closed(self):
         with self.assertRaisesRegex(RuntimeABError, "root"):
             self.prepare(self.base / "unused" / ".." / "noncanonical")
@@ -563,6 +623,7 @@ class RuntimeAdapterABTest(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["exact_array_match"])
         self.assertTrue(result["exact_payload_match"])
+        self.assertTrue(result["exact_raw_policy_input_match"])
         self.assertEqual(
             result["input_profile"], RUNTIME_ADAPTER_INPUT_PROFILE_LIVE
         )
@@ -593,6 +654,19 @@ class RuntimeAdapterABTest(unittest.TestCase):
         self.complete(shadow_rgb_delta=1)
         _, arms = self.documents()
         with self.assertRaisesRegex(RuntimeABError, "arrays differ exactly"):
+            compare_runtime_ab(self.plan_path)
+        self.assertFalse((self.root / "result.json").exists())
+        for arm in ARMS:
+            self.assertFalse(Path(arms[arm]["comparison_evidence_path"]).exists())
+
+    def test_raw_policy_input_mismatch_publishes_no_comparison_artifacts(self):
+        self.publish_warmup()
+        for arm in ARMS:
+            self.publish_arm(arm)
+        self.publish_observability("legacy")
+        self.publish_observability("shadow", policy_input_delta=1)
+        _, arms = self.documents()
+        with self.assertRaisesRegex(RuntimeABError, "raw policy inputs differ exactly"):
             compare_runtime_ab(self.plan_path)
         self.assertFalse((self.root / "result.json").exists())
         for arm in ARMS:

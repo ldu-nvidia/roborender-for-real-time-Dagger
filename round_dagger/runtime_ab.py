@@ -40,6 +40,8 @@ from .artifacts import (
 )
 from .runtime import (
     RUNTIME_ADAPTER_EVIDENCE_ENV,
+    RUNTIME_ADAPTER_CUBLAS_WORKSPACE_CONFIG,
+    RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA,
     RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
     RUNTIME_ADAPTER_INPUT_PROFILE_ENV,
     RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
@@ -54,9 +56,9 @@ from .runtime import (
 PLAN_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_plan.v2"
 CONFIG_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_config.v2"
 ARM_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_arm.v1"
-EVIDENCE_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_evidence.v2"
-RESULT_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_result.v2"
-RUNTIME_EVIDENCE_SCHEMA = "fast_roborender.round_runtime_validation.v2"
+EVIDENCE_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_evidence.v3"
+RESULT_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_result.v3"
+RUNTIME_EVIDENCE_SCHEMA = "fast_roborender.round_runtime_validation.v3"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_telemetry.v1"
 WARMUP_SCHEMA = "fast_roborender.round_dagger.image3f_warmup.v1"
 WARMUP_SPEC_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_warmup.v1"
@@ -168,6 +170,7 @@ _INPUT_PROFILES = frozenset(
     {
         RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
         RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+        RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA,
     }
 )
 
@@ -1060,7 +1063,7 @@ def runtime_ab_environment(path: str | Path, arm: str) -> dict[str, str]:
         )
     plan_path, plan = _load_plan(path)
     arm_path, document = _load_arms(plan)[arm]
-    return {
+    environment = {
         "ACCELERATE": plan["accelerate"],
         "ANCHORS": plan["anchors"],
         "DRY_RUN": "0",
@@ -1124,6 +1127,9 @@ def runtime_ab_environment(path: str | Path, arm: str) -> dict[str, str]:
         "ROUND_DAGGER_VALIDATION_TRAIN_ACK": VALIDATION_ACK,
         "TRAIN_RUN_DIR": document["run_dir"],
     }
+    if plan["input_profile"] == RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA:
+        environment["CUBLAS_WORKSPACE_CONFIG"] = RUNTIME_ADAPTER_CUBLAS_WORKSPACE_CONFIG
+    return environment
 
 
 def runtime_ab_warmup(path: str | Path) -> dict[str, Any]:
@@ -1236,8 +1242,10 @@ def _runtime_evidence(
         {
             "adapter_arm",
             "audit",
+            "cuda_determinism",
             "dimensions",
             "input_profile",
+            "policy_inputs",
             "promotion_gate",
             "rank",
             "replay_export",
@@ -1280,6 +1288,88 @@ def _runtime_evidence(
         STEPS_PER_ENVIRONMENT,
         f"{arm} runtime rollout steps",
     )
+
+    cuda_determinism = _exact_mapping(
+        raw["cuda_determinism"],
+        {
+            "cublas_workspace_config",
+            "cudnn_allow_tf32",
+            "cudnn_benchmark",
+            "cudnn_deterministic",
+            "deterministic_algorithms",
+            "deterministic_warn_only",
+            "enabled",
+            "matmul_allow_tf32",
+            "matmul_precision",
+        },
+        f"{arm} runtime CUDA determinism",
+    )
+    deterministic_profile = (
+        input_profile == RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_DETERMINISTIC_CUDA
+    )
+    _require_bool(
+        cuda_determinism["enabled"],
+        deterministic_profile,
+        f"{arm} runtime CUDA determinism enabled",
+    )
+    for key in (
+        "cudnn_allow_tf32",
+        "cudnn_benchmark",
+        "cudnn_deterministic",
+        "deterministic_algorithms",
+        "deterministic_warn_only",
+        "matmul_allow_tf32",
+    ):
+        if type(cuda_determinism[key]) is not bool:
+            raise RuntimeABError(
+                f"{arm} runtime CUDA determinism {key} must be a bool"
+            )
+    if not isinstance(cuda_determinism["matmul_precision"], str):
+        raise RuntimeABError(f"{arm} runtime CUDA matmul precision is malformed")
+    workspace = cuda_determinism["cublas_workspace_config"]
+    if workspace is not None and not isinstance(workspace, str):
+        raise RuntimeABError(f"{arm} runtime cuBLAS workspace config is malformed")
+    if deterministic_profile:
+        expected_determinism = {
+            "cublas_workspace_config": RUNTIME_ADAPTER_CUBLAS_WORKSPACE_CONFIG,
+            "cudnn_allow_tf32": False,
+            "cudnn_benchmark": False,
+            "cudnn_deterministic": True,
+            "deterministic_algorithms": True,
+            "deterministic_warn_only": False,
+            "enabled": True,
+            "matmul_allow_tf32": False,
+            "matmul_precision": "highest",
+        }
+        if dict(cuda_determinism) != expected_determinism:
+            raise RuntimeABError(f"{arm} runtime CUDA determinism settings mismatch")
+
+    policy_inputs = _exact_mapping(
+        raw["policy_inputs"],
+        {"key", "records"},
+        f"{arm} runtime policy inputs",
+    )
+    if policy_inputs["key"] != "vision_obs":
+        raise RuntimeABError(f"{arm} runtime policy input key mismatch")
+    records = policy_inputs["records"]
+    if not isinstance(records, list) or len(records) != STEPS_PER_ENVIRONMENT:
+        raise RuntimeABError(
+            f"{arm} runtime policy inputs must contain exactly two records"
+        )
+    checked_policy_inputs = []
+    for step, record in enumerate(records):
+        item = _exact_mapping(
+            record,
+            {"dtype", "sha256", "shape", "step"},
+            f"{arm} runtime policy input step {step}",
+        )
+        _require_int(item["step"], step, f"{arm} runtime policy input step")
+        _sha(item["sha256"], f"{arm} runtime policy input SHA-256")
+        if item["dtype"] != "torch.float32":
+            raise RuntimeABError(f"{arm} runtime policy input dtype mismatch")
+        if item["shape"] != [1, *VIEW_CONTRACT["shape"]]:
+            raise RuntimeABError(f"{arm} runtime policy input shape mismatch")
+        checked_policy_inputs.append(dict(item))
 
     rollout = _exact_mapping(
         raw["rollout"],
@@ -1385,6 +1475,8 @@ def _runtime_evidence(
             "cuda": cuda,
         },
         "audit": audit,
+        "cuda_determinism": dict(cuda_determinism),
+        "policy_inputs": {"key": "vision_obs", "records": checked_policy_inputs},
         "replay_export": replay,
     }
 
@@ -1578,6 +1670,13 @@ def compare_runtime_ab(
             f"legacy_only={sorted(legacy_keys - shadow_keys)} "
             f"shadow_only={sorted(shadow_keys - legacy_keys)}"
         )
+    legacy_policy_inputs = evidence_documents["legacy"]["runtime_evidence"][
+        "policy_inputs"
+    ]
+    shadow_policy_inputs = evidence_documents["shadow"]["runtime_evidence"][
+        "policy_inputs"
+    ]
+    raw_policy_inputs_match = legacy_policy_inputs == shadow_policy_inputs
     mismatches = []
     for name in sorted(legacy_keys):
         legacy = material["legacy"][name]
@@ -1588,9 +1687,16 @@ def compare_runtime_ab(
             or legacy.tobytes(order="C") != shadow.tobytes(order="C")
         ):
             mismatches.append(name)
+    if not raw_policy_inputs_match:
+        detail = "legacy/shadow raw policy inputs differ exactly"
+        if mismatches:
+            detail += "; rollout arrays differ exactly: " + ", ".join(mismatches)
+        raise RuntimeABError(detail)
     if mismatches:
         raise RuntimeABError(
-            "legacy/shadow rollout arrays differ exactly: " + ", ".join(mismatches)
+            "legacy/shadow rollout arrays differ exactly: "
+            + ", ".join(mismatches)
+            + "; raw policy inputs match exactly"
         )
     rollout_sha = evidence_documents["legacy"]["canonical_rollout_sha256"]
     if evidence_documents["shadow"]["canonical_rollout_sha256"] != rollout_sha:
@@ -1659,6 +1765,7 @@ def compare_runtime_ab(
         "canonical_rollout_sha256": rollout_sha,
         "exact_array_match": True,
         "exact_payload_match": True,
+        "exact_raw_policy_input_match": True,
         "global_env_id": GLOBAL_ENV_ID,
         "input_profile": plan["input_profile"],
         "performance": performance,
