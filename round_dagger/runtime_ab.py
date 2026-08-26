@@ -375,9 +375,14 @@ def _select_warmup_anchor(path: Path) -> Path:
                 raise RuntimeABError("warm-up anchor prompt must be scalar")
             for view in VIEW_CONTRACT["views"]:
                 value = archive[f"gen__{view}"]
-                if value.dtype != np.uint8 or value.shape != (1, 240, 416, 3):
+                if (
+                    value.dtype != np.uint8
+                    or value.ndim != 4
+                    or value.shape[0] < 1
+                    or value.shape[1:] != (240, 416, 3)
+                ):
                     raise RuntimeABError(
-                        f"warm-up anchor {view} must be uint8 [1,240,416,3]"
+                        f"warm-up anchor {view} must be uint8 [N>=1,240,416,3]"
                     )
     except RuntimeABError:
         raise

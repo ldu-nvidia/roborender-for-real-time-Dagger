@@ -163,7 +163,7 @@ class RuntimeAdapterABTest(unittest.TestCase):
                 prompt=np.array("lift the colored cube"),
                 **{
                     f"gen__{view}": np.full(
-                        (1, 240, 416, 3), 10 + index, dtype=np.uint8
+                        (2, 240, 416, 3), 10 + index, dtype=np.uint8
                     )
                     for view in ("head_color", "hand_left", "hand_right")
                 },
