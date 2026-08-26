@@ -13,6 +13,7 @@ from round_dagger.runtime import (
     DaggerAgentAdapter,
     DecisionRecord,
     MetadataAuditSubscriber,
+    RUNTIME_ADAPTER_SCALE_VALIDATION_ACK,
     RoboRenderObservationTransform,
     RoundContext,
     RuntimeAdapterError,
@@ -197,6 +198,35 @@ class RuntimeModeTest(unittest.TestCase):
                 },
                 required=True,
             )
+
+    def test_shadow_scale_ack_is_distinct_and_explicit(self) -> None:
+        environment = {
+            "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": (
+                RUNTIME_ADAPTER_SCALE_VALIDATION_ACK
+            ),
+            "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE": "live-isaac-v1",
+            "TRAIN_RUN_DIR": "/tmp/round-scale",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE": (
+                "/tmp/round-scale/evidence/shadow.json"
+            ),
+        }
+        with self.assertRaisesRegex(RuntimeAdapterError, "paired-1x2-v1"):
+            runtime_adapter_validation_evidence_path(environment)
+        self.assertEqual(
+            runtime_adapter_validation_evidence_path(
+                environment,
+                expected_acknowledgement=RUNTIME_ADAPTER_SCALE_VALIDATION_ACK,
+            ),
+            environment["ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE"],
+        )
+        self.assertEqual(
+            runtime_adapter_validation_input_profile(
+                environment,
+                required=True,
+                expected_acknowledgement=RUNTIME_ADAPTER_SCALE_VALIDATION_ACK,
+            ),
+            "live-isaac-v1",
+        )
 
 
 class VectorEnvironmentAdapterTest(unittest.TestCase):

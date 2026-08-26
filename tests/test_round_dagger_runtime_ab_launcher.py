@@ -633,7 +633,10 @@ class RuntimeABActorValidationInteractionTest(unittest.TestCase):
         )
         rejected = self._run_actor(standalone)
         self.assertEqual(rejected.returncode, 2)
-        self.assertIn("shadow runtime requires an immutable runtime A/B plan", rejected.stderr)
+        self.assertIn(
+            "shadow runtime requires an immutable runtime validation plan",
+            rejected.stderr,
+        )
 
         partial = fixture._environment()
         partial["ROUND_DAGGER_RUNTIME_AB_PLAN"] = str(fixture.root / "plan.json")

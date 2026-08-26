@@ -81,12 +81,18 @@ done
 }
 
 # The observer remains inaccessible to ordinary production and train-smoke
-# invocations.  A shadow selection is accepted only when every process value
-# is re-derived from one immutable, validation-only A/B plan.  Partial A/B
-# metadata and standalone ambient shadow flags fail before Isaac is imported.
+# invocations. A shadow selection is accepted only when every process value is
+# re-derived from either the immutable exact A/B plan or the separate bounded
+# scale plan. Partial, mixed, or standalone ambient flags fail before Isaac is
+# imported.
 RUNTIME_AB_HINT=${ROUND_DAGGER_RUNTIME_AB_PLAN:-}${ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256:-}${ROUND_DAGGER_RUNTIME_AB_ARM:-}${ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT:-}${ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256:-}${ROUND_DAGGER_RUNTIME_AB_EVIDENCE:-}
+RUNTIME_SCALE_HINT=${ROUND_DAGGER_RUNTIME_SCALE_PLAN:-}${ROUND_DAGGER_RUNTIME_SCALE_PLAN_SHA256:-}${ROUND_DAGGER_RUNTIME_SCALE_RUNG_CONTRACT:-}${ROUND_DAGGER_RUNTIME_SCALE_RUNG_CONTRACT_SHA256:-}${ROUND_DAGGER_RUNTIME_SCALE_EVIDENCE:-}
 RUNTIME_AB_ACTIVE=0
-if [[ -n $RUNTIME_AB_HINT ]]; then
+RUNTIME_SCALE_ACTIVE=0
+if [[ -n $RUNTIME_AB_HINT && -n $RUNTIME_SCALE_HINT ]]; then
+    echo "runtime adapter A/B and shadow-scale plans are mutually exclusive" >&2
+    exit 2
+elif [[ -n $RUNTIME_AB_HINT ]]; then
     for name in ROUND_DAGGER_RUNTIME_AB_PLAN ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256 \
         ROUND_DAGGER_RUNTIME_AB_ARM ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT \
         ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256 \
@@ -106,9 +112,38 @@ if [[ -n $RUNTIME_AB_HINT ]]; then
         --arm "$ROUND_DAGGER_RUNTIME_AB_ARM" \
         --expected-plan-sha256 "$ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256" \
         >/dev/null
+elif [[ -n $RUNTIME_SCALE_HINT ]]; then
+    for name in ROUND_DAGGER_RUNTIME_SCALE_PLAN \
+        ROUND_DAGGER_RUNTIME_SCALE_PLAN_SHA256 \
+        ROUND_DAGGER_RUNTIME_SCALE_RUNG_CONTRACT \
+        ROUND_DAGGER_RUNTIME_SCALE_RUNG_CONTRACT_SHA256 \
+        ROUND_DAGGER_RUNTIME_SCALE_EVIDENCE \
+        ROUND_DAGGER_RUNTIME_ADAPTER_MODE \
+        ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK \
+        ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK \
+        ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE \
+        ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE; do
+        [[ -n ${!name:-} ]] || {
+            echo "runtime adapter shadow-scale launch is missing $name" >&2
+            exit 2
+        }
+    done
+    [[ $ROUND_DAGGER_RUNTIME_SCALE_EVIDENCE == \
+       "$ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE" ]] || {
+        echo "runtime adapter shadow-scale evidence aliases differ" >&2
+        exit 2
+    }
+    RUNTIME_SCALE_ACTIVE=1
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \
+        -m round_dagger.runtime_scale authorize \
+        --plan "$ROUND_DAGGER_RUNTIME_SCALE_PLAN" \
+        --expected-plan-sha256 "$ROUND_DAGGER_RUNTIME_SCALE_PLAN_SHA256" \
+        --expected-rung-contract-sha256 \
+            "$ROUND_DAGGER_RUNTIME_SCALE_RUNG_CONTRACT_SHA256" \
+        >/dev/null
 else
     [[ ${ROUND_DAGGER_RUNTIME_ADAPTER_MODE:-legacy} == legacy ]] || {
-        echo "shadow runtime requires an immutable runtime A/B plan" >&2
+        echo "shadow runtime requires an immutable runtime validation plan" >&2
         exit 2
     }
     [[ -z ${ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK:-} && \
@@ -302,8 +337,9 @@ export IMAGE_DAGGER_TELEMETRY_IMAGE_EVERY=${IMAGE_DAGGER_TELEMETRY_IMAGE_EVERY:-
 export IMAGE_DAGGER_TELEMETRY_CLIP_EVERY=${IMAGE_DAGGER_TELEMETRY_CLIP_EVERY:-0}
 export IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES=${IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES:-32}
 export IMAGE_DAGGER_TELEMETRY_CLIP_FPS=${IMAGE_DAGGER_TELEMETRY_CLIP_FPS:-10}
-if ((RUNTIME_AB_ACTIVE)); then
-    # authorize_runtime_ab already proved that this namespace is arm-specific.
+if ((RUNTIME_AB_ACTIVE || RUNTIME_SCALE_ACTIVE)); then
+    # The immutable validation plan already proved that this namespace is
+    # arm/rung-specific.
     export IMAGE3F_RUN_ID
 else
     export IMAGE3F_RUN_ID="validation-${ROUND_DAGGER_CAMPAIGN_ID}-${ROUND_DAGGER_COHORT_INDEX}"

@@ -27,6 +27,7 @@ RUNTIME_ADAPTER_VALIDATION_ACK_ENV = (
     "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK"
 )
 RUNTIME_ADAPTER_VALIDATION_ACK = "paired-1x2-v1"
+RUNTIME_ADAPTER_SCALE_VALIDATION_ACK = "shadow-scale-2step-v1"
 RUNTIME_ADAPTER_EVIDENCE_ENV = "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE"
 RUNTIME_ADAPTER_INPUT_PROFILE_ENV = (
     "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"
@@ -108,6 +109,8 @@ def runtime_adapter_mode(
 
 def runtime_adapter_validation_evidence_path(
     environment: Mapping[str, str] | None = None,
+    *,
+    expected_acknowledgement: str = RUNTIME_ADAPTER_VALIDATION_ACK,
 ) -> str:
     """Validate the second, bounded A/B authorization and evidence path.
 
@@ -120,11 +123,11 @@ def runtime_adapter_validation_evidence_path(
 
     source = os.environ if environment is None else environment
     acknowledgement = source.get(RUNTIME_ADAPTER_VALIDATION_ACK_ENV)
-    if acknowledgement != RUNTIME_ADAPTER_VALIDATION_ACK:
+    if acknowledgement != expected_acknowledgement:
         raise RuntimeAdapterError(
             "runtime validation requires "
             f"{RUNTIME_ADAPTER_VALIDATION_ACK_ENV}="
-            f"{RUNTIME_ADAPTER_VALIDATION_ACK}"
+            f"{expected_acknowledgement}"
         )
     raw_run_dir = source.get("TRAIN_RUN_DIR")
     raw_evidence = source.get(RUNTIME_ADAPTER_EVIDENCE_ENV)
@@ -159,6 +162,7 @@ def runtime_adapter_validation_input_profile(
     environment: Mapping[str, str] | None = None,
     *,
     required: bool = False,
+    expected_acknowledgement: str = RUNTIME_ADAPTER_VALIDATION_ACK,
 ) -> str | None:
     """Return the explicitly authorized bounded-validation input profile.
 
@@ -177,11 +181,11 @@ def runtime_adapter_validation_input_profile(
                 f"{RUNTIME_ADAPTER_INPUT_PROFILE_ENV}"
             )
         return None
-    if source.get(RUNTIME_ADAPTER_VALIDATION_ACK_ENV) != RUNTIME_ADAPTER_VALIDATION_ACK:
+    if source.get(RUNTIME_ADAPTER_VALIDATION_ACK_ENV) != expected_acknowledgement:
         raise RuntimeAdapterError(
             f"{RUNTIME_ADAPTER_INPUT_PROFILE_ENV} is validation-only and requires "
             f"{RUNTIME_ADAPTER_VALIDATION_ACK_ENV}="
-            f"{RUNTIME_ADAPTER_VALIDATION_ACK}"
+            f"{expected_acknowledgement}"
         )
     profile = str(raw).strip().lower()
     if profile not in _RUNTIME_ADAPTER_INPUT_PROFILES:
@@ -1208,6 +1212,7 @@ __all__ = [
     "RUNTIME_ADAPTER_EVIDENCE_ENV",
     "RUNTIME_ADAPTER_SHADOW_ACK",
     "RUNTIME_ADAPTER_SHADOW_ACK_ENV",
+    "RUNTIME_ADAPTER_SCALE_VALIDATION_ACK",
     "RUNTIME_ADAPTER_VALIDATION_ACK",
     "RUNTIME_ADAPTER_VALIDATION_ACK_ENV",
     "RoboRenderObservationTransform",

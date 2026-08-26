@@ -370,7 +370,10 @@ class ActorValidationDryRunTest(unittest.TestCase):
         )
         rejected = self._run(shadow)
         self.assertEqual(rejected.returncode, 2)
-        self.assertIn("shadow runtime requires an immutable runtime A/B plan", rejected.stderr)
+        self.assertIn(
+            "shadow runtime requires an immutable runtime validation plan",
+            rejected.stderr,
+        )
         self.assertFalse(self.marker.exists())
 
         evidence = self._environment()
@@ -393,6 +396,26 @@ class ActorValidationDryRunTest(unittest.TestCase):
         rejected = self._run(environment)
         self.assertEqual(rejected.returncode, 2)
         self.assertIn("runtime adapter A/B launch is missing", rejected.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_partial_or_mixed_runtime_scale_contract_fails_before_launch(self) -> None:
+        partial = self._environment()
+        partial["ROUND_DAGGER_RUNTIME_SCALE_PLAN"] = str(
+            self.root / "missing-scale.json"
+        )
+        rejected = self._run(partial)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("shadow-scale launch is missing", rejected.stderr)
+        self.assertFalse(self.marker.exists())
+
+        mixed = self._environment()
+        mixed["ROUND_DAGGER_RUNTIME_AB_PLAN"] = str(self.root / "ab.json")
+        mixed["ROUND_DAGGER_RUNTIME_SCALE_PLAN"] = str(
+            self.root / "scale.json"
+        )
+        rejected = self._run(mixed)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("mutually exclusive", rejected.stderr)
         self.assertFalse(self.marker.exists())
 
     def test_rank_environment_and_step_bounds_fail_before_launch(self) -> None:
