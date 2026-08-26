@@ -667,6 +667,7 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
                 "ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy",
                 "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK=",
                 "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK=",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE=",
                 "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE=",
                 "ROUND_DAGGER_RUNTIME_AB_PLAN=",
                 "ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256=",

@@ -28,7 +28,20 @@ RUNTIME_ADAPTER_VALIDATION_ACK_ENV = (
 )
 RUNTIME_ADAPTER_VALIDATION_ACK = "paired-1x2-v1"
 RUNTIME_ADAPTER_EVIDENCE_ENV = "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE"
+RUNTIME_ADAPTER_INPUT_PROFILE_ENV = (
+    "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"
+)
+RUNTIME_ADAPTER_INPUT_PROFILE_LIVE = "live-isaac-v1"
+RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK = (
+    "canonical-zero-robot-mask-v1"
+)
 _RUNTIME_ADAPTER_MODES = frozenset({"legacy", "shadow"})
+_RUNTIME_ADAPTER_INPUT_PROFILES = frozenset(
+    {
+        RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
+        RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+    }
+)
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -135,6 +148,44 @@ def runtime_adapter_validation_evidence_path(
             f"{RUNTIME_ADAPTER_EVIDENCE_ENV} must be inside TRAIN_RUN_DIR"
         )
     return evidence
+
+
+def runtime_adapter_validation_input_profile(
+    environment: Mapping[str, str] | None = None,
+    *,
+    required: bool = False,
+) -> str | None:
+    """Return the explicitly authorized bounded-validation input profile.
+
+    The canonical-mask profile exists only to isolate adapter semantics from
+    cross-process Isaac semantic-mask rasterization variance.  It is never a
+    production fallback: setting the profile without the exact bounded A/B
+    acknowledgement fails closed.
+    """
+
+    source = os.environ if environment is None else environment
+    raw = source.get(RUNTIME_ADAPTER_INPUT_PROFILE_ENV)
+    if raw is None or not str(raw).strip():
+        if required:
+            raise RuntimeAdapterError(
+                "runtime validation requires "
+                f"{RUNTIME_ADAPTER_INPUT_PROFILE_ENV}"
+            )
+        return None
+    if source.get(RUNTIME_ADAPTER_VALIDATION_ACK_ENV) != RUNTIME_ADAPTER_VALIDATION_ACK:
+        raise RuntimeAdapterError(
+            f"{RUNTIME_ADAPTER_INPUT_PROFILE_ENV} is validation-only and requires "
+            f"{RUNTIME_ADAPTER_VALIDATION_ACK_ENV}="
+            f"{RUNTIME_ADAPTER_VALIDATION_ACK}"
+        )
+    profile = str(raw).strip().lower()
+    if profile not in _RUNTIME_ADAPTER_INPUT_PROFILES:
+        allowed = ", ".join(sorted(_RUNTIME_ADAPTER_INPUT_PROFILES))
+        raise RuntimeAdapterError(
+            f"{RUNTIME_ADAPTER_INPUT_PROFILE_ENV} must be one of {allowed}; "
+            f"got {raw!r}"
+        )
+    return profile
 
 
 @dataclass(frozen=True)

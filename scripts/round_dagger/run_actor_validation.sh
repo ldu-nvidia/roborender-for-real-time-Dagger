@@ -92,6 +92,7 @@ if [[ -n $RUNTIME_AB_HINT ]]; then
         ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256 \
         ROUND_DAGGER_RUNTIME_ADAPTER_MODE \
         ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK \
+        ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE \
         ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE; do
         [[ -n ${!name:-} ]] || {
             echo "runtime adapter A/B launch is missing $name" >&2
@@ -112,6 +113,7 @@ else
     }
     [[ -z ${ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK:-} && \
        -z ${ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK:-} && \
+       -z ${ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE:-} && \
        -z ${ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE:-} ]] || {
         echo "runtime adapter validation metadata is forbidden without an A/B plan" >&2
         exit 2
@@ -119,6 +121,7 @@ else
     export ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy
     unset ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK
     unset ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK
+    unset ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE
     unset ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE
 fi
 

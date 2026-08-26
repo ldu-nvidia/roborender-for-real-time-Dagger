@@ -231,6 +231,10 @@ for ARM in "${ARMS[@]}"; do
         echo "runtime A/B environment differs from the exact paired 1x1x2 contract" >&2
         exit 2
     }
+    case "$ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE" in
+        live-isaac-v1|canonical-zero-robot-mask-v1) ;;
+        *) echo "runtime A/B input profile is outside the bounded contract" >&2; exit 2 ;;
+    esac
     PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \
         -m round_dagger.runtime_ab authorize \
         --plan "$PLAN" --arm "$ARM" \

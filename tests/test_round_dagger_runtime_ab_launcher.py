@@ -58,6 +58,7 @@ class RuntimeABDockerLauncherTest(unittest.TestCase):
             "ROUND_DAGGER_RUNTIME_AB_PLAN": str(self.plan),
             "ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256": self.plan_sha256,
             "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": "paired-1x2-v1",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE": "live-isaac-v1",
             "ROUND_DAGGER_SIMULATOR_SEED": "0",
             "ROUND_DAGGER_VALIDATION_ENVS_PER_RANK": "1",
             "ROUND_DAGGER_VALIDATION_PURPOSE": "train",
@@ -400,6 +401,27 @@ class RuntimeABDockerLauncherTest(unittest.TestCase):
         self.assertIn("image ID differs from immutable plan", rejected.stderr)
         self.assertFalse(any(event["event"] == "docker_run" for event in self._events()))
 
+    def test_input_profile_is_bounded_even_when_fake_authorization_accepts_it(self) -> None:
+        for arm in ("legacy", "shadow"):
+            self.control["environments"][arm][
+                "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"
+            ] = "tolerant"
+        self._save_control()
+        rejected = self._run("legacy")
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("input profile is outside", rejected.stderr)
+        self.assertFalse(any(event["event"] == "docker_run" for event in self._events()))
+
+        for arm in ("legacy", "shadow"):
+            self.control["environments"][arm][
+                "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"
+            ] = "canonical-zero-robot-mask-v1"
+        self._save_control()
+        accepted = self._run("legacy")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        runs = [event for event in self._events() if event["event"] == "docker_run"]
+        self.assertEqual([event["arm"] for event in runs], ["legacy"])
+
     def test_repository_binding_mismatch_cannot_run_or_publish_warmup(self) -> None:
         self.control["source_repository_root"] = str(self.root / "other-source")
         self._save_control()
@@ -488,6 +510,12 @@ class RuntimeABDockerLauncherTest(unittest.TestCase):
             self.assertNotIn("RANK", event["environment_names"])
             self.assertEqual(event["environment_values"]["ROUND_DAGGER_SIMULATOR_SEED"], "0")
             self.assertEqual(event["environment_values"]["ROUND_DAGGER_IMAGE3F_SEED"], "42")
+            self.assertEqual(
+                event["environment_values"][
+                    "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"
+                ],
+                "live-isaac-v1",
+            )
             self.assertEqual(
                 event["environment_values"]["IMAGE3F_RUN_ID"],
                 f"runtime-ab-{arm}-seed42",
@@ -678,6 +706,7 @@ class RuntimeABActorValidationInteractionTest(unittest.TestCase):
                 "ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "shadow",
                 "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK": "metadata-only-v1",
                 "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": "paired-1x2-v1",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE": "live-isaac-v1",
                 "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE": str(
                     fixture.root / "shadow-runtime.json"
                 ),

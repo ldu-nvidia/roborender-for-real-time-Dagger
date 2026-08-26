@@ -17,6 +17,9 @@ from round_dagger.artifacts import (
 )
 from round_dagger.runtime import (
     RUNTIME_ADAPTER_EVIDENCE_ENV,
+    RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+    RUNTIME_ADAPTER_INPUT_PROFILE_ENV,
+    RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
     RUNTIME_ADAPTER_MODE_ENV,
     RUNTIME_ADAPTER_SHADOW_ACK,
     RUNTIME_ADAPTER_SHADOW_ACK_ENV,
@@ -194,7 +197,7 @@ class RuntimeAdapterABTest(unittest.TestCase):
             os.chmod(directory, 0o755)
         self.temporary.cleanup()
 
-    def prepare(self, root=None):
+    def prepare(self, root=None, *, input_profile=RUNTIME_ADAPTER_INPUT_PROFILE_LIVE):
         return prepare_runtime_ab(
             root or self.root,
             run_id="runtime-ab-test",
@@ -212,6 +215,7 @@ class RuntimeAdapterABTest(unittest.TestCase):
             gr00t_root=self.gr00t,
             actor_image="round-dagger:test",
             actor_image_id_sha256=digest("actor-image"),
+            input_profile=input_profile,
         )
 
     def documents(self):
@@ -298,6 +302,7 @@ class RuntimeAdapterABTest(unittest.TestCase):
             "promotion_gate": False,
             "validation_ack": RUNTIME_ADAPTER_VALIDATION_ACK,
             "adapter_arm": arm,
+            "input_profile": RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
             "rank": 0,
             "world_size": 1,
             "dimensions": {"local_num_envs": 1, "rollout_steps": 2},
@@ -375,6 +380,8 @@ class RuntimeAdapterABTest(unittest.TestCase):
         self.assertEqual(report["actor_gpu_id"], 7)
         self.assertEqual(report["renderer_slot"], 1)
         self.assertEqual(report["global_env_id"], 0)
+        self.assertEqual(report["input_profile"], RUNTIME_ADAPTER_INPUT_PROFILE_LIVE)
+        self.assertEqual(plan["input_profile"], RUNTIME_ADAPTER_INPUT_PROFILE_LIVE)
         self.assertEqual(report["warmup"]["state"], "pending")
         self.assertEqual(report["warmup"]["stream_id"], "runtime-ab-test-warmup")
         self.assertEqual(report["source"]["repository_root"], str(self.repository))
@@ -428,6 +435,14 @@ class RuntimeAdapterABTest(unittest.TestCase):
         self.assertEqual(legacy["ROUND_DAGGER_ACTOR_DOCKER_GPU_ID"], "7")
         self.assertEqual(legacy[RUNTIME_ADAPTER_MODE_ENV], "legacy")
         self.assertEqual(shadow[RUNTIME_ADAPTER_MODE_ENV], "shadow")
+        self.assertEqual(
+            legacy[RUNTIME_ADAPTER_INPUT_PROFILE_ENV],
+            RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
+        )
+        self.assertEqual(
+            shadow[RUNTIME_ADAPTER_INPUT_PROFILE_ENV],
+            RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
+        )
         self.assertEqual(legacy[RUNTIME_ADAPTER_SHADOW_ACK_ENV], "")
         self.assertEqual(
             shadow[RUNTIME_ADAPTER_SHADOW_ACK_ENV], RUNTIME_ADAPTER_SHADOW_ACK
@@ -469,6 +484,58 @@ class RuntimeAdapterABTest(unittest.TestCase):
                 self.plan_path, "shadow", digest("wrong-plan"), environment=shadow
             )
 
+    def test_canonical_mask_profile_is_plan_bound_and_authorized(self):
+        canonical_root = self.base / "runtime-ab-canonical"
+        report = self.prepare(
+            canonical_root,
+            input_profile=RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+        )
+        plan_path = canonical_root / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            report["input_profile"],
+            RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+        )
+        self.assertEqual(
+            plan["input_profile"],
+            RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+        )
+        warmup = {
+            "schema": WARMUP_SCHEMA,
+            "endpoint": plan["selected_endpoint_descriptor"],
+            "endpoint_sha256": plan["selected_endpoint_descriptor_sha256"],
+            "anchor": plan["warmup_anchor"],
+            "anchor_sha256": plan["warmup_anchor_sha256"],
+            "renderer_sha256": plan["renderer_sha256"],
+            "stream_id": plan["warmup_stream_id"],
+            "seed": 42,
+            "reference_lag": 256,
+            "replayed": False,
+            "inference_ms": 12.5,
+            "client_wall_ms": 14.25,
+            "reference_source": "anchor",
+            "generated_sha256": {
+                view: digest(f"canonical-warmup-{view}")
+                for view in ("head_color", "hand_left", "hand_right")
+            },
+        }
+        publish_immutable_json(plan["warmup_evidence_path"], warmup)
+        environment = runtime_ab_environment(plan_path, "legacy")
+        self.assertEqual(
+            environment[RUNTIME_ADAPTER_INPUT_PROFILE_ENV],
+            RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+        )
+        authorized = authorize_runtime_ab(
+            plan_path,
+            "legacy",
+            report["plan_sha256"],
+            environment=environment,
+        )
+        self.assertEqual(
+            authorized["input_profile"],
+            RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+        )
+
     def test_noncanonical_root_and_mutated_input_fail_closed(self):
         with self.assertRaisesRegex(RuntimeABError, "root"):
             self.prepare(self.base / "unused" / ".." / "noncanonical")
@@ -496,6 +563,9 @@ class RuntimeAdapterABTest(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["exact_array_match"])
         self.assertTrue(result["exact_payload_match"])
+        self.assertEqual(
+            result["input_profile"], RUNTIME_ADAPTER_INPUT_PROFILE_LIVE
+        )
         self.assertEqual(result["transition_count_per_arm"], 2)
         self.assertEqual(result["performance"]["legacy_rollout_wall_ms"], 1250.0)
         self.assertEqual(result["performance"]["shadow_rollout_wall_ms"], 750.0)
@@ -510,6 +580,9 @@ class RuntimeAdapterABTest(unittest.TestCase):
             self.assertNotEqual(comparison_path, runtime_path)
             evidence = json.loads(comparison_path.read_text(encoding="utf-8"))
             self.assertEqual(evidence["schema"], EVIDENCE_SCHEMA)
+            self.assertEqual(
+                evidence["input_profile"], RUNTIME_ADAPTER_INPUT_PROFILE_LIVE
+            )
             self.assertEqual(evidence["runtime_evidence"]["path"], str(runtime_path))
             self.assertEqual(evidence["telemetry"]["provenance_valid_count"], 2)
             self.assertEqual(evidence["telemetry"]["idempotent_replay_count"], 0)

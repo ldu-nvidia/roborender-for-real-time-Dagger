@@ -25,6 +25,7 @@ from round_dagger.runtime import (
     VectorEnvironmentAdapter,
     runtime_adapter_mode,
     runtime_adapter_validation_evidence_path,
+    runtime_adapter_validation_input_profile,
 )
 
 
@@ -147,6 +148,47 @@ class RuntimeModeTest(unittest.TestCase):
                 RuntimeAdapterError, pattern
             ):
                 runtime_adapter_validation_evidence_path(environment)
+
+    def test_validation_input_profile_is_explicit_and_never_a_production_fallback(self) -> None:
+        self.assertIsNone(runtime_adapter_validation_input_profile({}))
+        valid = {
+            "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": "paired-1x2-v1",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE": (
+                "canonical-zero-robot-mask-v1"
+            ),
+        }
+        self.assertEqual(
+            runtime_adapter_validation_input_profile(valid, required=True),
+            "canonical-zero-robot-mask-v1",
+        )
+        live = dict(valid)
+        live["ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"] = "live-isaac-v1"
+        self.assertEqual(
+            runtime_adapter_validation_input_profile(live, required=True),
+            "live-isaac-v1",
+        )
+        with self.assertRaisesRegex(RuntimeAdapterError, "validation-only"):
+            runtime_adapter_validation_input_profile(
+                {
+                    "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE": (
+                        "canonical-zero-robot-mask-v1"
+                    )
+                }
+            )
+        with self.assertRaisesRegex(RuntimeAdapterError, "must be one of"):
+            runtime_adapter_validation_input_profile(
+                {
+                    **valid,
+                    "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE": "tolerant",
+                }
+            )
+        with self.assertRaisesRegex(RuntimeAdapterError, "requires"):
+            runtime_adapter_validation_input_profile(
+                {
+                    "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": "paired-1x2-v1"
+                },
+                required=True,
+            )
 
 
 class VectorEnvironmentAdapterTest(unittest.TestCase):

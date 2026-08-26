@@ -40,6 +40,9 @@ from .artifacts import (
 )
 from .runtime import (
     RUNTIME_ADAPTER_EVIDENCE_ENV,
+    RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+    RUNTIME_ADAPTER_INPUT_PROFILE_ENV,
+    RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
     RUNTIME_ADAPTER_MODE_ENV,
     RUNTIME_ADAPTER_SHADOW_ACK,
     RUNTIME_ADAPTER_SHADOW_ACK_ENV,
@@ -48,12 +51,12 @@ from .runtime import (
 )
 
 
-PLAN_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_plan.v1"
-CONFIG_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_config.v1"
+PLAN_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_plan.v2"
+CONFIG_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_config.v2"
 ARM_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_arm.v1"
-EVIDENCE_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_evidence.v1"
-RESULT_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_result.v1"
-RUNTIME_EVIDENCE_SCHEMA = "fast_roborender.round_runtime_validation.v1"
+EVIDENCE_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_evidence.v2"
+RESULT_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_result.v2"
+RUNTIME_EVIDENCE_SCHEMA = "fast_roborender.round_runtime_validation.v2"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_telemetry.v1"
 WARMUP_SCHEMA = "fast_roborender.round_dagger.image3f_warmup.v1"
 WARMUP_SPEC_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_warmup.v1"
@@ -103,6 +106,7 @@ _PLAN_KEYS = {
     "gr00t_source_tree_sha256",
     "fast_roborender_revision",
     "fast_roborender_source_tree_sha256",
+    "input_profile",
     "macro_round",
     "policy_checkpoint",
     "policy_manifest",
@@ -160,6 +164,12 @@ _ARM_KEYS = {
     "schema",
     "shadow_acknowledgement",
 }
+_INPUT_PROFILES = frozenset(
+    {
+        RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
+        RUNTIME_ADAPTER_INPUT_PROFILE_CANONICAL_ZERO_MASK,
+    }
+)
 
 
 class RuntimeABError(RuntimeError):
@@ -175,6 +185,13 @@ def _sha(value: Any, label: str) -> str:
 def _token(value: Any, label: str) -> str:
     if not isinstance(value, str) or _TOKEN_RE.fullmatch(value) is None:
         raise RuntimeABError(f"{label} must be a safe non-empty token")
+    return value
+
+
+def _input_profile(value: Any) -> str:
+    if not isinstance(value, str) or value not in _INPUT_PROFILES:
+        allowed = ", ".join(sorted(_INPUT_PROFILES))
+        raise RuntimeABError(f"runtime A/B input profile must be one of {allowed}")
     return value
 
 
@@ -445,7 +462,11 @@ def _endpoint_descriptors(path: Path) -> tuple[Path, ...]:
     return tuple(result)
 
 
-def _expected_config(beta_sha256: str, source_inventory_sha256: str) -> dict[str, Any]:
+def _expected_config(
+    beta_sha256: str,
+    source_inventory_sha256: str,
+    input_profile: str,
+) -> dict[str, Any]:
     return {
         "acknowledgement": VALIDATION_ACK,
         "action_contract": {
@@ -457,6 +478,7 @@ def _expected_config(beta_sha256: str, source_inventory_sha256: str) -> dict[str
         "beta_sha256": beta_sha256,
         "environments_per_rank": ENVIRONMENTS_PER_RANK,
         "image3f_seed": IMAGE3F_SEED,
+        "input_profile": _input_profile(input_profile),
         "purpose": PURPOSE,
         "ranks": RANKS,
         "reference_lag": REFERENCE_LAG,
@@ -531,6 +553,7 @@ def prepare_runtime_ab(
     gr00t_root: str | Path,
     actor_image: str,
     actor_image_id_sha256: str,
+    input_profile: str = RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
     gr00t_python: str = "/opt/round-dagger-rtx/bin/python",
     accelerate: str = "/opt/round-dagger-rtx/bin/accelerate",
 ) -> dict[str, Any]:
@@ -575,6 +598,7 @@ def prepare_runtime_ab(
         )
     renderer_sha = _sha(renderer_sha256, "renderer identity")
     image_sha = _sha(actor_image_id_sha256, "actor image identity")
+    profile = _input_profile(input_profile)
     if not isinstance(actor_image, str) or not actor_image or any(
         character.isspace() for character in actor_image
     ):
@@ -609,7 +633,7 @@ def prepare_runtime_ab(
     )
     config_path = target / "config.json"
     config_sha = publish_immutable_json(
-        config_path, _expected_config(beta_sha, source_sha)
+        config_path, _expected_config(beta_sha, source_sha, profile)
     )
     selected_manifest = target / "renderer_endpoint_manifest.txt"
     selected_manifest_sha = _publish_immutable_text(
@@ -673,6 +697,7 @@ def prepare_runtime_ab(
         "config_sha256": config_sha,
         "gr00t_python": gr00t_python,
         "gr00t_root": str(gr00t),
+        "input_profile": profile,
         "macro_round": MACRO_ROUND,
         "policy_checkpoint": str(checkpoint),
         "policy_manifest": str(manifest),
@@ -718,6 +743,7 @@ def _load_plan(path: str | Path) -> tuple[Path, dict[str, Any]]:
     ):
         raise RuntimeABError("runtime A/B plan identity mismatch")
     _token(plan.get("run_id"), "runtime A/B run ID")
+    _input_profile(plan.get("input_profile"))
     return plan_path, plan
 
 
@@ -862,6 +888,7 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
         raise RuntimeABError("actor GPU ID is malformed")
     if type(plan.get("renderer_slot")) is not int or plan["renderer_slot"] < 0:
         raise RuntimeABError("renderer slot is malformed")
+    profile = _input_profile(plan.get("input_profile"))
     _sha(plan.get("source_inventory_sha256"), "source inventory")
     _sha(plan.get("renderer_sha256"), "renderer identity")
     _sha(plan.get("actor_image_id_sha256"), "actor image identity")
@@ -923,7 +950,7 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
     if sha256_file(config_path) != plan.get("config_sha256"):
         raise RuntimeABError("runtime A/B config digest changed")
     if load_strict_json(config_path) != _expected_config(
-        plan["beta_sha256"], plan["source_inventory_sha256"]
+        plan["beta_sha256"], plan["source_inventory_sha256"], profile
     ):
         raise RuntimeABError("runtime A/B shared config content mismatch")
 
@@ -997,7 +1024,7 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
     if arm_reports["legacy"]["image3f_run_id"] == arm_reports["shadow"]["image3f_run_id"]:
         raise RuntimeABError("legacy and shadow IMAGE3F run IDs must be distinct")
     return {
-        "schema": "fast_roborender.round_dagger.runtime_adapter_ab_validation.v1",
+        "schema": "fast_roborender.round_dagger.runtime_adapter_ab_validation.v2",
         "plan": str(plan_path),
         "plan_sha256": sha256_file(plan_path),
         "campaign_id": CAMPAIGN_ID,
@@ -1005,6 +1032,7 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
         "actor_gpu_id": plan["actor_gpu_id"],
         "renderer_slot": plan["renderer_slot"],
         "global_env_id": GLOBAL_ENV_ID,
+        "input_profile": profile,
         "source": {
             **_source_plan_binding(source_report),
             "repository_root": source_report["root"],
@@ -1040,6 +1068,7 @@ def runtime_ab_environment(path: str | Path, arm: str) -> dict[str, str]:
         "GR00T_ROOT": plan["gr00t_root"],
         "IMAGE3F_ENDPOINT_MANIFEST": document["endpoint_manifest"],
         "IMAGE3F_RUN_ID": document["image3f_run_id"],
+        RUNTIME_ADAPTER_INPUT_PROFILE_ENV: plan["input_profile"],
         "ROBORENDER_TELEMETRY_DIR": f"{document['run_dir']}/telemetry",
         "ROLLOUT_STEPS": str(STEPS_PER_ENVIRONMENT),
         "ROUND_DAGGER_ACTOR_DOCKER_GPU_ID": str(document["actor_gpu_id"]),
@@ -1127,12 +1156,13 @@ def authorize_runtime_ab(
             + ", ".join(sorted(mismatches))
         )
     return {
-        "schema": "fast_roborender.round_dagger.runtime_adapter_ab_authorization.v1",
+        "schema": "fast_roborender.round_dagger.runtime_adapter_ab_authorization.v2",
         "status": "authorized",
         "plan": expected_environment["ROUND_DAGGER_RUNTIME_AB_PLAN"],
         "plan_sha256": expected_sha,
         "arm": arm,
         "runtime_adapter_mode": expected_environment[RUNTIME_ADAPTER_MODE_ENV],
+        "input_profile": expected_environment[RUNTIME_ADAPTER_INPUT_PROFILE_ENV],
         "image3f_run_id": expected_environment["IMAGE3F_RUN_ID"],
         "expected_transitions": STEPS_PER_ENVIRONMENT,
     }
@@ -1188,7 +1218,9 @@ def _finite_number(value: Any, label: str, *, positive: bool = False) -> float:
 
 
 def _runtime_evidence(
-    arm: str, document: Mapping[str, Any]
+    arm: str,
+    document: Mapping[str, Any],
+    input_profile: str,
 ) -> dict[str, Any]:
     """Load and semantically validate trainer-published per-arm evidence."""
 
@@ -1205,6 +1237,7 @@ def _runtime_evidence(
             "adapter_arm",
             "audit",
             "dimensions",
+            "input_profile",
             "promotion_gate",
             "rank",
             "replay_export",
@@ -1227,6 +1260,8 @@ def _runtime_evidence(
         raise RuntimeABError(f"{arm} runtime validation acknowledgement mismatch")
     if raw["adapter_arm"] != arm:
         raise RuntimeABError(f"{arm} runtime evidence arm mismatch")
+    if raw["input_profile"] != _input_profile(input_profile):
+        raise RuntimeABError(f"{arm} runtime evidence input profile mismatch")
     _require_int(raw["rank"], 0, f"{arm} runtime rank")
     _require_int(raw["world_size"], RANKS, f"{arm} runtime world size")
 
@@ -1343,6 +1378,7 @@ def _runtime_evidence(
         "path": str(path),
         "sha256": digest,
         "schema": raw["schema"],
+        "input_profile": raw["input_profile"],
         "rollout": {
             **rollout,
             "wall_seconds": wall_seconds,
@@ -1437,6 +1473,7 @@ def _sealed_arm_arrays(
     arm: str,
     document: Mapping[str, Any],
     arm_contract_path: Path,
+    input_profile: str,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     cohort_dir = Path(document["cohort_dir"])
     seal = verify_cohort(cohort_dir)
@@ -1471,12 +1508,13 @@ def _sealed_arm_arrays(
         "config_sha256": document["config_sha256"],
         "global_env_ids": seal["global_env_ids"],
         "image3f_run_id": document["image3f_run_id"],
+        "input_profile": _input_profile(input_profile),
         "payload": str(payload),
         "payload_sha256": expected_payload_sha,
         "plan_sha256": plan_sha256,
         "renderer_slot": document["renderer_slot"],
         "runtime_adapter_mode": document["runtime_adapter_mode"],
-        "runtime_evidence": _runtime_evidence(arm, document),
+        "runtime_evidence": _runtime_evidence(arm, document, input_profile),
         "schema": EVIDENCE_SCHEMA,
         "shadow_acknowledgement": document["shadow_acknowledgement"],
         "telemetry": _telemetry_evidence(arm, document),
@@ -1526,7 +1564,11 @@ def compare_runtime_ab(
     for arm in ARMS:
         arm_path, document = arms[arm]
         material[arm], evidence_documents[arm] = _sealed_arm_arrays(
-            report["plan_sha256"], arm, document, arm_path
+            report["plan_sha256"],
+            arm,
+            document,
+            arm_path,
+            plan["input_profile"],
         )
     legacy_keys = set(material["legacy"])
     shadow_keys = set(material["shadow"])
@@ -1618,6 +1660,7 @@ def compare_runtime_ab(
         "exact_array_match": True,
         "exact_payload_match": True,
         "global_env_id": GLOBAL_ENV_ID,
+        "input_profile": plan["input_profile"],
         "performance": performance,
         "plan": str(plan_path),
         "plan_sha256": report["plan_sha256"],
@@ -1659,6 +1702,11 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--gr00t-root", type=Path, required=True)
     prepare.add_argument("--actor-image", required=True)
     prepare.add_argument("--actor-image-id-sha256", required=True)
+    prepare.add_argument(
+        "--input-profile",
+        choices=sorted(_INPUT_PROFILES),
+        default=RUNTIME_ADAPTER_INPUT_PROFILE_LIVE,
+    )
     prepare.add_argument("--gr00t-python", default="/opt/round-dagger-rtx/bin/python")
     prepare.add_argument("--accelerate", default="/opt/round-dagger-rtx/bin/accelerate")
     validate = subparsers.add_parser("validate")
@@ -1699,6 +1747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             gr00t_root=arguments.gr00t_root,
             actor_image=arguments.actor_image,
             actor_image_id_sha256=arguments.actor_image_id_sha256,
+            input_profile=arguments.input_profile,
             gr00t_python=arguments.gr00t_python,
             accelerate=arguments.accelerate,
         )
