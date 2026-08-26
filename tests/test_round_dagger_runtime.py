@@ -411,7 +411,10 @@ class ShadowRuntimeBridgeTest(unittest.TestCase):
         bridge.start_round(context)
         bridge.begin_decision(
             rollout_step=0,
-            observations={"vision_obs": rows["vision_obs"][0]},
+            observations={
+                "vision_obs": rows["vision_obs"][0],
+                "actor_obs": rows["actor_obs"][0],
+            },
             policy_state=current_policy_state,
             beta=0.5,
         )
@@ -460,12 +463,54 @@ class ShadowRuntimeBridgeTest(unittest.TestCase):
         bridge.start_round(RoundContext.create(num_envs=2, expected_steps=1))
         bridge.begin_decision(
             rollout_step=0,
-            observations={"vision_obs": rows["vision_obs"][0]},
+            observations={
+                "vision_obs": rows["vision_obs"][0],
+                "actor_obs": rows["actor_obs"][0],
+            },
             policy_state=state,
             beta=0.5,
         )
         with self.assertRaisesRegex(
             RuntimeAdapterError, "differs from committed storage: actions"
+        ):
+            bridge.complete_transition(
+                storage,
+                observation_keys=("vision_obs", "actor_obs"),
+                infos={"episode": {}},
+            )
+        self.assertTrue(bridge.has_pending_decision)
+        self.assertEqual(bridge.transition_count, 0)
+
+    def test_live_observation_storage_mismatch_fails_closed(self) -> None:
+        bridge = ShadowRuntimeBridge()
+        storage, rows = storage_rows()
+        storage.step = 1
+        state = {
+            key: rows[key][0]
+            for key in (
+                "student_actions",
+                "gt_actions",
+                "actions",
+                "expert_mask",
+                "round_global_env_ids",
+                "round_episode_ids",
+                "round_episode_steps",
+                "round_observation_is_raytraced",
+            )
+        }
+        bridge.start_round(RoundContext.create(num_envs=2, expected_steps=1))
+        bridge.begin_decision(
+            rollout_step=0,
+            observations={
+                "vision_obs": FakeTensor("different-vision", (2, 4)),
+                "actor_obs": rows["actor_obs"][0],
+            },
+            policy_state=state,
+            beta=0.5,
+        )
+        with self.assertRaisesRegex(
+            RuntimeAdapterError,
+            "observation differs from committed storage: vision_obs",
         ):
             bridge.complete_transition(
                 storage,
@@ -505,7 +550,10 @@ class ShadowRuntimeBridgeTest(unittest.TestCase):
         bridge.start_round(RoundContext.create(num_envs=2, expected_steps=1))
         bridge.begin_decision(
             rollout_step=0,
-            observations={"vision_obs": rows["vision_obs"][0]},
+            observations={
+                "vision_obs": rows["vision_obs"][0].clone(),
+                "actor_obs": rows["actor_obs"][0].clone(),
+            },
             policy_state=live,
             beta=0.0,
         )

@@ -758,6 +758,19 @@ class ShadowRuntimeBridge:
             beta=self._pending.decision.beta,
             infos=infos,
         )
+        observation_mismatches = tuple(
+            key
+            for key in observation_keys
+            if key not in self._pending.observations
+            or not _exact_array_equal(
+                self._pending.observations[key], record.observations[key]
+            )
+        )
+        if observation_mismatches:
+            raise RuntimeAdapterError(
+                "live DAgger observation differs from committed storage: "
+                + ", ".join(observation_mismatches)
+            )
         pending_state = self._pending.decision.policy_state
         parity_pairs = {
             "student_actions": (
