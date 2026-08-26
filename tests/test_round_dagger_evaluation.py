@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1204,7 +1206,25 @@ class PairedEvaluationTest(unittest.TestCase):
         self.assertIn("reference_lag=256", completed.stdout)
         self.assertIn("IMAGE_DAGGER_EVAL_RELABEL=1", completed.stdout)
         self.assertIn("EXPECTED_TRAIN_CHECKPOINT_SHA256=", completed.stdout)
-        self.assertIn("algo.config.videogen.view_names", completed.stdout)
+        self.assertIn(
+            "++algo.config.init_at_random_ep_len=false", completed.stdout
+        )
+        rendered_command = completed.stdout.replace("\\", "")
+        for override in (
+            "raytraced_mix_prob=0.0",
+            "image3f_endpoint_files=",
+            "view_names=[head_color,hand_left,hand_right]",
+            "reference_lag=256",
+            "primary_view=head_color",
+            "anchor_pool_dir=",
+            "anchor_index=0",
+        ):
+            self.assertIn(f"++algo.config.videogen.{override}", rendered_command)
+        self.assertIn(
+            "++simulator.config.cameras.policy_views="
+            "[head_color,hand_left,hand_right]",
+            rendered_command,
+        )
         self.assertIn("--output", completed.stdout)
         self.assertIn(str(orchestrator_result), completed.stdout)
         for view in POLICY_VIEWS:
@@ -1220,6 +1240,59 @@ class PairedEvaluationTest(unittest.TestCase):
             len({f"{run_id}:rank0:env0" for run_id in run_ids}), 4
         )
         self.assertFalse(results.exists())
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("hydra") is not None,
+        "Hydra is unavailable in the control interpreter",
+    )
+    def test_production_overrides_compose_against_real_base_eval(self) -> None:
+        production_gr00t = self.repository_root / "GR00T-VisualSim2Real"
+        evaluator = production_gr00t / "gr00t/rl/eval_agent_trl.py"
+        overrides = [
+            "++checkpoint=/tmp/checkpoint.pt",
+            "++num_envs=1",
+            "++headless=true",
+            "++seed=17",
+            "++eval_output_dir=/tmp/eval",
+            "++algo.config.eval.eval_num_envs_episodes=true",
+            "++algo.config.eval.num_eval_episodes=1",
+            "++algo.config.eval.save_videos=false",
+            "++algo.config.eval.save_trajectories=false",
+            "++algo.config.init_at_random_ep_len=false",
+            "++algo.config.videogen.raytraced_mix_prob=0.0",
+            "++algo.config.videogen.image3f_endpoint_files=[/tmp/renderer_0.txt]",
+            "++algo.config.videogen.view_names=[head_color,hand_left,hand_right]",
+            "++algo.config.videogen.reference_lag=256",
+            "++algo.config.videogen.primary_view=head_color",
+            "++algo.config.videogen.seed=17",
+            "++algo.config.videogen.anchor_pool_dir=/tmp/anchors",
+            "++algo.config.videogen.anchor_index=0",
+            "++simulator.config.cameras.policy_views="
+            "[head_color,hand_left,hand_right]",
+            "++env.config.image_dagger_policy_view_count=3",
+            "++algo.config.eval.training_enabled=false",
+            "++simulator.config.render_results=false",
+            "++use_wandb=false",
+            "hydra.run.dir=/tmp/eval/hydra",
+            "++output_dir=/tmp/eval/output",
+        ]
+        completed = subprocess.run(
+            [sys.executable, str(evaluator), "--cfg", "job", *overrides],
+            cwd=production_gr00t,
+            env={
+                **os.environ,
+                "PYTHONPATH": f"{production_gr00t}:{self.repository_root}",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("init_at_random_ep_len: false", completed.stdout)
+        self.assertIn("videogen:", completed.stdout)
+        self.assertIn("reference_lag: 256", completed.stdout)
+        self.assertIn("policy_views:", completed.stdout)
+        self.assertIn("image_dagger_policy_view_count: 3", completed.stdout)
 
     def test_sequential_sixteen_invocations_bound_and_clean_scratch(self) -> None:
         """One staged checkpoint namespace is retained at a time.
@@ -1347,7 +1420,7 @@ if program.endswith("image3f_probe.py"):
     output.write_text("{}\n")
     raise SystemExit(0)
 if program.endswith("eval_agent_metrics_adapter.py"):
-    checkpoint_arg = next(value for value in args if value.startswith("+checkpoint="))
+    checkpoint_arg = next(value for value in args if value.startswith("++checkpoint="))
     checkpoint = Path(checkpoint_arg.split("=", 1)[1])
     expected = os.environ.get("EXPECTED_TRAIN_CHECKPOINT_SHA256")
     actual = hashlib.sha256(checkpoint.read_bytes()).hexdigest()

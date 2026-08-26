@@ -365,7 +365,7 @@ DOCKER_RUN=("$DOCKER" run --rm
     --ipc=private
     --shm-size=32g
     --network=host
-    --workdir "$REPOSITORY_ROOT"
+    --workdir "$GR00T_SOURCE_ROOT"
     --mount "type=bind,src=$EVALUATION_SOURCE_ROOT,dst=$EVALUATION_SOURCE_ROOT,readonly"
     --mount "type=bind,src=$SOURCE_INVENTORY,dst=$SOURCE_INVENTORY,readonly"
     --mount "type=bind,src=$SOURCE_ATTESTATION,dst=$SOURCE_ATTESTATION,readonly"

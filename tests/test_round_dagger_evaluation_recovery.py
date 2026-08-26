@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from round_dagger import evaluation, evaluation_recovery, promotion, state
 from round_dagger.artifacts import (
@@ -36,7 +39,17 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=scratch)
         self.tmp = Path(self.temporary.name)
-        self.repository_root = Path(__file__).parents[1]
+        self.live_repository_root = Path(__file__).parents[1]
+        self.repository_root = self.tmp / "evaluation-source"
+        repository_sources = set(evaluation._REPOSITORY_EVALUATOR_SOURCES)
+        repository_sources.update(
+            evaluation_recovery._RECOVERY_REPOSITORY_SOURCES
+        )
+        for relative in sorted(repository_sources):
+            source = self.live_repository_root / relative
+            destination = self.repository_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
         self.evaluation_source_inventory_sha = _sha(
             "evaluation-source-inventory"
         )
@@ -46,7 +59,7 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         self.state = load_state(self.root)
         self.campaign = load_campaign(self.root)
 
-        self.gr00t = self.tmp / "gr00t"
+        self.gr00t = self.repository_root / "GR00T-VisualSim2Real"
         for relative in (
             "gr00t/rl/eval_agent_trl.py",
             "gr00t/rl/trl/trainer/anchor_io.py",
@@ -167,6 +180,55 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
             anchor_index=0,
             anchor_inventory_sha256=self.anchor_inventory_sha,
         )
+
+    def _trusted_run(self, *, environment: dict[str, str] | None = None) -> dict:
+        return evaluation_recovery.run_trusted_recovery(
+            self.root,
+            repository_root=self.repository_root,
+            gr00t_root=self.gr00t,
+            hold_attestation_path=self.hold["attestation_path"],
+            expected_hold_attestation_sha256=self.hold["attestation_sha256"],
+            scenario_cases_path=self.scenarios,
+            thresholds_path=self.thresholds,
+            evaluation_config_path=self.config,
+            renderer_runtime_sha256=self.renderer_runtime_sha,
+            expected_renderer_count=1,
+            learner_recovery_receipt_path=self.receipt["path"],
+            expected_learner_recovery_receipt_sha256=self.receipt["sha256"],
+            evaluation_source_inventory_sha256=(
+                self.evaluation_source_inventory_sha
+            ),
+            anchor_pool_path=self.anchor_pool,
+            anchor_count=1,
+            anchor_index=0,
+            anchor_inventory_sha256=self.anchor_inventory_sha,
+            environment={} if environment is None else environment,
+            hook_timeout_seconds=60,
+        )
+
+    def _snapshot(self, descriptors: list[int]) -> tuple[int, list[str]]:
+        descriptor = evaluation_recovery.orchestration._create_sealable_memfd(
+            "recovery-test-hook"
+        )
+        os.write(descriptor, b"#!/usr/bin/env bash\nexit 0\n")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        descriptors.append(descriptor)
+        return descriptor, ["/bin/bash", f"/proc/self/fd/{descriptor}"]
+
+    def _prepared_plan(self) -> dict:
+        paths = list(
+            self.root.glob(
+                "rounds/macro_round_000000/evaluation_recovery/"
+                "hardened-*/recovery_plan.json"
+            )
+        )
+        self.assertEqual(len(paths), 1)
+        path = paths[0]
+        return {
+            **json.loads(path.read_text(encoding="utf-8")),
+            "plan_path": path.relative_to(self.root).as_posix(),
+            "plan_sha256": sha256_file(path),
+        }
 
     def _produce_result(self, plan: dict, *, passing: bool) -> dict:
         contract = evaluation.load_contract(
@@ -391,6 +453,185 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         )
         self.assertFalse(legacy.exists())
         self.assertEqual(self._finalize(plan), completed)
+
+    def test_trusted_runner_verifies_before_any_recovery_publication(self) -> None:
+        before = load_state(self.root)
+        prepare = mock.patch.object(
+            evaluation_recovery,
+            "prepare_recovery",
+            wraps=evaluation_recovery.prepare_recovery,
+        )
+        with (
+            prepare as prepare_call,
+            mock.patch.object(evaluation_recovery.subprocess, "run") as execute,
+            mock.patch.object(
+                evaluation_recovery, "finalize_recovery"
+            ) as finalize,
+        ):
+            with self.assertRaisesRegex(
+                evaluation_recovery.EvaluationRecoveryError,
+                "trusted coordinator verification",
+            ):
+                self._trusted_run()
+        self.assertNotEqual(self.repository_root.stat().st_mode & 0o777, 0o555)
+        prepare_call.assert_not_called()
+        execute.assert_not_called()
+        finalize.assert_not_called()
+        self.assertEqual(load_state(self.root), before)
+        self.assertFalse(
+            (
+                self.root
+                / "rounds/macro_round_000000/evaluation_recovery"
+            ).exists()
+        )
+        self.assertFalse(
+            (self.root / "policies/policy_000001/evaluation.json").exists()
+        )
+        self.assertEqual(
+            (self.root / "policies/policy_000001").stat().st_mode & 0o777,
+            0o555,
+        )
+
+    def test_recovery_shell_is_a_logic_free_python_entry(self) -> None:
+        script = (
+            self.repository_root
+            / "scripts/round_dagger/run_hardened_evaluation_recovery.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("-m round_dagger.evaluation_recovery run", script)
+        self.assertNotIn("evaluation_recovery prepare", script)
+        self.assertNotIn("evaluation_recovery finalize", script)
+        self.assertNotIn('bash "$HOOK"', script)
+        self.assertNotIn("ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH", script)
+
+    def test_trusted_runner_hook_failure_is_held_and_retry_is_idempotent(self) -> None:
+        descriptors: list[int] = []
+        calls = 0
+
+        def snapshot(*_args, **_kwargs):
+            return self._snapshot(descriptors)
+
+        def execute(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            descriptor = kwargs["pass_fds"][0]
+            self.assertEqual(
+                argv, ["/bin/bash", f"/proc/self/fd/{descriptor}"]
+            )
+            self.assertEqual(
+                kwargs["env"]["ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH"],
+                "1",
+            )
+            if calls == 1:
+                return subprocess.CompletedProcess(argv, 19)
+            self._produce_result(self._prepared_plan(), passing=True)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with (
+            mock.patch.object(
+                evaluation_recovery.orchestration,
+                "_verified_evaluation_hook",
+                side_effect=snapshot,
+            ),
+            mock.patch.object(
+                evaluation_recovery.subprocess, "run", side_effect=execute
+            ),
+        ):
+            with self.assertRaisesRegex(
+                evaluation_recovery.EvaluationRecoveryError,
+                "exit status 19",
+            ):
+                self._trusted_run()
+            first_plan = self._prepared_plan()
+            self.assertEqual(load_state(self.root)["phase"], "TRAINED")
+            self.assertEqual(
+                (self.root / "policies/policy_000001").stat().st_mode & 0o777,
+                0o555,
+            )
+            self.assertFalse(
+                (self.root / "policies/policy_000001/evaluation.json").exists()
+            )
+            completed = self._trusted_run()
+            second_plan = self._prepared_plan()
+
+        self.assertEqual(first_plan["plan_sha256"], second_plan["plan_sha256"])
+        self.assertEqual(calls, 2)
+        self.assertEqual(load_state(self.root)["phase"], "READY")
+        self.assertEqual(completed["active_policy_version"], 1)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_trusted_runner_uses_latched_hook_and_finalizes_after_success(self) -> None:
+        descriptors: list[int] = []
+        events: list[str] = []
+        observed_environment: dict[str, str] = {}
+        real_prepare = evaluation_recovery.prepare_recovery
+        real_finalize = evaluation_recovery.finalize_recovery
+
+        def snapshot(*_args, **_kwargs):
+            events.append("snapshot")
+            return self._snapshot(descriptors)
+
+        def prepare(*args, **kwargs):
+            events.append("prepare")
+            return real_prepare(*args, **kwargs)
+
+        def execute(argv, **kwargs):
+            events.append("execute")
+            observed_environment.update(kwargs["env"])
+            descriptor = kwargs["pass_fds"][0]
+            self.assertEqual(
+                argv, ["/bin/bash", f"/proc/self/fd/{descriptor}"]
+            )
+            self._produce_result(self._prepared_plan(), passing=True)
+            return subprocess.CompletedProcess(argv, 0)
+
+        def finalize(*args, **kwargs):
+            events.append("finalize")
+            return real_finalize(*args, **kwargs)
+
+        inherited = {
+            "ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH": "spoofed",
+            "ROUND_DAGGER_EVALUATION_RECOVERY_ID": "wrong",
+            "ROUND_DAGGER_EVALUATOR_RESULT": "/tmp/wrong-result",
+        }
+        with (
+            mock.patch.object(
+                evaluation_recovery.orchestration,
+                "_verified_evaluation_hook",
+                side_effect=snapshot,
+            ),
+            mock.patch.object(
+                evaluation_recovery, "prepare_recovery", side_effect=prepare
+            ),
+            mock.patch.object(
+                evaluation_recovery.subprocess, "run", side_effect=execute
+            ),
+            mock.patch.object(
+                evaluation_recovery, "finalize_recovery", side_effect=finalize
+            ),
+        ):
+            completed = self._trusted_run(environment=inherited)
+
+        self.assertEqual(events, ["snapshot", "prepare", "execute", "finalize"])
+        plan = self._prepared_plan()
+        self.assertEqual(
+            observed_environment["ROUND_DAGGER_EVALUATION_RECOVERY_ID"],
+            plan["recovery_id"],
+        )
+        self.assertEqual(
+            observed_environment["ROUND_DAGGER_EVALUATOR_RESULT"],
+            str(self.root / plan["evaluator_result_path"]),
+        )
+        self.assertEqual(
+            observed_environment["ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH"],
+            "1",
+        )
+        self.assertEqual(completed["active_policy_version"], 1)
+        self.assertEqual(load_state(self.root)["phase"], "READY")
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     def test_failed_hardened_gate_keeps_candidate_held_and_unpublished(self) -> None:
         plan = self._prepare()

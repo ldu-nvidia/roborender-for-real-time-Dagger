@@ -259,6 +259,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.assertIn("round_dagger.evaluation prepare", completed.stdout)
         self.assertIn("--ipc=private", completed.stdout)
         self.assertIn("--network=host", completed.stdout)
+        self.assertIn(f"--workdir {self.gr00t}", completed.stdout)
         self.assertIn("device=0", completed.stdout)
         self.assertIn(str(self.result), completed.stdout)
         self.assertIn("--teacher-checkpoint", completed.stdout)
@@ -314,6 +315,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.assertIn("--ipc=private", invocation)
         self.assertIn("--shm-size=32g", invocation)
         self.assertIn("--network=host", invocation)
+        self.assertIn(f"--workdir {self.gr00t}", invocation)
         self.assertIn("run_paired_evaluation.sh", invocation)
         self.assertIn(str(self.result), invocation)
         teacher_mount = (

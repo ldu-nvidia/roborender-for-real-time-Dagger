@@ -501,24 +501,24 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256="$RUNTIME_POLICY_SHA"
         "$PYTHON_BIN" "$REPOSITORY_ROOT/scripts/eval/eval_agent_metrics_adapter.py"
         --evaluator "$EVALUATOR" --metrics-output "$METRICS" --
-        +checkpoint="$STAGED" +num_envs="$NUM_ENVS" +headless=true +seed="$SEED" +eval_output_dir="$RESULT_DIR"
-        algo.config.eval.eval_num_envs_episodes=true
-        algo.config.eval.num_eval_episodes="$NUM_ENVS"
-        algo.config.eval.save_videos=false algo.config.eval.save_trajectories=false
-        algo.config.init_at_random_ep_len=false
-        algo.config.videogen.raytraced_mix_prob=0.0
-        algo.config.videogen.image3f_endpoint_files="$ENDPOINT_LIST"
-        'algo.config.videogen.view_names=[head_color,hand_left,hand_right]'
+        ++checkpoint="$STAGED" ++num_envs="$NUM_ENVS" ++headless=true ++seed="$SEED" ++eval_output_dir="$RESULT_DIR"
+        ++algo.config.eval.eval_num_envs_episodes=true
+        ++algo.config.eval.num_eval_episodes="$NUM_ENVS"
+        ++algo.config.eval.save_videos=false ++algo.config.eval.save_trajectories=false
+        ++algo.config.init_at_random_ep_len=false
+        ++algo.config.videogen.raytraced_mix_prob=0.0
+        ++algo.config.videogen.image3f_endpoint_files="$ENDPOINT_LIST"
+        '++algo.config.videogen.view_names=[head_color,hand_left,hand_right]'
         ++algo.config.videogen.reference_lag=256
         ++algo.config.videogen.primary_view=head_color
         ++algo.config.videogen.seed="$SEED"
-        algo.config.videogen.anchor_pool_dir="$ANCHOR_POOL"
-        algo.config.videogen.anchor_index="$ANCHOR_INDEX"
-        'simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]'
+        ++algo.config.videogen.anchor_pool_dir="$ANCHOR_POOL"
+        ++algo.config.videogen.anchor_index="$ANCHOR_INDEX"
+        '++simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]'
         ++env.config.image_dagger_policy_view_count=3
         ++algo.config.eval.training_enabled=false
-        +simulator.config.render_results=false +use_wandb=false
-        hydra.run.dir="$RESULT_DIR/hydra" +output_dir="$RESULT_DIR/output")
+        ++simulator.config.render_results=false ++use_wandb=false
+        hydra.run.dir="$RESULT_DIR/hydra" ++output_dir="$RESULT_DIR/output")
     PROBE_AFTER=("${PROBE_BEFORE[@]}")
     PROBE_AFTER[$((${#PROBE_AFTER[@]} - 2))]="$AFTER"
     ATTEST=("$PYTHON_BIN" -m round_dagger.evaluation attest

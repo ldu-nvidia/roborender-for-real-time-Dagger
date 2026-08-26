@@ -20,11 +20,12 @@ import argparse
 import json
 import os
 import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from round_dagger import evaluation, promotion, state
+from round_dagger import evaluation, orchestration, promotion, state
 from round_dagger.artifacts import (
     ArtifactError,
     canonical_json_sha256,
@@ -132,6 +133,7 @@ _RECOVERY_REPOSITORY_SOURCES = (
     "round_dagger/learner_recovery.py",
     "scripts/round_dagger/run_hardened_evaluation_recovery.sh",
 )
+RECOVERY_EVALUATION_TIMEOUT_SECONDS = 28_800
 
 
 class EvaluationRecoveryError(ArtifactError):
@@ -1216,6 +1218,277 @@ def finalize_recovery(
     }
 
 
+def run_trusted_recovery(
+    root: str | Path,
+    *,
+    repository_root: str | Path,
+    gr00t_root: str | Path,
+    hold_attestation_path: str | Path,
+    expected_hold_attestation_sha256: str,
+    scenario_cases_path: str | Path,
+    thresholds_path: str | Path,
+    evaluation_config_path: str | Path,
+    renderer_runtime_sha256: str,
+    expected_renderer_count: int,
+    learner_recovery_receipt_path: str | Path,
+    expected_learner_recovery_receipt_sha256: str,
+    evaluation_source_inventory_sha256: str,
+    anchor_pool_path: str | Path,
+    anchor_count: int,
+    anchor_index: int,
+    anchor_inventory_sha256: str,
+    environment: Mapping[str, str] | None = None,
+    hook_timeout_seconds: int = RECOVERY_EVALUATION_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run one held-candidate recovery through a pre-latched evaluator hook.
+
+    Hook verification and the sealed anonymous-memory snapshot deliberately
+    happen before :func:`prepare_recovery`, the first operation that may
+    publish a recovery artifact.  The descriptor returned by the trusted
+    coordinator verifier is the only hook body executed and remains open until
+    evaluation exits.  Finalization is unreachable after a failed hook.
+    """
+
+    campaign_root = _root(root)
+    repository = _require_source_root(repository_root, "repository root")
+    gr00t = _require_source_root(gr00t_root, "GR00T root")
+    if gr00t != repository / "GR00T-VisualSim2Real":
+        raise EvaluationRecoveryError(
+            "GR00T root must be derived from the sealed evaluation source"
+        )
+    inventory_sha = _sha(
+        evaluation_source_inventory_sha256,
+        "evaluation source inventory SHA-256",
+    )
+    if (
+        type(hook_timeout_seconds) is not int
+        or hook_timeout_seconds < 1
+    ):
+        raise EvaluationRecoveryError("evaluation hook timeout must be positive")
+
+    child_environment = dict(os.environ if environment is None else environment)
+    child_environment.pop("ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH", None)
+    child_environment["ROUND_DAGGER_EVALUATION_SOURCE_ROOT"] = str(repository)
+    child_environment[
+        "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256"
+    ] = inventory_sha
+    hook_path = repository / orchestration._EVALUATION_HOOK_RELATIVE  # noqa: SLF001
+    hook = orchestration.HookSpec((str(hook_path),), hook_timeout_seconds)
+    descriptor: int | None = None
+    try:
+        # This is intentionally first: no contract, plan, result, or state
+        # publication is permitted until the exact hook bytes are immutable.
+        descriptor, argv = orchestration._verified_evaluation_hook(  # noqa: SLF001
+            hook,
+            child_environment,
+        )
+        prepared = prepare_recovery(
+            campaign_root,
+            repository_root=repository,
+            gr00t_root=gr00t,
+            hold_attestation_path=hold_attestation_path,
+            expected_hold_attestation_sha256=expected_hold_attestation_sha256,
+            scenario_cases_path=scenario_cases_path,
+            thresholds_path=thresholds_path,
+            evaluation_config_path=evaluation_config_path,
+            renderer_runtime_sha256=renderer_runtime_sha256,
+            expected_renderer_count=expected_renderer_count,
+            learner_recovery_receipt_path=learner_recovery_receipt_path,
+            expected_learner_recovery_receipt_sha256=(
+                expected_learner_recovery_receipt_sha256
+            ),
+            evaluation_source_inventory_sha256=inventory_sha,
+            anchor_pool_path=anchor_pool_path,
+            anchor_count=anchor_count,
+            anchor_index=anchor_index,
+            anchor_inventory_sha256=anchor_inventory_sha256,
+        )
+
+        current = state.load_state(campaign_root)
+        campaign = state.load_campaign(campaign_root)
+        candidate = promotion.load_candidate_manifest(
+            campaign_root,
+            prepared["candidate_manifest_path"],
+            expected_macro_round=prepared["macro_round"],
+            bind_state=True,
+        )
+        active = current["active_policy"]
+        result_path, result_relative = state._internal_path(
+            campaign_root,
+            prepared["evaluator_result_path"],
+            "hardened evaluator result",
+        )
+        if result_relative != prepared["evaluator_result_path"]:
+            raise EvaluationRecoveryError(
+                "hardened evaluator result path is non-canonical"
+            )
+        scenario_path = Path(os.path.abspath(scenario_cases_path))
+        threshold_path = Path(os.path.abspath(thresholds_path))
+        config_path = Path(os.path.abspath(evaluation_config_path))
+        child_environment.update(
+            {
+                "ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH": "1",
+                "ROUND_DAGGER_CAMPAIGN_ROOT": str(campaign_root),
+                "ROUND_DAGGER_CAMPAIGN_ID": campaign["campaign_id"],
+                "ROUND_DAGGER_MACRO_ROUND": str(prepared["macro_round"]),
+                "ROUND_DAGGER_POLICY_CHECKPOINT": str(
+                    campaign_root / active["checkpoint_path"]
+                ),
+                "ROUND_DAGGER_POLICY_SHA256": active["checkpoint_sha256"],
+                "ROUND_DAGGER_RUNTIME_POLICY_SHA256": active[
+                    "runtime_policy_sha256"
+                ],
+                "ROUND_DAGGER_CANDIDATE_MANIFEST": str(
+                    campaign_root / candidate["manifest_path"]
+                ),
+                "ROUND_DAGGER_CANDIDATE_SHA256": candidate["manifest_sha256"],
+                "ROUND_DAGGER_EVALUATOR_CONFIG_SHA256": sha256_file(config_path),
+                "ROUND_DAGGER_EVALUATOR_RESULT": str(result_path),
+                "ROUND_DAGGER_EVALUATION_RECOVERY_ID": prepared["recovery_id"],
+                "ROUND_DAGGER_EVALUATION_CONFIG": str(config_path),
+                "ROUND_DAGGER_EVALUATION_SCENARIOS": str(scenario_path),
+                "ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256": sha256_file(
+                    scenario_path
+                ),
+                "ROUND_DAGGER_EVALUATION_THRESHOLDS": str(threshold_path),
+                "ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256": sha256_file(
+                    threshold_path
+                ),
+                "ROUND_DAGGER_RENDERER_RUNTIME_SHA256": _sha(
+                    renderer_runtime_sha256, "renderer runtime SHA"
+                ),
+                "ROUND_DAGGER_EXPECTED_RENDERERS": str(expected_renderer_count),
+                "ANCHORS": prepared["anchor_pool_path"],
+                "ROUND_DAGGER_MIN_ANCHORS": str(prepared["anchor_count"]),
+                "ROUND_DAGGER_ANCHOR_INDEX": str(prepared["anchor_index"]),
+                "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256": prepared[
+                    "anchor_inventory_sha256"
+                ],
+            }
+        )
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=repository,
+                env=child_environment,
+                check=False,
+                timeout=hook_timeout_seconds,
+                pass_fds=(descriptor,),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EvaluationRecoveryError(
+                "hardened paired evaluation hook timed out"
+            ) from exc
+        except OSError as exc:
+            raise EvaluationRecoveryError(
+                f"hardened paired evaluation hook could not start ({type(exc).__name__})"
+            ) from exc
+        if completed.returncode != 0:
+            raise EvaluationRecoveryError(
+                "hardened paired evaluation hook failed with exit status "
+                f"{completed.returncode}"
+            )
+        return finalize_recovery(
+            campaign_root,
+            plan_path=prepared["plan_path"],
+            expected_plan_sha256=prepared["plan_sha256"],
+            repository_root=repository,
+            gr00t_root=gr00t,
+        )
+    except orchestration.OrchestrationError as exc:
+        raise EvaluationRecoveryError(
+            "evaluation hook failed trusted coordinator verification"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _required_environment(
+    environment: Mapping[str, str], name: str
+) -> str:
+    value = environment.get(name)
+    if not isinstance(value, str) or not value:
+        raise EvaluationRecoveryError(f"missing {name}")
+    return value
+
+
+def _environment_integer(
+    environment: Mapping[str, str], name: str, *, minimum: int
+) -> int:
+    value = _required_environment(environment, name)
+    if re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        raise EvaluationRecoveryError(f"{name} must be a canonical integer")
+    parsed = int(value)
+    if parsed < minimum:
+        raise EvaluationRecoveryError(f"{name} must be at least {minimum}")
+    return parsed
+
+
+def run_recovery_from_environment(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Parse the operator handoff and enter the trusted recovery runner."""
+
+    values = dict(os.environ if environment is None else environment)
+    if values.get("ROUND_DAGGER_RECOVERY_OPERATOR_ACK") != (
+        "legacy-orchestrator-stopped"
+    ):
+        raise EvaluationRecoveryError(
+            "ROUND_DAGGER_RECOVERY_OPERATOR_ACK must be "
+            "legacy-orchestrator-stopped"
+        )
+    repository = Path(
+        _required_environment(values, "ROUND_DAGGER_EVALUATION_SOURCE_ROOT")
+    )
+    return run_trusted_recovery(
+        _required_environment(values, "ROUND_DAGGER_CAMPAIGN_ROOT"),
+        repository_root=repository,
+        gr00t_root=repository / "GR00T-VisualSim2Real",
+        hold_attestation_path=_required_environment(
+            values, "ROUND_DAGGER_PROMOTION_HOLD_ATTESTATION"
+        ),
+        expected_hold_attestation_sha256=_required_environment(
+            values, "ROUND_DAGGER_PROMOTION_HOLD_ATTESTATION_SHA256"
+        ),
+        scenario_cases_path=_required_environment(
+            values, "ROUND_DAGGER_EVALUATION_SCENARIOS"
+        ),
+        thresholds_path=_required_environment(
+            values, "ROUND_DAGGER_EVALUATION_THRESHOLDS"
+        ),
+        evaluation_config_path=_required_environment(
+            values, "ROUND_DAGGER_EVALUATION_CONFIG"
+        ),
+        renderer_runtime_sha256=_required_environment(
+            values, "ROUND_DAGGER_RENDERER_RUNTIME_SHA256"
+        ),
+        expected_renderer_count=_environment_integer(
+            values, "ROUND_DAGGER_EXPECTED_RENDERERS", minimum=1
+        ),
+        learner_recovery_receipt_path=_required_environment(
+            values, "ROUND_DAGGER_LEARNER_RECOVERY_RECEIPT"
+        ),
+        expected_learner_recovery_receipt_sha256=_required_environment(
+            values, "ROUND_DAGGER_LEARNER_RECOVERY_RECEIPT_SHA256"
+        ),
+        evaluation_source_inventory_sha256=_required_environment(
+            values, "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256"
+        ),
+        anchor_pool_path=_required_environment(values, "ANCHORS"),
+        anchor_count=_environment_integer(
+            values, "ROUND_DAGGER_MIN_ANCHORS", minimum=1
+        ),
+        anchor_index=_environment_integer(
+            values, "ROUND_DAGGER_ANCHOR_INDEX", minimum=0
+        ),
+        anchor_inventory_sha256=_required_environment(
+            values, "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256"
+        ),
+        environment=values,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1251,6 +1524,7 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--expected-plan-sha256", required=True)
     finalize.add_argument("--repository-root", required=True)
     finalize.add_argument("--gr00t-root", required=True)
+    subparsers.add_parser("run")
     return parser
 
 
@@ -1289,7 +1563,7 @@ def main(argv: list[str] | None = None) -> int:
                 anchor_index=args.anchor_index,
                 anchor_inventory_sha256=args.anchor_inventory_sha256,
             )
-        else:
+        elif args.command == "finalize":
             result = finalize_recovery(
                 args.root,
                 plan_path=args.plan,
@@ -1297,6 +1571,8 @@ def main(argv: list[str] | None = None) -> int:
                 repository_root=args.repository_root,
                 gr00t_root=args.gr00t_root,
             )
+        else:
+            result = run_recovery_from_environment()
     except (
         EvaluationRecoveryError,
         evaluation.EvaluationError,
