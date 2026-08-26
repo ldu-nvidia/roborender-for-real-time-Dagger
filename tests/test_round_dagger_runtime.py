@@ -770,6 +770,79 @@ class ShadowRuntimeBridgeTest(unittest.TestCase):
         self.assertTrue(torch.equal(record.decision.behavior_actions, live["actions"]))
         bridge.end_round()
 
+    def test_live_tensors_are_snapshotted_before_environment_mutation(self) -> None:
+        """Delta-action environments may rewrite the live action in-place."""
+
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        original = {
+            "vision_obs": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+            "actor_obs": torch.arange(10, dtype=torch.float32).reshape(2, 5),
+            "student_actions": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            "gt_actions": torch.ones(2, 3),
+            "actions": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            "expert_mask": torch.zeros(2, 1, dtype=torch.bool),
+            "round_global_env_ids": torch.tensor([[10], [11]]),
+            "round_episode_ids": torch.tensor([[2], [3]]),
+            "round_episode_steps": torch.tensor([[7], [8]]),
+            "round_observation_is_raytraced": torch.zeros(2, 1, dtype=torch.bool),
+        }
+        rows = {key: [value.clone()] for key, value in original.items()}
+        rows.update(
+            {
+                "rewards": [torch.zeros(2, 1)],
+                "dones": [torch.zeros(2, 1, dtype=torch.bool)],
+                "time_outs": [torch.zeros(2, 1, dtype=torch.bool)],
+            }
+        )
+        storage = FakeStorage(rows, step=1)
+        state = {
+            key: original[key]
+            for key in (
+                "student_actions",
+                "gt_actions",
+                "actions",
+                "expert_mask",
+                "round_global_env_ids",
+                "round_episode_ids",
+                "round_episode_steps",
+                "round_observation_is_raytraced",
+            )
+        }
+        observations = {
+            "vision_obs": original["vision_obs"],
+            "actor_obs": original["actor_obs"],
+        }
+        bridge = ShadowRuntimeBridge()
+        bridge.start_round(RoundContext.create(num_envs=2, expected_steps=1))
+        bridge.begin_decision(
+            rollout_step=0,
+            observations=observations,
+            policy_state=state,
+            beta=0.5,
+        )
+
+        # Model the legacy DeltaActionBase and observation-buffer behavior
+        # after RolloutStorage.update_key(...).copy_ has committed the row.
+        state["actions"].add_(1000)
+        observations["vision_obs"].zero_()
+        state["round_episode_steps"].add_(1)
+
+        record = bridge.complete_transition(
+            storage,
+            observation_keys=("vision_obs", "actor_obs"),
+            infos={"episode": {}},
+        )
+        self.assertTrue(
+            torch.equal(record.decision.behavior_actions, rows["actions"][0])
+        )
+        self.assertTrue(
+            torch.equal(record.observations["vision_obs"], rows["vision_obs"][0])
+        )
+        bridge.end_round()
+
     def test_out_of_order_calls_fail_closed_without_advancing_state(self) -> None:
         bridge = ShadowRuntimeBridge()
         state = policy_state()

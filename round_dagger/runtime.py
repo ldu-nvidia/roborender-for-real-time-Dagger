@@ -263,7 +263,10 @@ class ActionDecision:
 
     The adapter consumes the final legacy policy-state mapping.  It never calls
     a policy or samples beta, so the behavior action and expert mask remain the
-    exact values used by the environment.
+    exact policy-space values passed to ``env.step`` and committed to replay.
+    Environment-internal delta integration, clipping, and control delay are a
+    later actuator boundary and are deliberately not relabeled as the DAgger
+    behavior decision.
     """
 
     student_actions: Any
@@ -747,6 +750,40 @@ def _exact_array_equal(left: Any, right: Any) -> bool:
     return False
 
 
+def _snapshot_array(value: Any) -> Any:
+    """Snapshot a live array without introducing a hard framework import.
+
+    The legacy environment is allowed to rewrite the action tensor after the
+    rollout storage has copied it (for example, ``DeltaActionBase`` expands a
+    policy delta into the cumulative action in-place).  A shadow audit must
+    therefore retain the value that existed at the decision/storage boundary,
+    not a shallow reference that follows a later environment mutation.
+
+    Only array types that the exact comparator supports are copied.  Test
+    doubles and opaque metadata values remain identity-preserving.
+    """
+
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None and isinstance(value, torch_module.Tensor):
+        return value.detach().clone()
+    numpy_module = sys.modules.get("numpy")
+    if numpy_module is not None and isinstance(value, numpy_module.ndarray):
+        return value.copy()
+    return value
+
+
+_SHADOW_LINEAGE_KEYS = (
+    "student_actions",
+    "gt_actions",
+    "actions",
+    "expert_mask",
+    "round_global_env_ids",
+    "round_episode_ids",
+    "round_episode_steps",
+    "round_observation_is_raytraced",
+)
+
+
 @dataclass(frozen=True)
 class _RngSnapshot:
     """Global RNG state that can affect a later actor or beta decision."""
@@ -966,10 +1003,28 @@ class ShadowRuntimeBridge:
             raise RuntimeAdapterError(
                 f"shadow decision step {step} does not follow {self._transition_count} transitions"
             )
+        # RolloutStorage copies these values before ``env.step``.  Some legacy
+        # environments then mutate the live action tensor in-place while
+        # converting policy deltas to effective actuator commands.  Preserve
+        # the exact pre-step values here so the later parity check compares the
+        # same semantic boundary as committed storage.  Only one transition is
+        # pending at a time, bounding the extra shadow-only memory.
+        observation_snapshot = MappingProxyType(
+            {key: _snapshot_array(value) for key, value in observations.items()}
+        )
+        policy_state_snapshot = dict(policy_state)
+        for key in _SHADOW_LINEAGE_KEYS:
+            if key in policy_state_snapshot:
+                policy_state_snapshot[key] = _snapshot_array(
+                    policy_state_snapshot[key]
+                )
         record = DecisionRecord(
             rollout_step=step,
-            observations=MappingProxyType(dict(observations)),
-            decision=ActionDecision.from_policy_state(policy_state, beta=beta),
+            observations=observation_snapshot,
+            decision=ActionDecision.from_policy_state(
+                policy_state_snapshot,
+                beta=beta,
+            ),
         )
         self.bus.publish_decision(record)
         self._pending = record
