@@ -211,6 +211,13 @@ class TrainSmokeDockerLauncherTest(TrainSmokePlanTest):
             "ROUND_DAGGER_ACTOR_DOCKER_IPC": ipc,
             "ROUND_DAGGER_ACTOR_DOCKER_SHM_SIZE": "24g",
             "ROUND_DAGGER_ACTOR_DOCKER_MOUNT_ROOTS": str(self.root),
+            "ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "shadow",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK": "metadata-only-v1",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_EVIDENCE": "/host/adapter-evidence.json",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_PLAN": "/host/adapter-plan.json",
+            "ROUND_DAGGER_RUNTIME_AB_EVIDENCE": "/host/ab-evidence.json",
+            "ROUND_DAGGER_RUNTIME_AB_PLAN": "/host/ab-plan.json",
+            "ROUND_DAGGER_RUNTIME_AB_MODE": "shadow",
         }
         environment.pop("ROUND_DAGGER_VALIDATION_TRAIN_ACK", None)
         if acknowledgement:
@@ -240,6 +247,38 @@ class TrainSmokeDockerLauncherTest(TrainSmokePlanTest):
         self.assertIn(str(ROOT / "scripts/round_dagger/run_actor_validation.sh"), argv)
         self.assertNotIn("WANDB_API_KEY", argv)
         self.assertNotIn("ROUND_DAGGER_ACTOR_RANK", argv)
+        self.assertIn("ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy", argv)
+        self.assertIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK=", argv)
+        self.assertNotIn("metadata-only-v1", argv)
+        runtime_args = [
+            value
+            for value in argv
+            if value.startswith("ROUND_DAGGER_RUNTIME_ADAPTER_")
+            or value.startswith("ROUND_DAGGER_RUNTIME_AB_")
+        ]
+        self.assertEqual(
+            runtime_args,
+            [
+                "ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK=",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK=",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE=",
+                "ROUND_DAGGER_RUNTIME_AB_PLAN=",
+                "ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256=",
+                "ROUND_DAGGER_RUNTIME_AB_ARM=",
+                "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT=",
+                "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256=",
+                "ROUND_DAGGER_RUNTIME_AB_EVIDENCE=",
+            ],
+        )
+        for host_value in (
+            "/host/adapter-evidence.json",
+            "/host/adapter-plan.json",
+            "/host/ab-evidence.json",
+            "/host/ab-plan.json",
+            "shadow",
+        ):
+            self.assertNotIn(host_value, argv)
 
     def test_explicit_acknowledgement_is_required_before_docker(self) -> None:
         result = self.run_launcher(0, acknowledgement=False)

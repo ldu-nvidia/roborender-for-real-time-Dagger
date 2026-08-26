@@ -283,6 +283,8 @@ class ActorValidationDryRunTest(unittest.TestCase):
         )
         self.assertIn("num_envs=1", result.stdout)
         self.assertIn("algo.config.num_steps_per_env=2", result.stdout)
+        self.assertIn("seed=0", result.stdout)
+        self.assertIn("++algo.config.videogen.seed=42", result.stdout)
         self.assertIn(
             'export IMAGE3F_LOCAL_ENVS="$ENVS_PER_RANK"',
             SCRIPT.read_text(encoding="utf-8"),
@@ -356,6 +358,41 @@ class ActorValidationDryRunTest(unittest.TestCase):
         )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertIn("purpose=train", accepted.stdout)
+        self.assertFalse(self.marker.exists())
+
+    def test_shadow_and_validation_evidence_require_immutable_ab_plan(self) -> None:
+        shadow = self._environment()
+        shadow.update(
+            {
+                "ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "shadow",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK": "metadata-only-v1",
+            }
+        )
+        rejected = self._run(shadow)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("shadow runtime requires an immutable runtime A/B plan", rejected.stderr)
+        self.assertFalse(self.marker.exists())
+
+        evidence = self._environment()
+        evidence.update(
+            {
+                "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": "paired-1x2-v1",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE": str(
+                    self.root / "unplanned-evidence.json"
+                ),
+            }
+        )
+        rejected = self._run(evidence)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("forbidden without an A/B plan", rejected.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_partial_runtime_ab_contract_fails_before_launch(self) -> None:
+        environment = self._environment()
+        environment["ROUND_DAGGER_RUNTIME_AB_PLAN"] = str(self.root / "missing.json")
+        rejected = self._run(environment)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("runtime adapter A/B launch is missing", rejected.stderr)
         self.assertFalse(self.marker.exists())
 
     def test_rank_environment_and_step_bounds_fail_before_launch(self) -> None:

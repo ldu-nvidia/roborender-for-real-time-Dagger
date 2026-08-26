@@ -129,9 +129,30 @@ ENV_NAMES=(
 )
 ENV_ARGS=()
 for name in "${ENV_NAMES[@]}"; do
+    case "$name" in
+        ROUND_DAGGER_RUNTIME_ADAPTER_*|ROUND_DAGGER_RUNTIME_AB_*)
+            echo "runtime adapter/AB variables must not enter the train-smoke allowlist: $name" >&2
+            exit 2
+            ;;
+    esac
     [[ -n ${!name:-} ]] || { echo "empty exact train-smoke environment: $name" >&2; exit 2; }
     ENV_ARGS+=(--env "$name")
 done
+# This train-replay smoke validates the production/default path.  Do not
+# inherit an ambient shadow selection, and clear any acknowledgement baked
+# into the image environment.
+ENV_ARGS+=(
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy"
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK="
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK="
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE="
+    --env "ROUND_DAGGER_RUNTIME_AB_PLAN="
+    --env "ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256="
+    --env "ROUND_DAGGER_RUNTIME_AB_ARM="
+    --env "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT="
+    --env "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256="
+    --env "ROUND_DAGGER_RUNTIME_AB_EVIDENCE="
+)
 
 exec "$DOCKER" run --rm \
     --name "$CONTAINER" \

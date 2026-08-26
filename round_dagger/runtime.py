@@ -23,6 +23,11 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 RUNTIME_ADAPTER_MODE_ENV = "ROUND_DAGGER_RUNTIME_ADAPTER_MODE"
 RUNTIME_ADAPTER_SHADOW_ACK_ENV = "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK"
 RUNTIME_ADAPTER_SHADOW_ACK = "metadata-only-v1"
+RUNTIME_ADAPTER_VALIDATION_ACK_ENV = (
+    "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK"
+)
+RUNTIME_ADAPTER_VALIDATION_ACK = "paired-1x2-v1"
+RUNTIME_ADAPTER_EVIDENCE_ENV = "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE"
 _RUNTIME_ADAPTER_MODES = frozenset({"legacy", "shadow"})
 
 
@@ -81,6 +86,55 @@ def runtime_adapter_mode(
                 f"{RUNTIME_ADAPTER_SHADOW_ACK}"
             )
     return mode
+
+
+def runtime_adapter_validation_evidence_path(
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Validate the second, bounded A/B authorization and evidence path.
+
+    This gate is intentionally separate from the generic metadata-only shadow
+    acknowledgement.  It prevents an ambient shadow flag from publishing a
+    validation marker and confines the marker to the actor's explicit run
+    directory.  Filesystem type and no-overwrite checks remain the trainer's
+    responsibility immediately before its atomic publication.
+    """
+
+    source = os.environ if environment is None else environment
+    acknowledgement = source.get(RUNTIME_ADAPTER_VALIDATION_ACK_ENV)
+    if acknowledgement != RUNTIME_ADAPTER_VALIDATION_ACK:
+        raise RuntimeAdapterError(
+            "runtime validation requires "
+            f"{RUNTIME_ADAPTER_VALIDATION_ACK_ENV}="
+            f"{RUNTIME_ADAPTER_VALIDATION_ACK}"
+        )
+    raw_run_dir = source.get("TRAIN_RUN_DIR")
+    raw_evidence = source.get(RUNTIME_ADAPTER_EVIDENCE_ENV)
+    for name, value in (
+        ("TRAIN_RUN_DIR", raw_run_dir),
+        (RUNTIME_ADAPTER_EVIDENCE_ENV, raw_evidence),
+    ):
+        if not value or "\x00" in str(value) or not os.path.isabs(str(value)):
+            raise RuntimeAdapterError(f"{name} must be a non-empty absolute path")
+        if os.path.normpath(str(value)) != str(value):
+            raise RuntimeAdapterError(f"{name} must be lexically canonical")
+    run_dir = str(raw_run_dir)
+    evidence = str(raw_evidence)
+    if not evidence.endswith(".json") or os.path.basename(evidence) == ".json":
+        raise RuntimeAdapterError(
+            f"{RUNTIME_ADAPTER_EVIDENCE_ENV} must name a JSON file"
+        )
+    try:
+        common = os.path.commonpath((run_dir, evidence))
+    except ValueError as exc:
+        raise RuntimeAdapterError(
+            f"{RUNTIME_ADAPTER_EVIDENCE_ENV} is outside TRAIN_RUN_DIR"
+        ) from exc
+    if common != run_dir or evidence == run_dir:
+        raise RuntimeAdapterError(
+            f"{RUNTIME_ADAPTER_EVIDENCE_ENV} must be inside TRAIN_RUN_DIR"
+        )
+    return evidence
 
 
 @dataclass(frozen=True)
@@ -433,6 +487,8 @@ class StepSubscriber(Protocol):
 class RuntimeSubscriber:
     """Convenience base class with no-op subscriber callbacks."""
 
+    __slots__ = ()
+
     def on_round_start(self, context: RoundContext) -> None:
         del context
 
@@ -444,6 +500,189 @@ class RuntimeSubscriber:
 
     def on_round_end(self, context: RoundContext) -> None:
         del context
+
+
+@dataclass(frozen=True)
+class MetadataAuditSummary:
+    """Scalar-only result of one complete metadata audit."""
+
+    num_envs: int
+    expected_steps: int
+    decision_count: int
+    transition_count: int
+    callback_count: int
+    callback_order_valid: bool
+    sequential_steps_valid: bool
+    batch_dimensions_valid: bool
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+        }
+
+
+def _iter_array_metadata(value: Any):
+    """Yield only value-free array descriptors from a projected callback."""
+
+    if isinstance(value, ArrayMetadata):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_array_metadata(item)
+    elif isinstance(value, tuple):
+        for item in value:
+            yield from _iter_array_metadata(item)
+    elif is_dataclass(value) and not isinstance(value, type):
+        for field in fields(value):
+            yield from _iter_array_metadata(getattr(value, field.name))
+
+
+class MetadataAuditSubscriber(RuntimeSubscriber):
+    """Validate one bounded shadow rollout using metadata and scalar state only.
+
+    The subscriber retains no callback record, array metadata, tensor, NumPy
+    value, or user mapping.  It performs no I/O.  Its sole output is a
+    scalar-only summary available after a correctly ordered round end.
+    """
+
+    __slots__ = (
+        "_phase",
+        "_started",
+        "_ended",
+        "_num_envs",
+        "_expected_steps",
+        "_decision_count",
+        "_transition_count",
+        "_callback_count",
+    )
+
+    def __init__(self) -> None:
+        self._phase = "idle"
+        self._started = False
+        self._ended = False
+        self._num_envs = 0
+        self._expected_steps = 0
+        self._decision_count = 0
+        self._transition_count = 0
+        self._callback_count = 0
+
+    def _require_batch(self, value: Any, label: str) -> None:
+        arrays = tuple(_iter_array_metadata(value))
+        if not arrays:
+            raise RuntimeAdapterError(
+                f"metadata audit found no array metadata in {label}"
+            )
+        mismatches = tuple(
+            metadata.shape
+            for metadata in arrays
+            if not metadata.shape or metadata.shape[0] != self._num_envs
+        )
+        if mismatches:
+            raise RuntimeAdapterError(
+                f"metadata audit batch mismatch in {label}: "
+                f"expected {self._num_envs}, got {mismatches}"
+            )
+
+    def on_round_start(self, context: RoundContext) -> None:
+        if self._started or self._phase != "idle":
+            raise RuntimeAdapterError("metadata audit received duplicate round start")
+        if not isinstance(context, RoundContext):
+            raise RuntimeAdapterError("metadata audit received malformed round context")
+        if context.num_envs <= 0 or context.expected_steps <= 0:
+            raise RuntimeAdapterError("metadata audit round dimensions must be positive")
+        self._num_envs = int(context.num_envs)
+        self._expected_steps = int(context.expected_steps)
+        self._started = True
+        self._phase = "decision"
+        self._callback_count = 1
+
+    def on_decision(self, record: DecisionRecord) -> None:
+        if self._phase != "decision" or self._ended:
+            raise RuntimeAdapterError("metadata audit callback order expected decision")
+        if not isinstance(record, DecisionRecord):
+            raise RuntimeAdapterError("metadata audit received malformed decision")
+        expected_step = self._transition_count
+        if record.rollout_step != expected_step:
+            raise RuntimeAdapterError(
+                "metadata audit decision step is not sequential: "
+                f"expected {expected_step}, got {record.rollout_step}"
+            )
+        if expected_step >= self._expected_steps:
+            raise RuntimeAdapterError("metadata audit received too many decisions")
+        self._require_batch(record.observations, "decision observations")
+        self._require_batch(record.decision, "decision lineage")
+        self._decision_count += 1
+        self._callback_count += 1
+        self._phase = "transition"
+
+    def on_transition(self, record: StepRecord) -> None:
+        if self._phase != "transition" or self._ended:
+            raise RuntimeAdapterError("metadata audit callback order expected transition")
+        if not isinstance(record, StepRecord):
+            raise RuntimeAdapterError("metadata audit received malformed transition")
+        expected_step = self._transition_count
+        if record.rollout_step != expected_step:
+            raise RuntimeAdapterError(
+                "metadata audit transition step is not sequential: "
+                f"expected {expected_step}, got {record.rollout_step}"
+            )
+        self._require_batch(record.observations, "transition observations")
+        self._require_batch(record.decision, "transition decision lineage")
+        # Check every canonical storage field independently.  Grouping these
+        # values would let one valid array mask a missing or scalar sibling,
+        # while the audit summary still claimed complete batch validation.
+        for value, label in (
+            (record.rewards, "transition rewards"),
+            (record.dones, "transition dones"),
+            (record.time_outs, "transition time_outs"),
+            (record.global_env_ids, "transition global_env_ids"),
+            (record.episode_ids, "transition episode_ids"),
+            (record.episode_steps, "transition episode_steps"),
+            (
+                record.observation_is_raytraced,
+                "transition observation_is_raytraced",
+            ),
+        ):
+            self._require_batch(value, label)
+        self._transition_count += 1
+        self._callback_count += 1
+        self._phase = (
+            "end" if self._transition_count == self._expected_steps else "decision"
+        )
+
+    def on_round_end(self, context: RoundContext) -> None:
+        if self._phase != "end" or self._ended:
+            raise RuntimeAdapterError("metadata audit round ended out of order")
+        if not isinstance(context, RoundContext):
+            raise RuntimeAdapterError("metadata audit received malformed round context")
+        if (
+            context.num_envs != self._num_envs
+            or context.expected_steps != self._expected_steps
+        ):
+            raise RuntimeAdapterError("metadata audit round context changed before end")
+        if (
+            self._decision_count != self._expected_steps
+            or self._transition_count != self._expected_steps
+        ):
+            raise RuntimeAdapterError("metadata audit callback count is incomplete")
+        self._callback_count += 1
+        self._ended = True
+        self._phase = "complete"
+
+    def summary(self) -> MetadataAuditSummary:
+        if not self._ended or self._phase != "complete":
+            raise RuntimeAdapterError("metadata audit summary requested before round end")
+        return MetadataAuditSummary(
+            num_envs=self._num_envs,
+            expected_steps=self._expected_steps,
+            decision_count=self._decision_count,
+            transition_count=self._transition_count,
+            callback_count=self._callback_count,
+            callback_order_valid=True,
+            sequential_steps_valid=True,
+            batch_dimensions_valid=True,
+        )
 
 
 def _metadata_projection(value: Any, seen: set[int] | None = None) -> Any:
@@ -850,11 +1089,16 @@ __all__ = [
     "DaggerAgentAdapter",
     "DecisionRecord",
     "EnvironmentStep",
+    "MetadataAuditSubscriber",
+    "MetadataAuditSummary",
     "ObservationTransform",
     "OpaqueMetadata",
     "RUNTIME_ADAPTER_MODE_ENV",
+    "RUNTIME_ADAPTER_EVIDENCE_ENV",
     "RUNTIME_ADAPTER_SHADOW_ACK",
     "RUNTIME_ADAPTER_SHADOW_ACK_ENV",
+    "RUNTIME_ADAPTER_VALIDATION_ACK",
+    "RUNTIME_ADAPTER_VALIDATION_ACK_ENV",
     "RoboRenderObservationTransform",
     "RoundContext",
     "RuntimeAdapterError",
@@ -868,4 +1112,5 @@ __all__ = [
     "VectorEnvironment",
     "VectorEnvironmentAdapter",
     "runtime_adapter_mode",
+    "runtime_adapter_validation_evidence_path",
 ]

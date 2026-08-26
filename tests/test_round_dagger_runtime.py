@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import random
 import unittest
+from dataclasses import replace
+from unittest import mock
 
 from round_dagger.runtime import (
     ActionDecision,
     ArrayMetadata,
     DaggerAgentAdapter,
     DecisionRecord,
+    MetadataAuditSubscriber,
     RoboRenderObservationTransform,
     RoundContext,
     RuntimeAdapterError,
@@ -21,6 +24,7 @@ from round_dagger.runtime import (
     SubscriberSideEffectError,
     VectorEnvironmentAdapter,
     runtime_adapter_mode,
+    runtime_adapter_validation_evidence_path,
 )
 
 
@@ -97,6 +101,52 @@ class RuntimeModeTest(unittest.TestCase):
             runtime_adapter_mode(
                 {"ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "shadow"}
             )
+
+    def test_validation_evidence_path_requires_exact_bounded_authorization(self) -> None:
+        valid = {
+            "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": "paired-1x2-v1",
+            "TRAIN_RUN_DIR": "/tmp/round-validation",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE": (
+                "/tmp/round-validation/evidence/legacy.json"
+            ),
+        }
+        self.assertEqual(
+            runtime_adapter_validation_evidence_path(valid),
+            valid["ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE"],
+        )
+        for update, pattern in (
+            (
+                {"ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK": "wrong"},
+                "runtime validation requires",
+            ),
+            ({"TRAIN_RUN_DIR": "relative"}, "non-empty absolute path"),
+            (
+                {"ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE": "/tmp/outside.json"},
+                "inside TRAIN_RUN_DIR",
+            ),
+            (
+                {
+                    "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE": (
+                        "/tmp/round-validation/evidence/../legacy.json"
+                    )
+                },
+                "lexically canonical",
+            ),
+            (
+                {
+                    "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE": (
+                        "/tmp/round-validation/evidence/legacy.txt"
+                    )
+                },
+                "must name a JSON file",
+            ),
+        ):
+            environment = dict(valid)
+            environment.update(update)
+            with self.subTest(update=update), self.assertRaisesRegex(
+                RuntimeAdapterError, pattern
+            ):
+                runtime_adapter_validation_evidence_path(environment)
 
 
 class VectorEnvironmentAdapterTest(unittest.TestCase):
@@ -320,6 +370,161 @@ class SubscriberBusTest(unittest.TestCase):
         np.testing.assert_array_equal(numpy_after[1], numpy_before[1])
         self.assertEqual(numpy_after[2:], numpy_before[2:])
         self.assertTrue(torch.equal(torch.random.get_rng_state(), torch_before))
+
+
+class MetadataAuditSubscriberTest(unittest.TestCase):
+    @staticmethod
+    def _live_state(rows, step):
+        return {
+            key: rows[key][step]
+            for key in (
+                "student_actions",
+                "gt_actions",
+                "actions",
+                "expert_mask",
+                "round_global_env_ids",
+                "round_episode_ids",
+                "round_episode_steps",
+                "round_observation_is_raytraced",
+            )
+        }
+
+    def test_two_step_bridge_audit_retains_only_scalar_summary(self) -> None:
+        audit = MetadataAuditSubscriber()
+        bridge = ShadowRuntimeBridge([audit])
+        context = RoundContext.create(num_envs=2, expected_steps=2)
+        storage, rows = storage_rows()
+
+        with mock.patch(
+            "builtins.open",
+            side_effect=AssertionError("metadata audit must not perform I/O"),
+        ):
+            bridge.start_round(context)
+            for step in range(2):
+                storage.step = step + 1
+                bridge.begin_decision(
+                    rollout_step=step,
+                    observations={
+                        "vision_obs": rows["vision_obs"][step],
+                        "actor_obs": rows["actor_obs"][step],
+                    },
+                    policy_state=self._live_state(rows, step),
+                    beta=0.5,
+                )
+                bridge.complete_transition(
+                    storage,
+                    observation_keys=("vision_obs", "actor_obs"),
+                    infos={"episode": {}},
+                )
+            bridge.end_round()
+
+        self.assertEqual(
+            audit.summary().as_dict(),
+            {
+                "num_envs": 2,
+                "expected_steps": 2,
+                "decision_count": 2,
+                "transition_count": 2,
+                "callback_count": 6,
+                "callback_order_valid": True,
+                "sequential_steps_valid": True,
+                "batch_dimensions_valid": True,
+            },
+        )
+        self.assertIs(bridge.bus.subscribers[0], audit)
+        self.assertFalse(hasattr(audit, "__dict__"))
+        retained = tuple(getattr(audit, slot) for slot in audit.__slots__)
+        self.assertTrue(
+            all(isinstance(value, (bool, int, str)) for value in retained)
+        )
+
+    def test_callback_order_and_sequential_steps_fail_closed(self) -> None:
+        audit = MetadataAuditSubscriber()
+        bus = SubscriberBus([audit])
+        context = RoundContext.create(num_envs=2, expected_steps=1)
+        storage, _rows = storage_rows()
+        transition = StepRecord.from_storage(
+            storage,
+            rollout_step=0,
+            observation_keys=("vision_obs", "actor_obs"),
+            beta=0.5,
+            infos={},
+        )
+        bus.publish_round_start(context)
+        with self.assertRaises(SubscriberExecutionError) as caught:
+            bus.publish_transition(transition)
+        self.assertIsInstance(caught.exception.__cause__, RuntimeAdapterError)
+        self.assertIn("callback order", str(caught.exception.__cause__))
+
+        sequential_audit = MetadataAuditSubscriber()
+        sequential_bus = SubscriberBus([sequential_audit])
+        sequential_bus.publish_round_start(context)
+        decision = DecisionRecord(
+            rollout_step=1,
+            observations={"vision_obs": FakeTensor("vision", (2, 4))},
+            decision=ActionDecision.from_policy_state(policy_state(), beta=0.5),
+        )
+        with self.assertRaises(SubscriberExecutionError) as caught:
+            sequential_bus.publish_decision(decision)
+        self.assertIn("not sequential", str(caught.exception.__cause__))
+
+    def test_batch_dimension_mismatch_fails_closed(self) -> None:
+        audit = MetadataAuditSubscriber()
+        bus = SubscriberBus([audit])
+        bus.publish_round_start(RoundContext.create(num_envs=2, expected_steps=1))
+        decision = DecisionRecord(
+            rollout_step=0,
+            observations={"vision_obs": FakeTensor("vision", (3, 4))},
+            decision=ActionDecision.from_policy_state(policy_state(), beta=0.5),
+        )
+        with self.assertRaises(SubscriberExecutionError) as caught:
+            bus.publish_decision(decision)
+        self.assertIn("batch mismatch", str(caught.exception.__cause__))
+
+    def test_each_transition_storage_field_requires_array_metadata(self) -> None:
+        storage, _rows = storage_rows()
+        context = RoundContext.create(num_envs=2, expected_steps=1)
+        transition = StepRecord.from_storage(
+            storage,
+            rollout_step=0,
+            observation_keys=("vision_obs", "actor_obs"),
+            beta=0.5,
+            infos={},
+        )
+        for field_name in (
+            "rewards",
+            "dones",
+            "time_outs",
+            "global_env_ids",
+            "episode_ids",
+            "episode_steps",
+            "observation_is_raytraced",
+        ):
+            with self.subTest(field=field_name):
+                audit = MetadataAuditSubscriber()
+                bus = SubscriberBus([audit])
+                bus.publish_round_start(context)
+                bus.publish_decision(
+                    DecisionRecord(
+                        rollout_step=0,
+                        observations={
+                            "vision_obs": FakeTensor("vision", (2, 4))
+                        },
+                        decision=ActionDecision.from_policy_state(
+                            policy_state(), beta=0.5
+                        ),
+                    )
+                )
+                malformed = replace(transition, **{field_name: 0.0})
+                with self.assertRaises(SubscriberExecutionError) as caught:
+                    bus.publish_transition(malformed)
+                self.assertIsInstance(
+                    caught.exception.__cause__, RuntimeAdapterError
+                )
+                self.assertIn(
+                    f"transition {field_name}",
+                    str(caught.exception.__cause__),
+                )
 
 
 class CanonicalStorageRecordTest(unittest.TestCase):

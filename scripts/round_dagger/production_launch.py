@@ -1404,6 +1404,10 @@ def build_environment(
         "ROUND_DAGGER_MIN_ANCHORS": str(artifact["anchor_pool"]["anchor_count"]),
         "ROUND_DAGGER_ENVS_PER_SHARD": str(runtime["environments_per_shard"]),
         "ROUND_DAGGER_ROLLOUT_ID": str(runtime["rollout_id"]),
+        # Production remains pinned to the previously validated rollout.  The
+        # runtime adapter shadow is a separate bounded-validation surface and
+        # must never be selected through an ambient operator environment.
+        "ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "legacy",
         "IMAGE_DAGGER_TELEMETRY_REQUIRED": "1" if telemetry["required"] else "0",
         "IMAGE_DAGGER_TELEMETRY_REQUIRE_VIDEO": "1" if telemetry["require_video"] else "0",
         "IMAGE_DAGGER_TELEMETRY_SCALAR_EVERY": str(telemetry["scalar_every_steps"]),

@@ -620,6 +620,13 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
             "ROUND_DAGGER_ACTOR_DOCKER_MOUNT_ROOTS": str(self.root),
             "NETRC": str(self.root / ".netrc"),
             "WANDB_API_KEY": "must-not-be-forwarded",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "shadow",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK": "metadata-only-v1",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_EVIDENCE": "/host/adapter-evidence.json",
+            "ROUND_DAGGER_RUNTIME_ADAPTER_PLAN": "/host/adapter-plan.json",
+            "ROUND_DAGGER_RUNTIME_AB_EVIDENCE": "/host/ab-evidence.json",
+            "ROUND_DAGGER_RUNTIME_AB_PLAN": "/host/ab-plan.json",
+            "ROUND_DAGGER_RUNTIME_AB_MODE": "shadow",
         }
 
     def test_executor_uses_distinct_gpu_private_ipc_and_large_shm(self) -> None:
@@ -645,6 +652,38 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
         self.assertIn("NETRC", argv)
         self.assertNotIn("WANDB_API_KEY", argv)
         self.assertNotIn("must-not-be-forwarded", argv)
+        self.assertIn("ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy", argv)
+        self.assertIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK=", argv)
+        self.assertNotIn("metadata-only-v1", argv)
+        runtime_args = [
+            value
+            for value in argv
+            if value.startswith("ROUND_DAGGER_RUNTIME_ADAPTER_")
+            or value.startswith("ROUND_DAGGER_RUNTIME_AB_")
+        ]
+        self.assertEqual(
+            runtime_args,
+            [
+                "ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK=",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK=",
+                "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE=",
+                "ROUND_DAGGER_RUNTIME_AB_PLAN=",
+                "ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256=",
+                "ROUND_DAGGER_RUNTIME_AB_ARM=",
+                "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT=",
+                "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256=",
+                "ROUND_DAGGER_RUNTIME_AB_EVIDENCE=",
+            ],
+        )
+        for host_value in (
+            "/host/adapter-evidence.json",
+            "/host/adapter-plan.json",
+            "/host/ab-evidence.json",
+            "/host/ab-plan.json",
+            "shadow",
+        ):
+            self.assertNotIn(host_value, argv)
 
     def test_host_ipc_is_rejected_before_docker_is_invoked(self) -> None:
         result = subprocess.run(

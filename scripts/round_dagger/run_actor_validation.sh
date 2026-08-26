@@ -80,6 +80,48 @@ done
     echo "teacher checkpoint SHA-256 mismatch" >&2; exit 2;
 }
 
+# The observer remains inaccessible to ordinary production and train-smoke
+# invocations.  A shadow selection is accepted only when every process value
+# is re-derived from one immutable, validation-only A/B plan.  Partial A/B
+# metadata and standalone ambient shadow flags fail before Isaac is imported.
+RUNTIME_AB_HINT=${ROUND_DAGGER_RUNTIME_AB_PLAN:-}${ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256:-}${ROUND_DAGGER_RUNTIME_AB_ARM:-}${ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT:-}${ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256:-}${ROUND_DAGGER_RUNTIME_AB_EVIDENCE:-}
+RUNTIME_AB_ACTIVE=0
+if [[ -n $RUNTIME_AB_HINT ]]; then
+    for name in ROUND_DAGGER_RUNTIME_AB_PLAN ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256 \
+        ROUND_DAGGER_RUNTIME_AB_ARM ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT \
+        ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256 \
+        ROUND_DAGGER_RUNTIME_ADAPTER_MODE \
+        ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK \
+        ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE; do
+        [[ -n ${!name:-} ]] || {
+            echo "runtime adapter A/B launch is missing $name" >&2
+            exit 2
+        }
+    done
+    RUNTIME_AB_ACTIVE=1
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \
+        -m round_dagger.runtime_ab authorize \
+        --plan "$ROUND_DAGGER_RUNTIME_AB_PLAN" \
+        --arm "$ROUND_DAGGER_RUNTIME_AB_ARM" \
+        --expected-plan-sha256 "$ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256" \
+        >/dev/null
+else
+    [[ ${ROUND_DAGGER_RUNTIME_ADAPTER_MODE:-legacy} == legacy ]] || {
+        echo "shadow runtime requires an immutable runtime A/B plan" >&2
+        exit 2
+    }
+    [[ -z ${ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK:-} && \
+       -z ${ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK:-} && \
+       -z ${ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE:-} ]] || {
+        echo "runtime adapter validation metadata is forbidden without an A/B plan" >&2
+        exit 2
+    }
+    export ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy
+    unset ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK
+    unset ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK
+    unset ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE
+fi
+
 # A checkpoint byte digest alone cannot prove that the actor, replay and
 # simulator agree on their different action widths.  Bind this validation rung
 # to the immutable bootstrap bundle and validate the portable policy spec before
@@ -257,7 +299,12 @@ export IMAGE_DAGGER_TELEMETRY_IMAGE_EVERY=${IMAGE_DAGGER_TELEMETRY_IMAGE_EVERY:-
 export IMAGE_DAGGER_TELEMETRY_CLIP_EVERY=${IMAGE_DAGGER_TELEMETRY_CLIP_EVERY:-0}
 export IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES=${IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES:-32}
 export IMAGE_DAGGER_TELEMETRY_CLIP_FPS=${IMAGE_DAGGER_TELEMETRY_CLIP_FPS:-10}
-export IMAGE3F_RUN_ID="validation-${ROUND_DAGGER_CAMPAIGN_ID}-${ROUND_DAGGER_COHORT_INDEX}"
+if ((RUNTIME_AB_ACTIVE)); then
+    # authorize_runtime_ab already proved that this namespace is arm-specific.
+    export IMAGE3F_RUN_ID
+else
+    export IMAGE3F_RUN_ID="validation-${ROUND_DAGGER_CAMPAIGN_ID}-${ROUND_DAGGER_COHORT_INDEX}"
+fi
 export IMAGE3F_REFERENCE_LAG=256
 export IMAGE3F_LOCAL_ENVS="$ENVS_PER_RANK"
 export ROBORENDER_TELEMETRY_DIR="$BASE_TRAIN_RUN_DIR/telemetry"
@@ -276,6 +323,8 @@ fi
 TRAINER=(
     "$GR00T_ROOT/gr00t/rl/train_agent_trl.py"
     +exp=loco_manip/wsdpt_round_actor_3view
+    seed="${ROUND_DAGGER_SIMULATOR_SEED:-0}"
+    ++algo.config.videogen.seed="${ROUND_DAGGER_IMAGE3F_SEED:-42}"
     num_envs="$ENVS_PER_RANK" algo.config.num_steps_per_env="$STEPS"
     algo.config.num_learning_epochs=0
     algo.config.rollout_with_teacher_num_steps=0

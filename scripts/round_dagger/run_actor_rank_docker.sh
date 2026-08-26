@@ -81,12 +81,31 @@ ENV_ARGS=()
 while IFS= read -r name; do
     case "$name" in
         WANDB_API_KEY) ;;
+        # The production container receives a literal legacy selection below.
+        # Never forward adapter/AB selectors, plans, evidence, or any future
+        # variables in those namespaces from the operator shell.
+        ROUND_DAGGER_RUNTIME_ADAPTER_*|ROUND_DAGGER_RUNTIME_AB_*) ;;
         ROUND_DAGGER_*|IMAGE3F_*|IMAGE_DAGGER_*|WANDB_*|ROBORENDER_*|\
         GR00T_ROOT|GR00T_PYTHON|ANCHORS|TRAIN_RUN_DIR|PYTHONPATH|NETRC|DRY_RUN|ROLLOUT_STEPS)
             ENV_ARGS+=(--env "$name")
             ;;
     esac
 done < <(compgen -e | LC_ALL=C sort)
+# Clear a possible image-level acknowledgement as well as rejecting ambient
+# host values.  Shadow validation has its own launcher and cannot enter this
+# production executor accidentally.
+ENV_ARGS+=(
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy"
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK="
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_VALIDATION_ACK="
+    --env "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE="
+    --env "ROUND_DAGGER_RUNTIME_AB_PLAN="
+    --env "ROUND_DAGGER_RUNTIME_AB_PLAN_SHA256="
+    --env "ROUND_DAGGER_RUNTIME_AB_ARM="
+    --env "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT="
+    --env "ROUND_DAGGER_RUNTIME_AB_ARM_CONTRACT_SHA256="
+    --env "ROUND_DAGGER_RUNTIME_AB_EVIDENCE="
+)
 
 exec "$DOCKER" run --rm \
     --name "$CONTAINER" \

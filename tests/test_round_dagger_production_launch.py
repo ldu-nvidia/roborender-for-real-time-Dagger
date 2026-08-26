@@ -267,6 +267,36 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(learner["cluster"]["partition"], "batch_singlenode")
         self.assertEqual(learner["cluster"]["qos"], "normal")
 
+    def test_build_environment_forces_legacy_runtime_adapter(self) -> None:
+        # Read the checked-in documents directly so this unit gate remains
+        # runnable from a clean isolated worktree whose absolute path differs
+        # from the canonical production checkout pinned by the full validator.
+        campaign = json.loads(CAMPAIGN_CONTRACT.read_text(encoding="utf-8"))
+        learner = json.loads(LEARNER_CONTRACT.read_text(encoding="utf-8"))
+        environment = production_launch.build_environment(
+            campaign,
+            learner,
+            sealed_source_root="/remote/sealed/source",
+            sealed_source_inventory_sha256="a" * 64,
+            evaluation_source_root="/local/sealed/evaluation",
+            evaluation_source_inventory_sha256="b" * 64,
+            sealed_teacher_checkpoint="/local/sealed/evaluation/teacher.pt",
+            learner_contract_sha256="c" * 64,
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_RUNTIME_ADAPTER_MODE"], "legacy"
+        )
+        self.assertNotIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK", environment)
+        self.assertEqual(
+            [
+                name
+                for name in environment
+                if name.startswith("ROUND_DAGGER_RUNTIME_ADAPTER_")
+                or name.startswith("ROUND_DAGGER_RUNTIME_AB_")
+            ],
+            ["ROUND_DAGGER_RUNTIME_ADAPTER_MODE"],
+        )
+
     def test_validate_launch_binds_campaign_source_config_and_static_environment(self) -> None:
         evaluation_inventory_sha = "d" * 64
         local_sealed_root = Path(
@@ -369,6 +399,10 @@ class ProductionLaunchTests(unittest.TestCase):
             str(ROOT / "runtime/round_dagger_credentials/.netrc"),
         )
         self.assertEqual(environment["IMAGE_DAGGER_TELEMETRY_REQUIRE_VIDEO"], "1")
+        self.assertEqual(
+            environment["ROUND_DAGGER_RUNTIME_ADAPTER_MODE"], "legacy"
+        )
+        self.assertNotIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK", environment)
         self.assertEqual(
             environment["ROUND_DAGGER_FAST_ROBORENDER_REVISION"], "1" * 40
         )
