@@ -1,5 +1,5 @@
 diff --git a/gr00t/rl/agents/modules/ppo_modules.py b/gr00t/rl/agents/modules/ppo_modules.py
-index 87c138e..a989d24 100644
+index 87c138e15e1e1b180ad697650c3505b50374a0e3..a989d240681bb5aaacbeb33102e145bd1db6eda1 100644
 --- a/gr00t/rl/agents/modules/ppo_modules.py
 +++ b/gr00t/rl/agents/modules/ppo_modules.py
 @@ -4,6 +4,7 @@
@@ -32,7 +32,7 @@ index 87c138e..a989d24 100644
              metadata = TrainableDatasetMetadata_V1_2.model_validate(json.load(f))
  
 diff --git a/gr00t/rl/apps/isaaclab.python.headless.rendering.kit b/gr00t/rl/apps/isaaclab.python.headless.rendering.kit
-index 870c65b..1bd513d 100755
+index 870c65bb4bfdc8baa607509fe12de7d2db794df4..1bd513dfc847a0aa5055bddddd1ddfd084d74379 100755
 --- a/gr00t/rl/apps/isaaclab.python.headless.rendering.kit
 +++ b/gr00t/rl/apps/isaaclab.python.headless.rendering.kit
 @@ -50,10 +50,35 @@ isaac.startup.ros_bridge_extension = ""
@@ -83,7 +83,7 @@ index 870c65b..1bd513d 100755
  # Set the DLSS model
  rtx.post.dlss.execMode = 0 # can be 0 (Performance), 1 (Balanced), 2 (Quality), or 3 (Auto)
 diff --git a/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit b/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit
-index 870c65b..1bd513d 100755
+index 870c65bb4bfdc8baa607509fe12de7d2db794df4..1bd513dfc847a0aa5055bddddd1ddfd084d74379 100755
 --- a/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit
 +++ b/gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit
 @@ -50,10 +50,35 @@ isaac.startup.ros_bridge_extension = ""
@@ -134,7 +134,7 @@ index 870c65b..1bd513d 100755
  # Set the DLSS model
  rtx.post.dlss.execMode = 0 # can be 0 (Performance), 1 (Balanced), 2 (Quality), or 3 (Auto)
 diff --git a/gr00t/rl/apps/phc.isaaclab.python.rendering.kit b/gr00t/rl/apps/phc.isaaclab.python.rendering.kit
-index d27498b..dc85ed4 100755
+index d27498bd4054fd5e683036d0f7fa25ab6c36c045..dc85ed4a9c4bf8c8be29ec243c216db469bf9b2c 100755
 --- a/gr00t/rl/apps/phc.isaaclab.python.rendering.kit
 +++ b/gr00t/rl/apps/phc.isaaclab.python.rendering.kit
 @@ -51,10 +51,35 @@ isaac.startup.ros_bridge_extension = ""
@@ -185,7 +185,7 @@ index d27498b..dc85ed4 100755
  # Set the DLSS model
  rtx.post.dlss.execMode = 0 # can be 0 (Performance), 1 (Balanced), 2 (Quality), or 3 (Auto)
 diff --git a/gr00t/rl/config/base.yaml b/gr00t/rl/config/base.yaml
-index 8e4263b..577f4c9 100755
+index 8e4263b473b1a0ca3e0aa03c876f40ac1f2f480c..577f4c90b74e9decba28010054874e3bc63efef8 100755
 --- a/gr00t/rl/config/base.yaml
 +++ b/gr00t/rl/config/base.yaml
 @@ -28,6 +28,10 @@ num_envs: 4096
@@ -205,7 +205,7 @@ index 8e4263b..577f4c9 100755
    use_wandb: False
 -
 diff --git a/gr00t/rl/config/callbacks/model_save.yaml b/gr00t/rl/config/callbacks/model_save.yaml
-index 5163839..0e4875c 100755
+index 5163839454f9f5144f044a6d4a462b8440d0feaf..0e4875c50157d563d232f022b1616bb92bc47c79 100755
 --- a/gr00t/rl/config/callbacks/model_save.yaml
 +++ b/gr00t/rl/config/callbacks/model_save.yaml
 @@ -1,4 +1,8 @@
@@ -220,7 +220,7 @@ index 5163839..0e4875c 100755
 +  # launchers reject this test-only interruption control.
 +  test_stop_after_checkpoint_step: null
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
-index 6109601..61c43be 100644
+index 61096011abecb0800cf17cbc9e0d8712e3634378..61c43bec5e70575b5fc1c6e8fda441e9824abac7 100644
 --- a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml
 @@ -59,11 +59,9 @@ algo:
@@ -247,7 +247,7 @@ index 6109601..61c43be 100644
        view_names: [head_color, hand_left, hand_right]
        primary_view: head_color
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml
-index 1557865..c1cb5db 100644
+index 15578657d11582cadd73b4801ea2aa53a525160b..c1cb5db8bb7695d8257545b3b45ef6248fab2d92 100644
 --- a/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml
 @@ -50,6 +50,9 @@ simulator:
@@ -306,7 +306,7 @@ index 1557865..c1cb5db 100644
  
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_round_actor_3view.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_round_actor_3view.yaml
 new file mode 100644
-index 0000000..427e119
+index 0000000000000000000000000000000000000000..427e119ea5cd9f17d89ea7bb14d0892d751b2b53
 --- /dev/null
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_round_actor_3view.yaml
 @@ -0,0 +1,97 @@
@@ -408,7 +408,7 @@ index 0000000..427e119
 +
 +policy_view_count: 3
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
-index fefff65..cdfb856 100644
+index fefff652b378d5e0667d9258a9b833bfc9e8e4b6..cdfb8569b7bd577aafbe3317ea4523602b02b56a 100644
 --- a/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
 @@ -106,36 +106,9 @@ domain_rand:
@@ -457,7 +457,7 @@ index fefff65..cdfb856 100644
    check_action_dim: False
 -
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
-index 2e743f5..6131031 100644
+index 2e743f5858a2e70de9f64f7cd5818f5926e0fa23..61310315eb898f4bca7a427c15e805837fa120e7 100644
 --- a/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml
 @@ -61,6 +61,6 @@ algo:
@@ -469,7 +469,7 @@ index 2e743f5..6131031 100644
        view_names: [ext1, wrist]
        primary_view: ext1
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
-index 40a888f..1bcf533 100644
+index 40a888f6f003d96d2fe8b3f8cea62a0436d16fe9..1bcf533dcd35704f927ffbe3d615274eb4c58963 100644
 --- a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml
 @@ -59,7 +59,7 @@ algo:
@@ -490,7 +490,7 @@ index 40a888f..1bcf533 100644
        view_names: [ext1, wrist]
        primary_view: ext1
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
-index 4f094a6..41d3530 100644
+index 4f094a6e9d1ad6aff6cec72f15195ba2a4aff3a0..41d35306562884dc0c302259275e4031ad3b8dff 100644
 --- a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml
 @@ -47,7 +47,7 @@ algo:
@@ -511,7 +511,7 @@ index 4f094a6..41d3530 100644
        view_names: [ext1, wrist]
        primary_view: ext1
 diff --git a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml
-index f3d3a1c..0af7d51 100644
+index f3d3a1c7b451c06241df6ddfadb59a91dd3338c7..0af7d51945f072ded73d77ddbb77ca33f4f3c3b1 100644
 --- a/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml
 +++ b/gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml
 @@ -55,7 +55,7 @@ algo:
@@ -533,7 +533,7 @@ index f3d3a1c..0af7d51 100644
        primary_view: ext1
  
 diff --git a/gr00t/rl/eval_agent_trl.py b/gr00t/rl/eval_agent_trl.py
-index c5fc62c..a5b1ddf 100644
+index c5fc62c0e717e1128da2e4ecdf7f6548e99bb0d7..a5b1ddf8426585342d22bdcba9ed4be6f4d323f4 100644
 --- a/gr00t/rl/eval_agent_trl.py
 +++ b/gr00t/rl/eval_agent_trl.py
 @@ -39,6 +39,11 @@ from hydra.utils import instantiate
@@ -575,7 +575,7 @@ index c5fc62c..a5b1ddf 100644
      # --- Build policy and value models ---
      process_output_dim_in_config(config)
 diff --git a/gr00t/rl/simulator/isaacsim/isaacsim.py b/gr00t/rl/simulator/isaacsim/isaacsim.py
-index 5d0a5ee..c8c60f4 100644
+index 5d0a5ee13846d6c8bfbe037cc76fe6d14e571fe5..c8c60f46d29238d1227c12e7b6ccd3fd09402934 100644
 --- a/gr00t/rl/simulator/isaacsim/isaacsim.py
 +++ b/gr00t/rl/simulator/isaacsim/isaacsim.py
 @@ -63,7 +63,7 @@ if DEFAULT_ISAACSIM_VERSION == "4.5":
@@ -667,7 +667,7 @@ index 5d0a5ee..c8c60f4 100644
          self.all_root_base_quat = {}
          self.all_root_states["robot"] = self._robot.data.root_state_w  # (num_envs, 13)
 diff --git a/gr00t/rl/train_agent_trl.py b/gr00t/rl/train_agent_trl.py
-index 1cd6d89..cca310d 100644
+index 1cd6d89eb1c7d1d04dffab82b5cfa3b67faa1866..cca310d059964ed82b646be2228d19be3585581d 100644
 --- a/gr00t/rl/train_agent_trl.py
 +++ b/gr00t/rl/train_agent_trl.py
 @@ -38,8 +38,10 @@ import glob
@@ -1064,7 +1064,7 @@ index 1cd6d89..cca310d 100644
  
  if __name__ == "__main__":
 diff --git a/gr00t/rl/trl/callbacks/model_save_callback.py b/gr00t/rl/trl/callbacks/model_save_callback.py
-index 0b62522..17b5f08 100644
+index 0b62522188cc2d4010f938fce0befee213437804..17b5f0840b7e6a1a29df15e26bdc63e9315c404b 100644
 --- a/gr00t/rl/trl/callbacks/model_save_callback.py
 +++ b/gr00t/rl/trl/callbacks/model_save_callback.py
 @@ -6,6 +6,7 @@ import copy
@@ -1233,7 +1233,7 @@ index 0b62522..17b5f08 100644
 +                        os.unlink(temporary_name)
 diff --git a/gr00t/rl/trl/trainer/anchor_io.py b/gr00t/rl/trl/trainer/anchor_io.py
 new file mode 100644
-index 0000000..70f8bf0
+index 0000000000000000000000000000000000000000..70f8bf01393e3dfdd2b05ed4762335052ced6c1e
 --- /dev/null
 +++ b/gr00t/rl/trl/trainer/anchor_io.py
 @@ -0,0 +1,239 @@
@@ -1478,7 +1478,7 @@ index 0000000..70f8bf0
 +        snapshot.close()
 diff --git a/gr00t/rl/trl/trainer/checkpoint_io.py b/gr00t/rl/trl/trainer/checkpoint_io.py
 new file mode 100644
-index 0000000..1ed5a6a
+index 0000000000000000000000000000000000000000..1ed5a6aa939f3587bd89f9663c1dcbcb55e6f264
 --- /dev/null
 +++ b/gr00t/rl/trl/trainer/checkpoint_io.py
 @@ -0,0 +1,119 @@
@@ -1602,7 +1602,7 @@ index 0000000..1ed5a6a
 +            os.close(descriptor)
 +    return payload, actual_sha256
 diff --git a/gr00t/rl/trl/trainer/distill_trainer.py b/gr00t/rl/trl/trainer/distill_trainer.py
-index 12af3dc..4af6b19 100644
+index 12af3dca1fe6cb4bb863e7cf6a19c5afd0c35703..4af6b191de070c39c0b0e20c5c57c69ddf6b2beb 100644
 --- a/gr00t/rl/trl/trainer/distill_trainer.py
 +++ b/gr00t/rl/trl/trainer/distill_trainer.py
 @@ -4,6 +4,7 @@
@@ -1649,7 +1649,7 @@ index 12af3dc..4af6b19 100644
              self.ref_model.load_state_dict(loaded_dict["actor_model_state_dict"])
          elif "policy_state_dict" in loaded_dict:
 diff --git a/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py b/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
-index 0ae54f4..04d6abc 100644
+index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad293122e9c9 100644
 --- a/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
 +++ b/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
 @@ -3,6 +3,8 @@
@@ -1846,7 +1846,7 @@ index 0ae54f4..04d6abc 100644
 +        # evaluator adapter persist provenance without source-specific scraping.
 +        return eval_dict
 diff --git a/gr00t/rl/trl/trainer/distill_trainer_videogen.py b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
-index 8db4235..4348d6b 100644
+index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9abeb2b7d14 100644
 --- a/gr00t/rl/trl/trainer/distill_trainer_videogen.py
 +++ b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
 @@ -27,9 +27,15 @@ video needs no upscaling; falls back to the ego camera's depth otherwise.
@@ -4074,7 +4074,7 @@ index 8db4235..4348d6b 100644
  
      # --------------------------------------------------------------- conversion
 diff --git a/gr00t/rl/trl/trainer/ppo_trainer.py b/gr00t/rl/trl/trainer/ppo_trainer.py
-index 8d9c4c9..cea9498 100644
+index 8d9c4c9e7e886a84fe88a274ee097e56fdc88490..cea9498e178c6955959275625f39bc5f667638f1 100644
 --- a/gr00t/rl/trl/trainer/ppo_trainer.py
 +++ b/gr00t/rl/trl/trainer/ppo_trainer.py
 @@ -3,9 +3,12 @@
@@ -4339,7 +4339,7 @@ index 8d9c4c9..cea9498 100644
      def eval(self, save_dirpath: Optional[str] = None):
 diff --git a/gr00t/rl/utils/camera_rendering_contract.py b/gr00t/rl/utils/camera_rendering_contract.py
 new file mode 100644
-index 0000000..5b7a6e4
+index 0000000000000000000000000000000000000000..5b7a6e4df29ca082166b90aa51d512299c6f6ba8
 --- /dev/null
 +++ b/gr00t/rl/utils/camera_rendering_contract.py
 @@ -0,0 +1,122 @@
@@ -4467,7 +4467,7 @@ index 0000000..5b7a6e4
 +    return validate_headless_camera_rendering(settings)
 diff --git a/gr00t/rl/utils/dagger_telemetry.py b/gr00t/rl/utils/dagger_telemetry.py
 new file mode 100644
-index 0000000..c8a5480
+index 0000000000000000000000000000000000000000..c8a5480f7c65766ad376a5e84755241e02066c1f
 --- /dev/null
 +++ b/gr00t/rl/utils/dagger_telemetry.py
 @@ -0,0 +1,508 @@
@@ -4982,10 +4982,10 @@ index 0000000..c8a5480
 diff --git a/gr00t/rl/utils/image3f_frame_client.py b/gr00t/rl/utils/image3f_frame_client.py
 old mode 100644
 new mode 100755
-index 91960ad..14ead33
+index 91960ad0d5a2368bf0c06906bec2d630cdf1f4b2..37481477da860d9d7041c65e33001d0fdf89834d
 --- a/gr00t/rl/utils/image3f_frame_client.py
 +++ b/gr00t/rl/utils/image3f_frame_client.py
-@@ -1,111 +1,684 @@
+@@ -1,111 +1,729 @@
 -# Copyright (c) 2026. Client for the warm Image3F per-frame render server.
 -"""Per-frame 3-view image render client (fixed-lag DAgger conditioning).
 +#!/usr/bin/env python3
@@ -5026,10 +5026,62 @@ index 91960ad..14ead33
 +DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 +MAX_WIRE_NESTING = 32
 +MAX_WIRE_ITEMS = 1_000_000
++PRODUCTION_OUTPUT_VIEWS = ("head_color", "hand_left", "hand_right")
++PRODUCTION_OUTPUT_LAYOUT = "vertical"
++PRODUCTION_OUTPUT_TILE_SHAPE_HWC = (240, 416, 3)
++PRODUCTION_OUTPUT_STACKED_SHAPE_HWC = (720, 416, 3)
 +
 +
 +class Image3FWireError(RuntimeError):
 +    """Raised before unsafe or malformed wire bytes reach Image3F code."""
++
++
++def _validate_server_capabilities(
++    capabilities: object, *, required_reference_lag: int
++) -> dict[str, object]:
++    """Validate the complete fixed protocol-v3 production capability contract."""
++
++    if not isinstance(capabilities, dict):
++        raise Image3FWireError("Image3F ping capabilities are missing or malformed")
++    if capabilities.get("lagged_reference_history") is not True:
++        raise Image3FWireError("Image3F server lacks lagged reference history")
++    if capabilities.get("server_incarnation_binding") is not True:
++        raise Image3FWireError("Image3F server lacks incarnation binding")
++    maximum_lag = capabilities.get("reference_lag_max")
++    if (
++        isinstance(maximum_lag, bool)
++        or not isinstance(maximum_lag, int)
++        or maximum_lag < 0
++    ):
++        raise Image3FWireError("Image3F maximum reference lag is malformed")
++    if maximum_lag < int(required_reference_lag):
++        raise Image3FWireError(
++            f"Image3F maximum reference lag {maximum_lag} is below "
++            f"required {required_reference_lag}"
++        )
++
++    output_views = capabilities.get("output_views")
++    if (
++        not isinstance(output_views, (list, tuple))
++        or tuple(output_views) != PRODUCTION_OUTPUT_VIEWS
++    ):
++        raise Image3FWireError(
++            "Image3F server output view order does not match the production contract"
++        )
++    if capabilities.get("output_layout") != PRODUCTION_OUTPUT_LAYOUT:
++        raise Image3FWireError(
++            "Image3F server output layout does not match the production contract"
++        )
++    for field, expected in (
++        ("output_tile_shape_hwc", PRODUCTION_OUTPUT_TILE_SHAPE_HWC),
++        ("output_stacked_shape_hwc", PRODUCTION_OUTPUT_STACKED_SHAPE_HWC),
++    ):
++        observed = capabilities.get(field)
++        if not isinstance(observed, (list, tuple)) or tuple(observed) != expected:
++            raise Image3FWireError(
++                f"Image3F server {field} does not match the production contract"
++            )
++    return dict(capabilities)
 +
 +
 +class _PrimitiveUnpickler(pickle.Unpickler):
@@ -5494,25 +5546,13 @@ index 91960ad..14ead33
 +            raise Image3FWireError(
 +                "Image3F ping response does not implement protocol version 3"
 +            )
-+        capabilities = response.get("capabilities")
-+        if not isinstance(capabilities, dict):
-+            raise Image3FWireError("Image3F ping capabilities are missing or malformed")
-+        if capabilities.get("lagged_reference_history") is not True:
-+            raise Image3FWireError("Image3F server lacks lagged reference history")
-+        if capabilities.get("server_incarnation_binding") is not True:
-+            raise Image3FWireError("Image3F server lacks incarnation binding")
-+        try:
-+            maximum_lag = int(capabilities.get("reference_lag_max", 0))
-+        except (TypeError, ValueError) as exc:
-+            raise Image3FWireError("Image3F maximum reference lag is malformed") from exc
-+        if maximum_lag < int(required_reference_lag):
-+            raise Image3FWireError(
-+                f"Image3F maximum reference lag {maximum_lag} is below "
-+                f"required {required_reference_lag}"
-+            )
++        capabilities = _validate_server_capabilities(
++            response.get("capabilities"),
++            required_reference_lag=required_reference_lag,
++        )
 +        _validate_renderer_identity(response)
 +        self._bind_server_incarnation(response, required=True)
-+        self._server_capabilities = dict(capabilities)
++        self._server_capabilities = capabilities
 +
 +    def _handshake_locked(self, sock: socket.socket, *, required_reference_lag: int) -> None:
 +        """Bind an incarnation before the first stateful render is transmitted."""
@@ -5603,6 +5643,11 @@ index 91960ad..14ead33
 +                    if stateful_render and self._server_incarnation_id is None:
 +                        self._handshake_locked(
 +                            sock, required_reference_lag=reference_lag
++                        )
++                    if stateful_render:
++                        self._server_capabilities = _validate_server_capabilities(
++                            self._server_capabilities,
++                            required_reference_lag=reference_lag,
 +                        )
 +                    if self._server_incarnation_id is not None:
 +                        request_payload["expected_server_incarnation_id"] = (
@@ -5763,7 +5808,7 @@ index 91960ad..14ead33
 +        self.close()
 diff --git a/gr00t/rl/utils/policy_view_contract.py b/gr00t/rl/utils/policy_view_contract.py
 new file mode 100644
-index 0000000..d8ecc0d
+index 0000000000000000000000000000000000000000..d8ecc0d655c8e44523d86e9d1d4e28f5bb08076a
 --- /dev/null
 +++ b/gr00t/rl/utils/policy_view_contract.py
 @@ -0,0 +1,180 @@
@@ -5949,7 +5994,7 @@ index 0000000..d8ecc0d
 +    return bound
 diff --git a/gr00t/rl/utils/round_dagger_paired_eval.py b/gr00t/rl/utils/round_dagger_paired_eval.py
 new file mode 100644
-index 0000000..f935f7e
+index 0000000000000000000000000000000000000000..f935f7efcdc454309f61990f604b80678379f227
 --- /dev/null
 +++ b/gr00t/rl/utils/round_dagger_paired_eval.py
 @@ -0,0 +1,622 @@
@@ -6577,7 +6622,7 @@ index 0000000..f935f7e
 +]
 diff --git a/gr00t/rl/utils/simulation_app_lifecycle.py b/gr00t/rl/utils/simulation_app_lifecycle.py
 new file mode 100644
-index 0000000..2f2623a
+index 0000000000000000000000000000000000000000..2f2623a68911f0e40c062373a3016282e5a63ddd
 --- /dev/null
 +++ b/gr00t/rl/utils/simulation_app_lifecycle.py
 @@ -0,0 +1,176 @@
@@ -6759,7 +6804,7 @@ index 0000000..2f2623a
 +        return False
 diff --git a/tests/test_anchor_io.py b/tests/test_anchor_io.py
 new file mode 100644
-index 0000000..88d1403
+index 0000000000000000000000000000000000000000..88d1403bf235d0b3087ff48eb4a8be3d970bfe61
 --- /dev/null
 +++ b/tests/test_anchor_io.py
 @@ -0,0 +1,180 @@
@@ -6945,7 +6990,7 @@ index 0000000..88d1403
 +    unittest.main()
 diff --git a/tests/test_camera_rendering_contract.py b/tests/test_camera_rendering_contract.py
 new file mode 100644
-index 0000000..d4aac6f
+index 0000000000000000000000000000000000000000..d4aac6ffbde92464edf4b57f7efdcd2b4ad92703
 --- /dev/null
 +++ b/tests/test_camera_rendering_contract.py
 @@ -0,0 +1,82 @@
@@ -7033,7 +7078,7 @@ index 0000000..d4aac6f
 +    ]
 diff --git a/tests/test_checkpoint_io_snapshot.py b/tests/test_checkpoint_io_snapshot.py
 new file mode 100644
-index 0000000..7ba66b7
+index 0000000000000000000000000000000000000000..7ba66b7c599a197d660081a72c37db5cbfcbba3f
 --- /dev/null
 +++ b/tests/test_checkpoint_io_snapshot.py
 @@ -0,0 +1,128 @@
@@ -7167,7 +7212,7 @@ index 0000000..7ba66b7
 +    unittest.main()
 diff --git a/tests/test_dagger_telemetry_permissions.py b/tests/test_dagger_telemetry_permissions.py
 new file mode 100644
-index 0000000..c30f1ab
+index 0000000000000000000000000000000000000000..c30f1abdb7169363b60a11c33021babcc7e55dae
 --- /dev/null
 +++ b/tests/test_dagger_telemetry_permissions.py
 @@ -0,0 +1,44 @@
@@ -7217,7 +7262,7 @@ index 0000000..c30f1ab
 +    unittest.main()
 diff --git a/tests/test_policy_checkpoint_consumer.py b/tests/test_policy_checkpoint_consumer.py
 new file mode 100644
-index 0000000..917fd8c
+index 0000000000000000000000000000000000000000..917fd8c190650a33f55950d5b2c47eb2b52732aa
 --- /dev/null
 +++ b/tests/test_policy_checkpoint_consumer.py
 @@ -0,0 +1,44 @@
@@ -7267,7 +7312,7 @@ index 0000000..917fd8c
 +    unittest.main()
 diff --git a/tests/test_policy_view_contract.py b/tests/test_policy_view_contract.py
 new file mode 100644
-index 0000000..9ad902d
+index 0000000000000000000000000000000000000000..9ad902d3185f2cd68aa338967c76c97229b7c3e1
 --- /dev/null
 +++ b/tests/test_policy_view_contract.py
 @@ -0,0 +1,146 @@
@@ -7419,7 +7464,7 @@ index 0000000..9ad902d
 +    unittest.main()
 diff --git a/tests/test_runtime_shadow_integration.py b/tests/test_runtime_shadow_integration.py
 new file mode 100644
-index 0000000..ab501ce
+index 0000000000000000000000000000000000000000..ab501ce8288a5c1081d57506c9cd94f805283706
 --- /dev/null
 +++ b/tests/test_runtime_shadow_integration.py
 @@ -0,0 +1,802 @@
@@ -8227,7 +8272,7 @@ index 0000000..ab501ce
 +    }
 diff --git a/tests/test_simulation_app_lifecycle.py b/tests/test_simulation_app_lifecycle.py
 new file mode 100644
-index 0000000..6bebd9c
+index 0000000000000000000000000000000000000000..6bebd9cb1af24ecb86d160ee767123efbe5541f2
 --- /dev/null
 +++ b/tests/test_simulation_app_lifecycle.py
 @@ -0,0 +1,144 @@
@@ -8377,7 +8422,7 @@ index 0000000..6bebd9c
 +        SimulationAppLifecycle()
 diff --git a/tests/test_teacher_checkpoint_device.py b/tests/test_teacher_checkpoint_device.py
 new file mode 100644
-index 0000000..2e01021
+index 0000000000000000000000000000000000000000..2e010217adbbfca1b366024a39022cf03897637d
 --- /dev/null
 +++ b/tests/test_teacher_checkpoint_device.py
 @@ -0,0 +1,64 @@
@@ -8447,7 +8492,7 @@ index 0000000..2e01021
 +    unittest.main()
 diff --git a/tests/test_videogen_rollout_buffering.py b/tests/test_videogen_rollout_buffering.py
 new file mode 100644
-index 0000000..ee791d7
+index 0000000000000000000000000000000000000000..ee791d7e378ef027f27d00c27456cb0942760590
 --- /dev/null
 +++ b/tests/test_videogen_rollout_buffering.py
 @@ -0,0 +1,144 @@
