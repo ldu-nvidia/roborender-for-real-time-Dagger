@@ -146,6 +146,19 @@ class Image3FServerTransportTest(unittest.TestCase):
                 {
                     "cmd": "render_frame",
                     "protocol_version": 3,
+                    "reference_lag": 256,
+                },
+            )
+            missing = protocol._recv_msg(client_sock)
+            self.assertIs(missing["ok"], False)
+            self.assertIn("requires the exact current server incarnation", missing["error"])
+            self.assertEqual(session.generate_calls, 0)
+
+            protocol._send_msg(
+                client_sock,
+                {
+                    "cmd": "render_frame",
+                    "protocol_version": 3,
                     "expected_server_incarnation_id": "e" * 32,
                 },
             )
@@ -236,6 +249,9 @@ class Image3FServerTransportTest(unittest.TestCase):
                 remote_launcher,
             )
         self.assertIn("hostname -f", standalone)
+        self.assertIn("SLURMD_NODENAME", array)
+        self.assertIn("hostname -f", array)
+        self.assertIn("export IMAGE3F_ADVERTISE_HOST", array)
         self.assertIn('"IMAGE3F_ADVERTISE_HOST": args.advertise_host', local_fleet)
         self.assertIn('"IMAGE3F_BIND_HOST": args.advertise_host', local_fleet)
         self.assertIn('default="127.0.0.1"', local_fleet)

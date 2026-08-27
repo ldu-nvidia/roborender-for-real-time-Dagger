@@ -14,9 +14,22 @@ import numpy as np
 from integrations.gr00t import image3f_frame_client as client_module
 
 
+def stateful_capabilities(reference_lag_max=512):
+    return {
+        "lagged_reference_history": True,
+        "server_incarnation_binding": True,
+        "reference_lag_max": reference_lag_max,
+        "output_views": ["head_color", "hand_left", "hand_right"],
+        "output_layout": "vertical",
+        "output_tile_shape_hwc": [240, 416, 3],
+        "output_stacked_shape_hwc": [720, 416, 3],
+    }
+
+
 class FakeImage3FServer:
-    def __init__(self, requests):
+    def __init__(self, requests, *, reference_lag_max=512):
         self.requests = requests
+        self.reference_lag_max = reference_lag_max
         self.received = []
         self.server = socket.socket()
         self.server.bind(("127.0.0.1", 0))
@@ -36,11 +49,9 @@ class FakeImage3FServer:
                         "ok": True,
                         "protocol_version": client_module.PROTOCOL_VERSION,
                         "server_incarnation_id": self.incarnation,
-                        "capabilities": {
-                            "lagged_reference_history": True,
-                            "server_incarnation_binding": True,
-                            "reference_lag_max": 512,
-                        },
+                        "capabilities": stateful_capabilities(
+                            self.reference_lag_max
+                        ),
                     }
                 else:
                     step = int(request.get("step", 0))
@@ -101,11 +112,7 @@ class RestartBetweenRetryServer:
             "ok": True,
             "protocol_version": client_module.PROTOCOL_VERSION,
             "server_incarnation_id": incarnation,
-            "capabilities": {
-                "lagged_reference_history": True,
-                "server_incarnation_binding": True,
-                "reference_lag_max": 512,
-            },
+            "capabilities": stateful_capabilities(),
         }
 
     def _run(self):
@@ -192,11 +199,7 @@ class Image3FFrameClientTest(unittest.TestCase):
             "ok": True,
             "protocol_version": client_module.PROTOCOL_VERSION,
             "server_incarnation_id": "a" * 32,
-            "capabilities": {
-                "lagged_reference_history": True,
-                "server_incarnation_binding": True,
-                "reference_lag_max": 256,
-            },
+            "capabilities": stateful_capabilities(256),
         }
         client._validate_ping_response(base, required_reference_lag=256)
         old = dict(base, protocol_version=2)
@@ -213,6 +216,62 @@ class Image3FFrameClientTest(unittest.TestCase):
             client_module.Image3FFrameClient(
                 "127.0.0.1", 1
             )._validate_ping_response(missing)
+
+        malformed_lag = dict(base, capabilities=stateful_capabilities(True))
+        with self.assertRaisesRegex(
+            client_module.Image3FWireError, "maximum reference lag is malformed"
+        ):
+            client_module.Image3FFrameClient(
+                "127.0.0.1", 1
+            )._validate_ping_response(malformed_lag)
+
+        malformed_contracts = (
+            ("output_views", ["hand_left", "head_color", "hand_right"]),
+            ("output_layout", "horizontal"),
+            ("output_tile_shape_hwc", [240, 415, 3]),
+            ("output_stacked_shape_hwc", [719, 416, 3]),
+        )
+        for field, value in malformed_contracts:
+            with self.subTest(field=field):
+                capabilities = stateful_capabilities(256)
+                capabilities[field] = value
+                malformed = dict(base, capabilities=capabilities)
+                with self.assertRaisesRegex(
+                    client_module.Image3FWireError, "production contract"
+                ):
+                    client_module.Image3FFrameClient(
+                        "127.0.0.1", 1
+                    )._validate_ping_response(malformed)
+
+    def test_cached_handshake_revalidates_lag_before_stateful_send(self):
+        server = FakeImage3FServer(requests=1, reference_lag_max=128)
+        server.start()
+        client = client_module.Image3FFrameClient(
+            "127.0.0.1", server.port, timeout_s=2
+        )
+        image = np.zeros((2, 3, 3), dtype=np.uint8)
+        condition = {"head_color": image}
+        try:
+            self.assertTrue(client.ping()["ok"])
+            with self.assertRaisesRegex(
+                client_module.Image3FWireError,
+                "maximum reference lag 128 is below required 256",
+            ):
+                client.render_frame(
+                    condition,
+                    condition,
+                    condition,
+                    prompt="scene",
+                    stream_id="run:rank0:env0",
+                    episode_id=0,
+                    step=0,
+                    reference_lag=256,
+                )
+        finally:
+            client.close()
+            server.thread.join(timeout=2)
+        self.assertFalse(server.thread.is_alive())
+        self.assertEqual([request["cmd"] for request in server.received], ["ping"])
 
     def test_first_stateful_render_is_bound_before_lost_response_retry(self):
         server = RestartBetweenRetryServer()

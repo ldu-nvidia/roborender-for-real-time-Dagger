@@ -42,6 +42,14 @@ export IMAGE3F_ALLOW_PY_QUEUE=0
 # This legacy Slurm-array topology serves remote trainer nodes.  Unlike the
 # round-based local actor fleet it therefore cannot use the loopback-only bind.
 export IMAGE3F_BIND_HOST=${IMAGE3F_BIND_HOST:-0.0.0.0}
+if [ -z "${IMAGE3F_ADVERTISE_HOST:-}" ]; then
+    IMAGE3F_ADVERTISE_HOST=${SLURMD_NODENAME:-}
+    if [ -z "$IMAGE3F_ADVERTISE_HOST" ]; then
+        IMAGE3F_ADVERTISE_HOST=$(hostname -f 2>/dev/null || hostname)
+    fi
+fi
+[ -n "$IMAGE3F_ADVERTISE_HOST" ]
+export IMAGE3F_ADVERTISE_HOST
 
 mkdir -p "$RUN_DIR/endpoints" "$RUN_DIR/stop_acks" \
          "$IMAGE3F_QUEUE/inbox" "$IMAGE3F_QUEUE/done"

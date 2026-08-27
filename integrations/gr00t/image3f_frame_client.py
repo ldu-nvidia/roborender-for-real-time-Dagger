@@ -32,10 +32,62 @@ REFERENCE_PROVENANCE_SCHEMA = "image3f.reference_provenance.v2"
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 MAX_WIRE_NESTING = 32
 MAX_WIRE_ITEMS = 1_000_000
+PRODUCTION_OUTPUT_VIEWS = ("head_color", "hand_left", "hand_right")
+PRODUCTION_OUTPUT_LAYOUT = "vertical"
+PRODUCTION_OUTPUT_TILE_SHAPE_HWC = (240, 416, 3)
+PRODUCTION_OUTPUT_STACKED_SHAPE_HWC = (720, 416, 3)
 
 
 class Image3FWireError(RuntimeError):
     """Raised before unsafe or malformed wire bytes reach Image3F code."""
+
+
+def _validate_server_capabilities(
+    capabilities: object, *, required_reference_lag: int
+) -> dict[str, object]:
+    """Validate the complete fixed protocol-v3 production capability contract."""
+
+    if not isinstance(capabilities, dict):
+        raise Image3FWireError("Image3F ping capabilities are missing or malformed")
+    if capabilities.get("lagged_reference_history") is not True:
+        raise Image3FWireError("Image3F server lacks lagged reference history")
+    if capabilities.get("server_incarnation_binding") is not True:
+        raise Image3FWireError("Image3F server lacks incarnation binding")
+    maximum_lag = capabilities.get("reference_lag_max")
+    if (
+        isinstance(maximum_lag, bool)
+        or not isinstance(maximum_lag, int)
+        or maximum_lag < 0
+    ):
+        raise Image3FWireError("Image3F maximum reference lag is malformed")
+    if maximum_lag < int(required_reference_lag):
+        raise Image3FWireError(
+            f"Image3F maximum reference lag {maximum_lag} is below "
+            f"required {required_reference_lag}"
+        )
+
+    output_views = capabilities.get("output_views")
+    if (
+        not isinstance(output_views, (list, tuple))
+        or tuple(output_views) != PRODUCTION_OUTPUT_VIEWS
+    ):
+        raise Image3FWireError(
+            "Image3F server output view order does not match the production contract"
+        )
+    if capabilities.get("output_layout") != PRODUCTION_OUTPUT_LAYOUT:
+        raise Image3FWireError(
+            "Image3F server output layout does not match the production contract"
+        )
+    for field, expected in (
+        ("output_tile_shape_hwc", PRODUCTION_OUTPUT_TILE_SHAPE_HWC),
+        ("output_stacked_shape_hwc", PRODUCTION_OUTPUT_STACKED_SHAPE_HWC),
+    ):
+        observed = capabilities.get(field)
+        if not isinstance(observed, (list, tuple)) or tuple(observed) != expected:
+            raise Image3FWireError(
+                f"Image3F server {field} does not match the production contract"
+            )
+    return dict(capabilities)
 
 
 class _PrimitiveUnpickler(pickle.Unpickler):
@@ -453,25 +505,13 @@ class Image3FFrameClient:
             raise Image3FWireError(
                 "Image3F ping response does not implement protocol version 3"
             )
-        capabilities = response.get("capabilities")
-        if not isinstance(capabilities, dict):
-            raise Image3FWireError("Image3F ping capabilities are missing or malformed")
-        if capabilities.get("lagged_reference_history") is not True:
-            raise Image3FWireError("Image3F server lacks lagged reference history")
-        if capabilities.get("server_incarnation_binding") is not True:
-            raise Image3FWireError("Image3F server lacks incarnation binding")
-        try:
-            maximum_lag = int(capabilities.get("reference_lag_max", 0))
-        except (TypeError, ValueError) as exc:
-            raise Image3FWireError("Image3F maximum reference lag is malformed") from exc
-        if maximum_lag < int(required_reference_lag):
-            raise Image3FWireError(
-                f"Image3F maximum reference lag {maximum_lag} is below "
-                f"required {required_reference_lag}"
-            )
+        capabilities = _validate_server_capabilities(
+            response.get("capabilities"),
+            required_reference_lag=required_reference_lag,
+        )
         _validate_renderer_identity(response)
         self._bind_server_incarnation(response, required=True)
-        self._server_capabilities = dict(capabilities)
+        self._server_capabilities = capabilities
 
     def _handshake_locked(self, sock: socket.socket, *, required_reference_lag: int) -> None:
         """Bind an incarnation before the first stateful render is transmitted."""
@@ -543,6 +583,11 @@ class Image3FFrameClient:
                     if stateful_render and self._server_incarnation_id is None:
                         self._handshake_locked(
                             sock, required_reference_lag=reference_lag
+                        )
+                    if stateful_render:
+                        self._server_capabilities = _validate_server_capabilities(
+                            self._server_capabilities,
+                            required_reference_lag=reference_lag,
                         )
                     if self._server_incarnation_id is not None:
                         request_payload["expected_server_incarnation_id"] = (

@@ -411,6 +411,36 @@ def handle_conn(
                     "server_incarnation_id": server_incarnation_id,
                 })
                 continue
+            reference_lag = 0
+            if cmd == "render_frame":
+                raw_reference_lag = req.get("reference_lag", 0)
+                if (
+                    isinstance(raw_reference_lag, bool)
+                    or not isinstance(raw_reference_lag, int)
+                    or raw_reference_lag < 0
+                ):
+                    _send_msg(sock, {
+                        "ok": False,
+                        "error": "Image3F reference_lag must be a non-negative integer",
+                        "retryable": False,
+                        "server_incarnation_id": server_incarnation_id,
+                    })
+                    continue
+                reference_lag = raw_reference_lag
+                if (
+                    reference_lag > 0
+                    and expected_incarnation != server_incarnation_id
+                ):
+                    _send_msg(sock, {
+                        "ok": False,
+                        "error": (
+                            "stateful Image3F render requires the exact current "
+                            "server incarnation"
+                        ),
+                        "retryable": False,
+                        "server_incarnation_id": server_incarnation_id,
+                    })
+                    continue
             if cmd == "ping":
                 _send_msg(sock, {
                     "ok": True,
@@ -468,7 +498,6 @@ def handle_conn(
                 mask = {v: decode_array(req["mask"][v]) for v in req["mask"]}
                 prev = {v: decode_array(req["prev"][v]) for v in req["prev"]}
                 validate_render_inputs(depth, mask, prev)
-                reference_lag = int(req.get("reference_lag", 0))
                 prompt = req.get("prompt")
                 if not isinstance(prompt, str) or not prompt or len(prompt.encode("utf-8")) > 16384:
                     raise Image3FWireError(
