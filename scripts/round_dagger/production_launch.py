@@ -539,7 +539,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
     )
     _require_equal(
         evaluation["threshold_contract_sha256"],
-        "1721049b8fcd8c4e0eefdbd581fcca6d77bc6cf8d5f9ffc789ae4a817d7a36ee",
+        "1079e2289a8afc93a8cdffd7ed060c1749c9a3067a27f0ba1213c0cd65148d96",
         "evaluation threshold contract identity",
     )
     for key in (

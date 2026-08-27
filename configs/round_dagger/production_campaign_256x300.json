@@ -121,6 +121,6 @@
     "scenario_contract": "configs/round_dagger/production_paired_scenarios_2x8.json",
     "scenario_contract_sha256": "99081ebee907ef36c388cf62a1d134c015d289776526cacc1db114a87074e724",
     "threshold_contract": "configs/round_dagger/production_paired_thresholds.json",
-    "threshold_contract_sha256": "1721049b8fcd8c4e0eefdbd581fcca6d77bc6cf8d5f9ffc789ae4a817d7a36ee"
+    "threshold_contract_sha256": "1079e2289a8afc93a8cdffd7ed060c1749c9a3067a27f0ba1213c0cd65148d96"
   }
 }

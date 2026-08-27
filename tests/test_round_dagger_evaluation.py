@@ -16,6 +16,7 @@ from round_dagger.artifacts import ArtifactError, canonical_json_sha256, sha256_
 from round_dagger.evaluation import (
     POLICY_VIEWS,
     RUNTIME_SCHEMA,
+    _score,
     EvaluationError,
     EVALUATOR_RESULT_SCHEMA,
     attest_outcome,
@@ -145,6 +146,32 @@ class PairedEvaluationTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_production_thresholds_reject_an_unchanged_candidate(self) -> None:
+        thresholds = json.loads(
+            (
+                self.repository_root
+                / "configs/round_dagger/production_paired_thresholds.json"
+            ).read_text(encoding="utf-8")
+        )
+        rows = [
+            {
+                "seed": 17 + index // 8,
+                "env_index": index % 8,
+                "scenario_id": _sha(f"scenario:{index}"),
+                "first_condition_sha256": _sha(f"condition:{index}"),
+                "first_generated_sha256": _sha(f"generated:{index}"),
+                "success": index % 2 == 0,
+                "safety_violation": False,
+                "action_imitation_mse": 1.0,
+                "episode_length": 300,
+            }
+            for index in range(16)
+        ]
+        _, decision = _score(rows, rows, thresholds)
+        self.assertTrue(decision["bounded_nonregression_all"])
+        self.assertFalse(decision["meaningful_improvement_any"])
+        self.assertFalse(decision["passed"])
 
     def _raw_evidence(
         self,

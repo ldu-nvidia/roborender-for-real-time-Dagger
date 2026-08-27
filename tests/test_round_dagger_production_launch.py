@@ -255,6 +255,11 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(campaign["telemetry"]["clip_every_steps"], 300)
         self.assertEqual(campaign["wandb"]["expected_email"], "ldu@nvidia.com")
         self.assertEqual(campaign["wandb"]["entity"], "nvidia")
+        thresholds = artifacts.load_strict_json(
+            ROOT / campaign["evaluation"]["threshold_contract"]
+        )
+        self.assertEqual(thresholds["minimum_paired_cases"], 16)
+        self.assertIs(thresholds["allow_bounded_nonregression"], False)
         self.assertEqual(
             campaign["wandb"]["netrc"],
             str(production_launch.WANDB_NETRC),
@@ -395,7 +400,7 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertEqual(
             environment["ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256"],
-            "1721049b8fcd8c4e0eefdbd581fcca6d77bc6cf8d5f9ffc789ae4a817d7a36ee",
+            "1079e2289a8afc93a8cdffd7ed060c1749c9a3067a27f0ba1213c0cd65148d96",
         )
         self.assertEqual(
             environment["ROUND_DAGGER_WANDB_NETRC"],
