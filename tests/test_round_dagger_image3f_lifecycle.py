@@ -83,7 +83,7 @@ class ResetServer:
                         connection,
                         {
                             "ok": True,
-                            "protocol_version": 2,
+                            "protocol_version": 3,
                             "server_id": self.server_id,
                             "renderer_identity_sha256": self.renderer_sha256,
                         },

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
@@ -19,6 +20,20 @@ from pathlib import Path
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_PING_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+class _PrimitiveUnpickler(pickle.Unpickler):
+    """Decode primitive-only health responses without importing globals."""
+
+    def find_class(self, module: str, name: str) -> object:
+        raise pickle.UnpicklingError(
+            f"Image3F health response requested forbidden global {module}.{name}"
+        )
+
+
+def _safe_pickle_loads(payload: bytes) -> object:
+    return _PrimitiveUnpickler(io.BytesIO(payload)).load()
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -41,11 +56,13 @@ def ping(path: Path, timeout_s: float) -> dict[str, object]:
     with socket.create_connection((host, port), timeout=timeout_s) as sock:
         sock.settimeout(timeout_s)
         payload = pickle.dumps(
-            {"cmd": "ping", "protocol_version": 2}, protocol=pickle.HIGHEST_PROTOCOL
+            {"cmd": "ping", "protocol_version": 3}, protocol=pickle.HIGHEST_PROTOCOL
         )
         sock.sendall(struct.pack("!Q", len(payload)) + payload)
         size = struct.unpack("!Q", recv_exact(sock, 8))[0]
-        response = pickle.loads(recv_exact(sock, size))  # noqa: S301 - trusted cluster
+        if size > MAX_PING_RESPONSE_BYTES:
+            raise RuntimeError("Image3F health response exceeds the bounded size")
+        response = _safe_pickle_loads(recv_exact(sock, size))
     if not isinstance(response, dict) or not response.get("ok"):
         raise RuntimeError(f"unhealthy response: {response!r}")
     return {
@@ -106,6 +123,8 @@ def capability_error(
     history_required = require_reference_history or required_reference_lag > 0
     if history_required and not capabilities.get("lagged_reference_history"):
         return "lagged reference history is not supported"
+    if history_required and not capabilities.get("server_incarnation_binding"):
+        return "stateful renderer has no server-incarnation binding"
     if history_required and max_lag < required_reference_lag:
         return f"maximum reference lag {max_lag} < required {required_reference_lag}"
     if expected_output_views is not None:
@@ -248,7 +267,7 @@ def main() -> int:
     parser.add_argument("--poll-s", type=float, default=10)
     parser.add_argument("--require-reference-history", action="store_true")
     parser.add_argument("--required-reference-lag", type=int, default=0)
-    parser.add_argument("--minimum-protocol-version", type=int, default=2)
+    parser.add_argument("--minimum-protocol-version", type=int, default=3)
     parser.add_argument("--expected-release-id")
     parser.add_argument("--expected-adapter-sha256")
     parser.add_argument("--expected-inference-steps", type=int)

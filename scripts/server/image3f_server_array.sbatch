@@ -39,6 +39,9 @@ export IMAGE3F_STOP_POLL_S=1
 export IMAGE3F_PORT=0
 export IMAGE3F_MAX_STREAMS=${IMAGE3F_MAX_STREAMS:-16}
 export IMAGE3F_ALLOW_PY_QUEUE=0
+# This legacy Slurm-array topology serves remote trainer nodes.  Unlike the
+# round-based local actor fleet it therefore cannot use the loopback-only bind.
+export IMAGE3F_BIND_HOST=${IMAGE3F_BIND_HOST:-0.0.0.0}
 
 mkdir -p "$RUN_DIR/endpoints" "$RUN_DIR/stop_acks" \
          "$IMAGE3F_QUEUE/inbox" "$IMAGE3F_QUEUE/done"

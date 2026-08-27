@@ -87,7 +87,7 @@ class TrainSmokePlanTest(unittest.TestCase):
                         "file": str(descriptor),
                         "response": {
                             "ok": True,
-                            "protocol_version": 2,
+                            "protocol_version": 3,
                             "renderer_identity_sha256": RENDERER_SHA,
                         },
                     }

@@ -13,7 +13,7 @@ Session loads ONCE; each request costs only generation time (~175 ms/frame).
 NOTE: "zero" mode patches the pipeline globally and cannot be undone in-process;
 zero requests are rejected here — use a batch job for those.
 """
-import json, os, pickle, shutil, socket, struct, sys, threading, time, traceback
+import io, json, os, pickle, secrets, shutil, socket, struct, sys, threading, time, traceback
 from pathlib import Path
 
 import numpy as np
@@ -34,13 +34,73 @@ from runtime import Image3FRequest, Image3FSession  # noqa: E402
 QUEUE = Path(os.environ["IMAGE3F_QUEUE"])
 VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]
 W, H = 416, 240
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
+DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+MAX_WIRE_NESTING = 32
+MAX_WIRE_ITEMS = 1_000_000
 
 DROID_PARAMS = {
     "head_color": dict(raw_clip=(0.0, 10.0), inv_clip=(1.0, 20.0)),
     "hand_left": dict(raw_clip=(0.0, 5.0), inv_clip=(1.0, 100.0), raw_pct=(1, 99)),
     "hand_right": dict(raw_clip=(0.0, 5.0), inv_clip=(1.0, 100.0), raw_pct=(1, 99)),
 }
+
+
+class Image3FWireError(RuntimeError):
+    """Raised before unsafe or malformed TCP bytes reach the renderer."""
+
+
+class _PrimitiveUnpickler(pickle.Unpickler):
+    """Accept protocol primitives but never import a pickled global."""
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(
+            f"Image3F wire payload requested forbidden global {module}.{name}"
+        )
+
+
+def _max_message_bytes():
+    raw = os.environ.get("IMAGE3F_MAX_MESSAGE_BYTES", str(DEFAULT_MAX_MESSAGE_BYTES))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise Image3FWireError("IMAGE3F_MAX_MESSAGE_BYTES must be an integer") from exc
+    if value < 1024 or value > 1024 * 1024 * 1024:
+        raise Image3FWireError(
+            "IMAGE3F_MAX_MESSAGE_BYTES must be between 1 KiB and 1 GiB"
+        )
+    return value
+
+
+def _validate_wire_value(value):
+    remaining = MAX_WIRE_ITEMS
+    stack = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0:
+            raise pickle.UnpicklingError("Image3F wire payload contains too many values")
+        if depth > MAX_WIRE_NESTING:
+            raise pickle.UnpicklingError("Image3F wire payload nesting is too deep")
+        if current is None or isinstance(current, (bool, int, float, str, bytes)):
+            continue
+        if isinstance(current, dict):
+            if any(not isinstance(key, str) for key in current):
+                raise pickle.UnpicklingError("Image3F wire mapping keys must be strings")
+            stack.extend((item, depth + 1) for item in current.values())
+            continue
+        if isinstance(current, (list, tuple)):
+            stack.extend((item, depth + 1) for item in current)
+            continue
+        raise pickle.UnpicklingError(
+            f"Image3F wire payload contains forbidden {type(current).__name__}"
+        )
+
+
+def _safe_pickle_loads(payload):
+    value = _PrimitiveUnpickler(io.BytesIO(payload)).load()
+    _validate_wire_value(value)
+    return value
 
 
 def reference_provenance(
@@ -118,7 +178,7 @@ def run_request(session, session_lock, req):
     seed = int(req.get("seed", 42))
     stats = {}
     for cpath in req["chunks"]:
-        d = np.load(cpath, allow_pickle=True)
+        d = np.load(cpath, allow_pickle=False)
         name = Path(cpath).stem
         prompt = str(d["prompt"])
         T = min(int(d["depth_ctrl__head_color"].shape[0]), int(req.get("max_frames", 81)))
@@ -132,7 +192,7 @@ def run_request(session, session_lock, req):
         gen_frames = {v: [] for _, v in VIEW_MAP}
         t_start = 0
         if mode in ("fixed", "chain"):
-            anchor = np.load(init_dir / f"{name}_teacher3v.npz", allow_pickle=True)
+            anchor = np.load(init_dir / f"{name}_teacher3v.npz", allow_pickle=False)
             for _, v in VIEW_MAP:
                 prev[v] = Image.fromarray(anchor[f"gen__{v}"][anchor_idx])
             if mode == "chain":
@@ -178,9 +238,59 @@ def encode_array(arr):
 
 
 def decode_array(obj):
-    if isinstance(obj, dict) and obj.get("__nd__"):
-        return np.frombuffer(obj["data"], dtype=np.dtype(obj["dtype"])).reshape(obj["shape"])
-    return obj
+    if not isinstance(obj, dict) or set(obj) != {"__nd__", "dtype", "shape", "data"}:
+        raise Image3FWireError("malformed Image3F ndarray envelope")
+    if obj.get("__nd__") is not True or not isinstance(obj.get("dtype"), str):
+        raise Image3FWireError("malformed Image3F ndarray metadata")
+    try:
+        dtype = np.dtype(obj["dtype"])
+    except (TypeError, ValueError) as exc:
+        raise Image3FWireError("invalid Image3F ndarray dtype") from exc
+    if dtype.hasobject or dtype.fields is not None or dtype.subdtype is not None:
+        raise Image3FWireError("object and structured Image3F dtypes are forbidden")
+    shape = obj.get("shape")
+    if (
+        not isinstance(shape, (list, tuple))
+        or len(shape) not in (2, 3)
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in shape)
+    ):
+        raise Image3FWireError("invalid Image3F ndarray shape")
+    data = obj.get("data")
+    if not isinstance(data, bytes):
+        raise Image3FWireError("Image3F ndarray data must be raw bytes")
+    expected_bytes = dtype.itemsize
+    for dimension in shape:
+        if expected_bytes > _max_message_bytes() // dimension:
+            raise Image3FWireError("Image3F ndarray shape exceeds the message limit")
+        expected_bytes *= dimension
+    if expected_bytes != len(data) or expected_bytes > _max_message_bytes():
+        raise Image3FWireError("Image3F ndarray byte length does not match its shape")
+    return np.frombuffer(data, dtype=dtype).reshape(shape)
+
+
+def validate_render_inputs(depth, mask, previous_rgb):
+    """Require the exact production three-view conditioning tensor contract."""
+
+    expected_views = tuple(view for _, view in VIEW_MAP)
+    for label, mapping in (
+        ("depth", depth),
+        ("mask", mask),
+        ("previous_rgb", previous_rgb),
+    ):
+        if not isinstance(mapping, dict) or set(mapping) != set(expected_views):
+            raise Image3FWireError(
+                f"Image3F {label} views must be exactly {expected_views!r}"
+            )
+    for view in expected_views:
+        if depth[view].dtype != np.uint8 or depth[view].shape != (H, W):
+            raise Image3FWireError(
+                f"Image3F depth[{view!r}] must be uint8 {(H, W)}"
+            )
+        for label, mapping in (("mask", mask), ("previous_rgb", previous_rgb)):
+            if mapping[view].dtype != np.uint8 or mapping[view].shape != (H, W, 3):
+                raise Image3FWireError(
+                    f"Image3F {label}[{view!r}] must be uint8 {(H, W, 3)}"
+                )
 
 
 def _recv_exact(sock, n):
@@ -195,12 +305,20 @@ def _recv_exact(sock, n):
 
 def _send_msg(sock, obj):
     payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    if len(payload) > _max_message_bytes():
+        raise Image3FWireError(
+            f"Image3F outbound message is {len(payload)} bytes, exceeding the limit"
+        )
     sock.sendall(struct.pack("!Q", len(payload)) + payload)
 
 
 def _recv_msg(sock):
     n = struct.unpack("!Q", _recv_exact(sock, 8))[0]
-    return pickle.loads(_recv_exact(sock, n))
+    if n > _max_message_bytes():
+        raise Image3FWireError(
+            f"Image3F inbound message declares {n} bytes, exceeding the limit"
+        )
+    return _safe_pickle_loads(_recv_exact(sock, n))
 
 
 def handle_conn(
@@ -213,20 +331,56 @@ def handle_conn(
     runtime_identity,
     renderer_identity,
     renderer_identity_sha256,
+    server_incarnation_id,
     connections,
 ):
     print(f"tcp client {addr}", flush=True)
     try:
         while True:
             req = _recv_msg(sock)
+            if not isinstance(req, dict):
+                raise Image3FWireError("Image3F request must be a mapping")
             cmd = req.get("cmd", "render_frame")
+            if cmd not in {"ping", "reset_stream", "render_frame"}:
+                _send_msg(sock, {
+                    "ok": False,
+                    "error": f"unsupported Image3F command {cmd!r}",
+                    "retryable": False,
+                    "server_incarnation_id": server_incarnation_id,
+                })
+                continue
+            if req.get("protocol_version") != PROTOCOL_VERSION:
+                _send_msg(sock, {
+                    "ok": False,
+                    "error": "Image3F protocol version mismatch",
+                    "retryable": False,
+                    "server_incarnation_id": server_incarnation_id,
+                })
+                continue
+            expected_incarnation = req.get("expected_server_incarnation_id")
+            if (
+                expected_incarnation is not None
+                and expected_incarnation != server_incarnation_id
+            ):
+                _send_msg(sock, {
+                    "ok": False,
+                    "error": (
+                        "Image3F server incarnation changed; lagged reference "
+                        "history is unavailable"
+                    ),
+                    "retryable": False,
+                    "server_incarnation_id": server_incarnation_id,
+                })
+                continue
             if cmd == "ping":
                 _send_msg(sock, {
                     "ok": True,
                     "protocol_version": PROTOCOL_VERSION,
                     "server_id": os.environ.get("IMAGE3F_SERVER_ID", "legacy"),
+                    "server_incarnation_id": server_incarnation_id,
                     "capabilities": {
                         "lagged_reference_history": True,
+                        "server_incarnation_binding": True,
                         "reference_lag_max": int(os.environ.get("IMAGE3F_MAX_REFERENCE_LAG", "512")),
                         "serialized_inference": True,
                         "output_views": [view for _, view in VIEW_MAP],
@@ -243,10 +397,25 @@ def handle_conn(
                 continue
             if cmd == "reset_stream":
                 try:
-                    removed = references.reset(str(req.get("stream_id", "")))
-                    _send_msg(sock, {"ok": True, "removed": removed})
+                    reset_stream_id = str(req.get("stream_id", ""))
+                    if not reset_stream_id:
+                        raise ValueError("stream_id is required for reset_stream")
+                    removed = references.reset(reset_stream_id)
+                    _send_msg(sock, {
+                        "ok": True,
+                        "removed": removed,
+                        "stream_id": reset_stream_id,
+                        "server_id": os.environ.get("IMAGE3F_SERVER_ID", "legacy"),
+                        "renderer_identity_sha256": renderer_identity_sha256,
+                        "server_incarnation_id": server_incarnation_id,
+                    })
                 except Exception as exc:
-                    _send_msg(sock, {"ok": False, "error": f"{exc}"})
+                    _send_msg(sock, {
+                        "ok": False,
+                        "error": f"{exc}",
+                        "retryable": False,
+                        "server_incarnation_id": server_incarnation_id,
+                    })
                 continue
             prepared = False
             stream_id = str(req.get("stream_id", ""))
@@ -257,12 +426,30 @@ def handle_conn(
                 depth = {v: decode_array(req["depth"][v]) for v in req["depth"]}
                 mask = {v: decode_array(req["mask"][v]) for v in req["mask"]}
                 prev = {v: decode_array(req["prev"][v]) for v in req["prev"]}
+                validate_render_inputs(depth, mask, prev)
                 reference_lag = int(req.get("reference_lag", 0))
+                prompt = req.get("prompt")
+                if not isinstance(prompt, str) or not prompt or len(prompt.encode("utf-8")) > 16384:
+                    raise Image3FWireError(
+                        "Image3F prompt must be a non-empty UTF-8 string of at most 16 KiB"
+                    )
+                seed = req.get("seed", 42)
+                if isinstance(seed, bool) or not isinstance(seed, int):
+                    raise Image3FWireError("Image3F seed must be an integer")
                 reference_source = "client"
                 if reference_lag:
                     request_id = str(req.get("request_id", ""))
-                    if not request_id:
-                        raise ValueError("request_id is required with reference_lag")
+                    if (
+                        not stream_id
+                        or not episode_id
+                        or len(stream_id) > 512
+                        or len(episode_id) > 256
+                        or len(request_id) > 1024
+                        or request_id != f"{stream_id}|{episode_id}|{step}"
+                    ):
+                        raise ValueError(
+                            "stateful Image3F stream/episode/request identity is malformed"
+                        )
                     max_lag = int(os.environ.get("IMAGE3F_MAX_REFERENCE_LAG", "512"))
                     if reference_lag > max_lag:
                         raise ValueError(
@@ -297,6 +484,7 @@ def handle_conn(
                                 replay_views
                             ),
                             "renderer_identity_sha256": renderer_identity_sha256,
+                            "server_incarnation_id": server_incarnation_id,
                             "stream_step": step,
                             "replayed": True,
                         })
@@ -314,11 +502,11 @@ def handle_conn(
                     prepared = True
                 order = [v for _, v in VIEW_MAP]
                 r = Image3FRequest(
-                    prompt=str(req["prompt"]),
+                    prompt=prompt,
                     depth=tuple(to_pil(depth[v]) for v in order),
                     mask=tuple(to_pil(mask[v]) for v in order),
                     previous_rgb=tuple(to_pil(prev[v]) for v in order),
-                    seed=int(req.get("seed", 42)),
+                    seed=seed,
                 )
                 queue_start = time.perf_counter()
                 with session_lock:
@@ -370,6 +558,7 @@ def handle_conn(
                     "reference_provenance": provenance,
                     "generated_sha256": generated_sha256,
                     "renderer_identity_sha256": renderer_identity_sha256,
+                    "server_incarnation_id": server_incarnation_id,
                     "stream_step": step if reference_lag else None,
                 })
             except Exception as exc:
@@ -381,8 +570,17 @@ def handle_conn(
                     "ok": False,
                     "error": error,
                     "retryable": "in flight" in error,
+                    "server_incarnation_id": server_incarnation_id,
                 })
-    except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError, struct.error):
+    except (
+        ConnectionError,
+        ConnectionResetError,
+        BrokenPipeError,
+        OSError,
+        struct.error,
+        pickle.UnpicklingError,
+        Image3FWireError,
+    ):
         pass
     finally:
         sock.close()
@@ -486,7 +684,10 @@ class ConnectionRegistry:
 def create_tcp_server(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", port))
+    bind_host = os.environ.get("IMAGE3F_BIND_HOST", "127.0.0.1").strip()
+    if not bind_host or any(character.isspace() for character in bind_host):
+        raise ValueError("IMAGE3F_BIND_HOST must be one non-empty host token")
+    srv.bind((bind_host, port))
     srv.listen(int(os.environ.get("IMAGE3F_LISTEN_BACKLOG", "256")))
     return srv, int(srv.getsockname()[1])
 
@@ -500,6 +701,7 @@ def tcp_listener(
     runtime_identity,
     renderer_identity,
     renderer_identity_sha256,
+    server_incarnation_id,
     stopped,
     connections,
 ):
@@ -527,6 +729,7 @@ def tcp_listener(
                 runtime_identity,
                 renderer_identity,
                 renderer_identity_sha256,
+                server_incarnation_id,
                 connections,
             ),
             daemon=True,
@@ -573,6 +776,7 @@ def main():
         ),
     )
     renderer_identity_sha256 = canonical_json_sha256(renderer_identity)
+    server_incarnation_id = secrets.token_hex(16)
     session_lock = threading.Lock()
     references = LaggedReferenceStore(
         max_streams=int(os.environ.get("IMAGE3F_MAX_STREAMS", "64"))
@@ -598,6 +802,7 @@ def main():
             runtime_identity,
             renderer_identity,
             renderer_identity_sha256,
+            server_incarnation_id,
             stopped,
             connections,
         ),
@@ -622,7 +827,7 @@ def main():
     (QUEUE / "READY").write_text(str(time.time()))
     while not stopped.is_set():
         reqs = list(inbox.glob("*.json"))
-        if os.environ.get("IMAGE3F_ALLOW_PY_QUEUE", "1") == "1":
+        if os.environ.get("IMAGE3F_ALLOW_PY_QUEUE", "0") == "1":
             reqs += list(inbox.glob("*.py"))
         reqs = sorted(reqs)
         if not reqs:

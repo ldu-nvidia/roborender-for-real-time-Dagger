@@ -41,7 +41,7 @@ DIGESTS = {
 
 
 class _ResetAckServer:
-    """Minimal protocol-2 reset endpoint for actor-pair lifecycle tests."""
+    """Minimal protocol-3 reset endpoint for actor-pair lifecycle tests."""
 
     def __init__(self, server_id: str):
         self.server_id = server_id

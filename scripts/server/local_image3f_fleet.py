@@ -279,7 +279,7 @@ def _build_probe_report(
             continue
         incompatible = capability_error(
             response,
-            minimum_protocol_version=2,
+            minimum_protocol_version=3,
             required_reference_lag=required_reference_lag,
             require_reference_history=True,
             expected_release_id=expected_release_id,
@@ -479,6 +479,7 @@ def run_fleet(args: argparse.Namespace) -> int:
                     "IMAGE3F_STOP_POLL_S": str(args.stop_poll_s),
                     "IMAGE3F_PORT": "0",
                     "IMAGE3F_ADVERTISE_HOST": args.advertise_host,
+                    "IMAGE3F_BIND_HOST": args.advertise_host,
                     "IMAGE3F_MAX_STREAMS": str(args.max_streams),
                     "IMAGE3F_MAX_REFERENCE_LAG": str(args.max_reference_lag),
                     "IMAGE3F_ALLOW_PY_QUEUE": "0",

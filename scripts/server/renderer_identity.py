@@ -14,7 +14,7 @@ from typing import Any
 
 RENDERER_IDENTITY_SCHEMA = "fast_roborender.image3f_renderer_identity.v1"
 REFERENCE_PROVENANCE_SCHEMA = "image3f.reference_provenance.v2"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RENDERER_IDENTITY_KEYS = {
     "schema",

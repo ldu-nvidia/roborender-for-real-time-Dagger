@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny protocol-v2 server used only by local fleet lifecycle tests."""
+"""Tiny protocol-v3 server used only by local fleet lifecycle tests."""
 
 from __future__ import annotations
 
@@ -105,10 +105,14 @@ def ping_response() -> dict[str, object]:
     )
     return {
         "ok": True,
-        "protocol_version": 2,
+        "protocol_version": 3,
         "server_id": os.environ["IMAGE3F_SERVER_ID"],
+        "server_incarnation_id": os.environ.get(
+            "IMAGE3F_SERVER_INCARNATION_ID", "f" * 32
+        ),
         "capabilities": {
             "lagged_reference_history": True,
+            "server_incarnation_binding": True,
             "reference_lag_max": int(os.environ["IMAGE3F_MAX_REFERENCE_LAG"]),
             "serialized_inference": True,
             "output_views": ["head_color", "hand_left", "hand_right"],

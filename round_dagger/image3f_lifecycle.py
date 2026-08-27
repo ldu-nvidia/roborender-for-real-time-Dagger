@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
@@ -126,6 +127,21 @@ _ABANDONMENT_KEYS = {
     "stream_ids_sha256",
     "reason",
 }
+
+
+class _PrimitiveUnpickler(pickle.Unpickler):
+    """Decode the legacy primitive-only control wire without globals."""
+
+    def find_class(self, module: str, name: str) -> object:
+        raise pickle.UnpicklingError(
+            f"Image3F control response requested forbidden global {module}.{name}"
+        )
+
+
+def _safe_pickle_loads(payload: bytes) -> object:
+    return _PrimitiveUnpickler(io.BytesIO(payload)).load()
+
+
 _CLEANUP_KEYS = {
     "schema",
     "campaign_id",
@@ -661,7 +677,7 @@ def _request(host: str, port: int, payload: Mapping[str, Any], timeout_s: float)
         size = struct.unpack("!Q", _recv_exact(sock, 8))[0]
         if size > 16 * 1024 * 1024:
             raise Image3FLifecycleError("Image3F reset response exceeds bounded size")
-        response = pickle.loads(_recv_exact(sock, size))  # noqa: S301 - trusted cluster
+        response = _safe_pickle_loads(_recv_exact(sock, size))
     if not isinstance(response, dict):
         raise Image3FLifecycleError("Image3F reset response is not a mapping")
     return response
@@ -680,7 +696,11 @@ def _reset_with_retry(
             response = _request(
                 row["host"],
                 row["port"],
-                {"cmd": "reset_stream", "stream_id": row["stream_id"]},
+                {
+                    "cmd": "reset_stream",
+                    "protocol_version": 3,
+                    "stream_id": row["stream_id"],
+                },
                 timeout_s,
             )
             if response.get("ok") is not True:
@@ -695,7 +715,7 @@ def _reset_with_retry(
             direct_renderer = response.get("renderer_identity_sha256")
             server_id = direct_server_id
             observed_renderer = direct_renderer
-            # The deployed protocol-2 renderer acknowledges reset with
+            # The deployed protocol-3 renderer acknowledges reset with
             # ``ok``/``removed`` only.  Bind that serialized response to the
             # endpoint identity with an immediate ping on the same selected
             # host/port.  Newer servers may echo identity directly; both paths
@@ -704,7 +724,7 @@ def _reset_with_retry(
                 ping = _request(
                     row["host"],
                     row["port"],
-                    {"cmd": "ping", "protocol_version": 2},
+                    {"cmd": "ping", "protocol_version": 3},
                     timeout_s,
                 )
                 if ping.get("ok") is not True:

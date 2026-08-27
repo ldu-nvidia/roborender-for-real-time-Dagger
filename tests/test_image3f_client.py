@@ -1,6 +1,8 @@
 import itertools
 import os
+import pickle
 import socket
+import struct
 import tempfile
 import threading
 import unittest
@@ -20,6 +22,7 @@ class FakeImage3FServer:
         self.server.bind(("127.0.0.1", 0))
         self.server.listen(1)
         self.port = self.server.getsockname()[1]
+        self.incarnation = "1" * 32
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self):
@@ -29,7 +32,11 @@ class FakeImage3FServer:
                 request = client_module._recv_msg(conn)
                 self.received.append(request)
                 if request["cmd"] == "ping":
-                    response = {"ok": True, "protocol_version": 2}
+                    response = {
+                        "ok": True,
+                        "protocol_version": client_module.PROTOCOL_VERSION,
+                        "server_incarnation_id": self.incarnation,
+                    }
                 else:
                     step = int(request.get("step", 0))
                     lag = int(request.get("reference_lag", 0))
@@ -58,6 +65,7 @@ class FakeImage3FServer:
                         },
                         "generated_sha256": digest,
                         "stream_step": step,
+                        "server_incarnation_id": self.incarnation,
                     }
                 client_module._send_msg(conn, response)
         self.server.close()
@@ -67,6 +75,43 @@ class FakeImage3FServer:
 
 
 class Image3FFrameClientTest(unittest.TestCase):
+    def test_wire_decoder_rejects_globals_and_oversized_frames(self):
+        payload = pickle.dumps(Path("/tmp/not-constructed"))
+        with self.assertRaisesRegex(pickle.UnpicklingError, "forbidden global"):
+            client_module._safe_pickle_loads(payload)
+
+        receiver, sender = socket.socketpair()
+        try:
+            sender.sendall(struct.pack("!Q", 1025))
+            with mock.patch.dict(
+                os.environ, {"IMAGE3F_MAX_MESSAGE_BYTES": "1024"}, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    client_module.Image3FWireError, "exceeding the limit"
+                ):
+                    client_module._recv_msg(receiver)
+        finally:
+            receiver.close()
+            sender.close()
+
+    def test_stateful_client_rejects_renderer_process_restart(self):
+        client = client_module.Image3FFrameClient("127.0.0.1", 1)
+        client._bind_server_incarnation(
+            {"server_incarnation_id": "a" * 32}, required=True
+        )
+        with self.assertRaisesRegex(
+            client_module.Image3FWireError, "incarnation changed"
+        ):
+            client._bind_server_incarnation(
+                {"server_incarnation_id": "b" * 32}, required=True
+            )
+        with self.assertRaisesRegex(
+            client_module.Image3FWireError, "no valid server incarnation"
+        ):
+            client_module.Image3FFrameClient("127.0.0.1", 1)._bind_server_incarnation(
+                {}, required=True
+            )
+
     def test_production_output_contract_rejects_order_shape_and_dtype(self):
         good = {
             view: np.zeros((240, 416, 3), dtype=np.uint8)
@@ -232,6 +277,18 @@ class Image3FFrameClientTest(unittest.TestCase):
         fake.thread.join(timeout=2)
 
         renders = fake.received[1:]
+        self.assertTrue(
+            all(
+                request["protocol_version"] == client_module.PROTOCOL_VERSION
+                for request in fake.received
+            )
+        )
+        self.assertTrue(
+            all(
+                request["expected_server_incarnation_id"] == fake.incarnation
+                for request in renders
+            )
+        )
         self.assertEqual([request["step"] for request in renders], [0, 1, 0])
         self.assertEqual([request["episode_id"] for request in renders], ["0", "0", "1"])
         self.assertTrue(all(request["reference_lag"] == 3 for request in renders))

@@ -9,7 +9,7 @@ from scripts.server.reference_history import LaggedReferenceStore
 
 
 class StoreBackedServer:
-    """Tiny protocol-2 server that exercises the real history state machine."""
+    """Tiny protocol-3 server that exercises the real history state machine."""
 
     def __init__(self):
         self.store = LaggedReferenceStore(max_streams=4)
@@ -17,6 +17,7 @@ class StoreBackedServer:
         self.replays = 0
         self.drop_first_response = True
         self.stop_event = threading.Event()
+        self.incarnation = "2" * 32
         self.server = socket.socket()
         self.server.settimeout(0.1)
         self.server.bind(("127.0.0.1", 0))
@@ -77,7 +78,14 @@ class StoreBackedServer:
                 except (ConnectionError, OSError):
                     return
                 if request["cmd"] == "ping":
-                    protocol._send_msg(conn, {"ok": True, "protocol_version": 2})
+                    protocol._send_msg(
+                        conn,
+                        {
+                            "ok": True,
+                            "protocol_version": protocol.PROTOCOL_VERSION,
+                            "server_incarnation_id": self.incarnation,
+                        },
+                    )
                     continue
                 stream = request["stream_id"]
                 episode = request["episode_id"]
@@ -106,6 +114,7 @@ class StoreBackedServer:
                                 for view, image in replay_views.items()
                             },
                             "replayed": True,
+                            "server_incarnation_id": self.incarnation,
                             **self._reference_metadata(
                                 step=step,
                                 lag=lag,
@@ -155,6 +164,7 @@ class StoreBackedServer:
                                 view: protocol._encode_array(image)
                                 for view, image in generated.items()
                             },
+                            "server_incarnation_id": self.incarnation,
                             **self._reference_metadata(
                                 step=step,
                                 lag=lag,
@@ -167,7 +177,14 @@ class StoreBackedServer:
                 except Exception as exc:
                     if prepared:
                         self.store.abort(stream_id=stream, episode_id=episode, step=step)
-                    protocol._send_msg(conn, {"ok": False, "error": str(exc)})
+                    protocol._send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            "server_incarnation_id": self.incarnation,
+                        },
+                    )
 
 
 class ProtocolIntegrationTest(unittest.TestCase):

@@ -18,7 +18,7 @@ evidence. Each service receives:
 - the shared regular-file STOP sentinel; and
 - Python queue execution disabled.
 
-The fleet becomes `ready` only after every endpoint answers a protocol-v2
+The fleet becomes `ready` only after every endpoint answers a protocol-v3
 ping, advertises all three views in the exact vertical `(720, 416, 3)` layout,
 supports the configured reference lag, and reports a load-verified TensorRT
 engine. Endpoints must have unique host/port pairs, exact server IDs, and one

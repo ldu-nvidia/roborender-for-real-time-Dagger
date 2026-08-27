@@ -251,8 +251,8 @@ def _validate_fleet_evidence(
             raise TrainSmokeError("renderer readiness does not contain a successful response")
         if response.get("renderer_identity_sha256") != renderer_sha256:
             raise TrainSmokeError("renderer readiness identity differs from requested identity")
-        if response.get("protocol_version") != 2:
-            raise TrainSmokeError("renderer readiness does not prove protocol version 2")
+        if response.get("protocol_version") != 3:
+            raise TrainSmokeError("renderer readiness does not prove protocol version 3")
 
 
 def prepare_train_smoke(

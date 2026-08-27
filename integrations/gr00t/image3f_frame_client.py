@@ -13,6 +13,7 @@ call remains compatible with Raven's trainer while optionally adding:
 from __future__ import annotations
 
 import hashlib
+import io
 import itertools
 import os
 import pickle
@@ -26,8 +27,75 @@ from typing import Mapping
 import numpy as np
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 REFERENCE_PROVENANCE_SCHEMA = "image3f.reference_provenance.v2"
+DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+MAX_WIRE_NESTING = 32
+MAX_WIRE_ITEMS = 1_000_000
+
+
+class Image3FWireError(RuntimeError):
+    """Raised before unsafe or malformed wire bytes reach Image3F code."""
+
+
+class _PrimitiveUnpickler(pickle.Unpickler):
+    """Unpickle protocol primitives while forbidding every global constructor.
+
+    Protocol-v3 payloads contain only mappings, sequences, numeric/string
+    scalars, and raw bytes.  The default unpickler is unnecessary and would
+    allow a network peer to import and execute arbitrary Python callables.
+    """
+
+    def find_class(self, module: str, name: str) -> object:
+        raise pickle.UnpicklingError(
+            f"Image3F wire payload requested forbidden global {module}.{name}"
+        )
+
+
+def _max_message_bytes() -> int:
+    raw = os.environ.get("IMAGE3F_MAX_MESSAGE_BYTES", str(DEFAULT_MAX_MESSAGE_BYTES))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise Image3FWireError("IMAGE3F_MAX_MESSAGE_BYTES must be an integer") from exc
+    if value < 1024 or value > 1024 * 1024 * 1024:
+        raise Image3FWireError(
+            "IMAGE3F_MAX_MESSAGE_BYTES must be between 1 KiB and 1 GiB"
+        )
+    return value
+
+
+def _validate_wire_value(value: object) -> None:
+    """Bound recursive container work and reject non-protocol Python objects."""
+
+    remaining = MAX_WIRE_ITEMS
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0:
+            raise pickle.UnpicklingError("Image3F wire payload contains too many values")
+        if depth > MAX_WIRE_NESTING:
+            raise pickle.UnpicklingError("Image3F wire payload nesting is too deep")
+        if current is None or isinstance(current, (bool, int, float, str, bytes)):
+            continue
+        if isinstance(current, dict):
+            if any(not isinstance(key, str) for key in current):
+                raise pickle.UnpicklingError("Image3F wire mapping keys must be strings")
+            stack.extend((item, depth + 1) for item in current.values())
+            continue
+        if isinstance(current, (list, tuple)):
+            stack.extend((item, depth + 1) for item in current)
+            continue
+        raise pickle.UnpicklingError(
+            f"Image3F wire payload contains forbidden {type(current).__name__}"
+        )
+
+
+def _safe_pickle_loads(payload: bytes) -> object:
+    value = _PrimitiveUnpickler(io.BytesIO(payload)).load()
+    _validate_wire_value(value)
+    return value
 
 
 def _image_mapping_sha256(images: Mapping[str, np.ndarray]) -> str:
@@ -90,16 +158,32 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
 
 def _send_msg(sock: socket.socket, obj: object) -> None:
     payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    if len(payload) > _max_message_bytes():
+        raise Image3FWireError(
+            f"Image3F outbound message is {len(payload)} bytes, exceeding the limit"
+        )
     sock.sendall(struct.pack("!Q", len(payload)) + payload)
 
 
 def _recv_msg(sock: socket.socket) -> object:
     size = struct.unpack("!Q", _recv_exact(sock, 8))[0]
-    return pickle.loads(_recv_exact(sock, size))  # noqa: S301 - trusted cluster protocol
+    if size > _max_message_bytes():
+        raise Image3FWireError(
+            f"Image3F inbound message declares {size} bytes, exceeding the limit"
+        )
+    return _safe_pickle_loads(_recv_exact(sock, size))
 
 
 def _encode_array(array: np.ndarray) -> dict[str, object]:
+    if not isinstance(array, np.ndarray):
+        raise TypeError("Image3F array input must be a numpy array")
     array = np.ascontiguousarray(array)
+    if array.dtype.hasobject or array.dtype.fields is not None or array.dtype.subdtype is not None:
+        raise TypeError("object and structured Image3F dtypes are forbidden")
+    if array.ndim not in (2, 3) or any(dimension < 1 for dimension in array.shape):
+        raise TypeError("Image3F array input must be a non-empty 2D or 3D tensor")
+    if array.nbytes > _max_message_bytes():
+        raise Image3FWireError("one Image3F tensor exceeds the wire message limit")
     return {
         "__nd__": True,
         "dtype": str(array.dtype),
@@ -109,9 +193,41 @@ def _encode_array(array: np.ndarray) -> dict[str, object]:
 
 
 def _decode_array(obj: object) -> np.ndarray:
-    if not isinstance(obj, dict) or not obj.get("__nd__"):
+    if (
+        not isinstance(obj, dict)
+        or set(obj) != {"__nd__", "dtype", "shape", "data"}
+        or obj.get("__nd__") is not True
+        or not isinstance(obj.get("dtype"), str)
+    ):
         raise TypeError("malformed Image3F ndarray response")
-    return np.frombuffer(obj["data"], dtype=np.dtype(obj["dtype"])).reshape(obj["shape"]).copy()
+    try:
+        dtype = np.dtype(obj["dtype"])
+    except (TypeError, ValueError) as exc:
+        raise TypeError("invalid Image3F ndarray response dtype") from exc
+    shape = obj.get("shape")
+    data = obj.get("data")
+    if (
+        dtype != np.uint8
+        or not isinstance(shape, (list, tuple))
+        or len(shape) != 3
+        or shape[-1] != 3
+        or any(
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension < 1
+            for dimension in shape
+        )
+        or not isinstance(data, bytes)
+    ):
+        raise TypeError("malformed Image3F ndarray response contract")
+    expected_bytes = dtype.itemsize
+    for dimension in shape:
+        if expected_bytes > _max_message_bytes() // dimension:
+            raise TypeError("Image3F ndarray response exceeds the message limit")
+        expected_bytes *= dimension
+    if len(data) != expected_bytes:
+        raise TypeError("Image3F ndarray response byte length mismatch")
+    return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
 
 
 def _validate_output_views(views: dict[str, np.ndarray]) -> None:
@@ -244,6 +360,7 @@ class Image3FFrameClient:
         self._auto_step = 0
         self._anchor_object_ids: tuple[tuple[str, int], ...] | None = None
         self._anchor_signature: bytes | None = None
+        self._server_incarnation_id: str | None = None
         self.last_metadata: dict[str, object] = {}
 
     @classmethod
@@ -293,6 +410,37 @@ class Image3FFrameClient:
             self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return self._socket
 
+    def _bind_server_incarnation(
+        self, response: Mapping[str, object], *, required: bool
+    ) -> None:
+        """Pin a stateful stream to one renderer process incarnation.
+
+        ``server_id`` identifies a fleet slot and intentionally survives a
+        process restart.  Lagged RGB history does not.  A per-process token is
+        therefore required for stateful renders so a transparent reconnect can
+        never continue against an empty or different in-memory history.
+        """
+
+        observed = response.get("server_incarnation_id")
+        valid = (
+            isinstance(observed, str)
+            and len(observed) == 32
+            and all(character in "0123456789abcdef" for character in observed)
+        )
+        if not valid:
+            if required:
+                raise Image3FWireError(
+                    "Image3F stateful response has no valid server incarnation"
+                )
+            return
+        if self._server_incarnation_id is None:
+            self._server_incarnation_id = observed
+        elif observed != self._server_incarnation_id:
+            raise Image3FWireError(
+                "Image3F server incarnation changed; lagged reference history "
+                "cannot be continued safely"
+            )
+
     def close(self) -> None:
         with self._lock:
             if self._socket is not None:
@@ -340,11 +488,24 @@ class Image3FFrameClient:
             try:
                 with self._lock:
                     sock = self._connect()
-                    _send_msg(sock, payload)
+                    request_payload = dict(payload)
+                    request_payload.setdefault("protocol_version", PROTOCOL_VERSION)
+                    if self._server_incarnation_id is not None:
+                        request_payload["expected_server_incarnation_id"] = (
+                            self._server_incarnation_id
+                        )
+                    _send_msg(sock, request_payload)
                     response = _recv_msg(sock)
-                if not isinstance(response, dict):
-                    raise RuntimeError(
-                        f"malformed Image3F response: {type(response).__name__}"
+                    if not isinstance(response, dict):
+                        raise Image3FWireError(
+                            f"malformed Image3F response: {type(response).__name__}"
+                        )
+                    self._bind_server_incarnation(
+                        response,
+                        required=(
+                            request_payload.get("cmd") == "render_frame"
+                            and int(request_payload.get("reference_lag", 0)) > 0
+                        ),
                     )
                 if response.get("ok"):
                     return response
@@ -352,6 +513,14 @@ class Image3FFrameClient:
                     time.sleep(min(2.0, 0.1 * (2**attempt)))
                     continue
                 break
+            except Image3FWireError:
+                with self._lock:
+                    if self._socket is not None:
+                        try:
+                            self._socket.close()
+                        finally:
+                            self._socket = None
+                raise
             except (ConnectionError, OSError, EOFError, pickle.UnpicklingError) as exc:
                 last_error = exc
                 with self._lock:

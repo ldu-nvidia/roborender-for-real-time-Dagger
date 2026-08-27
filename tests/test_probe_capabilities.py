@@ -9,9 +9,10 @@ class ProbeCapabilityTest(unittest.TestCase):
     def production_response():
         adapter_sha = "a" * 64
         return {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "capabilities": {
                 "lagged_reference_history": True,
+                "server_incarnation_binding": True,
                 "reference_lag_max": 512,
                 "output_views": ["head_color", "hand_left", "hand_right"],
                 "output_layout": "vertical",
@@ -58,7 +59,7 @@ class ProbeCapabilityTest(unittest.TestCase):
     def production_error(response):
         return capability_error(
             response,
-            minimum_protocol_version=2,
+            minimum_protocol_version=3,
             required_reference_lag=256,
             require_reference_history=True,
             expected_release_id="release-1",
@@ -74,31 +75,38 @@ class ProbeCapabilityTest(unittest.TestCase):
             expected_output_stacked_shape=(720, 416, 3),
         )
 
-    def test_accepts_protocol_two_and_sufficient_lag(self):
+    def test_accepts_protocol_three_and_sufficient_lag(self):
         response = {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "capabilities": {
                 "lagged_reference_history": True,
+                "server_incarnation_binding": True,
                 "reference_lag_max": 512,
             },
         }
         self.assertIsNone(
             capability_error(
                 response,
-                minimum_protocol_version=2,
+                minimum_protocol_version=3,
                 required_reference_lag=256,
                 require_reference_history=True,
             )
         )
 
     def test_rejects_insufficient_or_malformed_lag(self):
-        base = {"protocol_version": 2, "capabilities": {"lagged_reference_history": True}}
+        base = {
+            "protocol_version": 3,
+            "capabilities": {
+                "lagged_reference_history": True,
+                "server_incarnation_binding": True,
+            },
+        }
         base["capabilities"]["reference_lag_max"] = 128
         self.assertIn(
             "< required 256",
             capability_error(
                 base,
-                minimum_protocol_version=2,
+                minimum_protocol_version=3,
                 required_reference_lag=256,
                 require_reference_history=True,
             ),
@@ -108,7 +116,7 @@ class ProbeCapabilityTest(unittest.TestCase):
             "malformed",
             capability_error(
                 base,
-                minimum_protocol_version=2,
+                minimum_protocol_version=3,
                 required_reference_lag=256,
                 require_reference_history=True,
             ),
@@ -116,6 +124,11 @@ class ProbeCapabilityTest(unittest.TestCase):
 
     def test_accepts_exact_model_sampler_and_engine_identity(self):
         self.assertIsNone(self.production_error(self.production_response()))
+
+    def test_production_history_requires_process_incarnation_binding(self):
+        response = self.production_response()
+        del response["capabilities"]["server_incarnation_binding"]
+        self.assertIn("incarnation", self.production_error(response))
 
     def test_rejects_every_model_and_sampler_mismatch(self):
         mutations = (
