@@ -23,6 +23,7 @@ from round_dagger.actor_pair import (
     seal_actor_pair,
 )
 from round_dagger.image3f_lifecycle import create_attempt_plan, record_rank_completion
+from round_dagger.seed_policy import derive_actor_seed_contract
 from tests.test_round_dagger_handoff import publish_policy_bundle
 
 
@@ -262,6 +263,13 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
             renderer_sha256="4" * 64,
             beta_sha256="5" * 64,
             config_sha256="6" * 64,
+            actor_seed_contract=derive_actor_seed_contract(
+                campaign_id="pair-launcher-test",
+                macro_round=0,
+                cohort_index=0,
+                expected_ranks=[0, 1],
+                expected_global_env_ids=list(range(64)),
+            ),
         )
         endpoints = []
         for rank in (0, 1):

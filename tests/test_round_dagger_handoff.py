@@ -10,6 +10,7 @@ import numpy as np
 from round_dagger import artifacts
 from round_dagger import handoff
 from round_dagger.image3f_lifecycle import create_attempt_plan
+from round_dagger.seed_policy import derive_actor_seed_contract
 from round_dagger.gr00t_policy import (
     BASE_MODULE_TARGET,
     POLICY_TARGET,
@@ -304,6 +305,13 @@ class ActorLauncherContractTest(unittest.TestCase):
                 renderer_sha256=renderer_sha,
                 beta_sha256=beta_sha,
                 config_sha256=config_sha,
+                actor_seed_contract=derive_actor_seed_contract(
+                    campaign_id="launcher-test",
+                    macro_round=0,
+                    cohort_index=0,
+                    expected_ranks=[0, 1],
+                    expected_global_env_ids=list(range(64)),
+                ),
             )
             endpoints = []
             for index in range(2):
