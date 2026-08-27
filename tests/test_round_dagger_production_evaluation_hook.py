@@ -234,7 +234,11 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                     / "configs/round_dagger/production_paired_thresholds.json"
                 ).read_text(encoding="utf-8")
             ),
-            DEFAULT_THRESHOLDS,
+            {
+                **DEFAULT_THRESHOLDS,
+                "allow_bounded_nonregression": False,
+                "minimum_paired_cases": 16,
+            },
         )
 
     def test_direct_execution_without_trusted_dispatch_fails_closed(self) -> None:
