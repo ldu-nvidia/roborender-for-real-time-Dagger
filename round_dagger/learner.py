@@ -46,11 +46,16 @@ from round_dagger.policy_bundle import (
     PolicyBundleError,
     validate_policy_bundle_identity,
 )
+from round_dagger.policy_identity import (
+    PolicyIdentityError,
+    runtime_policy_identity_sha256,
+    validate_homie_controller_sha256,
+)
 from round_dagger.replay import load_snapshot
 
 
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
-CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v2"
+CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v3"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -988,6 +993,16 @@ def _checkpoint_document(
 ) -> dict[str, Any]:
     policy = _unwrap_model(model)
     policy_state = policy.state_dict()
+    model_config = config.to_mapping()["model_config"]
+    raw_controller_sha256 = model_config.get("homie_controller_sha256")
+    try:
+        controller_sha256 = (
+            None
+            if raw_controller_sha256 is None
+            else validate_homie_controller_sha256(raw_controller_sha256)
+        )
+    except PolicyIdentityError as exc:
+        raise LearnerError(str(exc)) from exc
     return {
         "schema": CHECKPOINT_SCHEMA,
         # These two fields make the promoted payload directly consumable by
@@ -996,6 +1011,7 @@ def _checkpoint_document(
         "checkpoint_schema": "gr00t.trl.full_state.v2",
         "policy_state_dict": policy_state,
         "policy_parameter_names": sorted(name for name, _ in policy.named_parameters()),
+        "homie_controller_sha256": controller_sha256,
         "campaign_id": config.campaign_id,
         "macro_round": config.macro_round,
         "model_lineage_sha256": config.model_lineage_sha256,
@@ -1056,6 +1072,9 @@ def _load_restart(
         "replay_snapshot_sha256": snapshot["snapshot_sha256"],
         "replay_snapshot_file_sha256": snapshot["file_sha256"],
         "world_size": world_size,
+        "homie_controller_sha256": config.to_mapping()["model_config"].get(
+            "homie_controller_sha256"
+        ),
     }
     mismatches = [
         key for key, value in expected.items() if checkpoint.get(key) != value
@@ -1532,13 +1551,33 @@ def publish_learner_result(
             raise LearnerError(
                 "candidate checkpoint has no non-empty policy_state_dict"
             )
-        runtime_policy_sha = runtime_state_dict_sha256(policy_state)
+        policy_state_sha = runtime_state_dict_sha256(policy_state)
         policy_spec = config.to_mapping()["model_config"]
         policy_spec = validate_policy_spec(policy_spec)
+        controller_sha256 = validate_homie_controller_sha256(
+            policy_spec["homie_controller_sha256"]
+        )
+        checkpoint_controller_sha256 = validate_homie_controller_sha256(
+            checkpoint_document.get("homie_controller_sha256")
+        )
+        if checkpoint_controller_sha256 != controller_sha256:
+            raise LearnerError(
+                "candidate checkpoint Homie controllers differ from learner policy spec"
+            )
+        runtime_policy_sha = runtime_policy_identity_sha256(
+            policy_state_sha, controller_sha256
+        )
         policy_spec["checkpoint_sha256"] = checkpoint_sha
+        policy_spec["policy_state_sha256"] = policy_state_sha
         policy_spec["runtime_policy_sha256"] = runtime_policy_sha
         policy_spec = validate_policy_spec(policy_spec)
-    except (ActorExportError, GR00TPolicyError, KeyError, TypeError) as exc:
+    except (
+        ActorExportError,
+        GR00TPolicyError,
+        PolicyIdentityError,
+        KeyError,
+        TypeError,
+    ) as exc:
         raise LearnerError(f"cannot publish candidate policy sidecars: {exc}") from exc
 
     policy_spec_name = f"{checkpoint_name}.policy_spec.json"

@@ -16,6 +16,11 @@ import numpy as np
 
 from .artifacts import publish_rollout_shard
 from .actor_identity import actor_process_identity
+from .policy_identity import (
+    PolicyIdentityError,
+    runtime_policy_identity_sha256,
+    validate_homie_controller_sha256,
+)
 
 
 class ActorExportError(RuntimeError):
@@ -75,14 +80,22 @@ def runtime_state_dict_sha256(state: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
-def runtime_policy_sha256(module: Any) -> str:
-    """Content-address a loaded policy, independent of device placement."""
+def runtime_policy_sha256(
+    module: Any, *, homie_controller_sha256: Mapping[str, str]
+) -> str:
+    """Content-address every model that contributes to executed actor actions."""
 
     if hasattr(module, "module"):
         module = module.module
     if not hasattr(module, "state_dict"):
         raise ActorExportError("policy does not expose state_dict()")
-    return runtime_state_dict_sha256(module.state_dict())
+    try:
+        controllers = validate_homie_controller_sha256(homie_controller_sha256)
+        return runtime_policy_identity_sha256(
+            runtime_state_dict_sha256(module.state_dict()), controllers
+        )
+    except PolicyIdentityError as exc:
+        raise ActorExportError(str(exc)) from exc
 
 
 def denormalize_policy_rgb(
@@ -231,7 +244,17 @@ def export_trainer_rollout(
 ) -> list[dict[str, Any]]:
     """Publish all parts for one rank after proving the actor stayed frozen."""
 
-    final_runtime_sha = runtime_policy_sha256(policy_module)
+    try:
+        homie_controller_sha256 = validate_homie_controller_sha256(
+            trainer.homie_controller_sha256
+        )
+    except (AttributeError, PolicyIdentityError) as exc:
+        raise ActorExportError(
+            "trainer lacks exact Homie walk/stand controller identities"
+        ) from exc
+    final_runtime_sha = runtime_policy_sha256(
+        policy_module, homie_controller_sha256=homie_controller_sha256
+    )
     if final_runtime_sha != initial_runtime_policy_sha256:
         raise ActorExportError(
             "frozen actor policy changed during collection: "

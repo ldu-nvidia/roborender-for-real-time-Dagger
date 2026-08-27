@@ -27,7 +27,7 @@ EVALUATION_CONFIG_SHA = (
 # Independently cross-checked against prepare_gr00t_learner_bundle.prepare_bundle
 # in the Torch-enabled learner environment for this deterministic fixture.
 EXPECTED_DERIVED_BUNDLE_SHA = (
-    "8ea3904e0b49d9123ec1259f3fbf1fec4acd21dba61032eb23a07e4de34a6dc3"
+    "6a46f66ea9ec1e8f9a936b35389631f14717ebd4406020eac25be80331144320"
 )
 
 
@@ -97,6 +97,7 @@ class ProductionLaunchTests(unittest.TestCase):
             "inventory_sha256": SOURCE_SHA,
             "fast_roborender_revision": "1" * 40,
             "gr00t_revision": "2" * 40,
+            "gr00t_source_tree_sha256": "4" * 64,
         }
         local = {
             "schema": production_launch.SEALED_REPORT_SCHEMA,
@@ -275,6 +276,53 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(learner["cluster"]["partition"], "batch_singlenode")
         self.assertEqual(learner["cluster"]["qos"], "normal")
 
+    def test_camera_acceptance_is_bound_to_both_nested_source_trees(self) -> None:
+        acceptance = self.base / "camera-acceptance.json"
+        accepted_revision = "1" * 40
+        accepted_tree = "2" * 64
+        acceptance.write_text(
+            json.dumps(
+                {
+                    "gr00t_revision": accepted_revision,
+                    "gr00t_source_tree_sha256": accepted_tree,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        campaign = {
+            "artifacts": {
+                "camera_acceptance": {
+                    "path": str(acceptance),
+                    "sha256": artifacts.sha256_file(acceptance),
+                }
+            }
+        }
+        report = {
+            "gr00t_revision": accepted_revision,
+            "gr00t_source_tree_sha256": accepted_tree,
+        }
+        production_launch._verify_camera_acceptance_source_bindings(
+            campaign,
+            learner_source_report=report,
+            evaluation_source_report=report,
+        )
+
+        for label, field, value in (
+            ("revision", "gr00t_revision", "3" * 40),
+            ("tree", "gr00t_source_tree_sha256", "4" * 64),
+        ):
+            with self.subTest(label=label):
+                changed = dict(report)
+                changed[field] = value
+                with self.assertRaises(production_launch.ProductionLaunchError):
+                    production_launch._verify_camera_acceptance_source_bindings(
+                        campaign,
+                        learner_source_report=changed,
+                        evaluation_source_report=report,
+                    )
+
     def test_build_environment_forces_legacy_runtime_adapter(self) -> None:
         # Read the checked-in documents directly so this unit gate remains
         # runnable from a clean isolated worktree whose absolute path differs
@@ -320,6 +368,7 @@ class ProductionLaunchTests(unittest.TestCase):
             "inventory_sha256": SOURCE_SHA,
             "fast_roborender_revision": "1" * 40,
             "gr00t_revision": "2" * 40,
+            "gr00t_source_tree_sha256": "4" * 64,
         }
         local_report = {
             "schema": "fast_roborender.round_dagger.local_source_checkout.v1",
@@ -355,6 +404,10 @@ class ProductionLaunchTests(unittest.TestCase):
                 production_launch,
                 "_verify_local_source_checkout",
                 return_value=local_report,
+            ),
+            mock.patch.object(
+                production_launch,
+                "_verify_camera_acceptance_source_bindings",
             ),
         ):
             environment, plan = production_launch.validate_launch(
@@ -416,6 +469,9 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertEqual(environment["ROUND_DAGGER_GR00T_REVISION"], "2" * 40)
         self.assertEqual(
+            environment["ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256"], "4" * 64
+        )
+        self.assertEqual(
             environment["ROUND_DAGGER_CONTROL_PYTHON"],
             "/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python",
         )
@@ -459,6 +515,29 @@ class ProductionLaunchTests(unittest.TestCase):
                 deployment_sha,
                 SOURCE_SHA,
                 ROOT,
+            )
+
+    def test_active_policy_spec_identity_cannot_be_rewritten_during_preflight(
+        self,
+    ) -> None:
+        root, _ = self._campaign_and_orchestration()
+        active = load_state(root)["active_policy"]
+        checkpoint = root / active["checkpoint_path"]
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "active base policy spec/runtime identity",
+        ):
+            production_launch.derive_learner_bundle_sha256(
+                base_policy_spec=Path(f"{checkpoint}.policy_spec.json"),
+                parent_checkpoint=checkpoint,
+                expected_parent_checkpoint_sha256=active["checkpoint_sha256"],
+                runtime_policy_sha256="f" * 64,
+                campaign_id="roborender-dagger-256x300-v1",
+                macro_round=0,
+                code_sha256=SOURCE_SHA,
+                learner_contract=production_launch.load_learner_contract(
+                    LEARNER_CONTRACT
+                ),
             )
 
     def test_wrong_sealed_source_identity_fails_before_orchestration(self) -> None:

@@ -1064,10 +1064,10 @@ index 1cd6d89eb1c7d1d04dffab82b5cfa3b67faa1866..cca310d059964ed82b646be2228d19be
  
  if __name__ == "__main__":
 diff --git a/gr00t/rl/trl/callbacks/model_save_callback.py b/gr00t/rl/trl/callbacks/model_save_callback.py
-index 0b62522188cc2d4010f938fce0befee213437804..17b5f0840b7e6a1a29df15e26bdc63e9315c404b 100644
+index 0b62522188cc2d4010f938fce0befee213437804..60c3abc2e604eeda056c89c48f768d01659877e6 100644
 --- a/gr00t/rl/trl/callbacks/model_save_callback.py
 +++ b/gr00t/rl/trl/callbacks/model_save_callback.py
-@@ -6,6 +6,7 @@ import copy
+@@ -6,25 +6,89 @@ import copy
  import os
  import subprocess
  import sys
@@ -1075,7 +1075,13 @@ index 0b62522188cc2d4010f938fce0befee213437804..17b5f0840b7e6a1a29df15e26bdc63e9
  from pathlib import Path
  
  import torch
-@@ -15,16 +16,75 @@ from transformers import TrainerCallback
+ from transformers import TrainerCallback
+ 
++from gr00t.rl.utils.homie_controller_identity import (
++    validate_homie_controller_sha256,
++)
++
+ 
  class ModelSaveCallback(TrainerCallback):
      """Callback to save model state_dict during training."""
  
@@ -1152,7 +1158,7 @@ index 0b62522188cc2d4010f938fce0befee213437804..17b5f0840b7e6a1a29df15e26bdc63e9
      def on_step_end(self, args, state, control, **kwargs):
          """Save model state_dict at the end of each step if frequency matches."""
          model = kwargs.get("model")
-@@ -61,6 +121,29 @@ class ModelSaveCallback(TrainerCallback):
+@@ -61,6 +125,29 @@ class ModelSaveCallback(TrainerCallback):
              )
              # self.export_policy_to_onnx(env, state, model)
  
@@ -1182,7 +1188,7 @@ index 0b62522188cc2d4010f938fce0befee213437804..17b5f0840b7e6a1a29df15e26bdc63e9
      def get_example_obs(self, env):
          obs_dict = copy.deepcopy(env.obs_buf_dict)
          for obs_key in obs_dict.keys():
-@@ -96,7 +179,14 @@ class ModelSaveCallback(TrainerCallback):
+@@ -96,7 +183,14 @@ class ModelSaveCallback(TrainerCallback):
              _state = copy.deepcopy(state)
              _state.__dict__.pop("log_history")
              checkpoint = {
@@ -1197,7 +1203,18 @@ index 0b62522188cc2d4010f938fce0befee213437804..17b5f0840b7e6a1a29df15e26bdc63e9
                  "value_state_dict": (
                      model.value_model.state_dict() if model.value_model is not None else None
                  ),  # Value model is not always preset (e.g. for distillation)
-@@ -111,12 +201,31 @@ class ModelSaveCallback(TrainerCallback):
+@@ -108,15 +202,42 @@ class ModelSaveCallback(TrainerCallback):
+                 "args": args,
+                 "env_state_dict": env_state_dict,
+             }
++            if hasattr(model, "homie_walk_model") or hasattr(
++                model, "homie_stand_model"
++            ):
++                checkpoint["homie_controller_sha256"] = (
++                    validate_homie_controller_sha256(
++                        getattr(model, "homie_controller_sha256", None)
++                    )
++                )
              if hasattr(model, "homie_model") and model.homie_model is not None:
                  checkpoint["homie_state_dict"] = model.homie_model.state_dict()
              for attempt in range(5):
@@ -1649,7 +1666,7 @@ index 12af3dca1fe6cb4bb863e7cf6a19c5afd0c35703..4af6b191de070c39c0b0e20c5c57c69d
              self.ref_model.load_state_dict(loaded_dict["actor_model_state_dict"])
          elif "policy_state_dict" in loaded_dict:
 diff --git a/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py b/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
-index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad293122e9c9 100644
+index 0ae54f45c9fc83f08cde50e0798e425c42afe168..546f5e8cc8bec1a23b670229adb913a78ce409c7 100644
 --- a/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
 +++ b/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py
 @@ -3,6 +3,8 @@
@@ -1661,7 +1678,166 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
  import os
  import time
  from copy import deepcopy
-@@ -591,6 +593,13 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+@@ -29,6 +31,10 @@ from gr00t.rl.trl.trainer.distill_trainer_obj_pred import (
+     TRLDistillTrainerObjPred,
+ )
+ from gr00t.rl.trl.utils.rl import compute_episode_attnmask
++from gr00t.rl.utils.homie_controller_identity import (
++    load_homie_controller_checkpoint,
++    validate_homie_controller_sha256,
++)
+ 
+ console = Console()
+ 
+@@ -185,6 +191,61 @@ def load_onnx_policy(path, device):
+     return run_inference
+ 
+ 
++def _finalize_paired_episode_evidence(
++    paired_evidence,
++    fixed_seed_episode_records,
++    paired_safety_by_env,
++    *,
++    num_envs,
++):
++    """Bind paired outcomes to the scenarios observed by this evaluator run."""
++
++    for env_id in range(num_envs):
++        if env_id not in paired_safety_by_env:
++            raise RuntimeError(
++                "paired evaluation is missing a safety outcome for "
++                f"environment {env_id}"
++            )
++        record = fixed_seed_episode_records[env_id]
++        paired_evidence.record_episode_outcome(
++            env_id,
++            scenario_id=record["scenario_id"],
++            success=bool(record["success"]),
++            safety_violation=paired_safety_by_env[env_id],
++            episode_length=int(record["episode_length"]),
++        )
++    return paired_evidence.finalize()
++
++
++def _required_paired_safety_violation(infos, env_id):
++    """Read the simulator's explicit boolean safety outcome for one episode.
++
++    Task failure and safety failure are different events.  In particular, an
++    unsuccessful non-timeout reset can represent an ordinary task reset, so it
++    must never be promoted into safety evidence by inference.
++    """
++
++    try:
++        safety_signal = infos.get("safety_violation")
++    except AttributeError as exc:
++        raise RuntimeError(
++            "paired evaluation requires infos.safety_violation"
++        ) from exc
++    if safety_signal is None:
++        raise RuntimeError("paired evaluation requires infos.safety_violation")
++    try:
++        value = safety_signal.reshape(-1)[env_id].item()
++    except (AttributeError, IndexError, TypeError, ValueError) as exc:
++        raise RuntimeError(
++            "paired evaluation safety_violation signal is malformed"
++        ) from exc
++    if type(value) is not bool:
++        raise RuntimeError(
++            "paired evaluation safety_violation signal must be boolean"
++        )
++    return value
++
++
+ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+     """
+     Combined Distillation trainer with object position prediction capability and Homie API integration.
+@@ -243,15 +304,27 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+             if self.accelerator
+             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+         )
+-        homie_walk_state_dict = torch.load(self.config.homie_walk_model_path, map_location=device)
++        homie_walk_state_dict, homie_walk_sha256 = load_homie_controller_checkpoint(
++            torch,
++            self.config.homie_walk_model_path,
++            map_location=device,
++        )
+         homie_walk_model = HIMActorCritic(**init_actor_critic_dict)
+         homie_walk_model.load_state_dict(homie_walk_state_dict["model_state_dict"])
+         self.homie_walk_model = HomieActorModule(homie_walk_model).to(device)
+ 
+-        homie_stand_state_dict = torch.load(self.config.homie_stand_model_path, map_location=device)
++        homie_stand_state_dict, homie_stand_sha256 = load_homie_controller_checkpoint(
++            torch,
++            self.config.homie_stand_model_path,
++            map_location=device,
++        )
+         homie_stand_model = HIMActorCritic(**init_actor_critic_dict)
+         homie_stand_model.load_state_dict(homie_stand_state_dict["model_state_dict"])
+         self.homie_stand_model = HomieActorModule(homie_stand_model).to(device)
++        self.homie_controller_sha256 = {
++            "walk": homie_walk_sha256,
++            "stand": homie_stand_sha256,
++        }
+ 
+         # Disable dropout in homie models
+         if self.config.get("disable_dropout", True):
+@@ -281,6 +354,7 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+             self.homie_stand_model,
+             self.ref_model,
+         )
++        self.model.homie_controller_sha256 = dict(self.homie_controller_sha256)
+         self.model.opt_homie = self.config.get("opt_homie", False)
+         self.model.homie_switch_threshold = self.config.get("homie_switch_threshold", 0.5)
+ 
+@@ -311,6 +385,47 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+         super()._init_config()
+         self.num_act = self.policy_model.num_actions + self.homie_walk_model.num_actions
+ 
++    def _complete_runtime_policy_sha256(self, policy_module):
++        from round_dagger.actor import runtime_policy_sha256
++
++        return runtime_policy_sha256(
++            policy_module,
++            homie_controller_sha256=self.homie_controller_sha256,
++        )
++
++    def load_checkpoint(self, checkpoint_path):
++        """Load policy state only when it binds the actual Homie controller bytes."""
++
++        checkpoint = super().load_checkpoint(checkpoint_path)
++        checkpoint_controller_sha256 = validate_homie_controller_sha256(
++            checkpoint.get("homie_controller_sha256")
++        )
++        if checkpoint_controller_sha256 != self.homie_controller_sha256:
++            raise RuntimeError(
++                "checkpoint Homie controllers differ from loaded controller bytes"
++            )
++
++        expected_runtime_values = {
++            value
++            for value in (
++                os.environ.get("ROUND_DAGGER_RUNTIME_POLICY_SHA256"),
++                os.environ.get("IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256"),
++            )
++            if value is not None
++        }
++        if len(expected_runtime_values) > 1:
++            raise RuntimeError("runtime policy identity gates disagree")
++        if expected_runtime_values:
++            model = self.accelerator.unwrap_model(self.model)
++            actual_runtime_sha256 = self._complete_runtime_policy_sha256(
++                model.policy
++            )
++            if actual_runtime_sha256 != next(iter(expected_runtime_values)):
++                raise RuntimeError(
++                    "loaded policy or Homie controllers differ from runtime identity"
++                )
++        return checkpoint
++
+     def policy_step(self, policy_model, obs_dict, cur_dones=None):
+         policy_state_dict = {}
+ 
+@@ -591,6 +706,13 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
          self._eval_mode()
          self.policy_model.eval_mode()
          self.policy_model.init_rollout()
@@ -1675,7 +1851,7 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
          obs_dict = self.env.reset_all()
          if self.config.get("init_at_random_ep_len", False):
              self.env.episode_length_buf = torch.randint_like(
-@@ -650,6 +659,7 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+@@ -650,6 +772,7 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
              self.env_episode_completed = torch.zeros(
                  self.env.num_envs, dtype=torch.bool, device=device
              )
@@ -1683,7 +1859,7 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
  
          if self.config.eval.save_videos:
              self.saved_episode_cnt = 0
-@@ -772,6 +782,74 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+@@ -772,6 +895,55 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
                              valid_new_ids = new_ids
  
                          if len(valid_new_ids) > 0:
@@ -1718,30 +1894,11 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
 +                                    ):
 +                                        object_class = str(object_classes[env_id])
 +                                    if paired_evidence is not None:
-+                                        safety_signal = infos.get("safety_violation")
-+                                        if safety_signal is not None:
-+                                            safety_violation = bool(
-+                                                safety_signal.reshape(-1)[env_id].item()
++                                        safety_violation = (
++                                            _required_paired_safety_violation(
++                                                infos, env_id
 +                                            )
-+                                        else:
-+                                            time_outs = infos.get("time_outs")
-+                                            if time_outs is None:
-+                                                raise RuntimeError(
-+                                                    "paired evaluation requires an explicit "
-+                                                    "safety_violation or time_outs signal"
-+                                                )
-+                                            # Conservative fallback for the current Isaac
-+                                            # task: an unsuccessful terminal reset that is
-+                                            # not the horizon timeout is unsafe.  Successful
-+                                            # task completion is also a non-timeout reset,
-+                                            # so ``not timeout`` alone would incorrectly mark
-+                                            # every successful episode as a safety failure.
-+                                            safety_violation = (
-+                                                not bool(
-+                                                    time_outs.reshape(-1)[env_id].item()
-+                                                )
-+                                                and not success
-+                                            )
++                                        )
 +                                        paired_safety_by_env[env_id] = safety_violation
 +                                    fixed_seed_episode_records[env_id] = {
 +                                        "env_index": int(env_id),
@@ -1758,7 +1915,7 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
                              if self.config.eval.save_videos:
                                  self.batch_reset_data_writer(valid_new_ids, save_dirpath)
  
-@@ -811,6 +889,69 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+@@ -811,6 +983,62 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
          eval_dict = self.env.get_eval_metrics_summary()
          eval_dict["eval_time"] = end_time - start_time
  
@@ -1809,26 +1966,19 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
 +            eval_dict["_roborender_fixed_seed_episodes"] = records
 +
 +            if paired_evidence is not None:
-+                for env_id in range(self.env.num_envs):
-+                    if env_id not in paired_safety_by_env:
-+                        raise RuntimeError(
-+                            "paired evaluation is missing a safety outcome for "
-+                            f"environment {env_id}"
-+                        )
-+                    record = fixed_seed_episode_records[env_id]
-+                    paired_evidence.record_episode_outcome(
-+                        env_id,
-+                        scenario_id=paired_evidence.scenario_id_for_env(env_id),
-+                        success=bool(record["success"]),
-+                        safety_violation=paired_safety_by_env[env_id],
-+                        episode_length=int(record["episode_length"]),
++                eval_dict.update(
++                    _finalize_paired_episode_evidence(
++                        paired_evidence,
++                        fixed_seed_episode_records,
++                        paired_safety_by_env,
++                        num_envs=self.env.num_envs,
 +                    )
-+                eval_dict.update(paired_evidence.finalize())
++                )
 +
          print(f"Eval time: {end_time - start_time} seconds")
          print(f"Collected {eval_dict['collected_episodes']} episodes")
          print(f"Average goal reached rate: {eval_dict['goal_reached_rate']:.3f}")
-@@ -821,8 +962,6 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+@@ -821,8 +1049,6 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
          print(f"Average finger DOF velocity: {eval_dict['eval_finger_dof_vel']:.3f}")
  
          # save eval_dict to a file
@@ -1837,7 +1987,7 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
          eval_output_dir = getattr(self.args, "eval_output_dir", self.args.output_dir)
          if not os.path.exists(eval_output_dir):
              os.makedirs(eval_output_dir, exist_ok=True)
-@@ -847,4 +986,6 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
+@@ -847,4 +1073,6 @@ class TRLDistillTrainerObjPredHomieAPI(TRLDistillTrainerObjPred):
          self.cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float32, device=device)
          self.cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.int32, device=device)
  
@@ -1846,7 +1996,7 @@ index 0ae54f45c9fc83f08cde50e0798e425c42afe168..04d6abc0ed2eb177ba3420f4f7a6ad29
 +        # evaluator adapter persist provenance without source-specific scraping.
 +        return eval_dict
 diff --git a/gr00t/rl/trl/trainer/distill_trainer_videogen.py b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
-index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9abeb2b7d14 100644
+index 8db4235076c345ba807b7d91f56d4338499fe2a6..3959f9b93ee056adaa2ec9d780880cf4c81e564c 100644
 --- a/gr00t/rl/trl/trainer/distill_trainer_videogen.py
 +++ b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
 @@ -27,9 +27,15 @@ video needs no upscaling; falls back to the ego camera's depth otherwise.
@@ -1865,7 +2015,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
  
  import numpy as np
  import torch
-@@ -38,10 +44,476 @@ import torch.nn.functional as F
+@@ -38,10 +44,537 @@ import torch.nn.functional as F
  from gr00t.rl.trl.trainer.distill_trainer_obj_pred_homie_api import (
      TRLDistillTrainerObjPredHomieAPI,
  )
@@ -2158,6 +2308,67 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +    raise RuntimeError(f"{name} must be a boolean value")
 +
 +
++def _parse_finite_gate_number(raw, name):
++    """Parse one production-gate number and reject ambiguous/non-finite input."""
++    if isinstance(raw, (bool, np.bool_)):
++        raise RuntimeError(
++            f"production gate failed: {name} must be a finite number"
++        )
++    try:
++        value = float(raw)
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise RuntimeError(
++            f"production gate failed: {name} must be a finite number"
++        ) from exc
++    if not math.isfinite(value):
++        raise RuntimeError(
++            f"production gate failed: {name} must be a finite number"
++        )
++    return value
++
++
++def _require_finite_gate_match(configured, expected, name, tolerance):
++    """Fail unless two finite production values match within a fixed tolerance."""
++    configured_value = _parse_finite_gate_number(
++        configured, f"configured {name}"
++    )
++    expected_value = _parse_finite_gate_number(expected, f"expected {name}")
++    tolerance_value = _parse_finite_gate_number(
++        tolerance, f"{name} comparison tolerance"
++    )
++    if tolerance_value < 0.0:
++        raise RuntimeError(
++            f"production gate failed: {name} comparison tolerance must be "
++            "non-negative"
++        )
++    if abs(configured_value - expected_value) > tolerance_value:
++        raise RuntimeError(f"production gate failed: {name} mismatch")
++    return configured_value
++
++
++def _require_production_homie_runtime(opt_homie, homie_switch_threshold):
++    """Pin Homie execution settings that are outside policy byte identity."""
++    if opt_homie is None:
++        raise RuntimeError(
++            "production gate failed: algo.config.opt_homie must be explicitly false"
++        )
++    if _parse_boolean_gate(opt_homie, "algo.config.opt_homie"):
++        raise RuntimeError(
++            "production gate failed: algo.config.opt_homie must be false"
++        )
++    if homie_switch_threshold is None:
++        raise RuntimeError(
++            "production gate failed: algo.config.homie_switch_threshold "
++            "must be explicitly 0.5"
++        )
++    return _require_finite_gate_match(
++        homie_switch_threshold,
++        0.5,
++        "Homie switch threshold",
++        0.0,
++    )
++
++
 +def _install_relabelled_vision_obs(obs_dict, relabelled_obs_dict):
 +    """Install the policy image in-place so rollout storage sees it too.
 +
@@ -2342,7 +2553,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
  
  
  class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
-@@ -50,9 +522,40 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -50,9 +583,40 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
      def _init_trl(self, *args, **kwargs):
          super()._init_trl(*args, **kwargs)
  
@@ -2384,7 +2595,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
          self.vg_enabled = bool(vg.get("enable", True))
          self.vg_prompt = vg.get("prompt", "A humanoid robot manipulating objects on a table.")
          self.vg_seed = int(vg.get("seed", 42))
-@@ -131,28 +634,142 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -131,28 +695,179 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
                      cfg_steps, VIDEO_MODEL_CHUNK,
                  )
  
@@ -2430,6 +2641,11 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +                os.environ.get("RUN_PROFILE") == "production_256x300"
 +                or os.environ.get("IMAGE_DAGGER_PAIRED_EVAL") == "1"
 +            )
++            if _production_anchor_consumer:
++                _require_production_homie_runtime(
++                    self.config.get("opt_homie"),
++                    self.config.get("homie_switch_threshold"),
++                )
 +            _expected_anchor_inventory = os.environ.get(
 +                "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256"
 +            )
@@ -2505,31 +2721,63 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +            if _gate_beta_schedule is not None and str(getattr(self, 'vg_beta_schedule', None)) != _gate_beta_schedule:
 +                raise RuntimeError('production gate failed: beta schedule mismatch')
 +            _gate_beta_start = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_START')
-+            if _gate_beta_start is not None and abs(float(getattr(self, 'vg_beta_start', -1.0)) - float(_gate_beta_start)) > 1e-9:
-+                raise RuntimeError('production gate failed: beta start mismatch')
++            if _gate_beta_start is not None:
++                _require_finite_gate_match(
++                    getattr(self, 'vg_beta_start', None),
++                    _gate_beta_start,
++                    'beta start',
++                    1e-9,
++                )
 +            _gate_beta_end = os.environ.get('IMAGE_DAGGER_EXPECT_BETA_END')
-+            if _gate_beta_end is not None and abs(float(getattr(self, 'vg_beta_end', -1.0)) - float(_gate_beta_end)) > 1e-9:
-+                raise RuntimeError('production gate failed: beta end mismatch')
++            if _gate_beta_end is not None:
++                _require_finite_gate_match(
++                    getattr(self, 'vg_beta_end', None),
++                    _gate_beta_end,
++                    'beta end',
++                    1e-9,
++                )
 +            _gate_warmup = os.environ.get('IMAGE_DAGGER_EXPECT_TEACHER_WARMUP_STEPS')
 +            if _gate_warmup is not None and int(self.config.get('rollout_with_teacher_num_steps', -1)) != int(_gate_warmup):
 +                raise RuntimeError('production gate failed: teacher warmup mismatch')
 +            _gate_enforce = os.environ.get('IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER')
 +            if _gate_enforce is not None:
-+                _gate_enforce_bool = _gate_enforce.lower() == 'true'
-+                if bool(self.config.get('enforce_teacher_rollout', False)) != _gate_enforce_bool:
++                _gate_enforce_bool = _parse_boolean_gate(
++                    _gate_enforce,
++                    'IMAGE_DAGGER_EXPECT_ENFORCE_TEACHER',
++                )
++                _configured_enforce_bool = _parse_boolean_gate(
++                    self.config.get('enforce_teacher_rollout', False),
++                    'algo.config.enforce_teacher_rollout',
++                )
++                if _configured_enforce_bool != _gate_enforce_bool:
 +                    raise RuntimeError('production gate failed: behavior source mismatch')
 +            _gate_ratio = os.environ.get('IMAGE_DAGGER_EXPECT_TEACHER_RATIO')
-+            if _gate_ratio is not None and abs(float(self.config.get('ratio_teacher_rollout', -1.0)) - float(_gate_ratio)) > 1e-9:
-+                raise RuntimeError('production gate failed: teacher ratio mismatch')
++            if _gate_ratio is not None:
++                _require_finite_gate_match(
++                    self.config.get('ratio_teacher_rollout'),
++                    _gate_ratio,
++                    'teacher ratio',
++                    1e-9,
++                )
 +            _gate_epochs = os.environ.get('IMAGE_DAGGER_EXPECT_LEARNING_EPOCHS')
 +            if _gate_epochs is not None and int(self.config.get('num_learning_epochs', -1)) != int(_gate_epochs):
 +                raise RuntimeError('production gate failed: learning epochs mismatch')
 +            _gate_value_loss = os.environ.get('IMAGE_DAGGER_EXPECT_VALUE_LOSS_COEF')
-+            if _gate_value_loss is not None and abs(float(self.config.get('value_loss_coef', -1.0)) - float(_gate_value_loss)) > 1e-12:
-+                raise RuntimeError('production gate failed: value loss coefficient mismatch')
++            if _gate_value_loss is not None:
++                _require_finite_gate_match(
++                    self.config.get('value_loss_coef'),
++                    _gate_value_loss,
++                    'value loss coefficient',
++                    1e-12,
++                )
 +            _gate_entropy = os.environ.get('IMAGE_DAGGER_EXPECT_ENTROPY_COEF')
-+            if _gate_entropy is not None and abs(float(self.config.get('entropy_coef', -1.0)) - float(_gate_entropy)) > 1e-12:
-+                raise RuntimeError('production gate failed: entropy coefficient mismatch')
++            if _gate_entropy is not None:
++                _require_finite_gate_match(
++                    self.config.get('entropy_coef'),
++                    _gate_entropy,
++                    'entropy coefficient',
++                    1e-12,
++                )
 +            # FAST_ROBORENDER_DAGGER_TELEMETRY_V1
 +            from gr00t.rl.utils.dagger_telemetry import DaggerTelemetry
 +            self._id_telemetry_step = 0
@@ -2537,7 +2785,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
          if self.vg_mode == "collect":
              assert self.vg_collect_dir, "videogen.collect_dir required in collect mode"
              os.makedirs(self.vg_collect_dir, exist_ok=True)
-@@ -192,6 +809,526 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -192,6 +907,526 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
          # earlier chunks, and so the renderer can group same-env sequences.
          self._vg_run_tag = os.environ.get("SLURM_JOB_ID", "local")
  
@@ -3064,7 +3312,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
      # ------------------------------------------------------------------ rollout
      def _get_depth_frame(self) -> torch.Tensor:
          hi = None
-@@ -200,12 +1337,90 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -200,12 +1435,90 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
          depth = hi if hi is not None else self.env.simulator.get_depth_image()
          return depth[..., :1].detach().to("cpu", torch.float32)
  
@@ -3095,8 +3343,6 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +        # Binding the actual parameter digest here prevents a staged checkpoint
 +        # from being mislabeled with an expected contract identity.
 +        from gr00t.rl.utils.round_dagger_paired_eval import PairedEvaluationEvidence
-+        from round_dagger.actor import runtime_policy_sha256
-+
 +        model = (
 +            self.accelerator.unwrap_model(self.model)
 +            if getattr(self, "accelerator", None) is not None
@@ -3106,7 +3352,9 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +        self._paired_eval_evidence = PairedEvaluationEvidence.from_environment(
 +            num_envs=int(self.env.num_envs),
 +            generation_seed=int(self.vg_seed),
-+            actual_runtime_policy_sha256=runtime_policy_sha256(model.policy),
++            actual_runtime_policy_sha256=self._complete_runtime_policy_sha256(
++                model.policy
++            ),
 +            policy_views=self._policy_views,
 +            view_layout=str(
 +                getattr(camera_config, "policy_view_layout", "vertical")
@@ -3158,7 +3406,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
  
          if self._in_train_rollout and self.vg_enabled:
              if (
-@@ -219,15 +1434,22 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -219,15 +1532,22 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
                  obs_dict = dict(obs_dict)
                  obs_dict["vision_obs"] = stale.reshape(cur.shape)
  
@@ -3190,7 +3438,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
              # Multi-view conditioning (e.g. head + both wrists for the
              # native3view student): capture every configured view.
              if self.vg_mode == "collect" and hasattr(self.env.simulator, "get_conditioning_views"):
-@@ -246,18 +1468,67 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -246,18 +1566,67 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
                          }
                      self._views_chunk.append(step_views)
  
@@ -3258,7 +3506,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
              elif beta > 0.0:
                  # Per-decision Bernoulli mixture, as in Ross et al.: each env independently
                  # follows the teacher this step with probability beta.
-@@ -268,10 +1539,137 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -268,10 +1637,137 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
                      take_teacher.view(-1, *([1] * (acts.dim() - 1))), gt, acts)
                  policy_state_dict = dict(policy_state_dict)
                  policy_state_dict["actions"] = mixed
@@ -3397,7 +3645,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
      def _dagger_beta(self) -> float:
          """Teacher fraction for the current rollout iteration."""
          src = self.vg_rollout_action_source
-@@ -299,8 +1697,38 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -299,8 +1795,38 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
                  f"(iter {self._beta_iter}, schedule {self.vg_beta_schedule})")
  
      def _id_sample_anchor(self, env_i: int):
@@ -3438,7 +3686,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
              frames = list(z["frames"]) if "frames" in z.files else None
              gi = frames.index(self.vg_anchor_index) if frames else self.vg_anchor_index
              anchor = {v: z[f"gen__{v}"][gi].copy() for v in self.vg_view_names}
-@@ -330,14 +1758,22 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -330,14 +1856,22 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
          if self._id_anchors is None:
              self._id_anchors = [None] * B
              self._id_prompts = [None] * B
@@ -3462,7 +3710,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
          cam_h, cam_w = int(self.camera_resolution[0]), int(self.camera_resolution[1])
          t0 = time.perf_counter()
          vision = obs_dict["vision_obs"]
-@@ -346,27 +1782,75 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -346,27 +1880,75 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
              from gr00t.rl.utils.image3f_frame_client import Image3FFrameClient
              nf = len(self._id_endpoint_files)
              self._id_env_clients = [
@@ -3543,7 +3791,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
              reqs[b] = (depth_d, mask_d, prev_d)
  
          from concurrent.futures import ThreadPoolExecutor
-@@ -374,15 +1858,136 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -374,15 +1956,136 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
          def _render(b):
              depth_d, mask_d, prev_d = reqs[b]
              return self._id_env_clients[b].render_frame(
@@ -3683,7 +3931,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
          for b in gen_envs:
              gen = gens[b]
              # Match the policy's observation layout: with several policy views the three
-@@ -392,13 +1997,47 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -392,13 +2095,47 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
                  rgb = np.concatenate([gen[v] for v in self._policy_views], axis=0)
              else:
                  rgb = gen[self._policy_views[0]]  # 240x416x3 u8
@@ -3735,7 +3983,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
                  _PILImage.fromarray(panel).save(
                      os.path.join(dump_dir, f"step{step_i:03d}_env{b}.png"))
              rgb_t = torch.from_numpy(rgb.copy()).float() / 255.0
-@@ -417,6 +2056,322 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -417,6 +2154,342 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
          out["vision_obs"] = new_vision.reshape(vision.shape)
          return out
  
@@ -3753,7 +4001,10 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +        if not self.vg_enabled:
 +            raise RuntimeError("round_actor requires videogen.enable=true")
 +
-+        from round_dagger.actor import export_trainer_rollout, runtime_policy_sha256
++        from round_dagger.actor import (
++            export_trainer_rollout,
++            runtime_state_dict_sha256,
++        )
 +
 +        model = self.accelerator.unwrap_model(self.model)
 +        policy_module = model.policy
@@ -3827,7 +4078,12 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +                        raise RuntimeError(
 +                            "initialize-only policy export requires explicit RGB normalization"
 +                        )
-+                    runtime_sha256 = runtime_policy_sha256(policy_module)
++                    policy_state_sha256 = runtime_state_dict_sha256(
++                        policy_module.state_dict()
++                    )
++                    runtime_sha256 = self._complete_runtime_policy_sha256(
++                        policy_module
++                    )
 +                    policy_spec = build_portable_policy_spec(
 +                        policy=policy_module,
 +                        actor_config=self.config.actor,
@@ -3844,7 +4100,8 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +                        homie_action_dim=int(self.homie_walk_model.num_actions),
 +                        replay_action_dim=int(self.num_act),
 +                        checkpoint_sha256=checkpoint_sha256,
-+                        runtime_policy_sha256=runtime_sha256,
++                        policy_state_sha256=policy_state_sha256,
++                        homie_controller_sha256=self.homie_controller_sha256,
 +                    )
 +                    publish_immutable_json(staged_spec, policy_spec)
 +                    bootstrap_manifest = {
@@ -3908,20 +4165,31 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
 +            raise RuntimeError("round_actor requires rollout_action_source=beta")
 +        if self.vg_beta_schedule != "constant":
 +            raise RuntimeError("round_actor beta must be constant within a macro-round")
-+        if abs(self.vg_beta_start - self.vg_beta_end) > 1e-12:
-+            raise RuntimeError("round_actor beta_start and beta_end must be identical")
++        _require_finite_gate_match(
++            self.vg_beta_start,
++            self.vg_beta_end,
++            "round_actor beta_start and beta_end",
++            1e-12,
++        )
 +        if int(self.config.get("rollout_with_teacher_num_steps", 0)) != 0:
 +            raise RuntimeError("round_actor forbids the legacy teacher warmup override")
-+        if bool(self.config.get("enforce_teacher_rollout", False)):
++        if _parse_boolean_gate(
++            self.config.get("enforce_teacher_rollout", False),
++            "algo.config.enforce_teacher_rollout",
++        ):
 +            raise RuntimeError("round_actor forbids the legacy teacher-rollout override")
 +        expected_beta = os.environ.get("ROUND_DAGGER_BETA")
 +        if expected_beta is None:
 +            raise RuntimeError("ROUND_DAGGER_BETA is required for round_actor")
-+        if abs(float(expected_beta) - self.vg_beta_start) > 1e-12:
-+            raise RuntimeError("round_actor configuration does not match frozen round beta")
++        _require_finite_gate_match(
++            self.vg_beta_start,
++            expected_beta,
++            "frozen round beta",
++            1e-12,
++        )
 +
 +        device = self.accelerator.device
-+        initial_runtime_sha = runtime_policy_sha256(policy_module)
++        initial_runtime_sha = self._complete_runtime_policy_sha256(policy_module)
 +        expected_runtime_sha = os.environ.get("ROUND_DAGGER_RUNTIME_POLICY_SHA256")
 +        if expected_runtime_sha and expected_runtime_sha != initial_runtime_sha:
 +            raise RuntimeError("loaded actor does not match frozen macro-round policy")
@@ -4058,7 +4326,7 @@ index 8db4235076c345ba807b7d91f56d4338499fe2a6..4348d6bd7865fa5c152b88e81d83b9ab
      def _rollout_step(self, model, obs_dict):
          if self.vg_mode == "offline":
              return self._offline_fill_storage(model, obs_dict)
-@@ -436,6 +2391,14 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+@@ -436,6 +2509,14 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
                  self._videogen_relabel()
              elif self.vg_mode == "collect":
                  self._save_collected_chunks()
@@ -4337,6 +4605,136 @@ index 8d9c4c9e7e886a84fe88a274ee097e56fdc88490..cea9498e178c6955959275625f39bc5f
          return checkpoint
  
      def eval(self, save_dirpath: Optional[str] = None):
+diff --git a/gr00t/rl/trl/trainer/ppo_trainer_homie_api.py b/gr00t/rl/trl/trainer/ppo_trainer_homie_api.py
+index 99c7dc85ff47a1346e690c4f2d19a4ef2100ebff..208ed3d523aa20a4b8862e0b905b52c152dd42fd 100644
+--- a/gr00t/rl/trl/trainer/ppo_trainer_homie_api.py
++++ b/gr00t/rl/trl/trainer/ppo_trainer_homie_api.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ 
++import os
+ from collections import deque
+ from copy import deepcopy
+ from typing import Dict, Optional
+@@ -17,6 +18,7 @@ from trl.trainer.ppo_trainer import *
+ 
+ from gr00t.rl.agents.modules.data_utils import RolloutStorage
+ from gr00t.rl.trl.callbacks.hv_callback_handler import HVCallbackHandler
++from gr00t.rl.trl.trainer.checkpoint_io import load_verified_torch_checkpoint
+ from gr00t.rl.trl.utils.common import wandb_run_exists
+ from gr00t.rl.trl.utils.rl import compute_episode_attnmask
+ from gr00t.rl.trl.utils.scheduler import update_scheduled_params
+@@ -32,6 +34,10 @@ from gr00t.rl.trl.modules.homie_modules import (
+     HomieActorModule,
+     init_actor_critic_dict,
+ )
++from gr00t.rl.utils.homie_controller_identity import (
++    load_homie_controller_checkpoint,
++    validate_homie_controller_sha256,
++)
+ 
+ 
+ class PolicyAndValueWrapper(nn.Module):
+@@ -472,19 +478,27 @@ class TRLPPOTrainer(PPOTrainer):
+         self.local_dataloader_batch_size = args.local_batch_size
+ 
+         # homie policy import
+-        homie_walk_state_dict = torch.load(
+-            self.config.homie_walk_model_path, map_location=self.device
++        homie_walk_state_dict, homie_walk_sha256 = load_homie_controller_checkpoint(
++            torch,
++            self.config.homie_walk_model_path,
++            map_location=self.device,
+         )
+         homie_walk_model = HIMActorCritic(**init_actor_critic_dict)
+         homie_walk_model.load_state_dict(homie_walk_state_dict["model_state_dict"])
+         self.homie_walk_model = HomieActorModule(homie_walk_model).to(self.device)
+ 
+-        homie_stand_state_dict = torch.load(
+-            self.config.homie_stand_model_path, map_location=self.device
++        homie_stand_state_dict, homie_stand_sha256 = load_homie_controller_checkpoint(
++            torch,
++            self.config.homie_stand_model_path,
++            map_location=self.device,
+         )
+         homie_stand_model = HIMActorCritic(**init_actor_critic_dict)
+         homie_stand_model.load_state_dict(homie_stand_state_dict["model_state_dict"])
+         self.homie_stand_model = HomieActorModule(homie_stand_model).to(self.device)
++        self.homie_controller_sha256 = {
++            "walk": homie_walk_sha256,
++            "stand": homie_stand_sha256,
++        }
+ 
+         #########
+         # setup model, optimizer, and others
+@@ -514,6 +528,7 @@ class TRLPPOTrainer(PPOTrainer):
+         self.model = PolicyAndValueWrapper(
+             self.policy_model, self.value_model, self.homie_walk_model, self.homie_stand_model
+         )
++        self.model.homie_controller_sha256 = dict(self.homie_controller_sha256)
+         if hasattr(self.model, "homie_switch_threshold"):
+             self.homie_switch_threshold = self.model.homie_switch_threshold
+         else:
+@@ -1981,9 +1996,38 @@ class TRLPPOTrainer(PPOTrainer):
+             checkpoint_path (str): Path to the checkpoint file
+         """
+         print(f"Loading checkpoint from {checkpoint_path}")
+-        checkpoint = torch.load(
+-            checkpoint_path, map_location=self.accelerator.device, weights_only=False
++        expected_runtime_values = {
++            value
++            for value in (
++                os.environ.get("ROUND_DAGGER_RUNTIME_POLICY_SHA256"),
++                os.environ.get("IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256"),
++            )
++            if value is not None
++        }
++        if len(expected_runtime_values) > 1:
++            raise RuntimeError("runtime policy identity gates disagree")
++        checkpoint, _checkpoint_sha256 = load_verified_torch_checkpoint(
++            torch,
++            checkpoint_path,
++            map_location=self.accelerator.device,
++            expected_sha256=os.environ.get("EXPECTED_TRAIN_CHECKPOINT_SHA256"),
++            require_expected_sha256=bool(expected_runtime_values),
++            weights_only=False,
+         )
++        if not isinstance(checkpoint, dict):
++            raise RuntimeError("Homie checkpoint payload must be a dictionary")
++        try:
++            checkpoint_controller_sha256 = validate_homie_controller_sha256(
++                checkpoint.get("homie_controller_sha256")
++            )
++        except RuntimeError as exc:
++            raise RuntimeError(
++                "Homie checkpoint lacks valid walk/stand controller byte identities"
++            ) from exc
++        if checkpoint_controller_sha256 != self.homie_controller_sha256:
++            raise RuntimeError(
++                "checkpoint Homie controllers differ from loaded controller bytes"
++            )
+ 
+         # Load model state
+         model = self.accelerator.unwrap_model(self.model)
+@@ -1995,6 +2039,17 @@ class TRLPPOTrainer(PPOTrainer):
+             model.value_model.load_state_dict(checkpoint["value_state_dict"])
+         if "homie_state_dict" in checkpoint and model.homie_model is not None:
+             model.homie_model.load_state_dict(checkpoint["homie_state_dict"])
++        if expected_runtime_values:
++            from round_dagger.actor import runtime_policy_sha256
++
++            actual_runtime_sha256 = runtime_policy_sha256(
++                model.policy,
++                homie_controller_sha256=self.homie_controller_sha256,
++            )
++            if actual_runtime_sha256 != next(iter(expected_runtime_values)):
++                raise RuntimeError(
++                    "loaded policy or Homie controllers differ from runtime identity"
++                )
+         # Load optimizer state
+         if "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
+             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 diff --git a/gr00t/rl/utils/camera_rendering_contract.py b/gr00t/rl/utils/camera_rendering_contract.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..5b7a6e4df29ca082166b90aa51d512299c6f6ba8
@@ -4979,13 +5377,106 @@ index 0000000000000000000000000000000000000000..c8a5480f7c65766ad376a5e84755241e
 +        ):
 +            artifacts["video"] = self._write_video_or_fallback(trainer_step)
 +        return artifacts
+diff --git a/gr00t/rl/utils/homie_controller_identity.py b/gr00t/rl/utils/homie_controller_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ce1c3c1f2c5572b099eecd865d0106d3368aaae
+--- /dev/null
++++ b/gr00t/rl/utils/homie_controller_identity.py
+@@ -0,0 +1,87 @@
++"""Byte-exact loading and validation for fixed Homie controller checkpoints."""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import os
++import re
++import stat
++from collections.abc import Mapping
++from pathlib import Path
++from typing import Any
++
++
++HOMIE_CONTROLLER_ROLES = ("walk", "stand")
++_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
++
++
++def validate_homie_controller_sha256(value: Any) -> dict[str, str]:
++    if not isinstance(value, Mapping) or set(value) != set(HOMIE_CONTROLLER_ROLES):
++        raise RuntimeError(
++            "homie_controller_sha256 must contain exactly walk and stand"
++        )
++    result = {}
++    for role in HOMIE_CONTROLLER_ROLES:
++        digest = value[role]
++        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
++            raise RuntimeError(
++                f"Homie {role} controller SHA-256 must be lowercase hexadecimal"
++            )
++        result[role] = digest
++    return result
++
++
++def load_homie_controller_checkpoint(torch_module, path, *, map_location):
++    """Load and hash one immutable byte snapshot, avoiding a hash/load race."""
++
++    candidate = Path(path).expanduser()
++    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
++    nofollow = getattr(os, "O_NOFOLLOW", 0)
++    if not nofollow and candidate.is_symlink():
++        raise RuntimeError("Homie controller must be a regular non-symlink file")
++    flags |= nofollow
++    try:
++        descriptor = os.open(candidate, flags)
++    except OSError as exc:
++        raise RuntimeError(
++            "Homie controller must be a readable regular non-symlink file"
++        ) from exc
++    try:
++        metadata = os.fstat(descriptor)
++        if not stat.S_ISREG(metadata.st_mode):
++            raise RuntimeError(
++                "Homie controller must be a regular non-symlink file"
++            )
++        if metadata.st_size <= 0:
++            raise RuntimeError("Homie controller checkpoint must not be empty")
++        chunks = []
++        while True:
++            chunk = os.read(descriptor, 1024 * 1024)
++            if not chunk:
++                break
++            chunks.append(chunk)
++        payload = b"".join(chunks)
++        if len(payload) != metadata.st_size:
++            raise RuntimeError(
++                "Homie controller changed while its immutable snapshot was read"
++            )
++    finally:
++        os.close(descriptor)
++    if not payload:
++        raise RuntimeError("Homie controller checkpoint must not be empty")
++    digest = hashlib.sha256(payload).hexdigest()
++    try:
++        checkpoint = torch_module.load(
++            io.BytesIO(payload), map_location=map_location, weights_only=False
++        )
++    except Exception as exc:
++        raise RuntimeError(f"cannot load Homie controller: {candidate}") from exc
++    return checkpoint, digest
++
++
++__all__ = [
++    "HOMIE_CONTROLLER_ROLES",
++    "load_homie_controller_checkpoint",
++    "validate_homie_controller_sha256",
++]
 diff --git a/gr00t/rl/utils/image3f_frame_client.py b/gr00t/rl/utils/image3f_frame_client.py
 old mode 100644
 new mode 100755
-index 91960ad0d5a2368bf0c06906bec2d630cdf1f4b2..37481477da860d9d7041c65e33001d0fdf89834d
+index 91960ad0d5a2368bf0c06906bec2d630cdf1f4b2..d5b05cc4158224f50f7fd7b665014cf0068797ff
 --- a/gr00t/rl/utils/image3f_frame_client.py
 +++ b/gr00t/rl/utils/image3f_frame_client.py
-@@ -1,111 +1,729 @@
+@@ -1,111 +1,756 @@
 -# Copyright (c) 2026. Client for the warm Image3F per-frame render server.
 -"""Per-frame 3-view image render client (fixed-lag DAgger conditioning).
 +#!/usr/bin/env python3
@@ -5030,10 +5521,32 @@ index 91960ad0d5a2368bf0c06906bec2d630cdf1f4b2..37481477da860d9d7041c65e33001d0f
 +PRODUCTION_OUTPUT_LAYOUT = "vertical"
 +PRODUCTION_OUTPUT_TILE_SHAPE_HWC = (240, 416, 3)
 +PRODUCTION_OUTPUT_STACKED_SHAPE_HWC = (720, 416, 3)
++_REQUEST_ACCOUNTING_LOCK = threading.Lock()
++_REQUEST_ERRORS = 0
++_REQUEST_REPLAYS = 0
 +
 +
 +class Image3FWireError(RuntimeError):
 +    """Raised before unsafe or malformed wire bytes reach Image3F code."""
++
++
++def _record_request_accounting(*, errors: int = 0, replays: int = 0) -> None:
++    """Record process-local request failures and idempotent server replays."""
++
++    global _REQUEST_ERRORS, _REQUEST_REPLAYS
++    with _REQUEST_ACCOUNTING_LOCK:
++        _REQUEST_ERRORS += errors
++        _REQUEST_REPLAYS += replays
++
++
++def image3f_request_accounting_snapshot() -> dict[str, int]:
++    """Return monotonic counters suitable for before/after evidence binding."""
++
++    with _REQUEST_ACCOUNTING_LOCK:
++        return {
++            "errors": _REQUEST_ERRORS,
++            "replays": _REQUEST_REPLAYS,
++        }
 +
 +
 +def _validate_server_capabilities(
@@ -5666,12 +6179,16 @@ index 91960ad0d5a2368bf0c06906bec2d630cdf1f4b2..37481477da860d9d7041c65e33001d0f
 +                            response, required=stateful_render
 +                        )
 +                if response.get("ok"):
++                    if response.get("replayed") is True:
++                        _record_request_accounting(replays=1)
 +                    return response
++                _record_request_accounting(errors=1)
 +                if response.get("retryable") and attempt < retries:
 +                    time.sleep(min(2.0, 0.1 * (2**attempt)))
 +                    continue
 +                break
 +            except Image3FWireError:
++                _record_request_accounting(errors=1)
 +                with self._lock:
 +                    if self._socket is not None:
 +                        try:
@@ -5681,6 +6198,7 @@ index 91960ad0d5a2368bf0c06906bec2d630cdf1f4b2..37481477da860d9d7041c65e33001d0f
 +                raise
 +            except (ConnectionError, OSError, EOFError, pickle.UnpicklingError) as exc:
 +                last_error = exc
++                _record_request_accounting(errors=1)
 +                with self._lock:
 +                    if self._socket is not None:
 +                        try:
@@ -5994,10 +6512,10 @@ index 0000000000000000000000000000000000000000..d8ecc0d655c8e44523d86e9d1d4e28f5
 +    return bound
 diff --git a/gr00t/rl/utils/round_dagger_paired_eval.py b/gr00t/rl/utils/round_dagger_paired_eval.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f935f7efcdc454309f61990f604b80678379f227
+index 0000000000000000000000000000000000000000..702d25ca2faf1838c7a0b5e19e4a144f0faaf243
 --- /dev/null
 +++ b/gr00t/rl/utils/round_dagger_paired_eval.py
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,641 @@
 +"""Fail-closed runtime evidence for paired RoboRender DAgger evaluation.
 +
 +This module deliberately does not run evaluation or decide promotion.  It
@@ -6025,6 +6543,8 @@ index 0000000000000000000000000000000000000000..f935f7efcdc454309f61990f604b8067
 +from typing import Any
 +
 +import numpy as np
++
++from gr00t.rl.utils.image3f_frame_client import image3f_request_accounting_snapshot
 +
 +CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v1"
 +RUNTIME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_runtime.v1"
@@ -6192,6 +6712,7 @@ index 0000000000000000000000000000000000000000..f935f7efcdc454309f61990f604b8067
 +        self._episodes: dict[int, dict[str, Any]] = {}
 +        self._renderer_errors = 0
 +        self._renderer_replays = 0
++        self._renderer_accounting_baseline = image3f_request_accounting_snapshot()
 +        self._sealed = False
 +        self._finalized: dict[str, Any] | None = None
 +
@@ -6569,7 +7090,23 @@ index 0000000000000000000000000000000000000000..f935f7efcdc454309f61990f604b8067
 +
 +        if self._finalized is not None:
 +            return copy.deepcopy(self._finalized)
-+        if self._renderer_errors or self._renderer_replays:
++        renderer_accounting = image3f_request_accounting_snapshot()
++        renderer_errors_delta = (
++            renderer_accounting["errors"]
++            - self._renderer_accounting_baseline["errors"]
++        )
++        renderer_replays_delta = (
++            renderer_accounting["replays"]
++            - self._renderer_accounting_baseline["replays"]
++        )
++        if renderer_errors_delta < 0 or renderer_replays_delta < 0:
++            raise PairedEvaluationEvidenceError(
++                "Image3F request accounting moved backwards"
++            )
++        if (
++            self._renderer_errors + renderer_errors_delta
++            or self._renderer_replays + renderer_replays_delta
++        ):
 +            raise PairedEvaluationEvidenceError(
 +                "renderer errors or replays make paired evidence unattestable"
 +            )
@@ -7260,6 +7797,760 @@ index 0000000000000000000000000000000000000000..c30f1abdb7169363b60a11c33021babc
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/tests/test_fail_closed_production_gate_parsing.py b/tests/test_fail_closed_production_gate_parsing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..468f58c88bfff369e1574ff5c1775f64a0cd9efb
+--- /dev/null
++++ b/tests/test_fail_closed_production_gate_parsing.py
+@@ -0,0 +1,230 @@
++"""Focused adversarial tests for production gate parsing in the trainer."""
++
++from __future__ import annotations
++
++import ast
++import math
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++
++SOURCE = (
++    Path(__file__).resolve().parents[1]
++    / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
++)
++
++
++def _tree() -> ast.Module:
++    return ast.parse(SOURCE.read_text(encoding="utf-8"))
++
++
++def _module_functions(*names: str):
++    selected = [
++        node
++        for node in _tree().body
++        if isinstance(node, ast.FunctionDef) and node.name in names
++    ]
++    assert {node.name for node in selected} == set(names)
++    namespace = {"math": math, "np": np}
++    exec(
++        compile(
++            ast.Module(body=selected, type_ignores=[]),
++            str(SOURCE),
++            "exec",
++        ),
++        namespace,
++    )
++    return tuple(namespace[name] for name in names)
++
++
++def _trainer_method(name: str) -> ast.FunctionDef:
++    trainer = next(
++        node
++        for node in _tree().body
++        if isinstance(node, ast.ClassDef)
++        and node.name == "TRLDistillTrainerVideoGen"
++    )
++    return next(
++        node
++        for node in trainer.body
++        if isinstance(node, ast.FunctionDef) and node.name == name
++    )
++
++
++@pytest.mark.parametrize(
++    "value",
++    (
++        float("nan"),
++        float("inf"),
++        float("-inf"),
++        "nan",
++        "+inf",
++        "-Infinity",
++        True,
++        np.bool_(False),
++        None,
++        "not-a-number",
++    ),
++)
++def test_finite_gate_number_rejects_nonfinite_and_ambiguous_values(value):
++    (parse_number,) = _module_functions("_parse_finite_gate_number")
++
++    with pytest.raises(RuntimeError, match="must be a finite number"):
++        parse_number(value, "test value")
++
++
++@pytest.mark.parametrize("value", (0, 1, -0.25, "2.5", np.float32(0.5)))
++def test_finite_gate_number_accepts_finite_numeric_values(value):
++    (parse_number,) = _module_functions("_parse_finite_gate_number")
++
++    assert parse_number(value, "test value") == float(value)
++
++
++@pytest.mark.parametrize(
++    ("configured", "expected"),
++    (
++        (float("nan"), "0.0"),
++        (0.0, "nan"),
++        (float("inf"), "inf"),
++        (float("-inf"), "-inf"),
++    ),
++)
++def test_gate_match_never_treats_nonfinite_values_as_equal(configured, expected):
++    parse_number, require_match = _module_functions(
++        "_parse_finite_gate_number",
++        "_require_finite_gate_match",
++    )
++    assert parse_number is not None
++
++    with pytest.raises(RuntimeError, match="must be a finite number"):
++        require_match(configured, expected, "test value", 1e-12)
++
++
++def test_gate_match_preserves_tolerance_and_rejects_finite_mismatch():
++    _parse_number, require_match = _module_functions(
++        "_parse_finite_gate_number",
++        "_require_finite_gate_match",
++    )
++
++    assert require_match(0.5, "0.5000000001", "test value", 1e-9) == 0.5
++    with pytest.raises(RuntimeError, match="test value mismatch"):
++        require_match(0.5, "0.50001", "test value", 1e-9)
++
++
++@pytest.mark.parametrize("value", ("tru", "fales", "", "2", object()))
++def test_boolean_gate_rejects_noncanonical_values(value):
++    (parse_boolean,) = _module_functions("_parse_boolean_gate")
++
++    with pytest.raises(RuntimeError, match="must be a boolean value"):
++        parse_boolean(value, "TEST_BOOLEAN")
++
++
++@pytest.mark.parametrize(
++    ("value", "expected"),
++    ((True, True), (False, False), ("true", True), ("false", False)),
++)
++def test_boolean_gate_accepts_explicit_boolean_values(value, expected):
++    (parse_boolean,) = _module_functions("_parse_boolean_gate")
++
++    assert parse_boolean(value, "TEST_BOOLEAN") is expected
++
++
++@pytest.mark.parametrize(
++    ("opt_homie", "threshold"),
++    ((False, 0.5), ("false", "0.5"), (0, np.float32(0.5))),
++)
++def test_production_homie_runtime_accepts_only_pinned_settings(
++    opt_homie, threshold
++):
++    (
++        _parse_boolean,
++        _parse_number,
++        _require_match,
++        require_runtime,
++    ) = _module_functions(
++        "_parse_boolean_gate",
++        "_parse_finite_gate_number",
++        "_require_finite_gate_match",
++        "_require_production_homie_runtime",
++    )
++
++    assert require_runtime(opt_homie, threshold) == 0.5
++
++
++@pytest.mark.parametrize("opt_homie", (None, True, "true", 1, "invalid"))
++def test_production_homie_runtime_rejects_enabled_missing_or_malformed_mode(
++    opt_homie,
++):
++    (
++        _parse_boolean,
++        _parse_number,
++        _require_match,
++        require_runtime,
++    ) = _module_functions(
++        "_parse_boolean_gate",
++        "_parse_finite_gate_number",
++        "_require_finite_gate_match",
++        "_require_production_homie_runtime",
++    )
++
++    with pytest.raises(RuntimeError, match="opt_homie"):
++        require_runtime(opt_homie, 0.5)
++
++
++@pytest.mark.parametrize(
++    "threshold",
++    (
++        None,
++        True,
++        float("nan"),
++        float("inf"),
++        float("-inf"),
++        "nan",
++        "not-a-number",
++        0.0,
++        0.499999999999,
++        0.500000000001,
++    ),
++)
++def test_production_homie_runtime_rejects_missing_nonfinite_or_inexact_threshold(
++    threshold,
++):
++    (
++        _parse_boolean,
++        _parse_number,
++        _require_match,
++        require_runtime,
++    ) = _module_functions(
++        "_parse_boolean_gate",
++        "_parse_finite_gate_number",
++        "_require_finite_gate_match",
++        "_require_production_homie_runtime",
++    )
++
++    with pytest.raises(RuntimeError, match="Homie switch threshold|explicitly 0.5"):
++        require_runtime(False, threshold)
++
++
++def test_production_and_round_actor_gates_use_strict_helpers():
++    init_source = ast.unparse(_trainer_method("_init_trl"))
++    train_source = ast.unparse(_trainer_method("train"))
++
++    assert init_source.count("_require_finite_gate_match(") == 5
++    assert "_gate_enforce.lower() == 'true'" not in init_source
++    assert "bool(self.config.get('enforce_teacher_rollout'" not in init_source
++    assert "_parse_boolean_gate(_gate_enforce" in init_source
++    assert "_parse_boolean_gate(self.config.get('enforce_teacher_rollout'" in (
++        init_source
++    )
++    assert "if _production_anchor_consumer:" in init_source
++    assert "_require_production_homie_runtime(" in init_source
++
++    assert train_source.count("_require_finite_gate_match(") == 2
++    assert "abs(self.vg_beta_start - self.vg_beta_end)" not in train_source
++    assert "abs(float(expected_beta) - self.vg_beta_start)" not in train_source
++    assert "bool(self.config.get('enforce_teacher_rollout'" not in train_source
++    assert "_parse_boolean_gate(self.config.get('enforce_teacher_rollout'" in (
++        train_source
++    )
+diff --git a/tests/test_homie_controller_identity.py b/tests/test_homie_controller_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ee1f797f62a41bfac6320fa656c383453910263
+--- /dev/null
++++ b/tests/test_homie_controller_identity.py
+@@ -0,0 +1,111 @@
++import hashlib
++import os
++from pathlib import Path
++from unittest import mock
++
++import pytest
++
++from gr00t.rl.utils import homie_controller_identity
++from gr00t.rl.utils.homie_controller_identity import (
++    load_homie_controller_checkpoint,
++    validate_homie_controller_sha256,
++)
++
++
++class _RecordingTorch:
++    def __init__(self):
++        self.loaded_payload = None
++        self.kwargs = None
++
++    def load(self, buffer, **kwargs):
++        self.loaded_payload = buffer.read()
++        self.kwargs = kwargs
++        return {"payload": self.loaded_payload}
++
++
++def test_loader_hashes_and_deserializes_the_same_descriptor_bytes(tmp_path):
++    payload = b"fixed-controller-checkpoint"
++    checkpoint = tmp_path / "controller.pt"
++    checkpoint.write_bytes(payload)
++    torch_module = _RecordingTorch()
++
++    document, digest = load_homie_controller_checkpoint(
++        torch_module, checkpoint, map_location="cpu"
++    )
++
++    assert document == {"payload": payload}
++    assert torch_module.loaded_payload == payload
++    assert torch_module.kwargs == {
++        "map_location": "cpu",
++        "weights_only": False,
++    }
++    assert digest == hashlib.sha256(payload).hexdigest()
++
++
++def test_loader_rejects_a_final_component_symlink(tmp_path):
++    target = tmp_path / "target.pt"
++    target.write_bytes(b"controller")
++    link = tmp_path / "controller.pt"
++    link.symlink_to(target)
++
++    with pytest.raises(RuntimeError, match="non-symlink"):
++        load_homie_controller_checkpoint(
++            _RecordingTorch(), link, map_location="cpu"
++        )
++
++
++def test_pathname_swap_after_open_cannot_change_loaded_bytes(tmp_path):
++    original_payload = b"controller-selected-by-open"
++    replacement_payload = b"controller-swapped-into-path"
++    checkpoint = tmp_path / "controller.pt"
++    replacement = tmp_path / "replacement.pt"
++    checkpoint.write_bytes(original_payload)
++    replacement.write_bytes(replacement_payload)
++    real_open = os.open
++
++    def open_then_swap(path, flags):
++        descriptor = real_open(path, flags)
++        os.replace(replacement, checkpoint)
++        return descriptor
++
++    torch_module = _RecordingTorch()
++    with mock.patch.object(
++        homie_controller_identity.os, "open", side_effect=open_then_swap
++    ):
++        _, digest = load_homie_controller_checkpoint(
++            torch_module, checkpoint, map_location="cpu"
++        )
++
++    assert checkpoint.read_bytes() == replacement_payload
++    assert torch_module.loaded_payload == original_payload
++    assert digest == hashlib.sha256(original_payload).hexdigest()
++
++
++@pytest.mark.parametrize(
++    "value",
++    [
++        None,
++        {"walk": "1" * 64},
++        {"walk": "1" * 64, "stand": "2" * 64, "extra": "3" * 64},
++        {"walk": "A" * 64, "stand": "2" * 64},
++    ],
++)
++def test_controller_mapping_is_exact_and_canonical(value):
++    with pytest.raises(RuntimeError):
++        validate_homie_controller_sha256(value)
++
++
++def test_checkpoint_producers_and_consumers_bind_controller_mapping():
++    root = Path(__file__).resolve().parents[1]
++    callback = (
++        root / "gr00t/rl/trl/callbacks/model_save_callback.py"
++    ).read_text(encoding="utf-8")
++    homie_trainer = (
++        root / "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py"
++    ).read_text(encoding="utf-8")
++
++    assert 'checkpoint["homie_controller_sha256"]' in callback
++    assert "validate_homie_controller_sha256(" in callback
++    assert "checkpoint.get(\"homie_controller_sha256\")" in homie_trainer
++    assert "checkpoint Homie controllers differ" in homie_trainer
++    assert "_complete_runtime_policy_sha256" in homie_trainer
+diff --git a/tests/test_homie_trainer_lineage.py b/tests/test_homie_trainer_lineage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7a3dbd303cd9cd0a02a4b07e512bac987da74da
+--- /dev/null
++++ b/tests/test_homie_trainer_lineage.py
+@@ -0,0 +1,135 @@
++"""Static lineage contract for the legacy walk/stand Homie trainer."""
++
++from __future__ import annotations
++
++import ast
++import unittest
++from pathlib import Path
++
++
++SOURCE = (
++    Path(__file__).resolve().parents[1]
++    / "gr00t/rl/trl/trainer/ppo_trainer_homie_api.py"
++)
++
++
++def _trainer_method(name: str) -> ast.FunctionDef:
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    trainer = next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "TRLPPOTrainer"
++    )
++    return next(
++        node
++        for node in trainer.body
++        if isinstance(node, ast.FunctionDef) and node.name == name
++    )
++
++
++def _call_name(call: ast.Call) -> str | None:
++    if isinstance(call.func, ast.Name):
++        return call.func.id
++    if isinstance(call.func, ast.Attribute):
++        return call.func.attr
++    return None
++
++
++class HomieTrainerLineageTest(unittest.TestCase):
++    def test_both_controller_files_are_loaded_and_hashed_as_one_byte_snapshot(self) -> None:
++        method = _trainer_method("_init_trl")
++        loader_calls = [
++            node
++            for node in ast.walk(method)
++            if isinstance(node, ast.Call)
++            and _call_name(node) == "load_homie_controller_checkpoint"
++        ]
++        self.assertEqual(len(loader_calls), 2)
++        self.assertEqual(
++            {
++                ast.unparse(call.args[1])
++                for call in loader_calls
++            },
++            {
++                "self.config.homie_walk_model_path",
++                "self.config.homie_stand_model_path",
++            },
++        )
++        for call in loader_calls:
++            self.assertEqual(ast.unparse(call.args[0]), "torch")
++            self.assertEqual(
++                ast.unparse(next(item.value for item in call.keywords if item.arg == "map_location")),
++                "self.device",
++            )
++
++        text = ast.unparse(method)
++        self.assertIn(
++            "self.homie_controller_sha256 = {'walk': homie_walk_sha256, 'stand': homie_stand_sha256}",
++            text,
++        )
++        self.assertIn(
++            "self.model.homie_controller_sha256 = dict(self.homie_controller_sha256)",
++            text,
++        )
++
++    def test_every_checkpoint_load_requires_and_checks_controller_lineage(self) -> None:
++        method = _trainer_method("load_checkpoint")
++        text = ast.unparse(method)
++        self.assertIn(
++            "validate_homie_controller_sha256(checkpoint.get('homie_controller_sha256'))",
++            text,
++        )
++        self.assertIn(
++            "checkpoint_controller_sha256 != self.homie_controller_sha256",
++            text,
++        )
++
++        validation = next(
++            node
++            for node in ast.walk(method)
++            if isinstance(node, ast.Call)
++            and _call_name(node) == "validate_homie_controller_sha256"
++        )
++        policy_load = next(
++            node
++            for node in ast.walk(method)
++            if isinstance(node, ast.Call)
++            and ast.unparse(node.func) == "model.policy.load_state_dict"
++        )
++        optimizer_load = next(
++            node
++            for node in ast.walk(method)
++            if isinstance(node, ast.Call)
++            and ast.unparse(node.func) == "self.optimizer.load_state_dict"
++        )
++        self.assertLess(validation.lineno, policy_load.lineno)
++        self.assertLess(policy_load.lineno, optimizer_load.lineno)
++
++    def test_trusted_runtime_gate_binds_policy_and_both_controllers(self) -> None:
++        method = _trainer_method("load_checkpoint")
++        text = ast.unparse(method)
++        self.assertIn("ROUND_DAGGER_RUNTIME_POLICY_SHA256", text)
++        self.assertIn("IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256", text)
++        self.assertIn("runtime policy identity gates disagree", text)
++
++        runtime_call = next(
++            node
++            for node in ast.walk(method)
++            if isinstance(node, ast.Call) and _call_name(node) == "runtime_policy_sha256"
++        )
++        self.assertEqual(ast.unparse(runtime_call.args[0]), "model.policy")
++        keywords = {item.arg: ast.unparse(item.value) for item in runtime_call.keywords}
++        self.assertEqual(
++            keywords["homie_controller_sha256"], "self.homie_controller_sha256"
++        )
++        optimizer_load = next(
++            node
++            for node in ast.walk(method)
++            if isinstance(node, ast.Call)
++            and ast.unparse(node.func) == "self.optimizer.load_state_dict"
++        )
++        self.assertLess(runtime_call.lineno, optimizer_load.lineno)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_image3f_retry_accounting.py b/tests/test_image3f_retry_accounting.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..592aef45e105282e08df404514ab9fbe4b6285c6
+--- /dev/null
++++ b/tests/test_image3f_retry_accounting.py
+@@ -0,0 +1,95 @@
++"""Retry/error accounting gates for paired Image3F evaluation evidence."""
++
++from __future__ import annotations
++
++import pytest
++
++from gr00t.rl.utils import image3f_frame_client as client_module
++from gr00t.rl.utils.image3f_frame_client import (
++    Image3FFrameClient,
++    image3f_request_accounting_snapshot,
++)
++from gr00t.rl.utils.round_dagger_paired_eval import (
++    PairedEvaluationEvidence,
++    PairedEvaluationEvidenceError,
++)
++
++
++def _request_with_responses(monkeypatch, *responses):
++    pending = iter(responses)
++    client = Image3FFrameClient("127.0.0.1", 1)
++    monkeypatch.setattr(client, "_connect", lambda: object())
++    monkeypatch.setattr(client_module, "_send_msg", lambda _sock, _payload: None)
++
++    def receive(_sock):
++        response = next(pending)
++        if isinstance(response, BaseException):
++            raise response
++        return response
++
++    monkeypatch.setattr(client_module, "_recv_msg", receive)
++    monkeypatch.setattr(client_module.time, "sleep", lambda _seconds: None)
++    return client._request(
++        {"cmd": "render_frame", "reference_lag": 0}, retries=len(responses) - 1
++    )
++
++
++def _evidence():
++    return PairedEvaluationEvidence(
++        num_envs=1,
++        generation_seed=7,
++        scenario_ids_by_env={0: "a" * 64},
++        runtime_policy_sha256="b" * 64,
++        evaluation_config_sha256="c" * 64,
++        evaluator_code_sha256="d" * 64,
++    )
++
++
++def test_retryable_response_increments_error_accounting(monkeypatch):
++    before = image3f_request_accounting_snapshot()
++
++    response = _request_with_responses(
++        monkeypatch,
++        {"ok": False, "retryable": True, "error": "in flight"},
++        {"ok": True},
++    )
++
++    after = image3f_request_accounting_snapshot()
++    assert response["ok"] is True
++    assert after["errors"] - before["errors"] == 1
++    assert after["replays"] - before["replays"] == 0
++
++
++def test_transport_retry_increments_error_accounting(monkeypatch):
++    before = image3f_request_accounting_snapshot()
++
++    response = _request_with_responses(
++        monkeypatch,
++        ConnectionError("lost response"),
++        {"ok": True},
++    )
++
++    after = image3f_request_accounting_snapshot()
++    assert response["ok"] is True
++    assert after["errors"] - before["errors"] == 1
++    assert after["replays"] - before["replays"] == 0
++
++
++def test_paired_evidence_rejects_success_after_retryable_error(monkeypatch):
++    evidence = _evidence()
++    _request_with_responses(
++        monkeypatch,
++        {"ok": False, "retryable": True, "error": "in flight"},
++        {"ok": True},
++    )
++
++    with pytest.raises(PairedEvaluationEvidenceError, match="errors or replays"):
++        evidence.finalize()
++
++
++def test_paired_evidence_rejects_idempotent_replay(monkeypatch):
++    evidence = _evidence()
++    _request_with_responses(monkeypatch, {"ok": True, "replayed": True})
++
++    with pytest.raises(PairedEvaluationEvidenceError, match="errors or replays"):
++        evidence.finalize()
+diff --git a/tests/test_paired_scenario_binding.py b/tests/test_paired_scenario_binding.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cd3e2c10e560d5016fd66b69d8a90bf4f6cc480
+--- /dev/null
++++ b/tests/test_paired_scenario_binding.py
+@@ -0,0 +1,153 @@
++"""Integration coverage for observed paired-evaluation scenario binding."""
++
++from __future__ import annotations
++
++import ast
++import hashlib
++import json
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from gr00t.rl.utils.round_dagger_paired_eval import (
++    POLICY_VIEWS,
++    PairedEvaluationEvidence,
++    PairedEvaluationEvidenceError,
++)
++
++
++SOURCE = (
++    Path(__file__).resolve().parents[1]
++    / "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py"
++)
++
++
++def _load_finalizer():
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    selected = [
++        node
++        for node in tree.body
++        if isinstance(node, ast.FunctionDef)
++        and node.name == "_finalize_paired_episode_evidence"
++    ]
++    assert len(selected) == 1
++    namespace = {}
++    exec(
++        compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"),
++        namespace,
++    )
++    return namespace["_finalize_paired_episode_evidence"]
++
++
++def _load_safety_reader():
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    selected = [
++        node
++        for node in tree.body
++        if isinstance(node, ast.FunctionDef)
++        and node.name == "_required_paired_safety_violation"
++    ]
++    assert len(selected) == 1
++    namespace = {}
++    exec(
++        compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"),
++        namespace,
++    )
++    return namespace["_required_paired_safety_violation"]
++
++
++def _scenario_id(first_condition_sha256: str) -> str:
++    identity = {
++        "seed": 17,
++        "env_index": 0,
++        "first_condition_sha256": first_condition_sha256,
++    }
++    return hashlib.sha256(
++        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    ).hexdigest()
++
++
++def _prepared_evidence(contract_scenario_id: str) -> PairedEvaluationEvidence:
++    evidence = PairedEvaluationEvidence(
++        num_envs=1,
++        generation_seed=17,
++        scenario_ids_by_env={0: contract_scenario_id},
++        runtime_policy_sha256="1" * 64,
++        evaluation_config_sha256="2" * 64,
++        evaluator_code_sha256="3" * 64,
++    )
++    evidence.record_generation_step(
++        {
++            0: {
++                view: np.full((2, 2, 3), index, dtype=np.uint8)
++                for index, view in enumerate(POLICY_VIEWS)
++            }
++        }
++    )
++    evidence.record_action_pair(0, np.zeros(2), np.zeros(2))
++    return evidence
++
++
++def _records(observed_scenario_id: str):
++    return {
++        0: {
++            "scenario_id": observed_scenario_id,
++            "success": True,
++            "episode_length": 1,
++        }
++    }
++
++
++def test_matching_observed_scenario_is_attested():
++    scenario_id = _scenario_id("a" * 64)
++    evidence = _prepared_evidence(scenario_id)
++
++    result = _load_finalizer()(
++        evidence,
++        _records(scenario_id),
++        {0: False},
++        num_envs=1,
++    )
++
++    assert result["_roborender_paired_episodes"][0]["scenario_id"] == scenario_id
++
++
++def test_observed_scenario_mismatch_fails_closed():
++    contract_scenario_id = _scenario_id("a" * 64)
++    observed_scenario_id = _scenario_id("b" * 64)
++    evidence = _prepared_evidence(contract_scenario_id)
++
++    with pytest.raises(
++        PairedEvaluationEvidenceError,
++        match="scenario identity differs from contract",
++    ):
++        _load_finalizer()(
++            evidence,
++            _records(observed_scenario_id),
++            {0: False},
++            num_envs=1,
++        )
++
++    # A rejected observation must not be replaced with the contract value or
++    # partially seal the accumulator.
++    result = _load_finalizer()(
++        evidence,
++        _records(contract_scenario_id),
++        {0: False},
++        num_envs=1,
++    )
++    assert result["_roborender_paired_episodes"][0]["scenario_id"] == contract_scenario_id
++
++
++def test_paired_safety_requires_an_explicit_boolean_simulator_signal():
++    read_safety = _load_safety_reader()
++    assert read_safety({"safety_violation": np.array([False], dtype=np.bool_)}, 0) is False
++    assert read_safety({"safety_violation": np.array([True], dtype=np.bool_)}, 0) is True
++
++    with pytest.raises(RuntimeError, match="requires infos.safety_violation"):
++        read_safety({"time_outs": np.array([False], dtype=np.bool_)}, 0)
++    with pytest.raises(RuntimeError, match="must be boolean"):
++        read_safety({"safety_violation": np.array([0], dtype=np.int64)}, 0)
++    with pytest.raises(RuntimeError, match="malformed"):
++        read_safety({"safety_violation": np.array([], dtype=np.bool_)}, 0)
 diff --git a/tests/test_policy_checkpoint_consumer.py b/tests/test_policy_checkpoint_consumer.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..917fd8c190650a33f55950d5b2c47eb2b52732aa

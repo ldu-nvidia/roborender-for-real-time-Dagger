@@ -24,9 +24,14 @@ from pathlib import Path
 from typing import Any
 
 from round_dagger.artifacts import canonical_json_sha256, load_strict_json, sha256_file
+from round_dagger.policy_identity import (
+    PolicyIdentityError,
+    runtime_policy_identity_sha256,
+    validate_homie_controller_sha256,
+)
 
 
-POLICY_SPEC_SCHEMA = "fast_roborender.round_dagger.gr00t_policy_spec.v2"
+POLICY_SPEC_SCHEMA = "fast_roborender.round_dagger.gr00t_policy_spec.v3"
 POLICY_TARGET = (
     "gr00t.rl.trl.modules.vision_actor_critic_modules_obj_pred.VisionActorObjPred"
 )
@@ -154,7 +159,8 @@ def build_portable_policy_spec(
     homie_action_dim: int,
     replay_action_dim: int,
     checkpoint_sha256: str,
-    runtime_policy_sha256: str,
+    policy_state_sha256: str,
+    homie_controller_sha256: Mapping[str, str],
 ) -> dict[str, Any]:
     """Capture the exact initialized student architecture without simulator state."""
 
@@ -281,6 +287,19 @@ def build_portable_policy_spec(
             algo_plain.get("max_noise_std", 1.0), "algo_config.max_noise_std"
         ),
     }
+    try:
+        controller_sha256 = validate_homie_controller_sha256(
+            homie_controller_sha256
+        )
+        policy_state_sha256 = _sha256(
+            policy_state_sha256, "policy_state_sha256"
+        )
+        runtime_policy_sha256 = runtime_policy_identity_sha256(
+            policy_state_sha256, controller_sha256
+        )
+    except PolicyIdentityError as exc:
+        raise GR00TPolicyError(str(exc)) from exc
+
     document = {
         "schema": POLICY_SPEC_SCHEMA,
         "policy_target": POLICY_TARGET,
@@ -318,9 +337,9 @@ def build_portable_policy_spec(
             "frozen_parameter_groups": ["obj_pred_mlp", "std"],
         },
         "checkpoint_sha256": _sha256(checkpoint_sha256, "checkpoint_sha256"),
-        "runtime_policy_sha256": _sha256(
-            runtime_policy_sha256, "runtime_policy_sha256"
-        ),
+        "policy_state_sha256": policy_state_sha256,
+        "homie_controller_sha256": controller_sha256,
+        "runtime_policy_sha256": runtime_policy_sha256,
     }
     return validate_policy_spec(document)
 
@@ -375,6 +394,8 @@ def validate_policy_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
             "output_contract",
             "initialization_contract",
             "checkpoint_sha256",
+            "policy_state_sha256",
+            "homie_controller_sha256",
             "runtime_policy_sha256",
         },
         "policy spec",
@@ -553,7 +574,22 @@ def validate_policy_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(initialization["source_actor_requested_pretrained"], bool):
         raise GR00TPolicyError("source pretrained provenance must be boolean")
     _sha256(document["checkpoint_sha256"], "checkpoint_sha256")
-    _sha256(document["runtime_policy_sha256"], "runtime_policy_sha256")
+    policy_state_sha256 = _sha256(
+        document["policy_state_sha256"], "policy_state_sha256"
+    )
+    try:
+        controller_sha256 = validate_homie_controller_sha256(
+            document["homie_controller_sha256"]
+        )
+        expected_runtime_sha256 = runtime_policy_identity_sha256(
+            policy_state_sha256, controller_sha256
+        )
+    except PolicyIdentityError as exc:
+        raise GR00TPolicyError(str(exc)) from exc
+    if document["runtime_policy_sha256"] != expected_runtime_sha256:
+        raise GR00TPolicyError(
+            "runtime_policy_sha256 does not bind policy state and Homie controllers"
+        )
     # Ensure the document itself contains only canonical JSON values.
     canonical_json_sha256(document)
     return copy.deepcopy(document)

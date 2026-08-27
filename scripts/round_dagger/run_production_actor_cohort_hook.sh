@@ -48,6 +48,7 @@ required=(
     ROUND_DAGGER_RENDERER_SHA256 IMAGE3F_ENDPOINT_MANIFEST ANCHORS
     ROUND_DAGGER_RTX_IMAGE ROUND_DAGGER_DOCKER_BIN
     ROUND_DAGGER_CAMERA_ACCEPTANCE ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256
+    ROUND_DAGGER_GR00T_REVISION ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256
     ROUND_DAGGER_WANDB_NETRC
     ROUND_DAGGER_ACTOR_RUN_DIR TRAIN_RUN_DIR
 )
@@ -108,15 +109,20 @@ grep -q '^  password wandb_v1_' "$ROUND_DAGGER_WANDB_NETRC" || \
 [[ "$ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256" =~ ^[0-9a-f]{64}$ ]] || fatal "camera acceptance SHA-256 is malformed"
 [[ "$ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256" == "$EXPECTED_CAMERA_ACCEPTANCE_SHA256" ]] || fatal "camera acceptance is not the operator-approved production artifact"
 [[ $(sha256_file "$ROUND_DAGGER_CAMERA_ACCEPTANCE") == "$ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256" ]] || fatal "camera acceptance bytes changed"
+[[ "$ROUND_DAGGER_GR00T_REVISION" =~ ^[0-9a-f]{40}$ ]] || fatal "GR00T revision is malformed"
+[[ "$ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]] || fatal "GR00T source tree SHA-256 is malformed"
 
 # The acceptance is evidence, not merely an opaque file hash.  Require the
 # exact three-view semantic mapping the operator accepted.
-python3 - "$ROUND_DAGGER_CAMERA_ACCEPTANCE" <<'PY' || fatal "camera acceptance semantic contract is invalid"
+python3 - "$ROUND_DAGGER_CAMERA_ACCEPTANCE" "$ROUND_DAGGER_GR00T_REVISION" \
+    "$ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256" <<'PY' || fatal "camera acceptance semantic contract is invalid"
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+expected_gr00t_revision = sys.argv[2]
+expected_gr00t_tree = sys.argv[3]
 try:
     document = json.loads(path.read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -133,6 +139,10 @@ expected = {
 for key, value in expected.items():
     if document.get(key) != value:
         raise SystemExit(f"camera acceptance {key} mismatch")
+if document.get("gr00t_revision") != expected_gr00t_revision:
+    raise SystemExit("camera acceptance GR00T revision mismatch")
+if document.get("gr00t_source_tree_sha256") != expected_gr00t_tree:
+    raise SystemExit("camera acceptance GR00T source tree mismatch")
 panels = document.get("panels")
 if not isinstance(panels, list) or len(panels) != 2:
     raise SystemExit("camera acceptance must bind exactly two panels")
@@ -149,10 +159,11 @@ ACTUAL_IMAGE_ID=$(
 [[ "$ACTUAL_IMAGE_ID" == "$EXPECTED_ACTOR_IMAGE_ID" ]] || fatal "actor image ID mismatch"
 
 printf '%s\n' "$ANCHOR_REPORT"
-printf '{"schema":"fast_roborender.round_dagger.production_collect_preflight.v1","status":"verified","cohort_index":%s,"global_env_offset":%s,"teacher_sha256":"%s","renderer_sha256":"%s","endpoint_manifest_sha256":"%s","actor_image_id":"%s","camera_acceptance_sha256":"%s"}\n' \
+printf '{"schema":"fast_roborender.round_dagger.production_collect_preflight.v1","status":"verified","cohort_index":%s,"global_env_offset":%s,"teacher_sha256":"%s","renderer_sha256":"%s","endpoint_manifest_sha256":"%s","actor_image_id":"%s","camera_acceptance_sha256":"%s","gr00t_revision":"%s","gr00t_source_tree_sha256":"%s"}\n' \
     "$ROUND_DAGGER_COHORT_INDEX" "$ROUND_DAGGER_GLOBAL_ENV_OFFSET" \
     "$EXPECTED_TEACHER_SHA256" "$EXPECTED_RENDERER_SHA256" "$EXPECTED_ENDPOINT_MANIFEST_SHA256" \
-    "$EXPECTED_ACTOR_IMAGE_ID" "$ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256"
+    "$EXPECTED_ACTOR_IMAGE_ID" "$ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256" \
+    "$ROUND_DAGGER_GR00T_REVISION" "$ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256"
 
 export NETRC="$ROUND_DAGGER_WANDB_NETRC"
 exec "$PAIR_SCRIPT"

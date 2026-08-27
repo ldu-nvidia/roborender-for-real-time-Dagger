@@ -75,13 +75,14 @@ COHORTS = 4
 STEPS = 8
 VIEW_SHAPE = (6, 2, 3)
 FULL_ACTION_DIM = 2
+HOMIE_CONTROLLER_SHA256 = {"walk": "4" * 64, "stand": "5" * 64}
 
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
-def _portable_spec(checkpoint_sha: str, runtime_sha: str) -> dict:
+def _portable_spec(checkpoint_sha: str, policy_state_sha: str) -> dict:
     """Return a production-shaped portable spec for control-plane smoke gates."""
 
     policy_type = type("VisionActorObjPred", (), {})
@@ -164,7 +165,8 @@ def _portable_spec(checkpoint_sha: str, runtime_sha: str) -> dict:
         homie_action_dim=15,
         replay_action_dim=26,
         checkpoint_sha256=checkpoint_sha,
-        runtime_policy_sha256=runtime_sha,
+        policy_state_sha256=policy_state_sha,
+        homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
     )
 
 
@@ -286,9 +288,14 @@ def run(output_root: Path) -> dict:
     bootstrap_model = TinyPolicy()
     bootstrap_source = output_root / "bootstrap_source.pt"
     torch.save({"policy_state_dict": bootstrap_model.state_dict()}, bootstrap_source)
-    bootstrap_runtime_sha = runtime_state_dict_sha256(bootstrap_model.state_dict())
+    bootstrap_policy_state_sha = runtime_state_dict_sha256(
+        bootstrap_model.state_dict()
+    )
     bootstrap_source_sha = sha256_file(bootstrap_source)
-    bootstrap_spec = _portable_spec(bootstrap_source_sha, bootstrap_runtime_sha)
+    bootstrap_spec = _portable_spec(
+        bootstrap_source_sha, bootstrap_policy_state_sha
+    )
+    bootstrap_runtime_sha = bootstrap_spec["runtime_policy_sha256"]
     bootstrap_spec_path = Path(f"{bootstrap_source}.policy_spec.json")
     bootstrap_spec_sha = publish_immutable_json(
         bootstrap_spec_path, bootstrap_spec

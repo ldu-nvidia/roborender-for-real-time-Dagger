@@ -17,6 +17,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/round_dagger/verify_learner_restart_equivalence.py"
+HOMIE_CONTROLLER_SHA256 = {"walk": "a" * 64, "stand": "b" * 64}
 
 
 def _load_gate():
@@ -39,14 +40,21 @@ class RestartEquivalenceGateTest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def _checkpoint(self, path: Path, *, weight: float = 1.0) -> None:
+    def _checkpoint(
+        self,
+        path: Path,
+        *,
+        weight: float = 1.0,
+        homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
+    ) -> None:
         state = {"linear.weight": torch.tensor([[weight]], dtype=torch.float32)}
         torch.save(
             {
-                "schema": "fast_roborender.round_dagger.learner_checkpoint.v2",
+                "schema": "fast_roborender.round_dagger.learner_checkpoint.v3",
                 "checkpoint_schema": "gr00t.trl.full_state.v2",
                 "policy_state_dict": state,
                 "policy_parameter_names": ["linear.weight"],
+                "homie_controller_sha256": homie_controller_sha256,
                 "campaign_id": "test",
                 "macro_round": 0,
                 "model_lineage_sha256": "1" * 64,
@@ -119,6 +127,35 @@ class RestartEquivalenceGateTest(unittest.TestCase):
                 resumed_checkpoint=resumed,
                 expected_completed_steps=3,
             )
+
+    def test_malformed_homie_controller_identity_fails_closed(self):
+        invalid_values = (
+            None,
+            {"walk": "a" * 64},
+            {"walk": "a" * 64, "stand": "B" * 64},
+            {
+                "walk": "a" * 64,
+                "stand": "b" * 64,
+                "unexpected": "c" * 64,
+            },
+        )
+        for index, invalid in enumerate(invalid_values):
+            with self.subTest(invalid=invalid):
+                full = self.root / f"full-invalid-{index}.pt"
+                resumed = self.root / f"resumed-invalid-{index}.pt"
+                self._checkpoint(
+                    full, homie_controller_sha256=invalid
+                )
+                self._checkpoint(resumed)
+                with self.assertRaisesRegex(
+                    self.gate.RestartEquivalenceError,
+                    "Homie controller identity is malformed",
+                ):
+                    self.gate.verify(
+                        uninterrupted_checkpoint=full,
+                        resumed_checkpoint=resumed,
+                        expected_completed_steps=2,
+                    )
 
 
 if __name__ == "__main__":

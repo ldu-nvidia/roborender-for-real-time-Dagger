@@ -66,8 +66,10 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         snapshot_dir.mkdir(parents=True)
         checkpoint = policy_dir / "checkpoint.pt"
         checkpoint.write_bytes(b"strict-parent-checkpoint")
-        runtime_sha = "2" * 64
-        spec, manifest = publish_policy_bundle(checkpoint, runtime_sha)
+        spec, manifest = publish_policy_bundle(checkpoint, "2" * 64)
+        runtime_sha = artifacts.load_strict_json(spec)[
+            "runtime_policy_sha256"
+        ]
         snapshot = snapshot_dir / "through_macro_round_000000.json"
         snapshot.write_text("{}\n", encoding="utf-8")
         wandb = campaign / "actors/cohort_00/.wandb_media"

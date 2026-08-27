@@ -440,6 +440,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         candidate = torch.load(candidate_path, map_location="cpu", weights_only=False)
         self.assertEqual(candidate["checkpoint_schema"], "gr00t.trl.full_state.v2")
         self.assertIn("policy_state_dict", candidate)
+        self.assertEqual(
+            candidate["homie_controller_sha256"],
+            _config().to_mapping()["model_config"][
+                "homie_controller_sha256"
+            ],
+        )
         self.assertEqual(report["optimizer_steps"], 120)
         self.assertEqual(
             Path(report["manifest_path"]).parent
@@ -455,6 +461,29 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
                 / report["policy_bundle_manifest_path"]
             ).is_file()
         )
+
+    def test_candidate_publication_rejects_controller_lineage_drift(self):
+        result = train_from_replay(
+            TinyPolicy(),
+            snapshot_path=self.snapshot_path,
+            config=_config(),
+            output_dir=self.root / "controller-drift",
+            max_steps=1,
+            save_every=1,
+        )
+        checkpoint = torch.load(
+            result.restart_checkpoint, map_location="cpu", weights_only=False
+        )
+        checkpoint["homie_controller_sha256"]["walk"] = "f" * 64
+        torch.save(checkpoint, result.restart_checkpoint)
+        with self.assertRaisesRegex(
+            LearnerError, "controllers differ from learner policy spec"
+        ):
+            publish_learner_result(
+                output_dir=self.root / "controller-drift-publish",
+                result=result,
+                config=_config(),
+            )
 
     def test_initial_and_final_losses_use_the_identical_deterministic_probe(self):
         model = ProbeRecordingPolicy()

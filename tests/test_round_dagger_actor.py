@@ -19,6 +19,10 @@ from round_dagger.actor import (
     runtime_state_dict_sha256,
     trainer_rollout_arrays,
 )
+from round_dagger.policy_identity import runtime_policy_identity_sha256
+
+
+HOMIE_CONTROLLER_SHA256 = {"walk": "a" * 64, "stand": "b" * 64}
 
 
 class FakeStorage:
@@ -106,6 +110,7 @@ def fake_trainer(*, steps=3, envs=4):
         env=env,
         algo_obs_dim_dict={"vision_obs": 72, "actor_obs": 5},
         accelerator=SimpleNamespace(process_index=0),
+        homie_controller_sha256=dict(HOMIE_CONTROLLER_SHA256),
     )
     return trainer, rgb
 
@@ -137,17 +142,46 @@ class ActorConversionTest(unittest.TestCase):
 
     def test_runtime_digest_is_stable_and_parameter_sensitive(self):
         policy = NumpyPolicy()
-        first = runtime_policy_sha256(policy)
-        self.assertEqual(first, runtime_policy_sha256(policy))
-        policy.weight[0, 0] += 1
-        self.assertNotEqual(first, runtime_policy_sha256(policy))
-
-    def test_state_mapping_and_module_runtime_digests_match(self):
-        policy = NumpyPolicy()
-        self.assertEqual(
-            runtime_policy_sha256(policy),
-            runtime_state_dict_sha256(policy.state_dict()),
+        first = runtime_policy_sha256(
+            policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
         )
+        self.assertEqual(
+            first,
+            runtime_policy_sha256(
+                policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
+            ),
+        )
+        policy.weight[0, 0] += 1
+        self.assertNotEqual(
+            first,
+            runtime_policy_sha256(
+                policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
+            ),
+        )
+
+    def test_runtime_digest_binds_state_and_both_homie_controllers(self):
+        policy = NumpyPolicy()
+        state_sha256 = runtime_state_dict_sha256(policy.state_dict())
+        self.assertEqual(
+            runtime_policy_sha256(
+                policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
+            ),
+            runtime_policy_identity_sha256(
+                state_sha256, HOMIE_CONTROLLER_SHA256
+            ),
+        )
+        for role in HOMIE_CONTROLLER_SHA256:
+            changed = dict(HOMIE_CONTROLLER_SHA256)
+            changed[role] = "c" * 64
+            with self.subTest(role=role):
+                self.assertNotEqual(
+                    runtime_policy_sha256(
+                        policy, homie_controller_sha256=changed
+                    ),
+                    runtime_policy_identity_sha256(
+                        state_sha256, HOMIE_CONTROLLER_SHA256
+                    ),
+                )
         with self.assertRaisesRegex(ActorExportError, "non-empty mapping"):
             runtime_state_dict_sha256({})
 
@@ -163,7 +197,13 @@ class ActorConversionTest(unittest.TestCase):
             root = Path(temporary)
             checkpoint = root / "candidate.pt"
             state = {"weight": torch.arange(6, dtype=torch.float32).reshape(2, 3)}
-            torch.save({"policy_state_dict": state}, checkpoint)
+            torch.save(
+                {
+                    "policy_state_dict": state,
+                    "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
+                },
+                checkpoint,
+            )
             expected = sha256_file(checkpoint)
             result = subprocess.run(
                 [
@@ -181,7 +221,17 @@ class ActorConversionTest(unittest.TestCase):
             report = json.loads(result.stdout)
             self.assertEqual(report["checkpoint_sha256"], expected)
             self.assertEqual(
-                report["runtime_policy_sha256"], runtime_state_dict_sha256(state)
+                report["policy_state_sha256"], runtime_state_dict_sha256(state)
+            )
+            self.assertEqual(
+                report["runtime_policy_sha256"],
+                runtime_policy_identity_sha256(
+                    runtime_state_dict_sha256(state),
+                    HOMIE_CONTROLLER_SHA256,
+                ),
+            )
+            self.assertEqual(
+                report["homie_controller_sha256"], HOMIE_CONTROLLER_SHA256
             )
             self.assertEqual(report["state_entries"], 1)
 
@@ -223,7 +273,9 @@ class ActorPublicationIntegrationTest(unittest.TestCase):
     def test_one_rank_exports_parts_and_seals_exactly(self):
         trainer, _ = fake_trainer()
         policy = NumpyPolicy()
-        runtime_sha = runtime_policy_sha256(policy)
+        runtime_sha = runtime_policy_sha256(
+            policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
+        )
         digests = {
             "policy_sha256": "1" * 64,
             "runtime_policy_sha256": runtime_sha,
@@ -283,7 +335,9 @@ class ActorPublicationIntegrationTest(unittest.TestCase):
     def test_changed_policy_is_rejected_before_publish(self):
         trainer, _ = fake_trainer()
         policy = NumpyPolicy()
-        before = runtime_policy_sha256(policy)
+        before = runtime_policy_sha256(
+            policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
+        )
         policy.bias += 1
         with self.assertRaisesRegex(ActorExportError, "changed during collection"):
             export_trainer_rollout(

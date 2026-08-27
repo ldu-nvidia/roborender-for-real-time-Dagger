@@ -236,10 +236,13 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
         self.teacher.write_bytes(b"teacher")
         self.policy_sha = artifacts.sha256_file(self.checkpoint)
         self.teacher_sha = artifacts.sha256_file(self.teacher)
-        self.runtime_sha = "2" * 64
+        policy_state_sha = "2" * 64
         self.spec, self.manifest = publish_policy_bundle(
-            self.checkpoint, self.runtime_sha
+            self.checkpoint, policy_state_sha
         )
+        self.runtime_sha = artifacts.load_strict_json(self.spec)[
+            "runtime_policy_sha256"
+        ]
         self.cohort = self.root / "cohort"
         artifacts.create_cohort(
             self.cohort,

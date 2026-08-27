@@ -15,6 +15,11 @@ if str(REPOSITORY) not in sys.path:
 
 from round_dagger.actor import ActorExportError, runtime_state_dict_sha256  # noqa: E402
 from round_dagger.artifacts import sha256_file  # noqa: E402
+from round_dagger.policy_identity import (  # noqa: E402
+    PolicyIdentityError,
+    runtime_policy_identity_sha256,
+    validate_homie_controller_sha256,
+)
 
 
 def _arguments() -> argparse.Namespace:
@@ -58,12 +63,26 @@ def main() -> int:
     # proves that this is the exact trusted artifact selected for the round.
     document = torch.load(checkpoint, map_location="cpu", weights_only=False)
     state = _policy_state(document)
+    if not isinstance(document, Mapping):
+        raise ActorExportError("checkpoint root must bind Homie controllers")
+    try:
+        controller_sha256 = validate_homie_controller_sha256(
+            document.get("homie_controller_sha256")
+        )
+        policy_state_sha256 = runtime_state_dict_sha256(state)
+        runtime_policy_sha256 = runtime_policy_identity_sha256(
+            policy_state_sha256, controller_sha256
+        )
+    except PolicyIdentityError as exc:
+        raise ActorExportError(str(exc)) from exc
     print(
         json.dumps(
             {
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": actual,
-                "runtime_policy_sha256": runtime_state_dict_sha256(state),
+                "policy_state_sha256": policy_state_sha256,
+                "homie_controller_sha256": controller_sha256,
+                "runtime_policy_sha256": runtime_policy_sha256,
                 "state_entries": len(state),
             },
             sort_keys=True,

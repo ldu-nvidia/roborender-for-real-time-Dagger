@@ -38,7 +38,10 @@ from round_dagger.state import (
     seal_collection,
     transition,
 )
-from tests.policy_bundle_helpers import publish_policy_bundle
+from tests.policy_bundle_helpers import (
+    complete_runtime_policy_sha256,
+    publish_policy_bundle,
+)
 
 
 def _sha(label: str) -> str:
@@ -290,7 +293,10 @@ class StatePromotionLifecycleTest(unittest.TestCase):
         contract = open_macro_round(root, expected_revision=0)
         self.assertEqual(contract["campaign_id"], "state-test")
         self.assertEqual(contract["macro_round"], 0)
-        self.assertEqual(contract["policy_runtime_sha256"], _sha("runtime-policy-0"))
+        self.assertEqual(
+            contract["policy_runtime_sha256"],
+            complete_runtime_policy_sha256(_sha("runtime-policy-0")),
+        )
         self.assertAlmostEqual(contract["beta"], 0.8)
         self.assertEqual(
             [item["cohort_index"] for item in contract["cohorts"]], [0, 1, 2, 3]
@@ -382,8 +388,9 @@ class StatePromotionLifecycleTest(unittest.TestCase):
 
         source = self.tmp_path / "renamed-source.pt"
         source.write_bytes(b"complete-bundle")
-        runtime_sha = _sha("canonical-runtime")
-        publish_policy_bundle(source, runtime_sha)
+        policy_state_sha = _sha("canonical-policy-state")
+        runtime_sha = complete_runtime_policy_sha256(policy_state_sha)
+        publish_policy_bundle(source, policy_state_sha)
         root = self.tmp_path / "canonical-sidecar-campaign"
         bootstrap = stage_bootstrap_policy(
             root,

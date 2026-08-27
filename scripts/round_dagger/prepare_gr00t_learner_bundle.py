@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Prepare one immutable, parent-bound GR00T learner bundle.
 
-The portable policy specification is an architecture template.  This command
-binds that template to the active parent checkpoint and its runtime identity,
-adds all optimizer/restart settings, and publishes the canonical
-``LearnerBundleConfig`` consumed by every H100 rank.
+The portable policy specification is the exact active-parent identity.  This
+command refuses to relabel it, adds optimizer/restart settings, and publishes
+the canonical ``LearnerBundleConfig`` consumed by every H100 rank.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import re
@@ -107,12 +105,18 @@ def prepare_bundle(
     if actual_parent != expected_parent:
         raise BundlePreparationError("parent checkpoint SHA-256 mismatch")
 
-    base_spec = load_policy_spec(spec_path)
-    derived_spec = copy.deepcopy(base_spec)
-    derived_spec["checkpoint_sha256"] = actual_parent
-    derived_spec["runtime_policy_sha256"] = _sha256(
+    derived_spec = load_policy_spec(spec_path)
+    expected_runtime = _sha256(
         runtime_policy_sha256, "runtime policy SHA-256"
     )
+    if derived_spec["checkpoint_sha256"] != actual_parent:
+        raise BundlePreparationError(
+            "active policy spec checkpoint identity mismatch"
+        )
+    if derived_spec["runtime_policy_sha256"] != expected_runtime:
+        raise BundlePreparationError(
+            "active policy spec runtime identity mismatch"
+        )
     derived_spec = validate_policy_spec(derived_spec)
     if derived_spec["input_contract"]["vision_shape"] != list(VISION_SHAPE):
         raise BundlePreparationError("portable policy does not use the production view")

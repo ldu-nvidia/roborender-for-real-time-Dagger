@@ -16,8 +16,10 @@ from round_dagger.gr00t_policy import (
     POLICY_TARGET,
     build_portable_policy_spec,
 )
+from round_dagger.policy_identity import runtime_policy_identity_sha256
 
 
+HOMIE_CONTROLLER_SHA256 = {"walk": "7" * 64, "stand": "8" * 64}
 DIGESTS = {
     "policy_sha256": "1" * 64,
     "runtime_policy_sha256": "2" * 64,
@@ -32,7 +34,7 @@ _FakePolicy = type("VisionActorObjPred", (), {})
 _FakePolicy.__module__ = "gr00t.rl.trl.modules.vision_actor_critic_modules_obj_pred"
 
 
-def portable_policy_spec(checkpoint_sha256, runtime_policy_sha256):
+def portable_policy_spec(checkpoint_sha256, policy_state_sha256):
     policy = _FakePolicy()
     policy.num_actions = 11
     policy.obj_pred_mlp = types.SimpleNamespace(output_dim=3)
@@ -108,13 +110,14 @@ def portable_policy_spec(checkpoint_sha256, runtime_policy_sha256):
         homie_action_dim=15,
         replay_action_dim=26,
         checkpoint_sha256=checkpoint_sha256,
-        runtime_policy_sha256=runtime_policy_sha256,
+        policy_state_sha256=policy_state_sha256,
+        homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
     )
 
 
-def publish_policy_bundle(checkpoint, runtime_policy_sha256, mutate_spec=None):
+def publish_policy_bundle(checkpoint, policy_state_sha256, mutate_spec=None):
     checkpoint_sha256 = artifacts.sha256_file(checkpoint)
-    spec = portable_policy_spec(checkpoint_sha256, runtime_policy_sha256)
+    spec = portable_policy_spec(checkpoint_sha256, policy_state_sha256)
     if mutate_spec is not None:
         mutate_spec(spec)
     spec_path = Path(f"{checkpoint}.policy_spec.json")
@@ -128,7 +131,7 @@ def publish_policy_bundle(checkpoint, runtime_policy_sha256, mutate_spec=None):
             "schema": "fast_roborender.round_dagger.bootstrap_policy.v1",
             "checkpoint_path": checkpoint.name,
             "checkpoint_sha256": checkpoint_sha256,
-            "runtime_policy_sha256": runtime_policy_sha256,
+            "runtime_policy_sha256": spec["runtime_policy_sha256"],
             "policy_spec_path": spec_path.name,
             "policy_spec_sha256": artifacts.sha256_file(spec_path),
         },
@@ -275,12 +278,15 @@ class ActorLauncherContractTest(unittest.TestCase):
             teacher.write_bytes(b"teacher")
             policy_sha = artifacts.sha256_file(checkpoint)
             teacher_sha = artifacts.sha256_file(teacher)
-            runtime_sha = "2" * 64
+            policy_state_sha = "2" * 64
+            runtime_sha = runtime_policy_identity_sha256(
+                policy_state_sha, HOMIE_CONTROLLER_SHA256
+            )
             renderer_sha = "4" * 64
             beta_sha = "5" * 64
             config_sha = "6" * 64
             policy_spec, policy_manifest = publish_policy_bundle(
-                checkpoint, runtime_sha
+                checkpoint, policy_state_sha
             )
             cohort = root / "cohort"
             artifacts.create_cohort(
@@ -562,7 +568,7 @@ class ActorLauncherContractTest(unittest.TestCase):
             }
             for label, (mutation, expected_error) in action_mutations.items():
                 with self.subTest(label=label):
-                    publish_policy_bundle(checkpoint, runtime_sha, mutation)
+                    publish_policy_bundle(checkpoint, policy_state_sha, mutation)
                     invalid = subprocess.run(
                         ["bash", str(script)],
                         env={
@@ -584,7 +590,7 @@ class ActorLauncherContractTest(unittest.TestCase):
                     self.assertIn(expected_error, invalid.stderr)
                     self.assertFalse(launch_marker.exists())
 
-            publish_policy_bundle(checkpoint, runtime_sha)
+            publish_policy_bundle(checkpoint, policy_state_sha)
             manifest_document = artifacts.load_strict_json(policy_manifest)
             policy_manifest.unlink()
             manifest_document["runtime_policy_sha256"] = "f" * 64
@@ -610,7 +616,7 @@ class ActorLauncherContractTest(unittest.TestCase):
             )
             self.assertFalse(launch_marker.exists())
 
-            publish_policy_bundle(checkpoint, runtime_sha)
+            publish_policy_bundle(checkpoint, policy_state_sha)
             policy_manifest.unlink()
             missing = subprocess.run(
                 ["bash", str(script)],

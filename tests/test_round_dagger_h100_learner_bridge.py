@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import importlib.util
 import os
 import subprocess
@@ -35,6 +34,7 @@ except ImportError:  # The lightweight control-plane environment has no torch.
 ROOT = Path(__file__).resolve().parents[1]
 PREPARER_PATH = ROOT / "scripts/round_dagger/prepare_gr00t_learner_bundle.py"
 LAUNCHER_PATH = ROOT / "scripts/round_dagger/run_h100_learner.sh"
+HOMIE_CONTROLLER_SHA256 = {"walk": "7" * 64, "stand": "8" * 64}
 
 
 def _load_preparer():
@@ -58,7 +58,9 @@ def _load_train_entrypoint():
     return module
 
 
-def _policy_spec() -> dict:
+def _policy_spec(
+    *, checkpoint_sha256: str = "1" * 64, policy_state_sha256: str = "2" * 64
+) -> dict:
     policy_type = type("VisionActorObjPred", (), {})
     policy_type.__module__ = "gr00t.rl.trl.modules.vision_actor_critic_modules_obj_pred"
     policy = policy_type()
@@ -135,21 +137,24 @@ def _policy_spec() -> dict:
         rgb_std=[0.229, 0.224, 0.225],
         homie_action_dim=15,
         replay_action_dim=26,
-        checkpoint_sha256="1" * 64,
-        runtime_policy_sha256="2" * 64,
+        checkpoint_sha256=checkpoint_sha256,
+        policy_state_sha256=policy_state_sha256,
+        homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
     )
 
 
 def _bundle_kwargs(root: Path) -> dict:
     parent = root / "parent.pt"
     parent.write_bytes(b"strict-parent-checkpoint")
+    parent_sha256 = artifacts.sha256_file(parent)
+    spec = _policy_spec(checkpoint_sha256=parent_sha256)
     spec_path = root / "base.policy_spec.json"
-    artifacts.publish_immutable_json(spec_path, _policy_spec())
+    artifacts.publish_immutable_json(spec_path, spec)
     return {
         "base_policy_spec": spec_path,
         "parent_checkpoint": parent,
-        "expected_parent_checkpoint_sha256": artifacts.sha256_file(parent),
-        "runtime_policy_sha256": "3" * 64,
+        "expected_parent_checkpoint_sha256": parent_sha256,
+        "runtime_policy_sha256": spec["runtime_policy_sha256"],
         "campaign_id": "production-test",
         "macro_round": 0,
         "code_sha256": "4" * 64,
@@ -251,23 +256,26 @@ class ImmutableLearnerBundleTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_derivation_binds_current_parent_runtime_and_optimizer_contract(self):
-        source = copy.deepcopy(_policy_spec())
+        source = artifacts.load_strict_json(self.kwargs["base_policy_spec"])
         bundle = self.preparer.prepare_bundle(**self.kwargs)
         mapping = bundle.to_mapping()
         parent_sha = self.kwargs["expected_parent_checkpoint_sha256"]
         self.assertEqual(bundle.model_lineage_sha256, parent_sha)
         self.assertEqual(bundle.initial_checkpoint_sha256, parent_sha)
         self.assertEqual(mapping["model_config"]["checkpoint_sha256"], parent_sha)
-        self.assertEqual(mapping["model_config"]["runtime_policy_sha256"], "3" * 64)
+        self.assertEqual(
+            mapping["model_config"]["runtime_policy_sha256"],
+            self.kwargs["runtime_policy_sha256"],
+        )
         self.assertEqual(mapping["train_action_slice"], [0, 11])
         self.assertEqual((bundle.max_steps, bundle.save_every), (11, 3))
         self.assertEqual((bundle.learning_rate, bundle.weight_decay), (2.5e-5, 0.01))
-        self.assertEqual(source["checkpoint_sha256"], "1" * 64)
+        self.assertEqual(source["checkpoint_sha256"], parent_sha)
         self.assertEqual(
             artifacts.load_strict_json(self.kwargs["base_policy_spec"])[
                 "checkpoint_sha256"
             ],
-            "1" * 64,
+            parent_sha,
         )
 
     def test_parent_digest_and_symlink_are_rejected(self):
@@ -283,6 +291,38 @@ class ImmutableLearnerBundleTest(unittest.TestCase):
             self.preparer.BundlePreparationError, "non-symlink"
         ):
             self.preparer.prepare_bundle(**bad_link)
+
+    def test_active_spec_cannot_be_relabelled_with_another_runtime(self):
+        with self.assertRaisesRegex(
+            self.preparer.BundlePreparationError,
+            "active policy spec runtime identity mismatch",
+        ):
+            self.preparer.prepare_bundle(
+                **dict(self.kwargs, runtime_policy_sha256="f" * 64)
+            )
+
+    def test_initial_checkpoint_state_must_match_portable_spec(self):
+        trainer = _load_train_entrypoint()
+        model = torch.nn.Linear(2, 1)
+        checkpoint = self.root / "initial.pt"
+        torch.save({"policy_state_dict": model.state_dict()}, checkpoint)
+        from round_dagger.actor import runtime_state_dict_sha256
+
+        trainer._load_initial_checkpoint(
+            model,
+            checkpoint,
+            expected_policy_state_sha256=runtime_state_dict_sha256(
+                model.state_dict()
+            ),
+        )
+        with self.assertRaisesRegex(
+            trainer.LearnerError, "differs from portable policy spec"
+        ):
+            trainer._load_initial_checkpoint(
+                model,
+                checkpoint,
+                expected_policy_state_sha256="f" * 64,
+            )
 
     def test_publication_is_idempotent_but_configuration_drift_conflicts(self):
         bundle = self.preparer.prepare_bundle(**self.kwargs)
@@ -614,7 +654,7 @@ class H100LauncherDryRunTest(unittest.TestCase):
         restart = self.output / "restart.pt"
         torch.save(
             {
-                "schema": "fast_roborender.round_dagger.learner_checkpoint.v2",
+                "schema": "fast_roborender.round_dagger.learner_checkpoint.v3",
                 "campaign_id": "production-test",
                 "macro_round": 0,
                 "model_lineage_sha256": self.bundle.model_lineage_sha256,
@@ -628,6 +668,7 @@ class H100LauncherDryRunTest(unittest.TestCase):
                 "replay_snapshot_sha256": self.snapshot["snapshot_sha256"],
                 "replay_snapshot_file_sha256": self.snapshot["file_sha256"],
                 "world_size": 1,
+                "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
                 "completed_steps": 3,
                 "initial_loss": 1.25,
                 "rng_states": [{}],
@@ -658,11 +699,23 @@ class H100LauncherDryRunTest(unittest.TestCase):
 
     def test_current_round_runtime_provenance_drift_is_rejected(self):
         environment = self._environment()
-        environment["ROUND_DAGGER_RUNTIME_POLICY_SHA256"] = "9" * 64
+        changed_spec = _policy_spec(
+            checkpoint_sha256=self.kwargs["expected_parent_checkpoint_sha256"],
+            policy_state_sha256="9" * 64,
+        )
+        changed_spec_path = self.root / "changed.policy_spec.json"
+        artifacts.publish_immutable_json(changed_spec_path, changed_spec)
+        changed_runtime = changed_spec["runtime_policy_sha256"]
+        environment["ROUND_DAGGER_RUNTIME_POLICY_SHA256"] = changed_runtime
+        environment["ROUND_DAGGER_BASE_POLICY_SPEC"] = str(changed_spec_path)
         # Recompute the immutable bundle so the failure is specifically at the
         # replay provenance gate rather than at bundle digest validation.
         changed = self.preparer.prepare_bundle(
-            **dict(self.kwargs, runtime_policy_sha256="9" * 64)
+            **dict(
+                self.kwargs,
+                base_policy_spec=changed_spec_path,
+                runtime_policy_sha256=changed_runtime,
+            )
         )
         environment["ROUND_DAGGER_LEARNER_CONFIG_SHA256"] = changed.sha256
         self._bind_identity(environment)

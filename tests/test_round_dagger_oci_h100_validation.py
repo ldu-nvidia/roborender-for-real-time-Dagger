@@ -17,7 +17,11 @@ from round_dagger.learner_identity import (
     learner_identity_sha256,
     learner_wandb_run_id,
 )
-from tests.policy_bundle_helpers import publish_policy_bundle
+from tests.policy_bundle_helpers import (
+    HOMIE_CONTROLLER_SHA256,
+    complete_runtime_policy_sha256,
+    publish_policy_bundle,
+)
 
 try:
     import torch
@@ -330,6 +334,10 @@ class H100ValidationAttestationTest(unittest.TestCase):
         self.source_sha = "1" * 64
         self.snapshot_sha = "2" * 64
         self.runtime_sha = "3" * 64
+        self.candidate_policy_state_sha = "4" * 64
+        self.candidate_runtime_sha = complete_runtime_policy_sha256(
+            self.candidate_policy_state_sha
+        )
 
         self.source = self.root / "source"
         self.source.mkdir()
@@ -647,7 +655,7 @@ class H100ValidationAttestationTest(unittest.TestCase):
         torch.save(
             {
                 "schema": (
-                    "fast_roborender.round_dagger.learner_checkpoint.v2"
+                    "fast_roborender.round_dagger.learner_checkpoint.v3"
                 ),
                 "checkpoint_schema": "gr00t.trl.full_state.v2",
                 "policy_state_dict": state,
@@ -656,6 +664,7 @@ class H100ValidationAttestationTest(unittest.TestCase):
                 "completed_steps": steps,
                 "initial_loss": 1.0,
                 "world_size": 8,
+                "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
                 "model_state_dict": {
                     "weight": torch.tensor([1.0])
                 },
@@ -670,7 +679,9 @@ class H100ValidationAttestationTest(unittest.TestCase):
     def _result(self, directory: Path, restart: Path) -> Path:
         candidate = directory / "candidate_round_000000.pt"
         shutil.copyfile(restart, candidate)
-        spec, manifest = publish_policy_bundle(candidate, self.runtime_sha)
+        spec, manifest = publish_policy_bundle(
+            candidate, self.candidate_policy_state_sha
+        )
         result = directory / "learner_result_round_000000.json"
         _json(
             result,
@@ -682,7 +693,7 @@ class H100ValidationAttestationTest(unittest.TestCase):
                 "macro_round": self.macro_round,
                 "checkpoint_path": candidate.name,
                 "checkpoint_sha256": sha256_file(candidate),
-                "runtime_policy_sha256": self.runtime_sha,
+                "runtime_policy_sha256": self.candidate_runtime_sha,
                 "policy_spec_path": spec.name,
                 "policy_spec_sha256": sha256_file(spec),
                 "policy_bundle_manifest_path": manifest.name,
@@ -932,6 +943,50 @@ class H100ValidationAttestationTest(unittest.TestCase):
             "v2 lineage mismatch",
         ):
             attestation.build_attestation(**self._kwargs())
+
+    def test_attestation_rejects_malformed_homie_controller_identity(self) -> None:
+        _, semantic = attestation._semantic_identity(
+            campaign_id=self.campaign_id,
+            macro_round=self.macro_round,
+            learner_code_sha256=self.source_sha,
+            learner_config_sha256=self.config_sha,
+            model_lineage_sha256=self.policy_sha,
+            replay_snapshot_file_sha256=self.snapshot_file_sha,
+            replay_snapshot_sha256=self.snapshot_sha,
+            parent_runtime_policy_sha256=self.runtime_sha,
+            learner_identity_sha256=self.identity_sha,
+            runtime_container_sha256=self.container_sha,
+            validation_contract_sha256=self.contract_sha,
+        )
+        template = torch.load(
+            self.full_restart, map_location="cpu", weights_only=False
+        )
+        invalid_values = (
+            None,
+            {"walk": "a" * 64},
+            {"walk": "a" * 64, "stand": "B" * 64},
+            {
+                "walk": "a" * 64,
+                "stand": "b" * 64,
+                "unexpected": "c" * 64,
+            },
+        )
+        for index, invalid in enumerate(invalid_values):
+            with self.subTest(invalid=invalid):
+                document = dict(template)
+                document["homie_controller_sha256"] = invalid
+                checkpoint = self.root / f"invalid-controller-{index}.pt"
+                torch.save(document, checkpoint)
+                with self.assertRaisesRegex(
+                    attestation.H100ValidationAttestationError,
+                    "Homie controller identity is malformed",
+                ):
+                    attestation._checkpoint(
+                        checkpoint,
+                        label="validation checkpoint",
+                        completed_steps=2,
+                        semantic=semantic,
+                    )
 
 
 if __name__ == "__main__":

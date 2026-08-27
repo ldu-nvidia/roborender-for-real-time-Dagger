@@ -17,11 +17,16 @@ from round_dagger.gr00t_policy import (
     POLICY_TARGET,
     build_portable_policy_spec,
 )
+from round_dagger.policy_identity import runtime_policy_identity_sha256
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/round_dagger/run_actor_validation.sh"
-RUNTIME_SHA = "2" * 64
+POLICY_STATE_SHA = "2" * 64
+HOMIE_CONTROLLER_SHA256 = {"walk": "6" * 64, "stand": "7" * 64}
+RUNTIME_SHA = runtime_policy_identity_sha256(
+    POLICY_STATE_SHA, HOMIE_CONTROLLER_SHA256
+)
 RENDERER_SHA = "3" * 64
 BETA_SHA = "4" * 64
 CONFIG_SHA = "5" * 64
@@ -111,7 +116,8 @@ def _portable_spec(checkpoint_sha256: str) -> dict:
         homie_action_dim=15,
         replay_action_dim=26,
         checkpoint_sha256=checkpoint_sha256,
-        runtime_policy_sha256=RUNTIME_SHA,
+        policy_state_sha256=POLICY_STATE_SHA,
+        homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
     )
 
 

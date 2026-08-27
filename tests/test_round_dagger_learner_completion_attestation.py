@@ -14,7 +14,11 @@ from round_dagger.learner_identity import (
 )
 from scripts.round_dagger import learner_completion_attestation as completion
 from scripts.round_dagger import remote_learner_success
-from tests.policy_bundle_helpers import publish_policy_bundle
+from tests.policy_bundle_helpers import (
+    HOMIE_CONTROLLER_SHA256,
+    complete_runtime_policy_sha256,
+    publish_policy_bundle,
+)
 
 
 class LearnerCompletionAttestationTest(unittest.TestCase):
@@ -34,7 +38,10 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
         parent_sha = "2" * 64
         snapshot_file_sha = "3" * 64
         snapshot_sha = "4" * 64
-        candidate_runtime = "5" * 64
+        candidate_policy_state = "5" * 64
+        candidate_runtime = complete_runtime_policy_sha256(
+            candidate_policy_state
+        )
         parent_runtime = "6" * 64
         container_sha = "7" * 64
         contract_sha = "8" * 64
@@ -97,6 +104,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "replay_snapshot_file_sha256": snapshot_file_sha,
                 "completed_steps": 500,
                 "world_size": 8,
+                "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
                 "model_state_dict": {},
                 "optimizer_state_dict": {},
                 "rng_states": [None] * 8,
@@ -105,7 +113,9 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
         )
         candidate = output / "candidate_round_000000.pt"
         candidate.write_bytes(restart.read_bytes())
-        spec, manifest = publish_policy_bundle(candidate, candidate_runtime)
+        spec, manifest = publish_policy_bundle(
+            candidate, candidate_policy_state
+        )
         telemetry = output / "telemetry.jsonl"
         telemetry.write_text("sealed telemetry\n", encoding="utf-8")
         readback = output / "wandb_learner_readback_round_000000.json"

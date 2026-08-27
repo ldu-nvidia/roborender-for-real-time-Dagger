@@ -399,6 +399,9 @@ class ConfigAndTopologyTest(unittest.TestCase):
             spec, bundle_manifest = publish_policy_bundle(
                 checkpoint, SHA["runtime"]
             )
+            candidate_runtime = artifacts.load_strict_json(spec)[
+                "runtime_policy_sha256"
+            ]
             result_path = backend.learner_result_path()
             publish_immutable_json(
                 result_path,
@@ -408,7 +411,7 @@ class ConfigAndTopologyTest(unittest.TestCase):
                     "macro_round": 0,
                     "checkpoint_path": checkpoint.name,
                     "checkpoint_sha256": sha256_file(checkpoint),
-                    "runtime_policy_sha256": SHA["runtime"],
+                    "runtime_policy_sha256": candidate_runtime,
                     "policy_spec_path": spec.name,
                     "policy_spec_sha256": sha256_file(spec),
                     "policy_bundle_manifest_path": bundle_manifest.name,
@@ -426,7 +429,9 @@ class ConfigAndTopologyTest(unittest.TestCase):
                 campaign={"campaign_id": "production-campaign"},
                 snapshot={"snapshot_sha256": SHA["snapshot_semantic"]},
             )
-            self.assertEqual(loaded["runtime_policy_sha256"], SHA["runtime"])
+            self.assertEqual(
+                loaded["runtime_policy_sha256"], candidate_runtime
+            )
             self.assertEqual(loaded["absolute_policy_spec_path"], str(spec))
 
             spec.chmod(0o600)

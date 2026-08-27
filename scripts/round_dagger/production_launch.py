@@ -752,6 +752,58 @@ def _verify_static_inputs(campaign_contract: Mapping[str, Any]) -> None:
         raise ProductionLaunchError("local W&B netrc has no supported API credential")
 
 
+def _verify_camera_acceptance_source_bindings(
+    campaign_contract: Mapping[str, Any],
+    *,
+    learner_source_report: Mapping[str, Any],
+    evaluation_source_report: Mapping[str, Any],
+) -> None:
+    """Bind accepted camera evidence to the nested renderer implementation.
+
+    The outer repository may receive control-plane hardening after an operator
+    accepts a calibration panel.  The nested GR00T source, however, owns the
+    Isaac camera construction and render cache.  Any change to that exact tree
+    invalidates the visual acceptance and must force a new calibration review.
+    """
+
+    camera = campaign_contract["artifacts"]["camera_acceptance"]
+    path = Path(camera["path"])
+    _file_identity(path, camera["sha256"], "camera acceptance")
+    try:
+        acceptance = artifacts.load_strict_json(path)
+    except Exception as exc:
+        raise ProductionLaunchError("cannot load strict camera acceptance") from exc
+    if not isinstance(acceptance, Mapping):
+        raise ProductionLaunchError("camera acceptance must be a JSON object")
+
+    accepted_revision = acceptance.get("gr00t_revision")
+    if not isinstance(accepted_revision, str) or REVISION_RE.fullmatch(
+        accepted_revision
+    ) is None:
+        raise ProductionLaunchError("camera acceptance GR00T revision is malformed")
+    accepted_tree = _require_sha(
+        acceptance.get("gr00t_source_tree_sha256"),
+        "camera acceptance GR00T source tree",
+    )
+    for label, report in (
+        ("learner", learner_source_report),
+        ("evaluation", evaluation_source_report),
+    ):
+        _require_equal(
+            report.get("gr00t_revision"),
+            accepted_revision,
+            f"{label} source/camera acceptance GR00T revision",
+        )
+        _require_equal(
+            _require_sha(
+                report.get("gr00t_source_tree_sha256"),
+                f"{label} GR00T source tree",
+            ),
+            accepted_tree,
+            f"{label} source/camera acceptance GR00T tree",
+        )
+
+
 def _verify_remote_source(
     root: str,
     inventory_sha256: str,
@@ -1183,13 +1235,21 @@ def derive_learner_bundle_sha256(
         policy_spec = load_policy_spec(
             _regular(base_policy_spec, "active base policy spec")
         )
-        policy_spec["checkpoint_sha256"] = actual_parent
-        policy_spec["runtime_policy_sha256"] = runtime_sha
         policy_spec = validate_policy_spec(policy_spec)
     except Exception as exc:
         raise ProductionLaunchError(
             f"cannot derive the active per-round learner bundle: {exc}"
         ) from exc
+    _require_equal(
+        policy_spec["checkpoint_sha256"],
+        actual_parent,
+        "active base policy spec/checkpoint identity",
+    )
+    _require_equal(
+        policy_spec["runtime_policy_sha256"],
+        runtime_sha,
+        "active base policy spec/runtime identity",
+    )
     if policy_spec["input_contract"]["vision_shape"] != list(VISION_SHAPE):
         raise ProductionLaunchError("portable policy does not use the production view")
     expected_output = {
@@ -1486,6 +1546,11 @@ def validate_launch(
         evaluation_sealed_source_inventory_sha256,
         campaign_contract=campaign_contract,
     )
+    _verify_camera_acceptance_source_bindings(
+        campaign_contract,
+        learner_source_report=source_report,
+        evaluation_source_report=local_seal_report,
+    )
     (
         configuration,
         campaign,
@@ -1527,6 +1592,10 @@ def validate_launch(
         "fast_roborender"
     ]["revision"]
     environment["ROUND_DAGGER_GR00T_REVISION"] = local_source["gr00t"]["revision"]
+    environment["ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256"] = _require_sha(
+        source_report.get("gr00t_source_tree_sha256"),
+        "sealed source GR00T tree",
+    )
     for name, value in environment.items():
         if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name) or "\x00" in value or "\n" in value:
             raise ProductionLaunchError("generated environment is unsafe")

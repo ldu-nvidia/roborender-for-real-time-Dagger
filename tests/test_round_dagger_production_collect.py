@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -188,10 +189,12 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.checkpoint = self.root / "student-v0.pt"
         self.checkpoint.write_bytes(b"fresh-policy")
-        self.runtime_sha = "2" * 64
         self.spec, self.manifest = publish_policy_bundle(
-            self.checkpoint, self.runtime_sha
+            self.checkpoint, "2" * 64
         )
+        self.runtime_sha = artifacts.load_strict_json(self.spec)[
+            "runtime_policy_sha256"
+        ]
         self.policy_sha = artifacts.sha256_file(self.checkpoint)
         self.cohort = self.root / "actors/cohort_00"
         artifacts.create_cohort(
@@ -236,6 +239,7 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
 
     def test_full_preflight_reaches_only_pair_dry_run(self) -> None:
         run_dir = self.root / "actors/cohort_00_run"
+        camera_acceptance = json.loads(self.CAMERA.read_text(encoding="utf-8"))
         environment = {
             **os.environ,
             "DRY_RUN": "1",
@@ -280,6 +284,10 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
             "ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256": artifacts.sha256_file(
                 self.CAMERA
             ),
+            "ROUND_DAGGER_GR00T_REVISION": camera_acceptance["gr00t_revision"],
+            "ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256": camera_acceptance[
+                "gr00t_source_tree_sha256"
+            ],
             "ROUND_DAGGER_WANDB_NETRC": str(self.WANDB_NETRC),
             "ROUND_DAGGER_ACTOR_RUN_DIR": str(run_dir),
             "TRAIN_RUN_DIR": str(run_dir),

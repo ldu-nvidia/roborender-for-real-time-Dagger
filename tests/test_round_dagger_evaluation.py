@@ -120,11 +120,23 @@ class PairedEvaluationTest(unittest.TestCase):
             },
         }
         self.renderer_runtime_sha = canonical_json_sha256(self.renderer_identity)
-        self.cases = [
-            {"seed": seed, "env_index": env, "scenario_id": _sha(f"{seed}:{env}")}
-            for seed in (17, 29)
-            for env in range(4)
-        ]
+        self.cases = []
+        for seed in (17, 29):
+            for env in range(4):
+                condition_sha = _sha(f"condition:shared:{seed}:{env}")
+                self.cases.append(
+                    {
+                        "seed": seed,
+                        "env_index": env,
+                        "scenario_id": canonical_json_sha256(
+                            {
+                                "seed": seed,
+                                "env_index": env,
+                                "first_condition_sha256": condition_sha,
+                            }
+                        ),
+                    }
+                )
         self.contract = create_contract(
             self.root,
             candidate_manifest=self.candidate["manifest_path"],
@@ -223,6 +235,13 @@ class PairedEvaluationTest(unittest.TestCase):
             generated_sha = _sha(
                 f"generated:{generated_tag}:{seed}:{env_index}"
             )
+            observed_scenario_id = canonical_json_sha256(
+                {
+                    "seed": seed,
+                    "env_index": env_index,
+                    "first_condition_sha256": condition_sha,
+                }
+            )
             first_conditions[str(env_index)] = condition_sha
             first_generated[str(env_index)] = generated_sha
             episodes.append(
@@ -231,7 +250,7 @@ class PairedEvaluationTest(unittest.TestCase):
                     "seed": seed,
                     "scenario_id": _sha("wrong")
                     if bad_scenario and env_index == 0
-                    else case["scenario_id"],
+                    else observed_scenario_id,
                     "success": success,
                     "safety_violation": unsafe,
                     "action_imitation_mse": action_mse,
@@ -249,13 +268,7 @@ class PairedEvaluationTest(unittest.TestCase):
                     "seed": seed,
                     "first_condition_sha256": condition_sha,
                     "first_generated_sha256": generated_sha,
-                    "scenario_id": canonical_json_sha256(
-                        {
-                            "seed": seed,
-                            "env_index": env_index,
-                            "first_condition_sha256": condition_sha,
-                        }
-                    ),
+                    "scenario_id": observed_scenario_id,
                 }
             )
         generated_policy_steps = episode_length
@@ -965,7 +978,7 @@ class PairedEvaluationTest(unittest.TestCase):
                         output=f"evaluation/bad/{index}/outcome.json",
                     )
 
-    def test_actual_initial_conditions_must_match_across_policy_roles(self) -> None:
+    def test_actual_initial_conditions_must_match_the_paired_contract(self) -> None:
         for role in ("parent", "candidate"):
             for seed in self.contract["seeds"]:
                 metrics, before, after = self._raw_evidence(
@@ -976,26 +989,24 @@ class PairedEvaluationTest(unittest.TestCase):
                     action_mse=1.0,
                     condition_tag=role,
                 )
-                attest_outcome(
-                    self.root,
-                    contract_path=self.contract["contract_path"],
-                    role=role,
-                    seed=seed,
-                    metrics_path=metrics,
-                    renderer_before_path=before,
-                    renderer_after_path=after,
-                    image3f_run_id=evaluation_run_id(
-                        self.contract, role=role, seed=seed, attempt=1
-                    ),
-                    output=f"{self.results_relative}/{role}/seed_{seed}/outcome.json",
-                )
-        with self.assertRaisesRegex(EvaluationError, "not case-paired"):
-            summarize_to_evaluator_result(
-                self.root,
-                contract_path=self.contract["contract_path"],
-                results_dir=self.results_relative,
-                output=self.result_relative,
-            )
+                with self.assertRaisesRegex(
+                    EvaluationError, "runtime scenario identity differs"
+                ):
+                    attest_outcome(
+                        self.root,
+                        contract_path=self.contract["contract_path"],
+                        role=role,
+                        seed=seed,
+                        metrics_path=metrics,
+                        renderer_before_path=before,
+                        renderer_after_path=after,
+                        image3f_run_id=evaluation_run_id(
+                            self.contract, role=role, seed=seed, attempt=1
+                        ),
+                        output=(
+                            f"{self.results_relative}/{role}/seed_{seed}/outcome.json"
+                        ),
+                    )
 
     def test_actual_initial_generated_observations_must_match_across_roles(self) -> None:
         for role in ("parent", "candidate"):

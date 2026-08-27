@@ -124,9 +124,10 @@ CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE" \
 Calibration `RUN_ID`/`RUN_ROOT` reservations are fresh-only. If submission fails,
 use a new `RUN_ID`; an existing calibration run root is never reused.
 
-The camera acceptance and smoke manifests are immutable evidence. A changed
-source file, foundation shard, adapter, TensorRT engine, teacher checkpoint, or
-anchor file invalidates them and requires re-promotion.
+The camera acceptance and smoke manifests are immutable evidence. Camera
+acceptance is bound to the exact fast_roborender and GR00T revisions and trees;
+a changed source file, foundation shard, adapter, TensorRT engine, teacher
+checkpoint, or anchor file invalidates them and requires re-promotion.
 The W&B validation also retains its job-specific JSON. If a different canonical
 acceptance already exists, the validation fails closed instead of replacing it;
 select a reviewed job JSON explicitly with `WANDB_ONLINE_VALIDATION=/absolute/path`

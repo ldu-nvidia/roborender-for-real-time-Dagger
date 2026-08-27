@@ -90,11 +90,23 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         self.config = self.tmp / "evaluation.yaml"
         self.config.write_text("fixed_seed: true\n", encoding="utf-8")
         self.scenarios = self.tmp / "scenarios.json"
-        self.cases = [
-            {"seed": seed, "env_index": env, "scenario_id": _sha(f"{seed}:{env}")}
-            for seed in (17, 29)
-            for env in range(4)
-        ]
+        self.cases = []
+        for seed in (17, 29):
+            for env in range(4):
+                condition_sha256 = _sha(f"condition:{seed}:{env}")
+                self.cases.append(
+                    {
+                        "seed": seed,
+                        "env_index": env,
+                        "scenario_id": canonical_json_sha256(
+                            {
+                                "seed": seed,
+                                "env_index": env,
+                                "first_condition_sha256": condition_sha256,
+                            }
+                        ),
+                    }
+                )
         self.scenarios.write_text(json.dumps(self.cases), encoding="utf-8")
         self.thresholds = self.tmp / "thresholds.json"
         self.thresholds.write_text(

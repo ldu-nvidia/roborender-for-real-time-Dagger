@@ -33,6 +33,10 @@ MANIFEST_KEYS = {
     "policy_spec_path",
     "policy_spec_sha256",
 }
+HOMIE_CONTROLLER_PATHS = {
+    "walk": GR00T_ROOT / "models/model_walk.pt",
+    "stand": GR00T_ROOT / "models/model_stand.pt",
+}
 
 
 def _regular_read_only(path: Path, label: str) -> Path:
@@ -70,9 +74,21 @@ def validate(checkpoint: Path) -> dict[str, object]:
         raise RuntimeError("portable policy spec checkpoint identity mismatch")
     if spec["runtime_policy_sha256"] != manifest["runtime_policy_sha256"]:
         raise RuntimeError("portable policy spec runtime identity mismatch")
+    actual_controller_sha256 = {}
+    for role, path in HOMIE_CONTROLLER_PATHS.items():
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(
+                f"Homie {role} controller must be a regular non-symlink file"
+            )
+        actual_controller_sha256[role] = sha256_file(path)
+    if actual_controller_sha256 != spec["homie_controller_sha256"]:
+        raise RuntimeError("portable policy Homie controller identity mismatch")
+
     model = create_vision_actor_obj_pred(spec)
     load_checkpoint_strict(model, checkpoint, expected_sha256=checkpoint_sha)
-    runtime_sha = runtime_policy_sha256(model)
+    runtime_sha = runtime_policy_sha256(
+        model, homie_controller_sha256=actual_controller_sha256
+    )
     if runtime_sha != manifest["runtime_policy_sha256"]:
         raise RuntimeError("reconstructed policy runtime identity mismatch")
     hidden_staging = sorted(
@@ -88,6 +104,7 @@ def validate(checkpoint: Path) -> dict[str, object]:
         "checkpoint_sha256": checkpoint_sha,
         "policy_spec_sha256": spec_sha,
         "runtime_policy_sha256": runtime_sha,
+        "homie_controller_sha256": actual_controller_sha256,
         "policy_action_dim": int(model.num_actions),
         "output_contract": spec["output_contract"],
         "immutable_mode": "0444",

@@ -43,7 +43,7 @@ from scripts.round_dagger import remote_learner_success  # noqa: E402
 SCHEMA = "fast_roborender.round_dagger.learner_completion.v2"
 READBACK_SCHEMA = "fast_roborender.round_dagger.learner_wandb_readback.v3"
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
-CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v2"
+CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v3"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -498,7 +498,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         or sha256_file(candidate) != sha256_file(restart)
     ):
         raise CompletionAttestationError("candidate policy artifact digest mismatch")
-    validate_policy_bundle_identity(
+    policy_evidence = validate_policy_bundle_identity(
         checkpoint=candidate,
         policy_spec=spec,
         manifest=manifest,
@@ -520,6 +520,9 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "replay_snapshot_file_sha256": snapshot_file_sha,
         "completed_steps": 500,
         "world_size": 8,
+        "homie_controller_sha256": policy_evidence[
+            "homie_controller_sha256"
+        ],
     }
     if not isinstance(checkpoint, Mapping) or any(
         checkpoint.get(key) != value for key, value in restart_expected.items()
@@ -721,7 +724,7 @@ def verify_attestation(
     }
     if any(result_doc.get(key) != value for key, value in result_expected.items()):
         raise CompletionAttestationError("attested learner result mismatch")
-    validate_policy_bundle_identity(
+    policy_evidence = validate_policy_bundle_identity(
         checkpoint=resolved["candidate"],
         policy_spec=resolved["policy_spec"],
         manifest=resolved["policy_manifest"],
@@ -789,6 +792,9 @@ def verify_attestation(
         "replay_snapshot_file_sha256": snapshot_file_sha256,
         "completed_steps": 500,
         "world_size": 8,
+        "homie_controller_sha256": policy_evidence[
+            "homie_controller_sha256"
+        ],
     }
     if not isinstance(restart_document, Mapping) or any(
         restart_document.get(key) != value

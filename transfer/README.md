@@ -19,9 +19,10 @@ to match.
 0003 adds the explicit DAgger rollout action source and teacher/student beta schedule.
 
 0004 adds portable runtime paths, three-view enforcement, restart-complete checkpoints,
-DAgger telemetry, Image3F client hardening, Isaac camera/lifecycle gates, fixed-seed evaluation
-evidence, and exact policy-parameter checkpoint digests. Commit the resulting GR00T tree locally
-before building an HSG snapshot so its 40-hex revision can be recorded in `.source_revision`.
+DAgger telemetry, Image3F client hardening and retry accounting, Isaac camera/lifecycle gates,
+scenario-bound paired evaluation with explicit safety signals, and byte-exact policy plus Homie
+controller lineage. Commit the resulting GR00T tree locally before building an HSG snapshot so
+its 40-hex revision can be recorded in `.source_revision`.
 
 Not included, because they live outside this repo:
 

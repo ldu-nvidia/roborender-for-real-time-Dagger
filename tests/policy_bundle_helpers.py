@@ -12,13 +12,26 @@ from round_dagger.gr00t_policy import (
     POLICY_TARGET,
     build_portable_policy_spec,
 )
+from round_dagger.policy_identity import runtime_policy_identity_sha256
+
+
+HOMIE_CONTROLLER_SHA256 = {
+    "walk": "4" * 64,
+    "stand": "5" * 64,
+}
 
 
 _FakePolicy = type("VisionActorObjPred", (), {})
 _FakePolicy.__module__ = "gr00t.rl.trl.modules.vision_actor_critic_modules_obj_pred"
 
 
-def portable_policy_spec(checkpoint_sha256: str, runtime_policy_sha256: str) -> dict:
+def complete_runtime_policy_sha256(policy_state_sha256: str) -> str:
+    return runtime_policy_identity_sha256(
+        policy_state_sha256, HOMIE_CONTROLLER_SHA256
+    )
+
+
+def portable_policy_spec(checkpoint_sha256: str, policy_state_sha256: str) -> dict:
     policy = _FakePolicy()
     policy.num_actions = 11
     policy.obj_pred_mlp = types.SimpleNamespace(output_dim=3)
@@ -94,18 +107,19 @@ def portable_policy_spec(checkpoint_sha256: str, runtime_policy_sha256: str) -> 
         homie_action_dim=15,
         replay_action_dim=26,
         checkpoint_sha256=checkpoint_sha256,
-        runtime_policy_sha256=runtime_policy_sha256,
+        policy_state_sha256=policy_state_sha256,
+        homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
     )
 
 
 def publish_policy_bundle(
     checkpoint: Path,
-    runtime_policy_sha256: str,
+    policy_state_sha256: str,
     *,
     mutate_spec: Callable[[dict], None] | None = None,
 ) -> tuple[Path, Path]:
     checkpoint_sha256 = artifacts.sha256_file(checkpoint)
-    spec = portable_policy_spec(checkpoint_sha256, runtime_policy_sha256)
+    spec = portable_policy_spec(checkpoint_sha256, policy_state_sha256)
     if mutate_spec is not None:
         mutate_spec(spec)
     spec_path = Path(f"{checkpoint}.policy_spec.json")
@@ -117,7 +131,7 @@ def publish_policy_bundle(
             "schema": "fast_roborender.round_dagger.bootstrap_policy.v1",
             "checkpoint_path": checkpoint.name,
             "checkpoint_sha256": checkpoint_sha256,
-            "runtime_policy_sha256": runtime_policy_sha256,
+            "runtime_policy_sha256": spec["runtime_policy_sha256"],
             "policy_spec_path": spec_path.name,
             "policy_spec_sha256": artifacts.sha256_file(spec_path),
         },

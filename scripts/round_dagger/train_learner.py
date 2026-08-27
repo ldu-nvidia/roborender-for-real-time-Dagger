@@ -21,6 +21,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from round_dagger.artifacts import sha256_file  # noqa: E402
+from round_dagger.actor import ActorExportError, runtime_state_dict_sha256  # noqa: E402
 from round_dagger.learner_identity import (  # noqa: E402
     learner_identity_sha256,
     learner_wandb_run_id,
@@ -48,7 +49,12 @@ def _symbol(specification: str) -> Any:
         raise LearnerError(f"cannot import {specification}: {exc}") from exc
 
 
-def _load_initial_checkpoint(model: nn.Module, path: Path) -> None:
+def _load_initial_checkpoint(
+    model: nn.Module,
+    path: Path,
+    *,
+    expected_policy_state_sha256: str | None = None,
+) -> None:
     try:
         document = torch.load(path, map_location="cpu", weights_only=False)
     except Exception as exc:
@@ -64,6 +70,17 @@ def _load_initial_checkpoint(model: nn.Module, path: Path) -> None:
         state = document
     if not isinstance(state, Mapping):
         raise LearnerError("initial policy checkpoint lacks a model state dictionary")
+    try:
+        policy_state_sha256 = runtime_state_dict_sha256(state)
+    except ActorExportError as exc:
+        raise LearnerError(f"cannot identify initial policy state: {exc}") from exc
+    if (
+        expected_policy_state_sha256 is not None
+        and policy_state_sha256 != expected_policy_state_sha256
+    ):
+        raise LearnerError(
+            "initial policy state identity differs from portable policy spec"
+        )
     try:
         model.load_state_dict(state, strict=True)
     except Exception as exc:
@@ -200,7 +217,13 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(model, nn.Module):
         raise LearnerError("model factory did not return torch.nn.Module")
     if arguments.initial_checkpoint is not None:
-        _load_initial_checkpoint(model, arguments.initial_checkpoint)
+        _load_initial_checkpoint(
+            model,
+            arguments.initial_checkpoint,
+            expected_policy_state_sha256=bundle_mapping["model_config"].get(
+                "policy_state_sha256"
+            ),
+        )
     adapter: PolicyAdapter
     if arguments.adapter_factory:
         adapter_factory = _symbol(arguments.adapter_factory)

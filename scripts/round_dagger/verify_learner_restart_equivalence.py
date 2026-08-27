@@ -29,6 +29,10 @@ from round_dagger.policy_bundle import (  # noqa: E402
     PolicyBundleError,
     validate_policy_bundle_identity,
 )
+from round_dagger.policy_identity import (  # noqa: E402
+    PolicyIdentityError,
+    validate_homie_controller_sha256,
+)
 
 
 REPORT_SCHEMA = "fast_roborender.round_dagger.restart_equivalence.v1"
@@ -37,6 +41,7 @@ _CHECKPOINT_FIELDS = {
     "checkpoint_schema",
     "policy_state_dict",
     "policy_parameter_names",
+    "homie_controller_sha256",
     "campaign_id",
     "macro_round",
     "model_lineage_sha256",
@@ -114,6 +119,14 @@ def _load_checkpoint(path: Path, label: str) -> tuple[Path, Mapping[str, Any]]:
         raise RestartEquivalenceError(f"{label} schema mismatch")
     if document.get("checkpoint_schema") != "gr00t.trl.full_state.v2":
         raise RestartEquivalenceError(f"{label} actor checkpoint schema mismatch")
+    try:
+        validate_homie_controller_sha256(
+            document.get("homie_controller_sha256")
+        )
+    except PolicyIdentityError as exc:
+        raise RestartEquivalenceError(
+            f"{label} Homie controller identity is malformed: {exc}"
+        ) from exc
     initial_loss = document.get("initial_loss")
     if (
         isinstance(initial_loss, bool)

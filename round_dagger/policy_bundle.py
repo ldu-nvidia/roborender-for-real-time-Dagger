@@ -111,6 +111,8 @@ def validate_policy_bundle_identity(
     return {
         "schema": "fast_roborender.round_dagger.policy_bundle_preflight.v1",
         "checkpoint_sha256": checkpoint_sha256,
+        "policy_state_sha256": spec["policy_state_sha256"],
+        "homie_controller_sha256": dict(spec["homie_controller_sha256"]),
         "runtime_policy_sha256": document["runtime_policy_sha256"],
         "policy_spec_sha256": policy_spec_sha256,
         "output_contract": dict(PRODUCTION_OUTPUT_CONTRACT),

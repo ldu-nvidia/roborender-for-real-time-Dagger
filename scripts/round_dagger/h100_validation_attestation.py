@@ -38,6 +38,10 @@ from round_dagger.policy_bundle import (  # noqa: E402
     PolicyBundleError,
     validate_policy_bundle_identity,
 )
+from round_dagger.policy_identity import (  # noqa: E402
+    PolicyIdentityError,
+    validate_homie_controller_sha256,
+)
 from scripts.round_dagger.h100_validation_wandb_readback import (  # noqa: E402
     H100ValidationReadbackError,
     RESUME_EVIDENCE_SCHEMA,
@@ -72,6 +76,7 @@ _CHECKPOINT_FIELDS = {
     "checkpoint_schema",
     "policy_state_dict",
     "policy_parameter_names",
+    "homie_controller_sha256",
     "campaign_id",
     "macro_round",
     "model_lineage_sha256",
@@ -336,7 +341,7 @@ def _checkpoint(
     checkpoint_path, document, digest = result
     if set(document) != _CHECKPOINT_FIELDS:
         raise H100ValidationAttestationError(
-            f"{label} has unexpected or missing v2 fields"
+            f"{label} has unexpected or missing checkpoint fields"
         )
     names = document.get("policy_parameter_names")
     if (
@@ -350,6 +355,14 @@ def _checkpoint(
         raise H100ValidationAttestationError(
             f"{label} policy frontier is malformed"
         )
+    try:
+        validate_homie_controller_sha256(
+            document.get("homie_controller_sha256")
+        )
+    except PolicyIdentityError as exc:
+        raise H100ValidationAttestationError(
+            f"{label} Homie controller identity is malformed: {exc}"
+        ) from exc
     return checkpoint_path, document, digest
 
 

@@ -1000,7 +1000,13 @@ def attest_outcome(
         fixed = fixed_by_env.get(env_index)
         if fixed is None or any(
             fixed[key] != episode[key]
-            for key in ("seed", "env_index", "success", "episode_length")
+            for key in (
+                "seed",
+                "env_index",
+                "scenario_id",
+                "success",
+                "episode_length",
+            )
         ):
             raise EvaluationError(
                 "paired episode differs from fixed-seed reset/outcome evidence"

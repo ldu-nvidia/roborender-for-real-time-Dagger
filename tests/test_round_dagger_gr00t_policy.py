@@ -20,11 +20,14 @@ from round_dagger.gr00t_policy import (
     validate_policy_spec,
     vision_actor_obj_pred_adapter_factory,
 )
+from round_dagger.policy_identity import runtime_policy_identity_sha256
 
 
 ROOT = Path(__file__).resolve().parents[1]
 GR00T_ROOT = ROOT / "GR00T-VisualSim2Real"
 TRAINER = GR00T_ROOT / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
+POLICY_STATE_SHA256 = "2" * 64
+HOMIE_CONTROLLER_SHA256 = {"walk": "3" * 64, "stand": "4" * 64}
 
 
 def _actor_config(pretrained=True):
@@ -121,7 +124,8 @@ def _spec():
         homie_action_dim=15,
         replay_action_dim=26,
         checkpoint_sha256="1" * 64,
-        runtime_policy_sha256="2" * 64,
+        policy_state_sha256=POLICY_STATE_SHA256,
+        homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
     )
 
 
@@ -173,7 +177,8 @@ class PortablePolicySpecTest(unittest.TestCase):
             homie_action_dim=15,
             replay_action_dim=26,
             checkpoint_sha256="1" * 64,
-            runtime_policy_sha256="2" * 64,
+            policy_state_sha256=POLICY_STATE_SHA256,
+            homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
         )
         backbone = spec["actor_config"]["backbone"]
         self.assertEqual(
@@ -189,6 +194,16 @@ class PortablePolicySpecTest(unittest.TestCase):
     def test_runtime_export_is_resolved_offline_and_binds_all_dimensions(self):
         spec = _spec()
         self.assertEqual(spec["schema"], POLICY_SPEC_SCHEMA)
+        self.assertEqual(spec["policy_state_sha256"], POLICY_STATE_SHA256)
+        self.assertEqual(
+            spec["homie_controller_sha256"], HOMIE_CONTROLLER_SHA256
+        )
+        self.assertEqual(
+            spec["runtime_policy_sha256"],
+            runtime_policy_identity_sha256(
+                POLICY_STATE_SHA256, HOMIE_CONTROLLER_SHA256
+            ),
+        )
         self.assertEqual(spec["adapter_id"], ADAPTER_ID)
         layer = spec["actor_config"]["backbone"]["vision_module"]["module_config_dict"][
             "layer_config"
@@ -253,6 +268,23 @@ class PortablePolicySpecTest(unittest.TestCase):
         cases.append(wrong_flat_vision)
         for candidate in cases:
             with self.subTest(candidate=candidate), self.assertRaises(GR00TPolicyError):
+                validate_policy_spec(candidate)
+
+    def test_spec_rejects_unbound_or_incomplete_controller_lineage(self):
+        mismatched_runtime = _spec()
+        mismatched_runtime["homie_controller_sha256"]["walk"] = "9" * 64
+        missing_controller = _spec()
+        del missing_controller["homie_controller_sha256"]["stand"]
+        missing_component = _spec()
+        del missing_component["policy_state_sha256"]
+        for candidate in (
+            mismatched_runtime,
+            missing_controller,
+            missing_component,
+        ):
+            with self.subTest(candidate=candidate), self.assertRaises(
+                GR00TPolicyError
+            ):
                 validate_policy_spec(candidate)
 
     def test_bundle_must_bind_normalization_slice_and_checkpoint(self):
@@ -386,7 +418,8 @@ class ActualGR00TPolicyIntegrationTest(unittest.TestCase):
             homie_action_dim=15,
             replay_action_dim=26,
             checkpoint_sha256="1" * 64,
-            runtime_policy_sha256="2" * 64,
+            policy_state_sha256=POLICY_STATE_SHA256,
+            homie_controller_sha256=HOMIE_CONTROLLER_SHA256,
         )
         self.assertEqual(runtime_export["actor_config"], spec["actor_config"])
         policy.eval()

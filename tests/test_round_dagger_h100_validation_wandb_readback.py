@@ -12,6 +12,7 @@ from round_dagger.learner_identity import (
     learner_wandb_run_id,
 )
 from scripts.round_dagger import h100_validation_wandb_readback as readback
+from tests.policy_bundle_helpers import HOMIE_CONTROLLER_SHA256
 
 try:
     import torch
@@ -175,10 +176,11 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
     def _checkpoint_document(self, completed_steps: int) -> dict:
         policy_state = {"weight": torch.tensor([1.0], dtype=torch.float32)}
         return {
-            "schema": "fast_roborender.round_dagger.learner_checkpoint.v2",
+            "schema": "fast_roborender.round_dagger.learner_checkpoint.v3",
             "checkpoint_schema": "gr00t.trl.full_state.v2",
             "policy_state_dict": policy_state,
             "policy_parameter_names": ["weight"],
+            "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
             "campaign_id": self.campaign_id,
             "macro_round": self.macro_round,
             "model_lineage_sha256": self.lineage_sha,

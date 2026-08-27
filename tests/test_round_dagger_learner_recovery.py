@@ -11,7 +11,10 @@ from unittest import mock
 from round_dagger import artifacts, learner_recovery, state
 from round_dagger.promotion import stage_bootstrap_policy
 from scripts.round_dagger import production_launch
-from tests.policy_bundle_helpers import publish_policy_bundle
+from tests.policy_bundle_helpers import (
+    complete_runtime_policy_sha256,
+    publish_policy_bundle,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +22,10 @@ CAMPAIGN_CONTRACT = ROOT / "configs/round_dagger/production_campaign_256x300.jso
 LEARNER_CONTRACT = ROOT / "configs/round_dagger/production_learner_8xh100_500.json"
 SOURCE_SHA = "7" * 64
 SNAPSHOT_SEMANTIC_SHA = "8" * 64
-CANDIDATE_RUNTIME_SHA = "9" * 64
+CANDIDATE_POLICY_STATE_SHA = "9" * 64
+CANDIDATE_RUNTIME_SHA = complete_runtime_policy_sha256(
+    CANDIDATE_POLICY_STATE_SHA
+)
 
 
 class IngestedLearnerRecoveryTest(unittest.TestCase):
@@ -138,7 +144,7 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
         checkpoint = output / "candidate_round_000000.pt"
         checkpoint.write_bytes(b"balanced-recovery-candidate")
         specification, manifest = publish_policy_bundle(
-            checkpoint, CANDIDATE_RUNTIME_SHA
+            checkpoint, CANDIDATE_POLICY_STATE_SHA
         )
         result = {
             "schema": "fast_roborender.round_dagger.learner_result.v2",

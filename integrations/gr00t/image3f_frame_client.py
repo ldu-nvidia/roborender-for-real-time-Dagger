@@ -36,10 +36,32 @@ PRODUCTION_OUTPUT_VIEWS = ("head_color", "hand_left", "hand_right")
 PRODUCTION_OUTPUT_LAYOUT = "vertical"
 PRODUCTION_OUTPUT_TILE_SHAPE_HWC = (240, 416, 3)
 PRODUCTION_OUTPUT_STACKED_SHAPE_HWC = (720, 416, 3)
+_REQUEST_ACCOUNTING_LOCK = threading.Lock()
+_REQUEST_ERRORS = 0
+_REQUEST_REPLAYS = 0
 
 
 class Image3FWireError(RuntimeError):
     """Raised before unsafe or malformed wire bytes reach Image3F code."""
+
+
+def _record_request_accounting(*, errors: int = 0, replays: int = 0) -> None:
+    """Record process-local request failures and idempotent server replays."""
+
+    global _REQUEST_ERRORS, _REQUEST_REPLAYS
+    with _REQUEST_ACCOUNTING_LOCK:
+        _REQUEST_ERRORS += errors
+        _REQUEST_REPLAYS += replays
+
+
+def image3f_request_accounting_snapshot() -> dict[str, int]:
+    """Return monotonic counters suitable for before/after evidence binding."""
+
+    with _REQUEST_ACCOUNTING_LOCK:
+        return {
+            "errors": _REQUEST_ERRORS,
+            "replays": _REQUEST_REPLAYS,
+        }
 
 
 def _validate_server_capabilities(
@@ -606,12 +628,16 @@ class Image3FFrameClient:
                             response, required=stateful_render
                         )
                 if response.get("ok"):
+                    if response.get("replayed") is True:
+                        _record_request_accounting(replays=1)
                     return response
+                _record_request_accounting(errors=1)
                 if response.get("retryable") and attempt < retries:
                     time.sleep(min(2.0, 0.1 * (2**attempt)))
                     continue
                 break
             except Image3FWireError:
+                _record_request_accounting(errors=1)
                 with self._lock:
                     if self._socket is not None:
                         try:
@@ -621,6 +647,7 @@ class Image3FFrameClient:
                 raise
             except (ConnectionError, OSError, EOFError, pickle.UnpicklingError) as exc:
                 last_error = exc
+                _record_request_accounting(errors=1)
                 with self._lock:
                     if self._socket is not None:
                         try:
