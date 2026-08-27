@@ -1093,22 +1093,69 @@ def _require_sealed_predecessors(
         )
 
 
-def runtime_scale_environment(path: str | Path, environments_per_rank: int) -> dict[str, str]:
-    """Return the exact process environment for one still-empty scale rung."""
+def _validate_prelaunch_run_tree(rung: Mapping[str, Any]) -> None:
+    """Accept only the empty directories made by the actor shell before Python."""
+
+    cohort_dir = _absolute_directory(rung["cohort_dir"], "scale cohort")
+    shards_dir = _absolute_directory(cohort_dir / "shards", "scale shard directory")
+    if any(shards_dir.iterdir()):
+        raise RuntimeScaleError("prelaunch scale rung already contains shard artifacts")
+    if inspect_actor_rank(cohort_dir, 0)["state"] != "empty":
+        raise RuntimeScaleError("prelaunch scale actor rank is not empty")
+    for path, label in (
+        (cohort_dir / "seal.json", "cohort seal"),
+        (Path(rung["evidence_path"]), "runtime evidence"),
+    ):
+        if path.exists() or path.is_symlink():
+            raise RuntimeScaleError(f"prelaunch scale rung already contains {label}")
+
+    run_dir = _absolute_directory(rung["run_dir"], "scale run directory")
+    expected = {
+        "ranks",
+        "ranks/rank_0000",
+        "ranks/rank_0000/hydra",
+        "ranks/rank_0000/output",
+    }
+    observed: set[str] = set()
+    for parent, directories, files in os.walk(run_dir, followlinks=False):
+        parent_path = Path(parent)
+        if files:
+            raise RuntimeScaleError(
+                "prelaunch scale run tree contains files: " + ", ".join(sorted(files))
+            )
+        for name in directories:
+            child = parent_path / name
+            _absolute_directory(child, "prelaunch scale run subdirectory")
+            observed.add(child.relative_to(run_dir).as_posix())
+    if observed != expected:
+        raise RuntimeScaleError(
+            "prelaunch scale run directory tree differs from actor shell contract"
+        )
+
+
+def _runtime_scale_environment(
+    path: str | Path,
+    environments_per_rank: int,
+    *,
+    allow_prelaunch_partial: bool,
+) -> dict[str, str]:
+    """Build the exact process environment for one authorized scale rung."""
 
     if environments_per_rank not in RUNGS:
         raise RuntimeScaleError("runtime scale rung must be one of 2,4,8,16,32")
     report = validate_runtime_scale(path)
     _require_sealed_predecessors(report, environments_per_rank)
     rung_report = report["rungs"][str(environments_per_rank)]
-    if rung_report["state"] != "empty":
+    plan_path, plan = _load_plan(path)
+    rung_path, rung = _load_rungs(plan)[environments_per_rank]
+    if rung_report["state"] == "partial" and allow_prelaunch_partial:
+        _validate_prelaunch_run_tree(rung)
+    elif rung_report["state"] != "empty":
         raise RuntimeScaleError(
             f"runtime scale rung {environments_per_rank} is "
             f"{rung_report['state']}; refusing overwrite"
         )
-    plan_path, plan = _load_plan(path)
     _, result, _, ab_plan = _validate_prerequisite(plan["prerequisite_result"])
-    rung_path, rung = _load_rungs(plan)[environments_per_rank]
     evidence_path = rung["evidence_path"]
     environment = {
         "ACCELERATE": ab_plan["accelerate"],
@@ -1176,6 +1223,16 @@ def runtime_scale_environment(path: str | Path, environments_per_rank: int) -> d
     return environment
 
 
+def runtime_scale_environment(path: str | Path, environments_per_rank: int) -> dict[str, str]:
+    """Return the exact process environment for one still-empty scale rung."""
+
+    return _runtime_scale_environment(
+        path,
+        environments_per_rank,
+        allow_prelaunch_partial=False,
+    )
+
+
 def _environment_rung(
     plan: Mapping[str, Any], environment: Mapping[str, str]
 ) -> tuple[int, str]:
@@ -1187,20 +1244,25 @@ def _environment_rung(
     raise RuntimeScaleError("process rung contract is absent from immutable scale plan")
 
 
-def authorize_runtime_scale(
+def _authorize_runtime_scale(
     path: str | Path,
     expected_plan_sha256: str,
     *,
     expected_rung_contract_sha256: str | None = None,
     environment: Mapping[str, str] | None = None,
+    allow_prelaunch_partial: bool,
 ) -> dict[str, Any]:
-    """Fail unless the process environment exactly matches one empty rung."""
+    """Fail unless the process environment matches one authorized rung."""
 
     expected_plan = _sha(expected_plan_sha256, "expected runtime scale plan")
     _, plan = _load_plan(path)
     observed = os.environ if environment is None else environment
     environments, observed_rung_sha = _environment_rung(plan, observed)
-    expected_environment = runtime_scale_environment(path, environments)
+    expected_environment = _runtime_scale_environment(
+        path,
+        environments,
+        allow_prelaunch_partial=allow_prelaunch_partial,
+    )
     if expected_environment[RUNTIME_SCALE_PLAN_SHA256_ENV] != expected_plan:
         raise RuntimeScaleError("runtime scale plan SHA-256 differs from authorization")
     expected_rung_sha = expected_environment[RUNTIME_SCALE_RUNG_CONTRACT_SHA256_ENV]
@@ -1232,6 +1294,42 @@ def authorize_runtime_scale(
         "runtime_adapter_mode": "shadow",
         "input_profile": expected_environment[RUNTIME_ADAPTER_INPUT_PROFILE_ENV],
     }
+
+
+def authorize_runtime_scale(
+    path: str | Path,
+    expected_plan_sha256: str,
+    *,
+    expected_rung_contract_sha256: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Authorize one empty rung before any actor output path is created."""
+
+    return _authorize_runtime_scale(
+        path,
+        expected_plan_sha256,
+        expected_rung_contract_sha256=expected_rung_contract_sha256,
+        environment=environment,
+        allow_prelaunch_partial=False,
+    )
+
+
+def authorize_runtime_scale_process(
+    path: str | Path,
+    expected_plan_sha256: str,
+    *,
+    expected_rung_contract_sha256: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Reauthorize after the actor shell creates only its empty rank directories."""
+
+    return _authorize_runtime_scale(
+        path,
+        expected_plan_sha256,
+        expected_rung_contract_sha256=expected_rung_contract_sha256,
+        environment=environment,
+        allow_prelaunch_partial=True,
+    )
 
 
 def seal_runtime_scale(path: str | Path, environments_per_rank: int) -> dict[str, Any]:
@@ -1363,6 +1461,7 @@ __all__ = [
     "RuntimeScaleError",
     "SCALE_ACK",
     "authorize_runtime_scale",
+    "authorize_runtime_scale_process",
     "prepare_runtime_scale",
     "runtime_scale_environment",
     "seal_runtime_scale",

@@ -27,6 +27,7 @@ from round_dagger.runtime_scale import (
     RUNTIME_SCALE_VALIDATION_ACK,
     RuntimeScaleError,
     authorize_runtime_scale,
+    authorize_runtime_scale_process,
     prepare_runtime_scale,
     runtime_scale_environment,
     seal_runtime_scale,
@@ -302,6 +303,40 @@ class RuntimeScaleTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeScaleError, "environment differs"):
             authorize_runtime_scale(
                 self.plan, self.report["plan_sha256"], environment=tampered
+            )
+
+    def test_process_authorization_accepts_only_actor_shell_empty_directories(self) -> None:
+        environment = runtime_scale_environment(self.plan, 2)
+        _, rung, _ = self._documents(2)
+        run_dir = Path(rung["run_dir"])
+        for relative in (
+            "ranks/rank_0000/hydra",
+            "ranks/rank_0000/output",
+        ):
+            (run_dir / relative).mkdir(parents=True, exist_ok=True)
+        with self.assertRaisesRegex(RuntimeScaleError, "partial"):
+            authorize_runtime_scale(
+                self.plan,
+                self.report["plan_sha256"],
+                environment=environment,
+            )
+        authorized = authorize_runtime_scale_process(
+            self.plan,
+            self.report["plan_sha256"],
+            expected_rung_contract_sha256=environment[
+                RUNTIME_SCALE_RUNG_CONTRACT_SHA256_ENV
+            ],
+            environment=environment,
+        )
+        self.assertEqual(authorized["status"], "authorized")
+        (run_dir / "ranks/rank_0000/hydra/config.yaml").write_text(
+            "already-started: true\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RuntimeScaleError, "contains files"):
+            authorize_runtime_scale_process(
+                self.plan,
+                self.report["plan_sha256"],
+                environment=environment,
             )
 
     def test_complete_rung_requires_evidence_then_seals_and_verifies(self) -> None:
