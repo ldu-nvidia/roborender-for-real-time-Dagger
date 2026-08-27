@@ -5,7 +5,7 @@ set -Eeuo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 FAST_REPO=${FAST_REPO:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}
 GR00T_REPO=${GR00T_REPO:-$FAST_REPO/GR00T-VisualSim2Real}
-LOCAL_OUTPUT_ROOT=${LOCAL_OUTPUT_ROOT:-/mnt/data1/ldu/research/.roborender_source_snapshots}
+LOCAL_OUTPUT_ROOT=${LOCAL_OUTPUT_ROOT:-/mnt/data2/ldu/roborender_source_snapshots}
 HSG_HOST=${HSG_HOST:-oci-hsg}
 STAGE_ROOT=${STAGE_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/ldu/roborender_gb200_sm100}
 REMOTE_OUTPUT_ROOT=${REMOTE_OUTPUT_ROOT:-$STAGE_ROOT/src_snapshots}
