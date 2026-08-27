@@ -592,6 +592,24 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
+        self.policy = self.root / "student.pt"
+        self.policy.write_bytes(b"policy")
+        (self.root / "student.pt.policy_spec.json").write_text("{}\n")
+        (self.root / "student.pt.manifest.json").write_text("{}\n")
+        self.teacher = self.root / "teacher.pt"
+        self.teacher.write_bytes(b"teacher")
+        self.endpoint = self.root / "renderer.endpoint.json"
+        self.endpoint.write_text("{}\n")
+        self.endpoint_manifest = self.root / "endpoint_manifest.txt"
+        self.endpoint_manifest.write_text(f"{self.endpoint}\n")
+        self.anchors = self.root / "anchors"
+        self.anchors.mkdir()
+        self.camera = self.root / "camera.json"
+        self.camera.write_text("{}\n")
+        self.netrc = self.root / ".netrc"
+        self.netrc.write_text("machine api.wandb.ai\n")
+        self.plan = self.root / "stream-plan.json"
+        self.plan.write_text("{}\n")
         self.argv_file = self.root / "docker.argv"
         self.fake_docker = self.root / "docker"
         self.fake_docker.write_text(
@@ -609,6 +627,9 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
             **os.environ,
             "ROUND_DAGGER_ACTOR_RANK": "0",
             "ROUND_DAGGER_ACTOR_WORLD_SIZE": "2",
+            "ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH": "1",
+            "ROUND_DAGGER_ACTOR_SOURCE_ROOT": str(ROOT),
+            "ROUND_DAGGER_ACTOR_SOURCE_INVENTORY_SHA256": "a" * 64,
             "ROUND_DAGGER_CAMPAIGN_ID": "docker-isolation-test",
             "ROUND_DAGGER_MACRO_ROUND": "0",
             "ROUND_DAGGER_COHORT_INDEX": "0",
@@ -618,7 +639,16 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
             "ROUND_DAGGER_ACTOR_DOCKER_SHM_SIZE": "32g",
             "ROUND_DAGGER_ACTOR_DOCKER_GPU_IDS": "4,7",
             "ROUND_DAGGER_ACTOR_DOCKER_MOUNT_ROOTS": str(self.root),
-            "NETRC": str(self.root / ".netrc"),
+            "ROUND_DAGGER_POLICY_CHECKPOINT": str(self.policy),
+            "ROUND_DAGGER_POLICY_SPEC": f"{self.policy}.policy_spec.json",
+            "ROUND_DAGGER_POLICY_MANIFEST": f"{self.policy}.manifest.json",
+            "ROUND_DAGGER_TEACHER_CHECKPOINT": str(self.teacher),
+            "IMAGE3F_ENDPOINT_MANIFEST": str(self.endpoint_manifest),
+            "ANCHORS": str(self.anchors),
+            "ROUND_DAGGER_CAMERA_ACCEPTANCE": str(self.camera),
+            "ROUND_DAGGER_WANDB_NETRC": str(self.netrc),
+            "ROUND_DAGGER_IMAGE3F_STREAM_PLAN": str(self.plan),
+            "NETRC": str(self.netrc),
             "WANDB_API_KEY": "must-not-be-forwarded",
             "ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "shadow",
             "ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK": "metadata-only-v1",
@@ -649,6 +679,10 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
         self.assertIn("--shm-size=32g", argv)
         self.assertIn('"device=4"', argv)
         self.assertIn("--network=host", argv)
+        self.assertIn(f"type=bind,src={ROOT},dst={ROOT},readonly", argv)
+        self.assertIn(
+            f"type=bind,src={self.anchors},dst={self.anchors},readonly", argv
+        )
         self.assertIn("NETRC", argv)
         self.assertNotIn("WANDB_API_KEY", argv)
         self.assertNotIn("must-not-be-forwarded", argv)

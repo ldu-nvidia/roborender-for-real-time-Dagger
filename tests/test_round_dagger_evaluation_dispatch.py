@@ -20,6 +20,11 @@ from round_dagger.orchestration import (
 
 
 HOOK_RELATIVE = "scripts/round_dagger/run_production_paired_evaluation_hook.sh"
+COLLECT_HOOK_RELATIVE = "scripts/round_dagger/run_production_actor_cohort_hook.sh"
+TRAIN_HOOK_RELATIVE = (
+    "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"
+)
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class EvaluationDispatchTest(unittest.TestCase):
@@ -205,6 +210,95 @@ class EvaluationDispatchTest(unittest.TestCase):
             self.assertFalse(marker.exists())
         finally:
             self._cleanup(temporary)
+
+    def _non_evaluation_fixture(self, name: str, relative: str):
+        temporary = tempfile.TemporaryDirectory()
+        base = Path(temporary.name)
+        parent = base / "sealed-coordinator"
+        root = parent / "fast_roborender_deadbee_cafef00_sealed"
+        hook = root / relative
+        hook.parent.mkdir(parents=True)
+        marker = base / f"{name}-ran.txt"
+        required_marker = {
+            "collect": "ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH",
+            "train": "ROUND_DAGGER_TRUSTED_TRAIN_DISPATCH",
+        }[name]
+        hook.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f'test "${{{required_marker}:-}}" = 1\n'
+            'test "${ROUND_DAGGER_TRUSTED_HOOK_SOURCE_ROOT:-}" = '
+            '"$EXPECTED_SOURCE_ROOT"\n'
+            f'printf trusted > "{marker}"\n',
+            encoding="utf-8",
+        )
+        os.chmod(hook, 0o555)
+        payload = hook.read_bytes()
+        inventory = {
+            "schema": "fast_roborender.hsg_source_inventory.v1",
+            "file_count": 1,
+            "total_file_bytes": len(payload),
+            "files": [
+                {
+                    "path": relative,
+                    "mode": "0o555",
+                    "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            ],
+        }
+        inventory_path = parent / f"{root.name}.inventory.json"
+        inventory_path.write_text(
+            json.dumps(inventory, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(inventory_path, 0o444)
+        for directory in (hook.parent, hook.parent.parent, root, parent):
+            os.chmod(directory, 0o555)
+        inventory_sha = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
+        environment = {
+            "ROUND_DAGGER_EVALUATION_SOURCE_ROOT": str(root),
+            "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256": inventory_sha,
+            "EXPECTED_SOURCE_ROOT": str(root),
+        }
+        if name == "collect":
+            # The real seal provides an inventory-bound teacher beneath the
+            # same root.  The synthetic hook is sufficient as an in-root path
+            # because this test exercises dispatch rather than model loading.
+            environment["ROUND_DAGGER_EVALUATION_SEALED_TEACHER"] = str(hook)
+        configured = REPOSITORY_ROOT / relative
+        return (
+            temporary,
+            root,
+            configured,
+            marker,
+            {"inventory_path": str(inventory_path)},
+            environment,
+        )
+
+    def test_collect_and_train_execute_only_from_common_verified_seal(self) -> None:
+        for name, relative in (
+            ("collect", COLLECT_HOOK_RELATIVE),
+            ("train", TRAIN_HOOK_RELATIVE),
+        ):
+            with self.subTest(name=name):
+                temporary, root, configured, marker, report, environment = (
+                    self._non_evaluation_fixture(name, relative)
+                )
+                try:
+                    with mock.patch(
+                        "round_dagger.orchestration.source_seal.verify",
+                        return_value=report,
+                    ):
+                        SubprocessHookRunner().run(
+                            name,
+                            HookSpec((str(configured),), 10),
+                            environment=environment,
+                            workdir=root,
+                        )
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "trusted")
+                finally:
+                    self._cleanup(temporary)
 
 
 if __name__ == "__main__":

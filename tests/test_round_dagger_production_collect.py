@@ -137,7 +137,7 @@ class ProductionCollectHookStaticContractTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("missing required environment", result.stderr)
+        self.assertIn("untrusted collect dispatch", result.stderr)
         self.assertNotIn("WANDB", result.stdout + result.stderr)
 
 

@@ -8,7 +8,16 @@ safe_absolute_path() {
        $1 != */../* && $1 != */./* && $1 != */.. && $1 != */. ]]
 }
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+if [[ ${ROUND_DAGGER_TRUSTED_TRAIN_DISPATCH:-0} == 1 ]]; then
+    ROOT=${ROUND_DAGGER_COORDINATOR_SOURCE_ROOT:?missing trusted coordinator source root}
+    [[ $ROOT == /* && -d $ROOT && ! -L $ROOT && $(cd "$ROOT" && pwd -P) == "$ROOT" ]] || \
+        fatal "trusted coordinator source root is unsafe"
+    [[ ${ROUND_DAGGER_TRUSTED_HOOK_SOURCE_INVENTORY_SHA256:-} =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "trusted coordinator source inventory SHA-256 is malformed"
+else
+    [[ ${DRY_RUN:-0} == 1 ]] || fatal "untrusted train hook dispatch"
+    ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+fi
 PYTHON=${ROUND_DAGGER_PYTHON:-python3}
 REMOTE=${ROUND_DAGGER_REMOTE_HOST:-oci-nrt}
 ACCOUNT=${ROUND_DAGGER_REMOTE_ACCOUNT:-general_cs_infra__ngcsre}

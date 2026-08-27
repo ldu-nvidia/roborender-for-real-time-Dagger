@@ -3,6 +3,13 @@
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+SOURCE_ROOT=${ROUND_DAGGER_ACTOR_SOURCE_ROOT:?missing ROUND_DAGGER_ACTOR_SOURCE_ROOT}
+[[ ${ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH:-0} == 1 ]] || {
+    echo "Docker actor requires trusted collect dispatch" >&2; exit 2;
+}
+[[ "$ROOT" == "$SOURCE_ROOT" && -d "$SOURCE_ROOT" && ! -L "$SOURCE_ROOT" ]] || {
+    echo "Docker actor source differs from the sealed actor source" >&2; exit 2;
+}
 [[ $# == 2 ]] || {
     echo "usage: run_actor_rank_docker.sh RANK ABSOLUTE_RANK_SCRIPT" >&2; exit 2;
 }
@@ -62,6 +69,34 @@ for mount_root in "${RAW_MOUNTS[@]}"; do
         echo "unsafe or missing Docker mount root: $mount_root" >&2; exit 2;
     }
     MOUNTS+=(--mount "type=bind,src=$mount_root,dst=$mount_root")
+done
+
+# The broad data roots preserve the already-validated Isaac asset and output
+# layout.  Overlay every source/input surface used by the actor as read-only,
+# while the exact cohort, run, and campaign output paths remain writable via
+# their parent mounts.  In particular, no actor container can mutate the
+# coordinator-verified source snapshot that defines its Python and shell code.
+READONLY_MOUNTS=(
+    "$SOURCE_ROOT"
+    "${ROUND_DAGGER_POLICY_CHECKPOINT:?missing policy checkpoint}"
+    "${ROUND_DAGGER_POLICY_SPEC:-${ROUND_DAGGER_POLICY_CHECKPOINT}.policy_spec.json}"
+    "${ROUND_DAGGER_POLICY_MANIFEST:-${ROUND_DAGGER_POLICY_CHECKPOINT}.manifest.json}"
+    "${ROUND_DAGGER_TEACHER_CHECKPOINT:?missing teacher checkpoint}"
+    "${IMAGE3F_ENDPOINT_MANIFEST:?missing endpoint manifest}"
+    "${ANCHORS:?missing anchor pool}"
+    "${ROUND_DAGGER_CAMERA_ACCEPTANCE:?missing camera acceptance}"
+    "${ROUND_DAGGER_WANDB_NETRC:?missing W&B netrc}"
+    "${ROUND_DAGGER_IMAGE3F_STREAM_PLAN:?missing Image3F stream plan}"
+)
+while IFS= read -r endpoint; do
+    [[ -z $endpoint ]] || READONLY_MOUNTS+=("$endpoint")
+done <"$IMAGE3F_ENDPOINT_MANIFEST"
+for readonly_path in "${READONLY_MOUNTS[@]}"; do
+    case "$readonly_path" in /*) ;; *) echo "read-only actor mount must be absolute" >&2; exit 2 ;; esac
+    [[ ( -f $readonly_path || -d $readonly_path ) && ! -L $readonly_path ]] || {
+        echo "unsafe or missing read-only actor mount: $readonly_path" >&2; exit 2;
+    }
+    MOUNTS+=(--mount "type=bind,src=$readonly_path,dst=$readonly_path,readonly")
 done
 
 CAMPAIGN=${ROUND_DAGGER_CAMPAIGN_ID:?missing ROUND_DAGGER_CAMPAIGN_ID}

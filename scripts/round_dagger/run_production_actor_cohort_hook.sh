@@ -3,7 +3,26 @@
 # dynamic cohort identity before launching the two isolated RTX actor ranks.
 set -Eeuo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+DRY_RUN=${DRY_RUN:-0}
+if [[ ${ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH:-0} == 1 ]]; then
+    ROOT=${ROUND_DAGGER_ACTOR_SOURCE_ROOT:?missing ROUND_DAGGER_ACTOR_SOURCE_ROOT}
+    [[ $ROOT == /* && -d $ROOT && ! -L $ROOT ]] || {
+        echo "production collect preflight failed: sealed actor source is unsafe" >&2
+        exit 2
+    }
+    [[ $(cd "$ROOT" && pwd -P) == "$ROOT" ]] || {
+        echo "production collect preflight failed: sealed actor source is not canonical" >&2
+        exit 2
+    }
+else
+    [[ $DRY_RUN == 1 ]] || {
+        echo "production collect preflight failed: untrusted collect dispatch" >&2
+        exit 2
+    }
+    # A direct dry-run remains useful for a zero-GPU preflight.  Production is
+    # dispatched only from the coordinator's verified anonymous-memory copy.
+    ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+fi
 PAIR_SCRIPT="$ROOT/scripts/round_dagger/run_actor_cohort_pair.sh"
 ANCHOR_VERIFIER="$ROOT/scripts/round_dagger/verify_anchor_pool.py"
 
@@ -50,7 +69,22 @@ esac
 EXPECTED_OFFSET=$((10#$ROUND_DAGGER_COHORT_INDEX * 64))
 [[ "$ROUND_DAGGER_GLOBAL_ENV_OFFSET" == "$EXPECTED_OFFSET" ]] || fatal "cohort/global-environment identity mismatch"
 [[ "$ROUND_DAGGER_ACTOR_RUN_DIR" == "$TRAIN_RUN_DIR" ]] || fatal "actor run directory must equal TRAIN_RUN_DIR"
-[[ ${DRY_RUN:-0} == 0 || ${DRY_RUN:-0} == 1 ]] || fatal "DRY_RUN must be exactly 0 or 1"
+[[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be exactly 0 or 1"
+
+if [[ ${ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH:-0} == 1 ]]; then
+    [[ ${ROUND_DAGGER_ACTOR_SOURCE_INVENTORY_SHA256:-} =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "sealed actor source inventory SHA-256 is malformed"
+    [[ ${GR00T_ROOT:-} == "$ROOT/GR00T-VisualSim2Real" ]] || \
+        fatal "GR00T root is not derived from the sealed actor source"
+    [[ ${ROUND_DAGGER_TEACHER_CHECKPOINT:-} == "$ROOT/"* ]] || \
+        fatal "teacher checkpoint is not derived from the sealed actor source"
+    [[ ${ROUND_DAGGER_ACTOR_PAIR_EXECUTOR:-} == \
+        "$ROOT/scripts/round_dagger/run_actor_rank_docker.sh" ]] || \
+        fatal "actor executor is not derived from the sealed actor source"
+    [[ ${ROUND_DAGGER_ACTOR_PAIR_RANK_SCRIPT:-} == \
+        "$ROOT/scripts/round_dagger/run_actor_cohort_with_wandb.sh" ]] || \
+        fatal "actor rank primitive is not derived from the sealed actor source"
+fi
 
 for file in "$ROUND_DAGGER_TEACHER_CHECKPOINT" "$IMAGE3F_ENDPOINT_MANIFEST" "$ROUND_DAGGER_CAMERA_ACCEPTANCE"; do
     [ -f "$file" ] && [ ! -L "$file" ] || fatal "unsafe or missing immutable input: $file"

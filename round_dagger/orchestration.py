@@ -55,9 +55,21 @@ EXPECTED_ACTOR_RANKS = (0, 1)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _HOOK_NAMES = ("collect", "transfer", "ingest", "train", "evaluate", "promote")
 _REQUIRED_HOOKS = {"collect", "train", "evaluate"}
-_EVALUATION_HOOK_RELATIVE = Path(
-    "scripts/round_dagger/run_production_paired_evaluation_hook.sh"
+_COORDINATOR_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+_TRUSTED_HOOK_RELATIVES = MappingProxyType(
+    {
+        "collect": Path(
+            "scripts/round_dagger/run_production_actor_cohort_hook.sh"
+        ),
+        "train": Path(
+            "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"
+        ),
+        "evaluate": Path(
+            "scripts/round_dagger/run_production_paired_evaluation_hook.sh"
+        ),
+    }
 )
+_EVALUATION_HOOK_RELATIVE = _TRUSTED_HOOK_RELATIVES["evaluate"]
 # Linux UAPI values are stable across supported architectures.  Python builds
 # predating their stdlib exposure still run on kernels that provide memfd and
 # file seals, so use the libc entry point plus audited UAPI constants rather
@@ -373,18 +385,32 @@ def _create_sealable_memfd(name: str) -> int:
     return descriptor
 
 
-def _verified_evaluation_hook(
+def _verified_source_hook(
+    name: str,
     hook: HookSpec,
     environment: Mapping[str, str],
-) -> tuple[int, list[str]]:
-    """Verify and snapshot the evaluation hook before any seal code executes.
+) -> tuple[int, list[str], Path, str]:
+    """Verify and snapshot one production hook before any seal code executes.
 
     The verifier is imported when the coordinator starts, from the
     coordinator's own contracted source.  It is intentionally not imported
-    from the later evaluation seal.  Bash consumes a sealed anonymous-memory
+    from the later source seal.  Bash consumes a sealed anonymous-memory
     snapshot, never the still-mutable source inode, so neither replacement nor
     in-place mutation can change the bytes after verification.
+
+    The local RTX evaluation seal is also the coordinator hook seal.  This
+    makes collection, learner submission, and evaluation use one verified
+    source inventory instead of letting the first two execute mutable checkout
+    bytes.  The learner itself still independently verifies its remote OCI
+    source seal.
     """
+
+    try:
+        relative_hook = _TRUSTED_HOOK_RELATIVES[name]
+    except KeyError as exc:
+        raise OrchestrationError(
+            f"{name} hook has no trusted sealed-dispatch contract"
+        ) from exc
 
     raw_root = environment.get("ROUND_DAGGER_EVALUATION_SOURCE_ROOT")
     inventory_sha256 = environment.get(
@@ -392,7 +418,7 @@ def _verified_evaluation_hook(
     )
     if not raw_root or not inventory_sha256:
         raise OrchestrationError(
-            "evaluate hook requires an explicit sealed evaluation source contract"
+            f"{name} hook requires an explicit sealed coordinator source contract"
         )
     root = Path(os.path.abspath(raw_root))
     try:
@@ -416,10 +442,19 @@ def _verified_evaluation_hook(
         raise OrchestrationError(
             "sealed evaluation source parent must be an immutable 0555 directory"
         )
-    expected_hook = root / _EVALUATION_HOOK_RELATIVE
-    if hook.argv != (str(expected_hook),):
+    expected_hook = root / relative_hook
+    # Evaluation is configured directly from the later seal because its hook
+    # is not needed until after training.  Collection and learner submission
+    # retain their coordinator-checkout argv identity for launch-contract
+    # compatibility, but those path bytes are never opened or executed here.
+    configured_hook = (
+        expected_hook
+        if name == "evaluate"
+        else _COORDINATOR_SOURCE_ROOT / relative_hook
+    )
+    if hook.argv != (str(configured_hook),):
         raise OrchestrationError(
-            "evaluate hook path is not derived from the sealed evaluation source"
+            f"{name} hook path differs from its production primitive"
         )
     try:
         report = source_seal.verify(root, inventory_sha256)
@@ -437,30 +472,30 @@ def _verified_evaluation_hook(
         records = source_seal._validate_inventory(inventory)  # noqa: SLF001
     except (KeyError, OSError, source_seal.VerificationError) as exc:
         raise OrchestrationError(
-            "sealed evaluation source failed coordinator-side verification"
+            "sealed coordinator source failed coordinator-side verification"
         ) from exc
     expected_record = next(
         (
             record
             for record in records
-            if record["path"] == _EVALUATION_HOOK_RELATIVE.as_posix()
+            if record["path"] == relative_hook.as_posix()
         ),
         None,
     )
     if expected_record is None or expected_record["mode"] != "0o555":
         raise OrchestrationError(
-            "evaluation hook is absent from the sealed source inventory"
+            f"{name} hook is absent from the sealed source inventory"
         )
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         source_descriptor = os.open(expected_hook, flags)
     except OSError as exc:
-        raise OrchestrationError("cannot safely open sealed evaluation hook") from exc
+        raise OrchestrationError(f"cannot safely open sealed {name} hook") from exc
     snapshot_descriptor: int | None = None
     try:
         snapshot_descriptor = _create_sealable_memfd(
-            "round-dagger-evaluation-hook"
+            f"round-dagger-{name}-hook"
         )
         before = os.fstat(source_descriptor)
         if (
@@ -468,7 +503,7 @@ def _verified_evaluation_hook(
             or stat.S_IMODE(before.st_mode) != 0o555
             or before.st_nlink != 1
         ):
-            raise OrchestrationError("sealed evaluation hook metadata is unsafe")
+            raise OrchestrationError(f"sealed {name} hook metadata is unsafe")
         digest = hashlib.sha256()
         observed = 0
         while True:
@@ -495,34 +530,48 @@ def _verified_evaluation_hook(
             value.st_ctime_ns,
         )
         if identity(before) != identity(after) or observed != before.st_size:
-            raise OrchestrationError("sealed evaluation hook changed while opened")
+            raise OrchestrationError(f"sealed {name} hook changed while opened")
         if (
             digest.hexdigest() != expected_record["sha256"]
             or observed != expected_record["bytes"]
         ):
             raise OrchestrationError(
-                "sealed evaluation hook bytes differ from verified inventory"
+                f"sealed {name} hook bytes differ from verified inventory"
             )
         seals = _F_SEAL_WRITE | _F_SEAL_GROW | _F_SEAL_SHRINK | _F_SEAL_SEAL
         fcntl.fcntl(snapshot_descriptor, _F_ADD_SEALS, seals)
         observed_seals = fcntl.fcntl(snapshot_descriptor, _F_GET_SEALS)
         if observed_seals & seals != seals:
             raise OrchestrationError(
-                "evaluation hook snapshot could not be made immutable"
+                f"{name} hook snapshot could not be made immutable"
             )
         os.lseek(snapshot_descriptor, 0, os.SEEK_SET)
         os.close(source_descriptor)
         source_descriptor = -1
-        return snapshot_descriptor, [
-            "/bin/bash",
-            f"/proc/self/fd/{snapshot_descriptor}",
-        ]
+        return (
+            snapshot_descriptor,
+            ["/bin/bash", f"/proc/self/fd/{snapshot_descriptor}"],
+            root,
+            inventory_sha256,
+        )
     except Exception:
         if source_descriptor >= 0:
             os.close(source_descriptor)
         if snapshot_descriptor is not None:
             os.close(snapshot_descriptor)
         raise
+
+
+def _verified_evaluation_hook(
+    hook: HookSpec,
+    environment: Mapping[str, str],
+) -> tuple[int, list[str]]:
+    """Compatibility wrapper for the original evaluation-only helper."""
+
+    descriptor, argv, _, _ = _verified_source_hook(
+        "evaluate", hook, environment
+    )
+    return descriptor, argv
 
 
 class SubprocessHookRunner:
@@ -539,11 +588,71 @@ class SubprocessHookRunner:
         child_environment = dict(os.environ)
         child_environment.update(environment)
         verified_descriptor: int | None = None
-        if name == "evaluate":
-            verified_descriptor, argv = _verified_evaluation_hook(
-                hook, child_environment
+        collect_sealed_teacher: Path | None = None
+        if name == "collect":
+            raw_source_root = child_environment.get(
+                "ROUND_DAGGER_EVALUATION_SOURCE_ROOT"
             )
-            child_environment["ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH"] = "1"
+            raw_sealed_teacher = child_environment.get(
+                "ROUND_DAGGER_EVALUATION_SEALED_TEACHER"
+            )
+            if not raw_source_root or not raw_sealed_teacher:
+                raise OrchestrationError(
+                    "collect hook requires the inventory-bound sealed teacher"
+                )
+            source_root = Path(os.path.abspath(raw_source_root))
+            collect_sealed_teacher = Path(os.path.abspath(raw_sealed_teacher))
+            try:
+                collect_sealed_teacher.relative_to(source_root)
+            except ValueError as exc:
+                raise OrchestrationError(
+                    "sealed teacher is outside the trusted actor source"
+                ) from exc
+        if name in _TRUSTED_HOOK_RELATIVES:
+            (
+                verified_descriptor,
+                argv,
+                trusted_source_root,
+                trusted_source_inventory_sha256,
+            ) = _verified_source_hook(name, hook, child_environment)
+            child_environment["ROUND_DAGGER_TRUSTED_HOOK_SOURCE_ROOT"] = str(
+                trusted_source_root
+            )
+            child_environment[
+                "ROUND_DAGGER_TRUSTED_HOOK_SOURCE_INVENTORY_SHA256"
+            ] = trusted_source_inventory_sha256
+            if name == "collect":
+                child_environment["ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH"] = "1"
+                child_environment["ROUND_DAGGER_ACTOR_SOURCE_ROOT"] = str(
+                    trusted_source_root
+                )
+                child_environment[
+                    "ROUND_DAGGER_ACTOR_SOURCE_INVENTORY_SHA256"
+                ] = trusted_source_inventory_sha256
+                child_environment["GR00T_ROOT"] = str(
+                    trusted_source_root / "GR00T-VisualSim2Real"
+                )
+                child_environment["ROUND_DAGGER_ACTOR_PAIR_EXECUTOR"] = str(
+                    trusted_source_root
+                    / "scripts/round_dagger/run_actor_rank_docker.sh"
+                )
+                child_environment["ROUND_DAGGER_ACTOR_PAIR_RANK_SCRIPT"] = str(
+                    trusted_source_root
+                    / "scripts/round_dagger/run_actor_cohort_with_wandb.sh"
+                )
+                assert collect_sealed_teacher is not None
+                child_environment["ROUND_DAGGER_TEACHER_CHECKPOINT"] = str(
+                    collect_sealed_teacher
+                )
+            elif name == "train":
+                child_environment["ROUND_DAGGER_TRUSTED_TRAIN_DISPATCH"] = "1"
+                child_environment["ROUND_DAGGER_COORDINATOR_SOURCE_ROOT"] = str(
+                    trusted_source_root
+                )
+            else:
+                child_environment[
+                    "ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH"
+                ] = "1"
         else:
             executable = Path(hook.argv[0])
             if not executable.is_file() or not os.access(executable, os.X_OK):

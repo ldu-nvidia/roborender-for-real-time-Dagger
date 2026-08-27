@@ -6,6 +6,14 @@ there is no `torchrun`, Accelerate multi-GPU launch, DDP, or NCCL process
 group. Both ranks write to the same immutable cohort and telemetry roots, but
 each rank has its own experiment directory and process log.
 
+Production collection is never dispatched from mutable checkout bytes.  The
+coordinator first verifies the complete local RTX source inventory (the same
+immutable seal used by paired evaluation), copies the collect hook into a
+write-sealed anonymous-memory file, and executes only that descriptor.  The
+hook then derives the pair launcher, Docker executor, rank launcher, GR00T
+tree, and teacher checkpoint from the verified source seal.  A direct non-dry
+invocation fails closed.
+
 The default non-dry executor is
 `scripts/round_dagger/run_actor_rank_docker.sh`. It maps logical ranks to the
 two values in `ROUND_DAGGER_ACTOR_DOCKER_GPU_IDS` (default `0,1`) and starts one
@@ -18,7 +26,11 @@ container per GPU. Each container uses:
   address host-local renderers; and
 - identical `/mnt/data1` and `/mnt/data2` bind paths by default, so all
   provenance and telemetry paths mean the same thing inside and outside the
-  container.
+  container; and
+- nested read-only overlays for the complete verified source tree, policy
+  bundle, teacher checkpoint, renderer endpoints, anchor pool, camera
+  acceptance, W&B netrc, and Image3F stream plan.  Cohort, campaign, and actor
+  run output directories remain writable through their parent mounts.
 
 Private IPC is essential. Separate containers can assign the same inner PID to
 both Isaac processes, while Carb includes that PID in shared-memory object
