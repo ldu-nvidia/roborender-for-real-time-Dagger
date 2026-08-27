@@ -69,7 +69,7 @@ _CONTRACT_CONTAINER_PATH = (
     "roborender-isaac-gr00t-x86_64-sm90-isaac5.1.sqsh"
 )
 _PRODUCTION_CONTRACT_SHA256 = (
-    "b044ba7d5bd5e3c1645e79616f19729438d00f66e2a40b19b4e955ae8d630d90"
+    "6f956c743635319eb711b78abac0372142073738d64de2698fd38569f13fd477"
 )
 _CHECKPOINT_FIELDS = {
     "schema",
@@ -436,15 +436,15 @@ def _telemetry(
         )
     except H100ValidationReadbackError as exc:
         raise H100ValidationAttestationError(str(exc)) from exc
-    expected_counts = [9600] * 8
+    expected_counts = [16384] * 8
     for row in rows:
         if (
-            row["replay_transitions_rank"] != 9600
+            row["replay_transitions_rank"] != 16384
             or row["replay_transitions_per_rank"] != expected_counts
-            or row["replay_transitions_global"] != 76800
+            or row["replay_transitions_global"] != 131072
         ):
             raise H100ValidationAttestationError(
-                "validation telemetry does not cover the exact 76,800-transition replay"
+                "validation telemetry does not cover the exact 131,072-transition replay"
             )
     return telemetry_path, rows
 

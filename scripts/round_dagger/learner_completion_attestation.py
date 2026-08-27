@@ -375,9 +375,9 @@ def _validate_readback(
         "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_file_sha256": snapshot_file_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
-        "verified_optimizer_steps": 500,
+        "verified_optimizer_steps": 1200,
         "first_optimizer_step": 1,
-        "last_optimizer_step": 500,
+        "last_optimizer_step": 1200,
     }
     if dict(document) != expected:
         raise CompletionAttestationError("W&B completion readback mismatch")
@@ -425,7 +425,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         or bundle.model_lineage_sha256 != parent_sha
         or bundle.initial_checkpoint_sha256 != parent_sha
         or bundle.batch_size != 8
-        or bundle.max_steps != 500
+        or bundle.max_steps != 1200
         or bundle.save_every != 5
         or bundle.learning_rate != 2.5e-5
         or bundle.weight_decay != 0.01
@@ -473,7 +473,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "replay_snapshot_sha256": snapshot_sha,
         "code_sha256": code_sha,
         "learner_config_sha256": config_sha,
-        "optimizer_steps": 500,
+        "optimizer_steps": 1200,
     }
     if any(result.get(key) != value for key, value in expected_result.items()):
         raise CompletionAttestationError("learner result lineage mismatch")
@@ -518,7 +518,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "learner_contract_sha256": contract_sha,
         "replay_snapshot_sha256": snapshot_sha,
         "replay_snapshot_file_sha256": snapshot_file_sha,
-        "completed_steps": 500,
+        "completed_steps": 1200,
         "world_size": 8,
         "homie_controller_sha256": policy_evidence[
             "homie_controller_sha256"
@@ -541,7 +541,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         telemetry_path,
         campaign_id=campaign_id,
         macro_round=args.macro_round,
-        optimizer_steps=500,
+        optimizer_steps=1200,
         replay_transitions_global=int(snapshot["transition_count"]),
     )
     readback_document = _wandb_readback(
@@ -611,7 +611,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "replay_snapshot_sha256": snapshot_sha,
         "world_size": 8,
         "batch_size_per_rank": 8,
-        "optimizer_steps": 500,
+        "optimizer_steps": 1200,
         "save_every": 5,
         "artifacts": artifacts,
         "wandb": {
@@ -619,7 +619,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
             "project": args.wandb_project,
             "run_id": args.wandb_run_id,
             "run_state": "finished",
-            "verified_optimizer_steps": 500,
+            "verified_optimizer_steps": 1200,
         },
     }
     attestation_path = Path(os.path.abspath(Path(args.attestation).expanduser()))
@@ -677,7 +677,7 @@ def verify_attestation(
         "replay_snapshot_sha256": _sha(snapshot_sha256, "snapshot SHA-256"),
         "world_size": 8,
         "batch_size_per_rank": 8,
-        "optimizer_steps": 500,
+        "optimizer_steps": 1200,
         "save_every": 5,
     }
     if any(document.get(key) != value for key, value in expected.items()):
@@ -713,7 +713,7 @@ def verify_attestation(
         "learner_config_sha256": config_sha256,
         "model_lineage_sha256": parent_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
-        "optimizer_steps": 500,
+        "optimizer_steps": 1200,
         "checkpoint_path": resolved["candidate"].name,
         "checkpoint_sha256": sha256_file(resolved["candidate"]),
         "runtime_policy_sha256": document["runtime_policy_sha256"],
@@ -742,7 +742,7 @@ def verify_attestation(
         or bundle.get("model_lineage_sha256") != parent_sha256
         or bundle.get("initial_checkpoint_sha256") != parent_sha256
         or (bundle.get("batch_size"), bundle.get("max_steps"), bundle.get("save_every"))
-        != (8, 500, 5)
+        != (8, 1200, 5)
         or bundle.get("learning_rate") != 2.5e-5
         or bundle.get("weight_decay") != 0.01
         or bundle.get("seed") != 17
@@ -790,7 +790,7 @@ def verify_attestation(
         "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
         "replay_snapshot_file_sha256": snapshot_file_sha256,
-        "completed_steps": 500,
+        "completed_steps": 1200,
         "world_size": 8,
         "homie_controller_sha256": policy_evidence[
             "homie_controller_sha256"
@@ -809,7 +809,7 @@ def verify_attestation(
     if (
         wandb.get("entity") != "nvidia"
         or wandb.get("run_state") != "finished"
-        or wandb.get("verified_optimizer_steps") != 500
+        or wandb.get("verified_optimizer_steps") != 1200
         or TOKEN_RE.fullmatch(str(wandb.get("project", ""))) is None
         or TOKEN_RE.fullmatch(str(wandb.get("run_id", ""))) is None
         or wandb.get("run_id")

@@ -91,7 +91,7 @@ class _ResetAckServer:
 
 
 def _arrays(rank: int) -> dict[str, np.ndarray]:
-    steps, envs = 300, 32
+    steps, envs = 512, 32
     global_start = rank * envs
     expert = np.ones((steps, envs, 2), dtype=np.float32)
     student = np.zeros_like(expert)
@@ -122,7 +122,7 @@ def _cohort(path: Path, *, image_shape: list[int] | None = None) -> None:
         purpose="train",
         expected_ranks=[0, 1],
         expected_global_env_ids=list(range(64)),
-        expected_transitions=64 * 300,
+        expected_transitions=64 * 512,
         view_contract={
             "dtype": "uint8",
             "layout": "vertical",
@@ -175,7 +175,7 @@ class ActorPairArtifactGateTest(unittest.TestCase):
         self._publish(1)
         sealed = seal_actor_pair(self.cohort)
         self.assertEqual(sealed["ranks"], [0, 1])
-        self.assertEqual(sealed["transition_count"], 64 * 300)
+        self.assertEqual(sealed["transition_count"], 64 * 512)
         self.assertTrue(inspect_actor_pair(self.cohort)["sealed"])
         self.assertEqual(
             seal_actor_pair(self.cohort)["cohort_sha256"],
@@ -223,7 +223,7 @@ class ActorPairArtifactGateTest(unittest.TestCase):
         peer_partial.write_bytes(b"peer still publishing")
         report = require_actor_rank_completion(self.cohort, 0)
         self.assertEqual(report["state"], "complete")
-        self.assertEqual(report["transition_count"], 32 * 300)
+        self.assertEqual(report["transition_count"], 32 * 512)
 
 
 class ActorPairLauncherDryRunTest(unittest.TestCase):
@@ -252,7 +252,7 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
             purpose="train",
             expected_ranks=[0, 1],
             expected_global_env_ids=list(range(64)),
-            expected_transitions=64 * 300,
+            expected_transitions=64 * 512,
             view_contract={
                 "dtype": "uint8",
                 "layout": "vertical",
@@ -299,8 +299,8 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
             "DRY_RUN": "1",
             "GR00T_PYTHON": "/usr/bin/python3",
             "ROUND_DAGGER_LOGICAL_ENV_COUNT": "64",
-            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
-            "ROUND_DAGGER_EXPECTED_TRANSITIONS": "19200",
+            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "512",
+            "ROUND_DAGGER_EXPECTED_TRANSITIONS": "32768",
             "ROUND_DAGGER_COHORT_DIR": str(self.cohort),
             "ROUND_DAGGER_CAMPAIGN_ID": "pair-launcher-test",
             "ROUND_DAGGER_MACRO_ROUND": "0",
@@ -322,6 +322,7 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
             ),
             "ROUND_DAGGER_MIN_ANCHORS": "1",
             "IMAGE3F_ENDPOINT_MANIFEST": str(self.endpoint_manifest),
+            "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE": "simulator_rgb",
             "ANCHORS": str(self.anchors),
             "TRAIN_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_ACTOR_RUN_DIR": str(self.run_dir),
@@ -500,8 +501,8 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             **os.environ,
             "DRY_RUN": "0",
             "ROUND_DAGGER_LOGICAL_ENV_COUNT": "64",
-            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
-            "ROUND_DAGGER_EXPECTED_TRANSITIONS": "19200",
+            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "512",
+            "ROUND_DAGGER_EXPECTED_TRANSITIONS": "32768",
             "ROUND_DAGGER_COHORT_DIR": str(self.cohort),
             "ROUND_DAGGER_CAMPAIGN_ID": "actor-pair-test",
             "ROUND_DAGGER_MACRO_ROUND": "0",

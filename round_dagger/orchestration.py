@@ -6,8 +6,8 @@ produce artifacts.  This module owns every coordinator transition and verifies
 the immutable artifact contract after each hook returns.
 
 The production topology is intentionally not configurable: four synchronous,
-sequential cohorts cover 64 logical environments each for 300 steps, yielding
-exactly 256 environments and 76,800 transitions per macro-round.
+sequential cohorts cover 64 logical environments each for 512 steps, yielding
+exactly 256 environments and 131,072 transitions per macro-round.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ WANDB_PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v
 COHORT_COUNT = 4
 ENVIRONMENTS_PER_COHORT = 64
 TARGET_ENVIRONMENTS = COHORT_COUNT * ENVIRONMENTS_PER_COHORT
-STEPS_PER_ENVIRONMENT = 300
+STEPS_PER_ENVIRONMENT = 512
 TRANSITIONS_PER_COHORT = ENVIRONMENTS_PER_COHORT * STEPS_PER_ENVIRONMENT
 TRANSITIONS_PER_MACRO_ROUND = TARGET_ENVIRONMENTS * STEPS_PER_ENVIRONMENT
 EXPECTED_ACTOR_RANKS = (0, 1)
@@ -689,7 +689,7 @@ class SubprocessHookRunner:
 def validate_production_topology(
     campaign: Mapping[str, Any], contract: Mapping[str, Any] | None = None
 ) -> None:
-    """Reject any campaign that is not exactly 4 x 64 x 300."""
+    """Reject any campaign that is not exactly 4 x 64 x 512."""
 
     expected = {
         "target_environments": TARGET_ENVIRONMENTS,
@@ -705,7 +705,7 @@ def validate_production_topology(
     if contract is None:
         return
     if contract.get("steps_per_environment") != STEPS_PER_ENVIRONMENT:
-        raise OrchestrationError("macro-round step count is not exactly 300")
+        raise OrchestrationError("macro-round step count is not exactly 512")
     cohorts = contract.get("cohorts")
     expected_cohorts = [
         {
@@ -1656,7 +1656,7 @@ class MacroRoundOrchestrator:
             if collection.get("cohort_count") != COHORT_COUNT or collection.get(
                 "transition_count"
             ) != TRANSITIONS_PER_MACRO_ROUND:
-                raise OrchestrationError("immutable collection aggregate is not exactly 256x300")
+                raise OrchestrationError("immutable collection aggregate is not exactly 256x512")
             self.backend.mark_collected(collection)
             telemetry.record(
                 step=self.config.macro_round * 100 + 10,

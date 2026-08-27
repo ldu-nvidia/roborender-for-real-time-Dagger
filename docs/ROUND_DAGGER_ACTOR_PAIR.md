@@ -37,7 +37,7 @@ both Isaac processes, while Carb includes that PID in shared-memory object
 names. Host IPC would therefore let the two plugin loaders collide even though
 their CUDA devices are distinct.
 
-The macro-round orchestrator supplies the cohort identity, exact `64 x 300`
+The macro-round orchestrator supplies the cohort identity, exact `64 x 512`
 coverage, frozen policy identity, and common `TRAIN_RUN_DIR`. The operator must
 also supply the machine-specific inputs already required by the rank-local
 launcher: the teacher checkpoint path, endpoint manifest, anchor directory,
@@ -45,11 +45,15 @@ validated GR00T Python/root, RTX image tag, and optional W&B account variables.
 W&B is launched only by logical rank 0; rank 1 contributes files to the same
 telemetry directory without creating a second remote run.
 
+Production pins `bootstrap_anchor_source=simulator_rgb`: reset frame zero uses
+the current three-view Isaac RGB observation. The legacy anchor pool remains a
+verified compatibility asset, but is not the production bootstrap source.
+
 The pair hook waits for both processes even if either fails. It never signals
 an actor, renderer, or unrelated job. A partial rank remains unsealed for
 forensics and is not overwritten. An exactly complete rank may be skipped on a
 retry; a cohort seal is published and reverified only after both exact
-32-environment partitions contain all 300 steps.
+32-environment partitions contain all 512 steps.
 
 Run the control-plane gates without Docker, Isaac, or a GPU:
 

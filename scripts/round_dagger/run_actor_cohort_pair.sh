@@ -74,11 +74,11 @@ esac
 [[ ${ROUND_DAGGER_LOGICAL_ENV_COUNT:-} == 64 ]] || {
     echo "actor pair requires exactly 64 logical environments" >&2; exit 2;
 }
-[[ ${ROUND_DAGGER_STEPS_PER_ENVIRONMENT:-} == 300 ]] || {
-    echo "actor pair requires exactly 300 steps per environment" >&2; exit 2;
+[[ ${ROUND_DAGGER_STEPS_PER_ENVIRONMENT:-} == 512 ]] || {
+    echo "actor pair requires exactly 512 steps per environment" >&2; exit 2;
 }
-[[ ${ROUND_DAGGER_EXPECTED_TRANSITIONS:-} == 19200 ]] || {
-    echo "actor pair requires exactly 19200 transitions" >&2; exit 2;
+[[ ${ROUND_DAGGER_EXPECTED_TRANSITIONS:-} == 32768 ]] || {
+    echo "actor pair requires exactly 32768 transitions" >&2; exit 2;
 }
 [[ "$EXPECTED_RENDERERS" =~ ^[1-9][0-9]*$ ]] || {
     echo "actor pair expected renderer count must be positive" >&2; exit 2;

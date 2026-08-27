@@ -86,7 +86,7 @@ TEACHER_CHECKPOINT_RELATIVE = Path(
 )
 TEACHER_CHECKPOINT = REPOSITORY_ROOT / TEACHER_CHECKPOINT_RELATIVE
 PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE = Path(
-    "configs/round_dagger/production_campaign_256x300.json"
+    "configs/round_dagger/production_campaign_256x512.json"
 )
 ANCHOR_POOL = PRODUCTION_ASSET_ROOT / "anchor_pool_2048"
 EVALUATION_CONFIG = (
@@ -179,6 +179,41 @@ def _directory(path: Path, label: str) -> Path:
     return path
 
 
+def _require_evaluation_case_capacity(
+    scenario_path: Path, threshold_path: Path
+) -> None:
+    """Reject an evaluation set that cannot satisfy its promotion minimum."""
+
+    try:
+        scenarios = artifacts.load_strict_json(scenario_path)
+        thresholds = artifacts.load_strict_json(threshold_path)
+    except Exception as exc:
+        raise ProductionLaunchError(
+            f"cannot read paired-evaluation capacity contracts: {exc}"
+        ) from exc
+    # The immutable scenario artifact consumed by round_dagger.evaluation is a
+    # canonical top-level list.  Do not confuse it with the later published
+    # evaluation contract, whose ``scenario_cases`` field wraps that list.
+    cases = scenarios if isinstance(scenarios, list) else None
+    minimum_cases = (
+        thresholds.get("minimum_paired_cases")
+        if isinstance(thresholds, Mapping)
+        else None
+    )
+    if (
+        not isinstance(cases, list)
+        or isinstance(minimum_cases, bool)
+        or not isinstance(minimum_cases, int)
+        or minimum_cases < 1
+        or len(cases) < minimum_cases
+    ):
+        observed = len(cases) if isinstance(cases, list) else 0
+        raise ProductionLaunchError(
+            "evaluation scenario contract contains "
+            f"{observed} cases but production requires {minimum_cases!r}"
+        )
+
+
 def _file_identity(path: Path, expected_sha: str, label: str) -> None:
     _regular(path, label)
     if artifacts.sha256_file(path) != _require_sha(expected_sha, f"{label} SHA-256"):
@@ -200,7 +235,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
     contract = _load_contract(
         path, CAMPAIGN_CONTRACT_SCHEMA, CAMPAIGN_CONTRACT_KEYS, "campaign contract"
     )
-    _require_equal(contract["campaign_id"], "roborender-dagger-256x300-v1", "campaign ID")
+    _require_equal(contract["campaign_id"], "roborender-dagger-256x512-v1", "campaign ID")
     _require_equal(
         _exact(
             contract["topology"],
@@ -236,6 +271,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
                 "policy_views",
                 "policy_image_shape",
                 "policy_view_layout",
+                "bootstrap_anchor_source",
                 "reference_lag_frames",
             },
             "observation contract",
@@ -245,6 +281,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
             "policy_views": ["head_color", "hand_left", "hand_right"],
             "policy_image_shape": [324, 192, 3],
             "policy_view_layout": "vertical",
+            "bootstrap_anchor_source": "simulator_rgb",
             "reference_lag_frames": 256,
         },
         "observation contract",
@@ -276,7 +313,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
             {"kind", "start", "end", "decay_rounds", "rate"},
             "beta schedule",
         ),
-        {"kind": "linear", "start": 1.0, "end": 0.0, "decay_rounds": 10, "rate": 1.0},
+        {"kind": "linear", "start": 1.0, "end": 0.0, "decay_rounds": 4, "rate": 1.0},
         "beta schedule",
     )
 
@@ -381,7 +418,13 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
     )
     anchors = _exact(
         artifacts_doc["anchor_pool"],
-        {"path", "anchor_count", "inventory_sha256", "inventory_algorithm"},
+        {
+            "path",
+            "anchor_count",
+            "inventory_sha256",
+            "inventory_algorithm",
+            "usage",
+        },
         "anchor pool",
     )
     _absolute(anchors["path"], "anchor pool")
@@ -396,6 +439,11 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
         anchors["inventory_algorithm"],
         "len64be(path_utf8)+path_utf8+size64be+sha256_binary",
         "anchor inventory algorithm",
+    )
+    _require_equal(
+        anchors["usage"],
+        "compatibility_fallback_only",
+        "anchor pool usage",
     )
     camera = _exact(
         artifacts_doc["camera_acceptance"], {"path", "sha256", "reviewer"}, "camera acceptance"
@@ -539,7 +587,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
     )
     _require_equal(
         evaluation["threshold_contract_sha256"],
-        "1079e2289a8afc93a8cdffd7ed060c1749c9a3067a27f0ba1213c0cd65148d96",
+        "05d9fbb64c41311e586f2d14f889902a3ea7fe56e31bd8b16cd539a65c035563",
         "evaluation threshold contract identity",
     )
     for key in (
@@ -577,7 +625,7 @@ def load_learner_contract(path: Path) -> dict[str, Any]:
             "learner optimization",
         ),
         {
-            "optimizer_steps": 500,
+            "optimizer_steps": 1200,
             "save_every_steps": 5,
             "learning_rate": 2.5e-5,
             "weight_decay": 0.01,
@@ -711,6 +759,10 @@ def _verify_static_inputs(campaign_contract: Mapping[str, Any]) -> None:
         if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
             raise ProductionLaunchError(f"{label} path must be repository-relative")
         _file_identity(REPOSITORY_ROOT / relative, evaluation[sha_key], label)
+    _require_evaluation_case_capacity(
+        REPOSITORY_ROOT / evaluation["scenario_contract"],
+        REPOSITORY_ROOT / evaluation["threshold_contract"],
+    )
 
     runtime = campaign_contract["actor_runtime"]
     docker = _regular(Path(runtime["docker_bin"]), "Docker executable")
@@ -1313,6 +1365,10 @@ def _validate_orchestration_and_campaign(
         configuration = MacroRoundConfig.load(orchestration_path)
     except Exception as exc:
         raise ProductionLaunchError(f"strict orchestration config is invalid: {exc}") from exc
+    if not 0 <= configuration.macro_round < 5:
+        raise ProductionLaunchError(
+            "production campaign contains exactly five macro-rounds (0 through 4)"
+        )
     root = _directory(configuration.campaign_root, "campaign root")
     _require_equal(configuration.actor_root, root / "actors", "orchestration actor root")
     _require_equal(configuration.learner_code_sha256, source_inventory_sha256, "learner/source identity")
@@ -1354,7 +1410,7 @@ def _validate_orchestration_and_campaign(
         "target_environments": 256,
         "active_environments": 64,
         "cohort_count": 4,
-        "steps_per_environment": 300,
+        "steps_per_environment": 512,
         "view_names": ["head_color", "hand_left", "hand_right"],
         "policy_image_shape": [324, 192, 3],
         "action_dim": 26,
@@ -1426,6 +1482,7 @@ def build_environment(
     learner_contract_sha256: str,
 ) -> dict[str, str]:
     artifact = campaign_contract["artifacts"]
+    observation = campaign_contract["observation_contract"]
     runtime = campaign_contract["actor_runtime"]
     telemetry = campaign_contract["telemetry"]
     wandb = campaign_contract["wandb"]
@@ -1448,6 +1505,9 @@ def build_environment(
         "ANCHORS": artifact["anchor_pool"]["path"],
         "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256": artifact["anchor_pool"]["inventory_sha256"],
         "ROUND_DAGGER_ANCHOR_INDEX": "0",
+        "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE": observation[
+            "bootstrap_anchor_source"
+        ],
         "ROUND_DAGGER_CAMERA_ACCEPTANCE": artifact["camera_acceptance"]["path"],
         "ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256": artifact["camera_acceptance"]["sha256"],
         "ROUND_DAGGER_RTX_IMAGE": artifact["actor_image"]["name"],
@@ -1608,9 +1668,12 @@ def validate_launch(
         "campaign_root": str(configuration.campaign_root),
         "macro_round": configuration.macro_round,
         "coordinator_phase": coordinator["phase"],
-        "topology": "4 cohorts x 2 actors x 32 environments x 300 steps",
+        "topology": "4 cohorts x 2 actors x 32 environments x 512 steps",
         "transitions_per_macro_round": TRANSITIONS_PER_MACRO_ROUND,
         "reference_lag_frames": 256,
+        "bootstrap_anchor_source": campaign_contract["observation_contract"][
+            "bootstrap_anchor_source"
+        ],
         "active_policy_sha256": coordinator["active_policy"]["checkpoint_sha256"],
         "learner_sealed_source_root": sealed_source_root,
         "learner_source_inventory_sha256": sealed_source_inventory_sha256,
@@ -1628,7 +1691,7 @@ def validate_launch(
         "derived_learner_bundle_sha256": derived_learner_bundle_sha,
         "campaign_contract_sha256": campaign_contract_sha,
         "orchestration_config_sha256": orchestration_sha,
-        "learner": "1 OCI-NRT node / 8 H100 / batch 8 per rank / 500 optimizer steps",
+        "learner": "1 OCI-NRT node / 8 H100 / batch 8 per rank / 1200 optimizer steps",
         "wandb": "ldu@nvidia.com -> nvidia/roborender-round-dagger",
         "hooks": {
             name: None if hook is None else {"argv": list(hook.argv), "timeout_seconds": hook.timeout_seconds}

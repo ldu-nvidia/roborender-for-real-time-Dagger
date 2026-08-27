@@ -86,13 +86,14 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "gr00t/rl/trl/trainer/ppo_trainer.py",
             "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
+            "gr00t/rl/utils/simulator_rgb_anchor.py",
         ):
             source = self.gr00t / relative
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(f"# fixture: {relative}\n", encoding="utf-8")
         sealed_campaign_path = (
             self.repository_root
-            / "configs/round_dagger/production_campaign_256x300.json"
+            / "configs/round_dagger/production_campaign_256x512.json"
         )
         sealed_campaign = json.loads(sealed_campaign_path.read_text(encoding="utf-8"))
         sealed_campaign["artifacts"]["anchor_pool"] = {
@@ -100,6 +101,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "anchor_count": 1,
             "inventory_sha256": self.anchor_inventory_sha,
             "inventory_algorithm": "len64be(path_utf8)+path_utf8+size64be+sha256_binary",
+            "usage": "compatibility_fallback_only",
         }
         sealed_campaign_path.write_text(json.dumps(sealed_campaign), encoding="utf-8")
         self.endpoints = self.tmp / "endpoints"
@@ -199,6 +201,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "ROUND_DAGGER_MIN_ANCHORS": "1",
             "ROUND_DAGGER_ANCHOR_INDEX": "0",
             "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256": self.anchor_inventory_sha,
+            "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE": "simulator_rgb",
             "DOCKER_LOG": str(self.docker_log),
         }
 
@@ -237,7 +240,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             {
                 **DEFAULT_THRESHOLDS,
                 "allow_bounded_nonregression": False,
-                "minimum_paired_cases": 16,
+                "minimum_paired_cases": 256,
             },
         )
 
@@ -270,6 +273,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.assertIn("--teacher-sha256", completed.stdout)
         self.assertIn("--sealed-teacher-checkpoint", completed.stdout)
         self.assertIn("--require-teacher-readonly-mount", completed.stdout)
+        self.assertIn("IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE", completed.stdout)
         teacher_mount = (
             f"type=bind,src={self.sealed_teacher},"
             f"dst={self.teacher_checkpoint},readonly"

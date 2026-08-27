@@ -53,7 +53,7 @@ class OCIH100ValidationLauncherTest(unittest.TestCase):
         production_bridge = (
             ROOT / "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("8:500:5:2.5e-5:0.01:17:23", production_bridge)
+        self.assertIn("8:1200:5:2.5e-5:0.01:17:23", production_bridge)
         for path in (SUBMIT, BATCH, WRAPPER, ATTEST, READBACK):
             self.assertTrue(os.access(path, os.X_OK), path)
         for path in (SUBMIT, BATCH, WRAPPER):
@@ -420,8 +420,8 @@ class H100ValidationAttestationTest(unittest.TestCase):
                     "project": "roborender-round-dagger-validation",
                 },
                 "production_target_contract_sha256": (
-                    "b044ba7d5bd5e3c1645e79616f19729438d00f66e2a40b19"
-                    "b4e955ae8d630d90"
+                    "6f956c743635319eb711b78abac0372142073738d64de2698f"
+                    "d38569f13fd477"
                 ),
             },
         )
@@ -550,9 +550,9 @@ class H100ValidationAttestationTest(unittest.TestCase):
                 "macro_round": self.macro_round,
                 "optimizer_step": step,
                 "loss": loss,
-                "replay_transitions_rank": 9600,
-                "replay_transitions_per_rank": [9600] * 8,
-                "replay_transitions_global": 76800,
+                "replay_transitions_rank": 16384,
+                "replay_transitions_per_rank": [16384] * 8,
+                "replay_transitions_global": 131072,
                 "world_size": 8,
             }
             for step, loss in ((1, 1.0), (2, 0.75))

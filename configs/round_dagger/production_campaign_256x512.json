@@ -1,15 +1,15 @@
 {
   "schema": "fast_roborender.round_dagger.production_campaign_contract.v1",
-  "campaign_id": "roborender-dagger-256x300-v1",
+  "campaign_id": "roborender-dagger-256x512-v1",
   "topology": {
     "target_environments": 256,
     "active_environments": 64,
     "cohort_count": 4,
     "environments_per_actor_rank": 32,
     "actor_ranks_per_cohort": 2,
-    "steps_per_environment": 300,
-    "transitions_per_cohort": 19200,
-    "transitions_per_macro_round": 76800
+    "steps_per_environment": 512,
+    "transitions_per_cohort": 32768,
+    "transitions_per_macro_round": 131072
   },
   "observation_contract": {
     "primary_view": "head_color",
@@ -24,6 +24,7 @@
       3
     ],
     "policy_view_layout": "vertical",
+    "bootstrap_anchor_source": "simulator_rgb",
     "reference_lag_frames": 256
   },
   "action_contract": {
@@ -40,7 +41,7 @@
     "kind": "linear",
     "start": 1.0,
     "end": 0.0,
-    "decay_rounds": 10,
+    "decay_rounds": 4,
     "rate": 1.0
   },
   "artifacts": {
@@ -71,7 +72,8 @@
       "path": "/mnt/data2/ldu/roborender_round_dagger_assets/anchor_pool_2048",
       "anchor_count": 2048,
       "inventory_sha256": "ee358a97581512a5d03730d06efd5804e53844f517112dc0a845ed86b6dae46f",
-      "inventory_algorithm": "len64be(path_utf8)+path_utf8+size64be+sha256_binary"
+      "inventory_algorithm": "len64be(path_utf8)+path_utf8+size64be+sha256_binary",
+      "usage": "compatibility_fallback_only"
     },
     "camera_acceptance": {
       "path": "/mnt/data2/ldu/roborender_round_dagger_validation/production_inputs_v1/camera/camera_calibration_acceptance.json",
@@ -121,6 +123,6 @@
     "scenario_contract": "configs/round_dagger/production_paired_scenarios_2x8.json",
     "scenario_contract_sha256": "99081ebee907ef36c388cf62a1d134c015d289776526cacc1db114a87074e724",
     "threshold_contract": "configs/round_dagger/production_paired_thresholds.json",
-    "threshold_contract_sha256": "1079e2289a8afc93a8cdffd7ed060c1749c9a3067a27f0ba1213c0cd65148d96"
+    "threshold_contract_sha256": "05d9fbb64c41311e586f2d14f889902a3ea7fe56e31bd8b16cd539a65c035563"
   }
 }

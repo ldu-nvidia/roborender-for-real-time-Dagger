@@ -42,5 +42,5 @@
     "authorization_scope": "team",
     "project": "roborender-round-dagger-validation"
   },
-  "production_target_contract_sha256": "b044ba7d5bd5e3c1645e79616f19729438d00f66e2a40b19b4e955ae8d630d90"
+  "production_target_contract_sha256": "6f956c743635319eb711b78abac0372142073738d64de2698fd38569f13fd477"
 }

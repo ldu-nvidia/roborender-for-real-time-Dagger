@@ -100,6 +100,10 @@ _GR00T_EVALUATOR_SOURCES = (
     # client bytes that never checked generated_t-256 responses.
     "gr00t/rl/utils/image3f_frame_client.py",
     "gr00t/rl/utils/round_dagger_paired_eval.py",
+    # Produces the state-aligned reset RGB triplet used by production instead
+    # of the compatibility anchor pool; omitting it would leave the actual
+    # observation producer outside the evaluator identity.
+    "gr00t/rl/utils/simulator_rgb_anchor.py",
 )
 
 

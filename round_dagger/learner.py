@@ -153,6 +153,9 @@ class LearnerBundleConfig:
     observation_key_map: tuple[tuple[str, str], ...] = ()
     train_action_slice: tuple[int, int] | None = None
     batch_size: int = 64
+    # Production supplies its 1200-step target explicitly through the sealed
+    # learner contract.  Keep the generic bundle default stable for smoke and
+    # library callers that intentionally omit a production target.
     max_steps: int = 500
     save_every: int = 100
     learning_rate: float = 1.0e-4
@@ -1156,7 +1159,7 @@ class JsonlTelemetry:
             # persisted.  Appending directly to JSONL can then leave a torn
             # final line, permanently wedging completion attestation even
             # though the last durable restart is valid.  The production log is
-            # small (500 scalar rows), so rewrite it through a same-directory
+            # small (1200 scalar rows), so rewrite it through a same-directory
             # temporary and atomically replace the old inode.  A crash exposes
             # either the complete previous log or the complete new log.
             if self.path.is_symlink():

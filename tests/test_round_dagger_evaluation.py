@@ -64,6 +64,7 @@ class PairedEvaluationTest(unittest.TestCase):
             "gr00t/rl/trl/trainer/ppo_trainer.py",
             "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
+            "gr00t/rl/utils/simulator_rgb_anchor.py",
         )
         for relative in fixture_sources:
             source = self.gr00t / relative
@@ -168,8 +169,8 @@ class PairedEvaluationTest(unittest.TestCase):
         )
         rows = [
             {
-                "seed": 17 + index // 8,
-                "env_index": index % 8,
+                "seed": 17 + index // 32,
+                "env_index": index % 32,
                 "scenario_id": _sha(f"scenario:{index}"),
                 "first_condition_sha256": _sha(f"condition:{index}"),
                 "first_generated_sha256": _sha(f"generated:{index}"),
@@ -178,7 +179,7 @@ class PairedEvaluationTest(unittest.TestCase):
                 "action_imitation_mse": 1.0,
                 "episode_length": 300,
             }
-            for index in range(16)
+            for index in range(256)
         ]
         _, decision = _score(rows, rows, thresholds)
         self.assertTrue(decision["bounded_nonregression_all"])
@@ -1103,13 +1104,17 @@ class PairedEvaluationTest(unittest.TestCase):
             self.gr00t,
             self.evaluation_inventory_sha,
         )
-        self.assertEqual(len(bundle["sources"]), 24)
+        self.assertEqual(len(bundle["sources"]), 25)
         self.assertIn(
             "gr00t/gr00t/rl/trl/trainer/anchor_io.py",
             {item["source"] for item in bundle["sources"]},
         )
         self.assertIn(
             "gr00t/gr00t/rl/utils/image3f_frame_client.py",
+            {item["source"] for item in bundle["sources"]},
+        )
+        self.assertIn(
+            "gr00t/gr00t/rl/utils/simulator_rgb_anchor.py",
             {item["source"] for item in bundle["sources"]},
         )
         self.assertEqual(canonical_json_sha256(bundle), self.evaluator_code_sha)

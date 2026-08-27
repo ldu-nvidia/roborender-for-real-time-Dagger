@@ -452,7 +452,7 @@ def initialize_campaign(
     bootstrap_policy_path: str,
     target_environments: int = 256,
     active_environments: int = 64,
-    steps_per_environment: int = 300,
+    steps_per_environment: int = 512,
     view_names: tuple[str, str, str] = ("head_color", "hand_left", "hand_right"),
     policy_image_shape: tuple[int, int, int] = (324, 192, 3),
     # 11 learned controls + 15 fixed Homie controls.  Isaac's robot.actions_dim
@@ -477,7 +477,7 @@ def initialize_campaign(
     )
     schedule = _validate_beta_schedule(
         beta_schedule
-        or {"kind": "linear", "start": 1.0, "end": 0.0, "decay_rounds": 10}
+        or {"kind": "linear", "start": 1.0, "end": 0.0, "decay_rounds": 4}
     )
     campaign = {
         "schema": CAMPAIGN_SCHEMA,

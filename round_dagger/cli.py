@@ -85,7 +85,7 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--training-config", type=_digest, required=True)
     init.add_argument("--target-environments", type=int, default=256)
     init.add_argument("--active-environments", type=int, default=64)
-    init.add_argument("--steps-per-environment", type=int, default=300)
+    init.add_argument("--steps-per-environment", type=int, default=512)
     # Round replay stores the 11-D learned student/teacher action followed by
     # the fixed 15-D Homie action.  The 31-D value in the Isaac configuration
     # is the downstream whole-body command after HomieBase expands this input,
@@ -96,7 +96,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--beta-start", type=float, default=1.0)
     init.add_argument("--beta-end", type=float, default=0.0)
-    init.add_argument("--beta-decay-rounds", type=int, default=10)
+    init.add_argument("--beta-decay-rounds", type=int, default=4)
     init.add_argument("--beta-rate", type=float, default=0.99)
 
     status = sub.add_parser("status", help="show the campaign and coordinator state")

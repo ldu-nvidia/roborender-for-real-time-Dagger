@@ -2,7 +2,7 @@
 # Launch one bounded validation cohort as two independent single-GPU actors.
 #
 # This is intentionally separate from run_actor_cohort_pair.sh.  Production is
-# fixed to 2 x 32 x 300 train transitions; this launcher derives a bounded
+# fixed to 2 x 32 x 512 train transitions; this launcher derives a bounded
 # 2 x (1..32) x (1..300) eval or acknowledged-train shape from contract.json.
 set -Eeuo pipefail
 

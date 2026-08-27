@@ -60,7 +60,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
             "observation_key_map": {},
             "train_action_slice": [0, 11],
             "batch_size": 8,
-            "max_steps": 500,
+            "max_steps": 1200,
             "save_every": 5,
             "learning_rate": 2.5e-5,
             "weight_decay": 0.01,
@@ -102,7 +102,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "learner_contract_sha256": contract_sha,
                 "replay_snapshot_sha256": snapshot_sha,
                 "replay_snapshot_file_sha256": snapshot_file_sha,
-                "completed_steps": 500,
+                "completed_steps": 1200,
                 "world_size": 8,
                 "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
                 "model_state_dict": {},
@@ -144,9 +144,9 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "learner_contract_sha256": contract_sha,
                 "replay_snapshot_file_sha256": snapshot_file_sha,
                 "replay_snapshot_sha256": snapshot_sha,
-                "verified_optimizer_steps": 500,
+                "verified_optimizer_steps": 1200,
                 "first_optimizer_step": 1,
-                "last_optimizer_step": 500,
+                "last_optimizer_step": 1200,
             },
         )
         result = output / "learner_result_round_000000.json"
@@ -165,7 +165,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
             "replay_snapshot_sha256": snapshot_sha,
             "code_sha256": code_sha,
             "learner_config_sha256": config_sha,
-            "optimizer_steps": 500,
+            "optimizer_steps": 1200,
             "initial_loss": 1.0,
             "final_loss": 0.5,
         }
@@ -200,7 +200,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "replay_snapshot_sha256": snapshot_sha,
                 "world_size": 8,
                 "batch_size_per_rank": 8,
-                "optimizer_steps": 500,
+                "optimizer_steps": 1200,
                 "save_every": 5,
                 "artifacts": artifacts,
                 "wandb": {
@@ -208,7 +208,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                     "project": "roborender-round-dagger",
                     "run_id": run_id,
                     "run_state": "finished",
-                    "verified_optimizer_steps": 500,
+                    "verified_optimizer_steps": 1200,
                 },
             },
         )

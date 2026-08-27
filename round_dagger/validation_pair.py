@@ -1,7 +1,7 @@
 """Exact completion gate for bounded two-rank actor validation cohorts.
 
 Unlike :mod:`round_dagger.actor_pair`, whose contract is deliberately fixed to
-the production ``2 x 32 x 300`` train shape, this module derives a bounded
+the production ``2 x 32 x 512`` train shape, this module derives a bounded
 validation shape from the immutable cohort contract.  It accepts exactly two
 logical ranks, 1--32 environments per rank, and 1--300 steps per environment.
 Both eval cohorts and explicitly acknowledged train-validation cohorts use the

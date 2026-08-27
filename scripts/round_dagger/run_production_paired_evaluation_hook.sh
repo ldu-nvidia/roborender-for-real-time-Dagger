@@ -76,6 +76,7 @@ ANCHOR_POOL=${ANCHORS:?missing ANCHORS}
 ANCHOR_COUNT=${ROUND_DAGGER_MIN_ANCHORS:?missing ROUND_DAGGER_MIN_ANCHORS}
 ANCHOR_INDEX=${ROUND_DAGGER_ANCHOR_INDEX:?missing ROUND_DAGGER_ANCHOR_INDEX}
 ANCHOR_INVENTORY_SHA=${ROUND_DAGGER_ANCHOR_INVENTORY_SHA256:?missing ROUND_DAGGER_ANCHOR_INVENTORY_SHA256}
+ANCHOR_SOURCE=${IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE:?missing IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE}
 
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "campaign ID is unsafe"
@@ -106,6 +107,8 @@ require_directory "$ENDPOINT_DIR" "renderer endpoint directory"
 require_directory "$ANCHOR_POOL" "anchor pool"
 [[ $ANCHOR_COUNT =~ ^[1-9][0-9]*$ ]] || fatal "anchor count is invalid"
 [[ $ANCHOR_INDEX =~ ^(0|[1-9][0-9]*)$ ]] || fatal "anchor index is invalid"
+[[ $ANCHOR_SOURCE == simulator_rgb ]] || \
+    fatal "production bootstrap anchor source must be exactly simulator_rgb"
 ((10#$ANCHOR_INDEX < 10#$ANCHOR_COUNT)) || \
     fatal "anchor index must be smaller than anchor count"
 require_regular "$PARENT_CHECKPOINT" "parent checkpoint"
@@ -221,23 +224,28 @@ CONFIGURED_ANCHOR_INDEX=${CONFIGURED_INPUTS[2]}
 [[ $CONFIGURED_ANCHOR_INDEX == "$ANCHOR_INDEX" ]] || \
     fatal "pinned evaluation config anchor index mismatch"
 
-SEALED_CAMPAIGN_CONTRACT="$EVALUATION_SOURCE_ROOT/configs/round_dagger/production_campaign_256x300.json"
+SEALED_CAMPAIGN_CONTRACT="$EVALUATION_SOURCE_ROOT/configs/round_dagger/production_campaign_256x512.json"
 require_regular "$SEALED_CAMPAIGN_CONTRACT" "sealed production campaign contract"
 $CONTROL_PYTHON - "$SEALED_CAMPAIGN_CONTRACT" "$ANCHOR_POOL" \
-    "$ANCHOR_COUNT" "$ANCHOR_INVENTORY_SHA" <<'PY' || \
+    "$ANCHOR_COUNT" "$ANCHOR_INVENTORY_SHA" "$ANCHOR_SOURCE" <<'PY' || \
     fatal "sealed campaign anchor contract mismatch"
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
-    anchor = json.load(handle)["artifacts"]["anchor_pool"]
+    campaign = json.load(handle)
+anchor = campaign["artifacts"]["anchor_pool"]
 expected = {
     "path": sys.argv[2],
     "anchor_count": int(sys.argv[3]),
     "inventory_sha256": sys.argv[4],
     "inventory_algorithm": "len64be(path_utf8)+path_utf8+size64be+sha256_binary",
+    "usage": "compatibility_fallback_only",
 }
-if anchor != expected:
+if (
+    anchor != expected
+    or campaign["observation_contract"]["bootstrap_anchor_source"] != sys.argv[5]
+):
     raise SystemExit(1)
 PY
 

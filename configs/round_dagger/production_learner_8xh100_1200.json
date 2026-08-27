@@ -8,7 +8,7 @@
     "global_batch_size": 64
   },
   "optimization": {
-    "optimizer_steps": 500,
+    "optimizer_steps": 1200,
     "save_every_steps": 5,
     "learning_rate": 2.5e-5,
     "weight_decay": 0.01,

@@ -11,14 +11,19 @@ from unittest import mock
 from round_dagger import artifacts
 from round_dagger.orchestration import MacroRoundConfig
 from round_dagger.promotion import stage_bootstrap_policy
-from round_dagger.state import initialize_campaign, load_campaign, load_state
+from round_dagger.state import (
+    beta_for_macro_round,
+    initialize_campaign,
+    load_campaign,
+    load_state,
+)
 from scripts.round_dagger import production_launch
 from tests.policy_bundle_helpers import publish_policy_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CAMPAIGN_CONTRACT = ROOT / "configs/round_dagger/production_campaign_256x300.json"
-LEARNER_CONTRACT = ROOT / "configs/round_dagger/production_learner_8xh100_500.json"
+CAMPAIGN_CONTRACT = ROOT / "configs/round_dagger/production_campaign_256x512.json"
+LEARNER_CONTRACT = ROOT / "configs/round_dagger/production_learner_8xh100_1200.json"
 SOURCE_SHA = "a" * 64
 RUNTIME_SHA = "b" * 64
 EVALUATION_CONFIG_SHA = (
@@ -27,7 +32,7 @@ EVALUATION_CONFIG_SHA = (
 # Independently cross-checked against prepare_gr00t_learner_bundle.prepare_bundle
 # in the Torch-enabled learner environment for this deterministic fixture.
 EXPECTED_DERIVED_BUNDLE_SHA = (
-    "6a46f66ea9ec1e8f9a936b35389631f14717ebd4406020eac25be80331144320"
+    "48a17f1675ead36d3925621be9248c2881769b5ccb32aad848c5d53008656187"
 )
 
 
@@ -77,6 +82,7 @@ class ProductionLaunchTests(unittest.TestCase):
                     "inventory_algorithm": (
                         "len64be(path_utf8)+path_utf8+size64be+sha256_binary"
                     ),
+                    "usage": "compatibility_fallback_only",
                 },
             },
             "evaluation": {
@@ -133,12 +139,12 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         initialize_campaign(
             root,
-            campaign_id="roborender-dagger-256x300-v1",
+            campaign_id="roborender-dagger-256x512-v1",
             bootstrap_policy_sha256=bootstrap["checkpoint_sha256"],
             bootstrap_policy_path=bootstrap["checkpoint_path"],
             target_environments=256,
             active_environments=64,
-            steps_per_environment=300,
+            steps_per_environment=512,
             view_names=("head_color", "hand_left", "hand_right"),
             policy_image_shape=(324, 192, 3),
             action_dim=26,
@@ -150,7 +156,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 "kind": "linear",
                 "start": 1.0,
                 "end": 0.0,
-                "decay_rounds": 10,
+                "decay_rounds": 4,
                 "rate": 1.0,
             },
         )
@@ -161,7 +167,7 @@ class ProductionLaunchTests(unittest.TestCase):
             parent_checkpoint=checkpoint,
             expected_parent_checkpoint_sha256=active["checkpoint_sha256"],
             runtime_policy_sha256=active["runtime_policy_sha256"],
-            campaign_id="roborender-dagger-256x300-v1",
+            campaign_id="roborender-dagger-256x512-v1",
             macro_round=0,
             code_sha256=SOURCE_SHA,
             learner_contract=learner_contract,
@@ -250,8 +256,25 @@ class ProductionLaunchTests(unittest.TestCase):
     def test_checked_in_contracts_pin_exact_production_topology_and_learner(self) -> None:
         campaign = production_launch.load_campaign_contract(CAMPAIGN_CONTRACT)
         learner = production_launch.load_learner_contract(LEARNER_CONTRACT)
-        self.assertEqual(campaign["topology"]["transitions_per_macro_round"], 76800)
+        self.assertEqual(campaign["topology"]["transitions_per_macro_round"], 131072)
+        self.assertEqual(campaign["topology"]["steps_per_environment"], 512)
+        self.assertEqual(campaign["topology"]["transitions_per_cohort"], 32768)
+        self.assertEqual(
+            [
+                beta_for_macro_round(campaign["beta_schedule"], macro_round)
+                for macro_round in range(5)
+            ],
+            [1.0, 0.75, 0.5, 0.25, 0.0],
+        )
         self.assertEqual(campaign["observation_contract"]["reference_lag_frames"], 256)
+        self.assertEqual(
+            campaign["observation_contract"]["bootstrap_anchor_source"],
+            "simulator_rgb",
+        )
+        self.assertEqual(
+            campaign["artifacts"]["anchor_pool"]["usage"],
+            "compatibility_fallback_only",
+        )
         self.assertEqual(campaign["action_contract"]["replay_action_dim"], 26)
         self.assertEqual(campaign["telemetry"]["clip_every_steps"], 300)
         self.assertEqual(campaign["wandb"]["expected_email"], "ldu@nvidia.com")
@@ -259,7 +282,7 @@ class ProductionLaunchTests(unittest.TestCase):
         thresholds = artifacts.load_strict_json(
             ROOT / campaign["evaluation"]["threshold_contract"]
         )
-        self.assertEqual(thresholds["minimum_paired_cases"], 16)
+        self.assertEqual(thresholds["minimum_paired_cases"], 256)
         self.assertIs(thresholds["allow_bounded_nonregression"], False)
         self.assertEqual(
             campaign["wandb"]["netrc"],
@@ -267,7 +290,7 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertEqual(learner["allocation"]["gpus_per_node"], 8)
         self.assertEqual(learner["allocation"]["global_batch_size"], 64)
-        self.assertEqual(learner["optimization"]["optimizer_steps"], 500)
+        self.assertEqual(learner["optimization"]["optimizer_steps"], 1200)
         self.assertEqual(learner["optimization"]["save_every_steps"], 5)
         self.assertEqual(learner["optimization"]["learning_rate"], 2.5e-5)
         self.assertEqual(learner["optimization"]["seed"], 17)
@@ -275,6 +298,37 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(learner["cluster"]["account"], "general_cs_infra__ngcsre")
         self.assertEqual(learner["cluster"]["partition"], "batch_singlenode")
         self.assertEqual(learner["cluster"]["qos"], "normal")
+
+    def test_evaluation_capacity_gate_rejects_legacy_sixteen_case_contract(self) -> None:
+        scenarios = self.base / "scenarios.json"
+        thresholds = self.base / "thresholds.json"
+        scenarios.write_text(
+            json.dumps([{} for _ in range(16)]),
+            encoding="utf-8",
+        )
+        thresholds.write_text(
+            json.dumps({"minimum_paired_cases": 256}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "contains 16 cases but production requires 256",
+        ):
+            production_launch._require_evaluation_case_capacity(
+                scenarios, thresholds
+            )
+
+    def test_evaluation_capacity_gate_accepts_canonical_256_case_list(self) -> None:
+        scenarios = self.base / "scenarios.json"
+        thresholds = self.base / "thresholds.json"
+        scenarios.write_text(
+            json.dumps([{} for _ in range(256)]), encoding="utf-8"
+        )
+        thresholds.write_text(
+            json.dumps({"minimum_paired_cases": 256}), encoding="utf-8"
+        )
+        production_launch._require_evaluation_case_capacity(
+            scenarios, thresholds
+        )
 
     def test_camera_acceptance_is_bound_to_both_nested_source_trees(self) -> None:
         acceptance = self.base / "camera-acceptance.json"
@@ -341,6 +395,9 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertEqual(
             environment["ROUND_DAGGER_RUNTIME_ADAPTER_MODE"], "legacy"
+        )
+        self.assertEqual(
+            environment["IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE"], "simulator_rgb"
         )
         self.assertNotIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK", environment)
         self.assertEqual(
@@ -442,7 +499,11 @@ class ProductionLaunchTests(unittest.TestCase):
             plan["learner_source_inventory_sha256"],
             plan["evaluation_source_inventory_sha256"],
         )
-        self.assertEqual(environment["ROUND_DAGGER_LEARNER_MAX_STEPS"], "500")
+        self.assertEqual(environment["ROUND_DAGGER_LEARNER_MAX_STEPS"], "1200")
+        self.assertEqual(
+            environment["IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE"], "simulator_rgb"
+        )
+        self.assertEqual(plan["bootstrap_anchor_source"], "simulator_rgb")
         self.assertEqual(environment["ROUND_DAGGER_LEARNER_BATCH_SIZE"], "8")
         self.assertEqual(environment["ROUND_DAGGER_LEARNER_LEARNING_RATE"], "2.5e-5")
         self.assertEqual(environment["ROUND_DAGGER_WANDB_EXPECTED_EMAIL"], "ldu@nvidia.com")
@@ -453,7 +514,7 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertEqual(
             environment["ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256"],
-            "1079e2289a8afc93a8cdffd7ed060c1749c9a3067a27f0ba1213c0cd65148d96",
+            "05d9fbb64c41311e586f2d14f889902a3ea7fe56e31bd8b16cd539a65c035563",
         )
         self.assertEqual(
             environment["ROUND_DAGGER_WANDB_NETRC"],
@@ -532,7 +593,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 parent_checkpoint=checkpoint,
                 expected_parent_checkpoint_sha256=active["checkpoint_sha256"],
                 runtime_policy_sha256="f" * 64,
-                campaign_id="roborender-dagger-256x300-v1",
+                campaign_id="roborender-dagger-256x512-v1",
                 macro_round=0,
                 code_sha256=SOURCE_SHA,
                 learner_contract=production_launch.load_learner_contract(

@@ -58,7 +58,7 @@ done
    $ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE == team ]] || \
     fatal "W&B identity authorization contract changed"
 [[ "$ROUND_DAGGER_TARGET_ENVIRONMENTS:$ROUND_DAGGER_COHORT_COUNT:$ROUND_DAGGER_ENVIRONMENTS_PER_COHORT:$ROUND_DAGGER_STEPS_PER_ENVIRONMENT:$ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND" == \
-   "256:4:64:300:76800" ]] || fatal "learner topology is not exactly 4x64x300"
+   "256:4:64:512:131072" ]] || fatal "learner topology is not exactly 4x64x512"
 
 [[ ${SLURM_JOB_NUM_NODES:-} == 1 ]] || fatal "learner allocation must use one node"
 [[ ${SLURM_GPUS_ON_NODE:-8} =~ (^|[^0-9])8([^0-9]|$)|^8$ ]] || \

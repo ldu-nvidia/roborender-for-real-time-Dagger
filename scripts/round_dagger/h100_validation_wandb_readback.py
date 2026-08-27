@@ -147,7 +147,7 @@ def _semantic_identity(
         ),
         # The validation contract is deliberately used as the learner
         # contract.  It must never be substituted with the production
-        # 8-node/500-step contract for this 1-node/2-step live gate.
+        # 8-rank/1200-step contract for this 1-node/2-step live gate.
         "learner_contract_sha256": _digest(
             validation_contract_sha256, "validation contract SHA-256"
         ),

@@ -297,7 +297,7 @@ class ActorLauncherContractTest(unittest.TestCase):
                 purpose="train",
                 expected_ranks=[0, 1],
                 expected_global_env_ids=list(range(64)),
-                expected_transitions=64 * 300,
+                expected_transitions=64 * 512,
                 view_contract={
                     "dtype": "uint8",
                     "layout": "vertical",
@@ -391,6 +391,7 @@ class ActorLauncherContractTest(unittest.TestCase):
                 ),
                 "ROUND_DAGGER_MIN_ANCHORS": "1",
                 "IMAGE3F_ENDPOINT_MANIFEST": str(endpoint_manifest),
+                "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE": "simulator_rgb",
                 "ANCHORS": str(anchors),
                 "TRAIN_RUN_DIR": str(run_dir),
             }

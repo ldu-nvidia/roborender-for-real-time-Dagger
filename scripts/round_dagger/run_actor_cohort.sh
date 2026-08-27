@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Collect one isolated 32-environment rank of a frozen 64 x 300 RTX cohort.
+# Collect one isolated 32-environment rank of a frozen 64 x 512 RTX cohort.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -24,11 +24,16 @@ required=(
     ROUND_DAGGER_TEACHER_SHA256 ROUND_DAGGER_RENDERER_SHA256
     ROUND_DAGGER_BETA ROUND_DAGGER_BETA_SHA256 ROUND_DAGGER_CONFIG_SHA256
     ROUND_DAGGER_IMAGE3F_ATTEMPT_NAMESPACE ROUND_DAGGER_IMAGE3F_STREAM_PLAN
-    IMAGE3F_ENDPOINT_MANIFEST ANCHORS TRAIN_RUN_DIR
+    IMAGE3F_ENDPOINT_MANIFEST IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE ANCHORS
+    TRAIN_RUN_DIR
 )
 for name in "${required[@]}"; do
     [ -n "${!name:-}" ] || { echo "missing required environment: $name" >&2; exit 2; }
 done
+[[ $IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE == simulator_rgb ]] || {
+    echo "production bootstrap anchor source must be exactly simulator_rgb" >&2
+    exit 2
+}
 
 case "$ROUND_DAGGER_COHORT_DIR:$ROUND_DAGGER_POLICY_CHECKPOINT:$ROUND_DAGGER_TEACHER_CHECKPOINT:$IMAGE3F_ENDPOINT_MANIFEST:$ROUND_DAGGER_IMAGE3F_STREAM_PLAN:$ANCHORS:$TRAIN_RUN_DIR" in
     /*:/*:/*:/*:/*:/*:/*) ;;
@@ -104,7 +109,7 @@ expected = {
     "purpose": os.environ["ROUND_DAGGER_PURPOSE"],
     "expected_ranks": [0, 1],
     "expected_global_env_ids": list(range(offset, offset + 64)),
-    "expected_transitions": 64 * 300,
+    "expected_transitions": 64 * 512,
     "policy_sha256": os.environ["ROUND_DAGGER_POLICY_SHA256"],
     "runtime_policy_sha256": os.environ["ROUND_DAGGER_RUNTIME_POLICY_SHA256"],
     "teacher_sha256": os.environ["ROUND_DAGGER_TEACHER_SHA256"],
@@ -244,10 +249,11 @@ COMMAND=(
     "$GR00T_PYTHON" "$GR00T_ROOT/gr00t/rl/train_agent_trl.py"
     +exp=loco_manip/wsdpt_round_actor_3view
     seed="$ROUND_DAGGER_SIMULATOR_BASE_SEED"
-    num_envs=32 algo.config.num_steps_per_env=300
+    num_envs=32 algo.config.num_steps_per_env=512
     algo.config.num_learning_epochs=0
     algo.config.rollout_with_teacher_num_steps=0
     algo.config.enforce_teacher_rollout=false
+    ++algo.config.videogen.anchor_source="$IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE"
     algo.config.ratio_teacher_rollout=0.0
     algo.config.videogen.rollout_action_source=beta
     ++algo.config.videogen.beta_schedule=constant

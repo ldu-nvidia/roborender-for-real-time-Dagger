@@ -70,6 +70,7 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
             "gr00t/rl/trl/trainer/ppo_trainer.py",
             "gr00t/rl/utils/image3f_frame_client.py",
             "gr00t/rl/utils/round_dagger_paired_eval.py",
+            "gr00t/rl/utils/simulator_rgb_anchor.py",
         ):
             source = self.gr00t / relative
             source.parent.mkdir(parents=True, exist_ok=True)

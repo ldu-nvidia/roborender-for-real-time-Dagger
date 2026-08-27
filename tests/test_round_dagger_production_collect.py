@@ -123,8 +123,10 @@ class ProductionCollectHookStaticContractTest(unittest.TestCase):
             "ee358a97581512a5d03730d06efd5804e53844f517112dc0a845ed86b6dae46f",
             "sha256:65a0cbe64eb71ee2edb672bed3ec7bdaa8adfeb22298c0e99af8b91d74dc78f8",
             "53234dfe2eab9b1ae02df21e143f996ecde831aadb8aacb2e5f2df632d3d8d27",
-            '"256:4:64:300:76800"',
-            '"64:19200"',
+            '"256:4:64:512:131072"',
+            '"64:32768"',
+            "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE",
+            "simulator_rgb",
         ):
             self.assertIn(expected, source)
         self.assertIn('exec "$PAIR_SCRIPT"', source)
@@ -205,7 +207,7 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
             purpose="train",
             expected_ranks=[0, 1],
             expected_global_env_ids=list(range(64)),
-            expected_transitions=19200,
+            expected_transitions=32768,
             view_contract={
                 "dtype": "uint8",
                 "layout": "vertical",
@@ -254,9 +256,9 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
             "ROUND_DAGGER_COHORT_COUNT": "4",
             "ROUND_DAGGER_ENVIRONMENTS_PER_COHORT": "64",
             "ROUND_DAGGER_LOGICAL_ENV_COUNT": "64",
-            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
-            "ROUND_DAGGER_EXPECTED_TRANSITIONS": "19200",
-            "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "76800",
+            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "512",
+            "ROUND_DAGGER_EXPECTED_TRANSITIONS": "32768",
+            "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "131072",
             "ROUND_DAGGER_POLICY_CHECKPOINT": str(self.checkpoint),
             "ROUND_DAGGER_POLICY_SHA256": self.policy_sha,
             "ROUND_DAGGER_POLICY_SPEC": str(self.spec),
@@ -277,6 +279,7 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
             "ROUND_DAGGER_BETA_SHA256": "5" * 64,
             "ROUND_DAGGER_CONFIG_SHA256": "6" * 64,
             "IMAGE3F_ENDPOINT_MANIFEST": str(self.ENDPOINTS),
+            "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE": "simulator_rgb",
             "ANCHORS": str(self.ANCHORS),
             "ROUND_DAGGER_RTX_IMAGE": self.IMAGE,
             "ROUND_DAGGER_DOCKER_BIN": "/usr/bin/docker",

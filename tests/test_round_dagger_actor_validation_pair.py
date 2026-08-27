@@ -104,7 +104,7 @@ class ValidationPairContractTest(unittest.TestCase):
         self.assertEqual(shape["global_env_offset"], 96)
         self.assertEqual(shape["expected_transitions"], 136)
 
-        with self.assertRaisesRegex(ActorPairError, "2x32x300 production"):
+        with self.assertRaisesRegex(ActorPairError, "2x32x512 production"):
             inspect_actor_pair(cohort)
 
         maximum = self.root / "maximum"

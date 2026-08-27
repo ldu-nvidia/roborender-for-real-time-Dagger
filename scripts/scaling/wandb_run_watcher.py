@@ -78,9 +78,9 @@ PUBLIC_CONFIG_EXACT_INTS = {
     "round_dagger/cohort_count": 4,
     "round_dagger/environments_per_cohort": 64,
     "round_dagger/target_environments": 256,
-    "round_dagger/steps_per_environment": 300,
-    "round_dagger/transitions_per_cohort": 64 * 300,
-    "round_dagger/transitions_per_macro_round": 256 * 300,
+    "round_dagger/steps_per_environment": 512,
+    "round_dagger/transitions_per_cohort": 64 * 512,
+    "round_dagger/transitions_per_macro_round": 256 * 512,
 }
 MEDIA_SUFFIXES = {
     "image": {".png", ".jpg", ".jpeg", ".webp"},

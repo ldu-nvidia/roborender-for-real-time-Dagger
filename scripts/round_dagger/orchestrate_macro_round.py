@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run or resume one fail-closed 4x64x300 DAgger macro-round."""
+"""Run or resume one fail-closed 4x64x512 DAgger macro-round."""
 
 from __future__ import annotations
 

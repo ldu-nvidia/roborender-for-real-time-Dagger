@@ -17,7 +17,7 @@ the ranks to distinct GPU IDs, gives each container a private IPC namespace,
 allocates at least 16 GiB of shared memory, and never creates a Torch
 distributed/NCCL process group. It accepts only
 `run_actor_validation.sh`; the production rank primitive has a separate
-executor and remains fixed to its exact `2 x 32 x 300` train contract.
+executor and remains fixed to its exact `2 x 32 x 512` train contract.
 
 The outer launcher waits for both children even when one fails. A zero trainer
 exit is not sufficient: both ranks must publish the exact immutable shard

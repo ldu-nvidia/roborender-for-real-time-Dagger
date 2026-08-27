@@ -18,8 +18,8 @@ from tests.policy_bundle_helpers import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CAMPAIGN_CONTRACT = ROOT / "configs/round_dagger/production_campaign_256x300.json"
-LEARNER_CONTRACT = ROOT / "configs/round_dagger/production_learner_8xh100_500.json"
+CAMPAIGN_CONTRACT = ROOT / "configs/round_dagger/production_campaign_256x512.json"
+LEARNER_CONTRACT = ROOT / "configs/round_dagger/production_learner_8xh100_1200.json"
 SOURCE_SHA = "7" * 64
 SNAPSHOT_SEMANTIC_SHA = "8" * 64
 CANDIDATE_POLICY_STATE_SHA = "9" * 64
@@ -53,7 +53,7 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
             bootstrap_policy_path=bootstrap["checkpoint_path"],
             target_environments=256,
             active_environments=64,
-            steps_per_environment=300,
+            steps_per_environment=512,
             view_names=campaign_contract["observation_contract"]["policy_views"],
             policy_image_shape=campaign_contract["observation_contract"][
                 "policy_image_shape"
@@ -105,7 +105,7 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
             "through_macro_round": 0,
             "expected_train_cohorts": 4,
             "cohort_count": 4,
-            "transition_count": 76800,
+            "transition_count": 131072,
         }
         telemetry = (
             self.root
@@ -163,7 +163,7 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
             "learner_config_sha256": environment[
                 "ROUND_DAGGER_LEARNER_CONFIG_SHA256"
             ],
-            "optimizer_steps": 500,
+            "optimizer_steps": 1200,
             "initial_loss": 1.0,
             "final_loss": 0.25,
         }
@@ -180,7 +180,7 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
             self.assertEqual(bridge, learner_recovery.BRIDGE)
             self.assertEqual(workdir, self.root)
             self.assertEqual(timeout, 172800)
-            self.assertEqual(environment["ROUND_DAGGER_LEARNER_MAX_STEPS"], "500")
+            self.assertEqual(environment["ROUND_DAGGER_LEARNER_MAX_STEPS"], "1200")
             self.assertEqual(environment["ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256"], SNAPSHOT_SEMANTIC_SHA)
             self.assertEqual(environment["ROUND_DAGGER_LEARNER_CODE_SHA256"], SOURCE_SHA)
             calls.append(environment)

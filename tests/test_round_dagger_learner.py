@@ -273,7 +273,7 @@ class ReplayInputContractTest(LearnerFixture):
         shards = [
             {
                 "logical_id": (
-                    "roborender-dagger-256x300-v1:"
+                    "roborender-dagger-256x512-v1:"
                     f"r000000000:c{cohort:04d}:train"
                 ),
                 "shard_id": (
@@ -281,7 +281,7 @@ class ReplayInputContractTest(LearnerFixture):
                 ),
                 "macro_round": 0,
                 "cohort_index": cohort,
-                "transition_count": 1200,
+                "transition_count": 2048,
             }
             for cohort in range(4)
             for collector_rank in range(2)
@@ -297,7 +297,7 @@ class ReplayInputContractTest(LearnerFixture):
                 sum(item["transition_count"] for item in assigned)
                 for assigned in assignments
             ],
-            [9600] * 8,
+            [16384] * 8,
         )
 
     def test_unequal_shards_are_transition_balanced(self):

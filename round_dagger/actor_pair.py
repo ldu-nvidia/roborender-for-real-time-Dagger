@@ -4,7 +4,7 @@ The frozen round actors deliberately do not form a Torch distributed process
 group.  This module is the filesystem rendezvous between those two processes:
 it verifies committed shard bytes, recognizes only an empty or exactly complete
 rank, and publishes the cohort seal only after both ranks cover their exact
-32-environment partition for 300 steps.
+32-environment partition for 512 steps.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from .artifacts import (
 
 PRODUCTION_RANKS = [0, 1]
 PRODUCTION_ENVIRONMENTS = 64
-PRODUCTION_STEPS = 300
+PRODUCTION_STEPS = 512
 PRODUCTION_TRANSITIONS = PRODUCTION_ENVIRONMENTS * PRODUCTION_STEPS
 
 
@@ -65,7 +65,7 @@ def _contract(root: Path) -> dict[str, Any]:
     mismatches = [key for key, value in expected.items() if document.get(key) != value]
     if mismatches:
         raise ActorPairError(
-            "actor cohort is not the exact 2x32x300 production contract: "
+            "actor cohort is not the exact 2x32x512 production contract: "
             + ", ".join(mismatches)
         )
     return document

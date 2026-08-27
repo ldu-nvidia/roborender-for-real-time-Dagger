@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate the immutable 256x300 production deployment, then run/resume exactly
+# Validate the immutable 256x512 production deployment, then run/resume exactly
 # one strict macro-round.  This launcher never initializes a campaign and never
 # carries a W&B credential in argv, a JSON config, or its printed dry-run plan.
 set -Eeuo pipefail
@@ -9,8 +9,8 @@ fatal() { echo "production macro-round launcher failed: $*" >&2; exit 2; }
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 VALIDATOR="$ROOT/scripts/round_dagger/production_launch.py"
 ORCHESTRATOR="$ROOT/scripts/round_dagger/orchestrate_macro_round.py"
-CAMPAIGN_CONTRACT="$ROOT/configs/round_dagger/production_campaign_256x300.json"
-LEARNER_CONTRACT="$ROOT/configs/round_dagger/production_learner_8xh100_500.json"
+CAMPAIGN_CONTRACT="$ROOT/configs/round_dagger/production_campaign_256x512.json"
+LEARNER_CONTRACT="$ROOT/configs/round_dagger/production_learner_8xh100_1200.json"
 PYTHON=${ROUND_DAGGER_CONTROL_PYTHON:-/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python}
 DRY_RUN=${DRY_RUN:-0}
 ORCHESTRATION_CONFIG=

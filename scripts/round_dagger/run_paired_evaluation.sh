@@ -494,6 +494,9 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         --expected-output-views head_color,hand_left,hand_right
         --expected-output-layout vertical --wait-timeout-s 120 --connect-timeout-s 10
         --write-report "$BEFORE" --json)
+    ANCHOR_SOURCE=${IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE:-pool}
+    [[ $ANCHOR_SOURCE == pool || $ANCHOR_SOURCE == simulator_rgb ]] || \
+        fatal "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE must be pool or simulator_rgb"
     EVAL=(env IMAGE_DAGGER_PAIRED_EVAL=1
         IMAGE_DAGGER_EVAL_RELABEL=1
         IMAGE3F_RUN_ID="$IMAGE3F_EVAL_RUN_ID"
@@ -514,6 +517,7 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         ++algo.config.videogen.seed="$SEED"
         ++algo.config.videogen.anchor_pool_dir="$ANCHOR_POOL"
         ++algo.config.videogen.anchor_index="$ANCHOR_INDEX"
+        ++algo.config.videogen.anchor_source="$ANCHOR_SOURCE"
         '++simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]'
         ++env.config.image_dagger_policy_view_count=3
         ++algo.config.eval.training_enabled=false

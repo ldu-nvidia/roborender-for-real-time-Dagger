@@ -109,8 +109,8 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             "ROUND_DAGGER_TARGET_ENVIRONMENTS": "256",
             "ROUND_DAGGER_COHORT_COUNT": "4",
             "ROUND_DAGGER_ENVIRONMENTS_PER_COHORT": "64",
-            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
-            "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "76800",
+            "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "512",
+            "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "131072",
         }
         return self._bind_identity(environment), root / "handoff"
 
@@ -133,7 +133,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             # its own import root instead of depending on coordinator cwd.
             completed = self._run(environment, cwd=root)
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertIn("gpus=8 updates=500 save_every=5", completed.stdout)
+            self.assertIn("gpus=8 updates=1200 save_every=5", completed.stdout)
             self.assertIn("OCI_NRT_ROUND_LEARNER_BRIDGE_DRY_RUN_OK", completed.stdout)
             self.assertFalse(handoff.exists())
 
@@ -288,8 +288,8 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn("learner_completion_attestation.py\" adopt", container_wrapper)
         self.assertIn("remote_learner_success.py\" verify", container_wrapper)
         self.assertIn("ROUND_DAGGER_CONTAINER_SUCCESS_MARKER", batch)
-        self.assertIn('"256:4:64:300:76800"', bridge)
-        self.assertIn('"256:4:64:300:76800"', batch)
+        self.assertIn('"256:4:64:512:131072"', bridge)
+        self.assertIn('"256:4:64:512:131072"', batch)
         self.assertIn("LEARNER_NAMESPACE=identity_", bridge)
         self.assertIn('JOB_NAME="rr-rd-${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"', bridge)
         self.assertIn("learner_run_identity.v2", bridge)
@@ -402,7 +402,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
                 ),
                 "ROUND_DAGGER_BASE_POLICY_SPEC": str(canonical_specification),
                 "ROUND_DAGGER_LEARNER_BATCH_SIZE": "8",
-                "ROUND_DAGGER_LEARNER_MAX_STEPS": "500",
+                "ROUND_DAGGER_LEARNER_MAX_STEPS": "1200",
                 "ROUND_DAGGER_LEARNER_SAVE_EVERY": "5",
                 "ROUND_DAGGER_LEARNER_LEARNING_RATE": "2.5e-5",
                 "ROUND_DAGGER_LEARNER_WEIGHT_DECAY": "0.01",
@@ -419,8 +419,8 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
                 "ROUND_DAGGER_TARGET_ENVIRONMENTS": "256",
                 "ROUND_DAGGER_COHORT_COUNT": "4",
                 "ROUND_DAGGER_ENVIRONMENTS_PER_COHORT": "64",
-                "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "300",
-                "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "76800",
+                "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "512",
+                "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "131072",
             }
             self._bind_identity(environment)
             identity = environment["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"]

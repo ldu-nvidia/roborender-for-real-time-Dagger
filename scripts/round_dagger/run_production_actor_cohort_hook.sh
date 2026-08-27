@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Production-only collect hook: verify every static input and exact 256x300
+# Production-only collect hook: verify every static input and exact 256x512
 # dynamic cohort identity before launching the two isolated RTX actor ranks.
 set -Eeuo pipefail
 
@@ -46,6 +46,7 @@ required=(
     ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND
     ROUND_DAGGER_TEACHER_CHECKPOINT ROUND_DAGGER_TEACHER_SHA256
     ROUND_DAGGER_RENDERER_SHA256 IMAGE3F_ENDPOINT_MANIFEST ANCHORS
+    IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE
     ROUND_DAGGER_RTX_IMAGE ROUND_DAGGER_DOCKER_BIN
     ROUND_DAGGER_CAMERA_ACCEPTANCE ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256
     ROUND_DAGGER_GR00T_REVISION ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256
@@ -64,12 +65,14 @@ esac
 [[ "$ROUND_DAGGER_MACRO_ROUND" =~ ^(0|[1-9][0-9]*)$ ]] || fatal "macro round must be a canonical integer"
 [[ "$ROUND_DAGGER_COHORT_INDEX" =~ ^[0-3]$ ]] || fatal "cohort index must be one of 0,1,2,3"
 [[ "$ROUND_DAGGER_TARGET_ENVIRONMENTS:$ROUND_DAGGER_COHORT_COUNT:$ROUND_DAGGER_ENVIRONMENTS_PER_COHORT:$ROUND_DAGGER_STEPS_PER_ENVIRONMENT:$ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND" == \
-   "256:4:64:300:76800" ]] || fatal "production topology must be exactly 256 environments x 300 steps"
-[[ "$ROUND_DAGGER_LOGICAL_ENV_COUNT:$ROUND_DAGGER_EXPECTED_TRANSITIONS" == "64:19200" ]] || \
-    fatal "cohort topology must be exactly 64 environments and 19200 transitions"
+   "256:4:64:512:131072" ]] || fatal "production topology must be exactly 256 environments x 512 steps"
+[[ "$ROUND_DAGGER_LOGICAL_ENV_COUNT:$ROUND_DAGGER_EXPECTED_TRANSITIONS" == "64:32768" ]] || \
+    fatal "cohort topology must be exactly 64 environments and 32768 transitions"
 EXPECTED_OFFSET=$((10#$ROUND_DAGGER_COHORT_INDEX * 64))
 [[ "$ROUND_DAGGER_GLOBAL_ENV_OFFSET" == "$EXPECTED_OFFSET" ]] || fatal "cohort/global-environment identity mismatch"
 [[ "$ROUND_DAGGER_ACTOR_RUN_DIR" == "$TRAIN_RUN_DIR" ]] || fatal "actor run directory must equal TRAIN_RUN_DIR"
+[[ $IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE == simulator_rgb ]] || \
+    fatal "production bootstrap anchor source must be exactly simulator_rgb"
 [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be exactly 0 or 1"
 
 if [[ ${ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH:-0} == 1 ]]; then

@@ -105,10 +105,10 @@ done
 [[ ${ROUND_DAGGER_COHORT_COUNT:-} == 4 ]] || fatal "cohort count must be 4"
 [[ ${ROUND_DAGGER_ENVIRONMENTS_PER_COHORT:-} == 64 ]] || \
     fatal "environments per cohort must be 64"
-[[ ${ROUND_DAGGER_STEPS_PER_ENVIRONMENT:-} == 300 ]] || \
-    fatal "steps per environment must be 300"
-[[ ${ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND:-} == 76800 ]] || \
-    fatal "transitions per macro-round must be 76800"
+[[ ${ROUND_DAGGER_STEPS_PER_ENVIRONMENT:-} == 512 ]] || \
+    fatal "steps per environment must be 512"
+[[ ${ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND:-} == 131072 ]] || \
+    fatal "transitions per macro-round must be 131072"
 
 printf -v ROUND_PADDED '%06d' "$((10#$ROUND_DAGGER_MACRO_ROUND))"
 ROUND_DECIMAL=$((10#$ROUND_DAGGER_MACRO_ROUND))
