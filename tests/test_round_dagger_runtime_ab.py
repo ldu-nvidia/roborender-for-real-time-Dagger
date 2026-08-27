@@ -645,8 +645,33 @@ class RuntimeAdapterABTest(unittest.TestCase):
                 evidence["input_profile"], RUNTIME_ADAPTER_INPUT_PROFILE_LIVE
             )
             self.assertEqual(evidence["runtime_evidence"]["path"], str(runtime_path))
+            self.assertEqual(
+                evidence["renderer_endpoint_evidence"]["document"]["descriptor"][
+                    "contents"
+                ],
+                "127.0.0.1 43102\n",
+            )
+            self.assertEqual(
+                evidence["renderer_endpoint_evidence"]["document"][
+                    "renderer_sha256"
+                ],
+                digest("renderer"),
+            )
             self.assertEqual(evidence["telemetry"]["provenance_valid_count"], 2)
             self.assertEqual(evidence["telemetry"]["idempotent_replay_count"], 0)
+        repeated = compare_runtime_ab(self.plan_path)
+        self.assertEqual(repeated["result_sha256"], result["result_sha256"])
+
+    def test_completed_evidence_survives_fleet_descriptor_cleanup_but_launch_fails(self):
+        self.complete()
+        result = compare_runtime_ab(self.plan_path)
+        self.descriptors[1].unlink()
+
+        with self.assertRaisesRegex(RuntimeABError, "endpoint descriptor"):
+            validate_runtime_ab(self.plan_path)
+        with self.assertRaisesRegex(RuntimeABError, "endpoint descriptor"):
+            runtime_ab_environment(self.plan_path, "legacy")
+
         repeated = compare_runtime_ab(self.plan_path)
         self.assertEqual(repeated["result_sha256"], result["result_sha256"])
 

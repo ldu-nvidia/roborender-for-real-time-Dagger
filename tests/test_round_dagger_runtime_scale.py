@@ -364,6 +364,19 @@ class RuntimeScaleTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeScaleError, "sealed"):
             runtime_scale_environment(self.plan, 2)
 
+    def test_sealed_rung_survives_fleet_cleanup_but_next_launch_fails_closed(self) -> None:
+        self._complete(2)
+        sealed = seal_runtime_scale(self.plan, 2)
+        self.ab.descriptors[1].unlink()
+
+        verified = verify_runtime_scale(self.plan, 2)
+        self.assertEqual(verified["status"], "PASS")
+        self.assertEqual(verified["transition_count"], 4)
+        with self.assertRaisesRegex(
+            RuntimeScaleError, "live renderer endpoint validation failed"
+        ):
+            runtime_scale_environment(self.plan, 4)
+
     def test_wrong_scale_audit_or_mutable_evidence_fails_closed(self) -> None:
         self._complete(4, evidence=False)
         _, rung, _ = self._documents(4)

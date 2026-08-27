@@ -56,12 +56,17 @@ from .runtime import (
 PLAN_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_plan.v2"
 CONFIG_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_config.v2"
 ARM_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_arm.v1"
-EVIDENCE_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_evidence.v3"
+LEGACY_EVIDENCE_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_evidence.v3"
+EVIDENCE_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_evidence.v4"
 RESULT_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_result.v3"
 RUNTIME_EVIDENCE_SCHEMA = "fast_roborender.round_runtime_validation.v3"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_telemetry.v1"
 WARMUP_SCHEMA = "fast_roborender.round_dagger.image3f_warmup.v1"
 WARMUP_SPEC_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_ab_warmup.v1"
+ENDPOINT_EVIDENCE_SCHEMA = (
+    "fast_roborender.round_dagger.renderer_endpoint_evidence.v1"
+)
+ENDPOINT_EVIDENCE_FILENAME = "renderer_endpoint_evidence.json"
 
 CAMPAIGN_ID = "rtx-runtime-adapter-ab-v1"
 MACRO_ROUND = 0
@@ -465,6 +470,185 @@ def _endpoint_descriptors(path: Path) -> tuple[Path, ...]:
     return tuple(result)
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_endpoint_contents(value: Any, label: str) -> tuple[str, int]:
+    if not isinstance(value, str):
+        raise RuntimeABError(f"{label} contents must be text")
+    fields = value.removesuffix("\n").split(" ")
+    if (
+        not value.endswith("\n")
+        or value.count("\n") != 1
+        or len(fields) != 2
+        or fields[0] != "127.0.0.1"
+        or not fields[1].isdigit()
+    ):
+        raise RuntimeABError(
+            f"{label} must be canonical '127.0.0.1 <port>\\n' text"
+        )
+    port = int(fields[1])
+    if not 1 <= port <= 65535:
+        raise RuntimeABError(f"{label} port is outside 1..65535")
+    return fields[0], port
+
+
+def _endpoint_evidence_document(
+    *,
+    source_manifest: Path,
+    selected_manifest: Path,
+    descriptor: Path,
+    renderer_slot: int,
+    renderer_sha256: str,
+) -> dict[str, Any]:
+    descriptor_contents = descriptor.read_text(encoding="utf-8")
+    host, port = _canonical_endpoint_contents(
+        descriptor_contents, "selected endpoint descriptor"
+    )
+    return {
+        "descriptor": {
+            "contents": descriptor_contents,
+            "host": host,
+            "path": str(descriptor),
+            "port": port,
+            "sha256": sha256_file(descriptor),
+        },
+        "renderer_sha256": _sha(renderer_sha256, "renderer identity"),
+        "renderer_slot": renderer_slot,
+        "schema": ENDPOINT_EVIDENCE_SCHEMA,
+        "selected_manifest": {
+            "contents": selected_manifest.read_text(encoding="utf-8"),
+            "path": str(selected_manifest),
+            "sha256": sha256_file(selected_manifest),
+        },
+        "source_manifest": {
+            "contents": source_manifest.read_text(encoding="utf-8"),
+            "path": str(source_manifest),
+            "sha256": sha256_file(source_manifest),
+        },
+    }
+
+
+def _load_endpoint_evidence(
+    plan_path: Path, plan: Mapping[str, Any], *, required: bool
+) -> dict[str, Any] | None:
+    """Load the durable equivalent of ephemeral fleet descriptor files."""
+
+    path = plan_path.parent / ENDPOINT_EVIDENCE_FILENAME
+    if not path.exists() and not path.is_symlink():
+        if required:
+            raise RuntimeABError(
+                "durable renderer endpoint evidence is required after fleet retirement"
+            )
+        return None
+    evidence_path = _absolute_file(path, "durable renderer endpoint evidence")
+    if stat.S_IMODE(os.stat(evidence_path, follow_symlinks=False).st_mode) != 0o444:
+        raise RuntimeABError(
+            "durable renderer endpoint evidence mode must be exactly 0444"
+        )
+    digest = sha256_file(evidence_path)
+    document = _exact_mapping(
+        load_strict_json(evidence_path),
+        {
+            "descriptor",
+            "renderer_sha256",
+            "renderer_slot",
+            "schema",
+            "selected_manifest",
+            "source_manifest",
+        },
+        "durable renderer endpoint evidence",
+    )
+    if sha256_file(evidence_path) != digest:
+        raise RuntimeABError("durable renderer endpoint evidence changed while loading")
+    if document["schema"] != ENDPOINT_EVIDENCE_SCHEMA:
+        raise RuntimeABError("durable renderer endpoint evidence schema mismatch")
+    descriptor = _exact_mapping(
+        document["descriptor"],
+        {"contents", "host", "path", "port", "sha256"},
+        "durable renderer descriptor",
+    )
+    selected = _exact_mapping(
+        document["selected_manifest"],
+        {"contents", "path", "sha256"},
+        "durable selected endpoint manifest",
+    )
+    source = _exact_mapping(
+        document["source_manifest"],
+        {"contents", "path", "sha256"},
+        "durable source endpoint manifest",
+    )
+    host, port = _canonical_endpoint_contents(
+        descriptor["contents"], "durable renderer descriptor"
+    )
+    source_contents = source["contents"]
+    if not isinstance(source_contents, str):
+        raise RuntimeABError("durable source endpoint manifest contents must be text")
+    source_lines = source_contents.splitlines()
+    if (
+        not source_lines
+        or source_contents != "\n".join(source_lines) + "\n"
+        or len(source_lines) != len(set(source_lines))
+        or any(not line or line.strip() != line for line in source_lines)
+    ):
+        raise RuntimeABError("durable source endpoint manifest is not canonical")
+    expected = {
+        "descriptor_path": plan["selected_endpoint_descriptor"],
+        "descriptor_sha256": plan["selected_endpoint_descriptor_sha256"],
+        "renderer_sha256": plan["renderer_sha256"],
+        "renderer_slot": plan["renderer_slot"],
+        "selected_manifest_path": plan["selected_endpoint_manifest"],
+        "selected_manifest_sha256": plan["selected_endpoint_manifest_sha256"],
+        "source_manifest_path": plan["source_endpoint_manifest"],
+        "source_manifest_sha256": plan["source_endpoint_manifest_sha256"],
+    }
+    observed = {
+        "descriptor_path": descriptor["path"],
+        "descriptor_sha256": descriptor["sha256"],
+        "renderer_sha256": document["renderer_sha256"],
+        "renderer_slot": document["renderer_slot"],
+        "selected_manifest_path": selected["path"],
+        "selected_manifest_sha256": selected["sha256"],
+        "source_manifest_path": source["path"],
+        "source_manifest_sha256": source["sha256"],
+    }
+    mismatches = sorted(
+        key for key, value in expected.items() if observed[key] != value
+    )
+    if mismatches:
+        raise RuntimeABError(
+            "durable renderer endpoint evidence differs from plan: "
+            + ", ".join(mismatches)
+        )
+    _sha(descriptor["sha256"], "durable renderer descriptor")
+    _sha(selected["sha256"], "durable selected endpoint manifest")
+    _sha(source["sha256"], "durable source endpoint manifest")
+    _sha(document["renderer_sha256"], "durable renderer identity")
+    if (
+        _sha256_text(descriptor["contents"]) != descriptor["sha256"]
+        or _sha256_text(selected["contents"]) != selected["sha256"]
+        or _sha256_text(source_contents) != source["sha256"]
+    ):
+        raise RuntimeABError(
+            "durable renderer endpoint evidence content digest mismatch"
+        )
+    if host != descriptor["host"] or port != descriptor["port"]:
+        raise RuntimeABError("durable renderer endpoint host or port mismatch")
+    slot = document["renderer_slot"]
+    if type(slot) is not int or slot < 0 or slot >= len(source_lines):
+        raise RuntimeABError("durable renderer slot is outside source manifest")
+    if source_lines[slot] != descriptor["path"]:
+        raise RuntimeABError("durable renderer slot does not select bound descriptor")
+    if selected["contents"] != f"{descriptor['path']}\n":
+        raise RuntimeABError("durable selected endpoint manifest mapping mismatch")
+    return {
+        "document": document,
+        "path": str(evidence_path),
+        "sha256": digest,
+    }
+
+
 def _expected_config(
     beta_sha256: str,
     source_inventory_sha256: str,
@@ -577,6 +761,12 @@ def prepare_runtime_ab(
     if not resolved_target.is_dir() or resolved_target != target:
         raise RuntimeABError("runtime A/B root must be its canonical real directory")
     target = resolved_target
+    existing_plan = target / "plan.json"
+    legacy_plan_without_endpoint_evidence = (
+        existing_plan.exists()
+        and not (target / ENDPOINT_EVIDENCE_FILENAME).exists()
+        and not (target / ENDPOINT_EVIDENCE_FILENAME).is_symlink()
+    )
     run_token = _token(run_id, "runtime A/B run ID")
     if type(renderer_slot) is not int or renderer_slot < 0:
         raise RuntimeABError("renderer_slot must be a non-negative integer")
@@ -642,6 +832,17 @@ def prepare_runtime_ab(
     selected_manifest_sha = _publish_immutable_text(
         selected_manifest, f"{descriptor}\n"
     )
+    if not legacy_plan_without_endpoint_evidence:
+        publish_immutable_json(
+            target / ENDPOINT_EVIDENCE_FILENAME,
+            _endpoint_evidence_document(
+                source_manifest=source_manifest,
+                selected_manifest=selected_manifest,
+                descriptor=descriptor,
+                renderer_slot=renderer_slot,
+                renderer_sha256=renderer_sha,
+            ),
+        )
 
     arm_references = []
     for cohort_index, arm in enumerate(ARMS):
@@ -772,17 +973,24 @@ def _load_arms(plan: Mapping[str, Any]) -> dict[str, tuple[Path, dict[str, Any]]
 
 
 def _warmup_report(
-    plan_path: Path, plan: Mapping[str, Any], anchor_root: Path
+    plan_path: Path,
+    plan: Mapping[str, Any],
+    anchor_root: Path,
+    *,
+    require_live_endpoint: bool,
 ) -> dict[str, Any]:
     expected_anchor = _select_warmup_anchor(anchor_root)
     anchor = _absolute_file(plan["warmup_anchor"], "bound warm-up anchor")
     if anchor != expected_anchor or sha256_file(anchor) != plan["warmup_anchor_sha256"]:
         raise RuntimeABError("bound warm-up anchor changed")
-    endpoint = _absolute_file(
-        plan["selected_endpoint_descriptor"], "bound warm-up endpoint"
-    )
-    if sha256_file(endpoint) != plan["selected_endpoint_descriptor_sha256"]:
-        raise RuntimeABError("bound warm-up endpoint changed")
+    if require_live_endpoint:
+        endpoint = _absolute_file(
+            plan["selected_endpoint_descriptor"], "bound warm-up endpoint"
+        )
+        if sha256_file(endpoint) != plan["selected_endpoint_descriptor_sha256"]:
+            raise RuntimeABError("bound warm-up endpoint changed")
+    else:
+        endpoint = Path(plan["selected_endpoint_descriptor"])
     stream_id = _token(plan["warmup_stream_id"], "warm-up stream ID")
     if stream_id != f"{plan['run_id']}-warmup":
         raise RuntimeABError("warm-up stream ID is not bound to the A/B run ID")
@@ -883,8 +1091,10 @@ def _warmup_report(
     }
 
 
-def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
-    """Revalidate every input, contract, and current arm state."""
+def _validate_runtime_ab(
+    path: str | Path, *, allow_retired_endpoint: bool
+) -> dict[str, Any]:
+    """Revalidate a plan, optionally using post-run durable endpoint evidence."""
 
     plan_path, plan = _load_plan(path)
     if type(plan.get("actor_gpu_id")) is not int or plan["actor_gpu_id"] < 0:
@@ -909,22 +1119,28 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
         raise RuntimeABError("runtime policy identity changed")
     source_report = _validate_source_plan(plan)
 
-    source_manifest = _absolute_file(
-        plan["source_endpoint_manifest"], "source endpoint manifest"
+    endpoint_evidence = _load_endpoint_evidence(
+        plan_path, plan, required=allow_retired_endpoint
     )
-    if sha256_file(source_manifest) != plan.get("source_endpoint_manifest_sha256"):
-        raise RuntimeABError("source endpoint manifest changed")
-    descriptors = _endpoint_descriptors(source_manifest)
     slot = plan["renderer_slot"]
-    if slot >= len(descriptors):
-        raise RuntimeABError("renderer slot is outside endpoint manifest")
-    descriptor = _absolute_file(
-        plan["selected_endpoint_descriptor"], "selected endpoint descriptor"
-    )
-    if descriptor != descriptors[slot] or sha256_file(descriptor) != plan.get(
-        "selected_endpoint_descriptor_sha256"
-    ):
-        raise RuntimeABError("selected endpoint descriptor changed")
+    if allow_retired_endpoint:
+        descriptor = Path(plan["selected_endpoint_descriptor"])
+    else:
+        source_manifest = _absolute_file(
+            plan["source_endpoint_manifest"], "source endpoint manifest"
+        )
+        if sha256_file(source_manifest) != plan.get("source_endpoint_manifest_sha256"):
+            raise RuntimeABError("source endpoint manifest changed")
+        descriptors = _endpoint_descriptors(source_manifest)
+        if slot >= len(descriptors):
+            raise RuntimeABError("renderer slot is outside endpoint manifest")
+        descriptor = _absolute_file(
+            plan["selected_endpoint_descriptor"], "selected endpoint descriptor"
+        )
+        if descriptor != descriptors[slot] or sha256_file(descriptor) != plan.get(
+            "selected_endpoint_descriptor_sha256"
+        ):
+            raise RuntimeABError("selected endpoint descriptor changed")
     selected_manifest = _absolute_file(
         plan["selected_endpoint_manifest"], "selected endpoint manifest"
     )
@@ -932,6 +1148,18 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
         raise RuntimeABError("selected endpoint manifest mapping changed")
     if sha256_file(selected_manifest) != plan.get("selected_endpoint_manifest_sha256"):
         raise RuntimeABError("selected endpoint manifest digest changed")
+    if not allow_retired_endpoint and endpoint_evidence is not None:
+        live_document = _endpoint_evidence_document(
+            source_manifest=source_manifest,
+            selected_manifest=selected_manifest,
+            descriptor=descriptor,
+            renderer_slot=slot,
+            renderer_sha256=plan["renderer_sha256"],
+        )
+        if live_document != endpoint_evidence["document"]:
+            raise RuntimeABError(
+                "live renderer endpoint differs from durable endpoint evidence"
+            )
 
     anchors = _absolute_directory(plan["anchors"], "anchor pool")
     count, inventory = anchor_inventory(anchors)
@@ -939,7 +1167,12 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
         "anchor_inventory_sha256"
     ):
         raise RuntimeABError("anchor pool count or inventory changed")
-    warmup = _warmup_report(plan_path, plan, anchors)
+    warmup = _warmup_report(
+        plan_path,
+        plan,
+        anchors,
+        require_live_endpoint=not allow_retired_endpoint,
+    )
     beta_path = _absolute_file(plan["beta_path"], "beta document")
     if sha256_file(beta_path) != plan.get("beta_sha256"):
         raise RuntimeABError("beta document digest changed")
@@ -1036,6 +1269,7 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
         "renderer_slot": plan["renderer_slot"],
         "global_env_id": GLOBAL_ENV_ID,
         "input_profile": profile,
+        "endpoint_evidence": endpoint_evidence,
         "source": {
             **_source_plan_binding(source_report),
             "repository_root": source_report["root"],
@@ -1044,6 +1278,12 @@ def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
         "arms": arm_reports,
         "states": states,
     }
+
+
+def validate_runtime_ab(path: str | Path) -> dict[str, Any]:
+    """Strictly revalidate every input, including the live fleet endpoint files."""
+
+    return _validate_runtime_ab(path, allow_retired_endpoint=False)
 
 
 def runtime_ab_environment(path: str | Path, arm: str) -> dict[str, str]:
@@ -1566,6 +1806,7 @@ def _sealed_arm_arrays(
     document: Mapping[str, Any],
     arm_contract_path: Path,
     input_profile: str,
+    endpoint_evidence: Mapping[str, Any] | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     cohort_dir = Path(document["cohort_dir"])
     seal = verify_cohort(cohort_dir)
@@ -1607,11 +1848,17 @@ def _sealed_arm_arrays(
         "renderer_slot": document["renderer_slot"],
         "runtime_adapter_mode": document["runtime_adapter_mode"],
         "runtime_evidence": _runtime_evidence(arm, document, input_profile),
-        "schema": EVIDENCE_SCHEMA,
+        "schema": (
+            EVIDENCE_SCHEMA
+            if endpoint_evidence is not None
+            else LEGACY_EVIDENCE_SCHEMA
+        ),
         "shadow_acknowledgement": document["shadow_acknowledgement"],
         "telemetry": _telemetry_evidence(arm, document),
         "transition_count": seal["transition_count"],
     }
+    if endpoint_evidence is not None:
+        evidence["renderer_endpoint_evidence"] = dict(endpoint_evidence)
     return arrays, evidence
 
 
@@ -1646,11 +1893,28 @@ def compare_runtime_ab(
 ) -> dict[str, Any]:
     """Require exact legacy/shadow rollout equality and publish evidence."""
 
-    report = validate_runtime_ab(path)
-    if report["states"] != ["sealed", "sealed"]:
-        raise RuntimeABError("runtime A/B comparison requires both sealed arms")
     plan_path, plan = _load_plan(path)
     arms = _load_arms(plan)
+    result_path = (
+        Path(output) if output is not None else plan_path.parent / "result.json"
+    )
+    endpoint_evidence_path = plan_path.parent / ENDPOINT_EVIDENCE_FILENAME
+    comparison_paths = tuple(
+        Path(arms[arm][1]["comparison_evidence_path"]) for arm in ARMS
+    )
+    retired_verification = (
+        (result_path.exists() or result_path.is_symlink())
+        and (endpoint_evidence_path.exists() or endpoint_evidence_path.is_symlink())
+        and all(
+            candidate.exists() or candidate.is_symlink()
+            for candidate in comparison_paths
+        )
+    )
+    report = _validate_runtime_ab(
+        path, allow_retired_endpoint=retired_verification
+    )
+    if report["states"] != ["sealed", "sealed"]:
+        raise RuntimeABError("runtime A/B comparison requires both sealed arms")
     material = {}
     evidence_documents = {}
     for arm in ARMS:
@@ -1661,6 +1925,7 @@ def compare_runtime_ab(
             document,
             arm_path,
             plan["input_profile"],
+            report["endpoint_evidence"],
         )
     legacy_keys = set(material["legacy"])
     shadow_keys = set(material["shadow"])
@@ -1741,7 +2006,6 @@ def compare_runtime_ab(
     evidence_paths = {
         arm: Path(arms[arm][1]["comparison_evidence_path"]) for arm in ARMS
     }
-    result_path = Path(output) if output is not None else plan_path.parent / "result.json"
     if len({*evidence_paths.values(), result_path}) != 3:
         raise RuntimeABError("runtime A/B publication targets must be distinct")
     evidence_receipts = {}

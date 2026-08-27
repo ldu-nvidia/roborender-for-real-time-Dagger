@@ -50,7 +50,7 @@ from .runtime import (
     RUNTIME_ADAPTER_VALIDATION_ACK_ENV,
 )
 from .runtime_ab import RESULT_SCHEMA as RUNTIME_AB_RESULT_SCHEMA
-from .runtime_ab import compare_runtime_ab
+from .runtime_ab import RuntimeABError, compare_runtime_ab, validate_runtime_ab
 
 
 PLAN_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_scale_plan.v1"
@@ -1147,6 +1147,15 @@ def _runtime_scale_environment(
     _require_sealed_predecessors(report, environments_per_rank)
     rung_report = report["rungs"][str(environments_per_rank)]
     plan_path, plan = _load_plan(path)
+    # Completed scale evidence is deliberately verifiable after a fleet clean
+    # stop, but every new launch must still prove that the original live
+    # descriptor files exist and match the immutable A/B contract.
+    try:
+        validate_runtime_ab(plan["prerequisite_plan"])
+    except RuntimeABError as exc:
+        raise RuntimeScaleError(
+            f"live renderer endpoint validation failed before scale launch: {exc}"
+        ) from exc
     rung_path, rung = _load_rungs(plan)[environments_per_rank]
     if rung_report["state"] == "partial" and allow_prelaunch_partial:
         _validate_prelaunch_run_tree(rung)
