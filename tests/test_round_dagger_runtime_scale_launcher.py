@@ -70,6 +70,9 @@ class RuntimeScaleLauncherTest(unittest.TestCase):
                         "rungs": {{"2": {{"state": state["2"]}}}},
                     }}))
                 elif operation == "environment":
+                    if os.environ.get("SCALE_ENVIRONMENT_FAIL") == "1":
+                        event("environment_failure")
+                        raise SystemExit(9)
                     rung = args[args.index("--rung") + 1]
                     values = {{
                         "ROUND_DAGGER_ACTOR_DOCKER_GPU_ID": "0",
@@ -122,6 +125,13 @@ class RuntimeScaleLauncherTest(unittest.TestCase):
                     handle.write(json.dumps({{"event": "docker", "argv": args}}, sort_keys=True) + "\\n")
                 if args[:2] == ["image", "inspect"]:
                     print("sha256:{IMAGE_SHA}")
+                elif args[:2] == ["container", "inspect"]:
+                    if os.environ.get("SCALE_EXISTING_CONTAINER") == "1":
+                        print("container-id|running|unrelated-component|other-plan|2|999")
+                    else:
+                        raise SystemExit(1)
+                elif args[:1] == ["stop"]:
+                    pass
                 elif args[:1] != ["run"]:
                     raise SystemExit(2)
                 """
@@ -143,6 +153,8 @@ class RuntimeScaleLauncherTest(unittest.TestCase):
             }
         )
         environment.pop("ROUND_DAGGER_RUNTIME_SCALE_LAUNCH_ACK", None)
+        environment.pop("SCALE_ENVIRONMENT_FAIL", None)
+        environment.pop("SCALE_EXISTING_CONTAINER", None)
         if acknowledgement is not None:
             environment["ROUND_DAGGER_RUNTIME_SCALE_LAUNCH_ACK"] = acknowledgement
         return environment
@@ -176,15 +188,83 @@ class RuntimeScaleLauncherTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         events = self._events()
         docker = [event for event in events if event["event"] == "docker"]
-        self.assertEqual(len(docker), 2)  # image inspect, then one actor run
-        run = docker[1]["argv"]
+        self.assertEqual(len(docker), 3)  # image inspect, name preflight, actor run
+        run = next(event["argv"] for event in docker if event["argv"][:1] == ["run"])
         self.assertIn(f"type=bind,src={self.root},dst={self.root},readonly", run)
         self.assertIn("TORCH_HOME", run)
         self.assertIn("sha256:" + IMAGE_SHA, run)
+        self.assertIn(
+            "ai.openai.round-dagger.component=runtime-adapter-shadow-scale", run
+        )
+        self.assertIn(
+            f"ai.openai.round-dagger.plan-sha256={self.plan_sha}", run
+        )
+        self.assertIn("ai.openai.round-dagger.rung=2", run)
         self.assertEqual(
             [event["event"] for event in events if event["event"] != "docker"],
             ["authorize", "seal", "verify"],
         )
+
+    def test_complete_rung_resumes_at_seal_without_rerunning_docker(self) -> None:
+        self.state.write_text(json.dumps({"2": "complete"}), encoding="utf-8")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self._events()
+        docker_runs = [
+            event
+            for event in events
+            if event["event"] == "docker" and event["argv"][:1] == ["run"]
+        ]
+        self.assertEqual(docker_runs, [])
+        self.assertEqual(
+            [event["event"] for event in events if event["event"] != "docker"],
+            ["seal", "verify"],
+        )
+        self.assertIn("RUNTIME_ADAPTER_SCALE_RESUME_SEAL", result.stdout)
+
+    def test_environment_producer_failure_is_observed_before_docker_run(self) -> None:
+        environment = self._environment()
+        environment["SCALE_ENVIRONMENT_FAIL"] = "1"
+        self.log.unlink(missing_ok=True)
+        result = subprocess.run(
+            ["bash", str(self.launcher), str(self.plan), "2"],
+            cwd=self.base,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("failed to derive", result.stderr)
+        self.assertFalse(
+            any(
+                event["event"] == "docker" and event["argv"][:1] == ["run"]
+                for event in self._events()
+            )
+        )
+
+    def test_existing_container_is_diagnosed_and_never_touched(self) -> None:
+        environment = self._environment()
+        environment["SCALE_EXISTING_CONTAINER"] = "1"
+        self.log.unlink(missing_ok=True)
+        result = subprocess.run(
+            ["bash", str(self.launcher), str(self.plan), "2"],
+            cwd=self.base,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refusing to touch it", result.stderr)
+        docker_commands = [
+            event["argv"]
+            for event in self._events()
+            if event["event"] == "docker"
+        ]
+        self.assertFalse(any(command[:1] in (["run"], ["stop"]) for command in docker_commands))
 
 
 if __name__ == "__main__":

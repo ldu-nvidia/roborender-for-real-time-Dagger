@@ -13,6 +13,7 @@ This module owns artifacts and authorization; Docker and Isaac are launched by
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -28,11 +29,13 @@ from .actor_pair import ActorPairError, inspect_actor_rank
 from .artifacts import (
     ArtifactError,
     create_cohort,
+    discover_rollout_shards,
     load_strict_json,
     publish_immutable_json,
     seal_cohort,
     sha256_file,
     verify_cohort,
+    verify_rollout_shard,
 )
 from .runtime import (
     RUNTIME_ADAPTER_CUBLAS_WORKSPACE_CONFIG,
@@ -55,6 +58,7 @@ CONFIG_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_scale_config.v1"
 RUNG_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_scale_rung.v1"
 EVIDENCE_SCHEMA = "fast_roborender.round_runtime_scale_validation.v1"
 VALIDATION_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_scale_validation.v1"
+TELEMETRY_SCHEMA = "fast_roborender.round_dagger.runtime_adapter_scale_telemetry.v1"
 AUTHORIZATION_SCHEMA = (
     "fast_roborender.round_dagger.runtime_adapter_scale_authorization.v1"
 )
@@ -227,6 +231,42 @@ def _finite_number(value: Any, label: str, *, positive: bool = False) -> float:
     if not np.isfinite(number) or (positive and number <= 0.0):
         raise RuntimeScaleError(f"{label} must be finite and positive")
     return number
+
+
+def _require_metric(
+    metrics: Mapping[str, Any], name: str, expected: int, *, step: int
+) -> None:
+    value = metrics.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+        raise RuntimeScaleError(
+            f"scale telemetry step {step} metric {name} is not numeric"
+        )
+    if float(value) != float(expected):
+        raise RuntimeScaleError(
+            f"scale telemetry step {step} metric {name} must equal {expected}"
+        )
+
+
+def _capacity_scope(environments_per_rank: int | None = None) -> dict[str, Any]:
+    """Describe exactly what a rung PASS proves, without implying production."""
+
+    scope: dict[str, Any] = {
+        "authoritative_rollout": False,
+        "classification": "bounded-shadow-execution-capacity-only",
+        "excludes": [
+            "two-rank-actor-concurrency",
+            "three-hundred-step-duration",
+            "two-hundred-fifty-six-simultaneous-environments",
+            "distributed-learner-training",
+            "production-promotion",
+        ],
+        "processes": RANKS,
+        "promotion_gate": False,
+        "steps_per_environment": STEPS_PER_ENVIRONMENT,
+    }
+    if environments_per_rank is not None:
+        scope["local_environments"] = environments_per_rank
+    return scope
 
 
 def _prepare_root(path: str | Path) -> Path:
@@ -506,6 +546,198 @@ def _load_rungs(plan: Mapping[str, Any]) -> dict[int, tuple[Path, dict[str, Any]
     return result
 
 
+def _renderer_telemetry(
+    document: Mapping[str, Any], *, environments_per_rank: int
+) -> dict[str, Any]:
+    """Require two immutable, batch-bound renderer records for one rung."""
+
+    scalar_dir = _absolute_directory(
+        Path(document["run_dir"]) / "telemetry" / "scalars",
+        "scale scalar telemetry directory",
+    )
+    expected_paths = tuple(
+        scalar_dir / f"step_{step:09d}.json"
+        for step in range(STEPS_PER_ENVIRONMENT)
+    )
+    actual_paths = tuple(sorted(scalar_dir.glob("step_*.json")))
+    if actual_paths != expected_paths:
+        raise RuntimeScaleError(
+            "scale scalar telemetry must contain exactly steps 0 and 1"
+        )
+
+    records = []
+    inference_values = []
+    for step, candidate in enumerate(expected_paths):
+        path = _absolute_file(
+            candidate, f"scale scalar telemetry step {step}", immutable=True
+        )
+        digest = sha256_file(path)
+        scalar = _exact_mapping(
+            load_strict_json(path),
+            {"metrics", "step"},
+            f"scale scalar telemetry step {step}",
+        )
+        if sha256_file(path) != digest:
+            raise RuntimeScaleError(
+                f"scale scalar telemetry step {step} changed while loading"
+            )
+        if type(scalar["step"]) is not int or scalar["step"] != step:
+            raise RuntimeScaleError(
+                f"scale scalar telemetry document step must equal {step}"
+            )
+        if not isinstance(scalar["metrics"], Mapping):
+            raise RuntimeScaleError(
+                f"scale scalar telemetry step {step} metrics must be a mapping"
+            )
+        metrics = dict(scalar["metrics"])
+        for name, expected in (
+            ("renderer/parallel_batch_size", environments_per_rank),
+            ("renderer/reference_provenance/configured_lag", REFERENCE_LAG),
+            ("renderer/reference_provenance/request_step", step),
+            ("renderer/reference_provenance/source_step", 0),
+            ("renderer/reference_provenance_valid", 1),
+            ("renderer/reference_source_anchor", 1),
+            ("renderer/reference_source_client", 0),
+            ("renderer/reference_source_generated_lag", 0),
+            ("renderer/reference_source_idempotent_replay", 0),
+            ("renderer/reference_source_unknown", 0),
+            ("renderer/stream_step", step),
+            ("rollout_frame_step", step),
+            ("telemetry/view_count", len(VIEW_CONTRACT["views"])),
+        ):
+            _require_metric(metrics, name, expected, step=step)
+
+        finite_metrics = {}
+        for name in (
+            "renderer/client_wall_ms",
+            "renderer/inference_ms",
+            "renderer/ms",
+            "renderer/parallel_batch_wall_ms",
+        ):
+            finite_metrics[name] = _finite_number(
+                metrics.get(name),
+                f"scale telemetry step {step} {name}",
+                positive=True,
+            )
+        queue_ms = _finite_number(
+            metrics.get("renderer/queue_ms"),
+            f"scale telemetry step {step} renderer/queue_ms",
+        )
+        if queue_ms < 0.0:
+            raise RuntimeScaleError(
+                f"scale telemetry step {step} renderer/queue_ms must be non-negative"
+            )
+        finite_metrics["renderer/queue_ms"] = queue_ms
+        inference_values.append(finite_metrics["renderer/inference_ms"])
+        records.append(
+            {
+                "path": str(path),
+                "sha256": digest,
+                "step": step,
+                "parallel_batch_size": environments_per_rank,
+                "reference_provenance_valid": 1,
+                **finite_metrics,
+            }
+        )
+    return {
+        "schema": TELEMETRY_SCHEMA,
+        "records": records,
+        "renderer_inference_ms": {
+            "count": len(inference_values),
+            "mean": float(sum(inference_values) / len(inference_values)),
+            "values": inference_values,
+        },
+    }
+
+
+def _policy_rgb_content(
+    document: Mapping[str, Any], *, environments_per_rank: int
+) -> dict[str, Any]:
+    """Prove the batched replay contains nondegenerate, per-env RGB outputs."""
+
+    cohort_dir = _absolute_directory(document["cohort_dir"], "scale cohort")
+    sidecars = discover_rollout_shards(cohort_dir)
+    if len(sidecars) != 1:
+        raise RuntimeScaleError(
+            "scale content validation requires exactly one rank-0 rollout shard"
+        )
+    shard = verify_rollout_shard(sidecars[0])
+    if (
+        shard["rank"] != 0
+        or shard["rollout_id"] != 0
+        or shard["part_index"] != 0
+        or shard["global_env_ids"] != list(range(environments_per_rank))
+    ):
+        raise RuntimeScaleError("scale content shard identity or coverage mismatch")
+    payload = _absolute_file(
+        cohort_dir / shard["payload_path"],
+        "scale rollout payload",
+        immutable=True,
+    )
+    payload_sha = sha256_file(payload)
+    if payload_sha != shard["payload_sha256"]:
+        raise RuntimeScaleError("scale content payload digest mismatch")
+    try:
+        with np.load(payload, allow_pickle=False) as archive:
+            if "policy_rgb" not in archive.files:
+                raise RuntimeScaleError("scale rollout payload has no policy_rgb")
+            policy_rgb = np.ascontiguousarray(archive["policy_rgb"])
+    except RuntimeScaleError:
+        raise
+    except Exception as exc:
+        raise RuntimeScaleError(f"cannot load scale policy_rgb: {exc}") from exc
+    if sha256_file(payload) != payload_sha:
+        raise RuntimeScaleError("scale rollout payload changed while loading")
+    expected_shape = (
+        STEPS_PER_ENVIRONMENT,
+        environments_per_rank,
+        *VIEW_CONTRACT["shape"],
+    )
+    if policy_rgb.dtype != np.uint8 or policy_rgb.shape != expected_shape:
+        raise RuntimeScaleError(
+            "scale policy_rgb dtype or shape mismatch: "
+            f"got {policy_rgb.dtype} {policy_rgb.shape}, expected uint8 {expected_shape}"
+        )
+    if not np.isfinite(policy_rgb).all():
+        raise RuntimeScaleError("scale policy_rgb contains non-finite values")
+
+    step_summaries = []
+    for step in range(STEPS_PER_ENVIRONMENT):
+        batch = policy_rgb[step]
+        minimum = int(batch.min())
+        maximum = int(batch.max())
+        nonzero_pixels = int(np.count_nonzero(batch))
+        if minimum == maximum or nonzero_pixels == 0:
+            raise RuntimeScaleError(
+                f"scale policy_rgb step {step} is zero or has degenerate range"
+            )
+        environment_hashes = [
+            hashlib.sha256(np.ascontiguousarray(batch[index]).tobytes(order="C")).hexdigest()
+            for index in range(environments_per_rank)
+        ]
+        if len(set(environment_hashes)) != environments_per_rank:
+            raise RuntimeScaleError(
+                f"scale policy_rgb step {step} is not unique per environment"
+            )
+        step_summaries.append(
+            {
+                "step": step,
+                "minimum": minimum,
+                "maximum": maximum,
+                "nonzero_pixels": nonzero_pixels,
+                "unique_environment_count": len(set(environment_hashes)),
+                "environment_sha256": environment_hashes,
+            }
+        )
+    return {
+        "dtype": "uint8",
+        "shape": list(expected_shape),
+        "payload_path": str(payload),
+        "payload_sha256": payload_sha,
+        "steps": step_summaries,
+    }
+
+
 def _validate_runtime_evidence(
     document: Mapping[str, Any], *, environments_per_rank: int, input_profile: str
 ) -> dict[str, Any]:
@@ -684,7 +916,20 @@ def _validate_runtime_evidence(
         }
         if deterministic != expected:
             raise RuntimeScaleError("scale deterministic CUDA settings mismatch")
-    return {"path": str(path), "sha256": digest, "wall_seconds": wall_seconds, "cuda": cuda}
+    telemetry = _renderer_telemetry(
+        document, environments_per_rank=environments_per_rank
+    )
+    content = _policy_rgb_content(
+        document, environments_per_rank=environments_per_rank
+    )
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "wall_seconds": wall_seconds,
+        "cuda": cuda,
+        "telemetry": telemetry,
+        "policy_rgb_content": content,
+    }
 
 
 def validate_runtime_scale(path: str | Path) -> dict[str, Any]:
@@ -827,8 +1072,25 @@ def validate_runtime_scale(path: str | Path) -> dict[str, Any]:
         "actor_image_id_sha256": ab_plan["actor_image_id_sha256"],
         "actor_gpu_id": ab_plan["actor_gpu_id"],
         "input_profile": plan["input_profile"],
+        "scope": _capacity_scope(),
         "rungs": reports,
     }
+
+
+def _require_sealed_predecessors(
+    report: Mapping[str, Any], environments_per_rank: int
+) -> None:
+    index = RUNGS.index(environments_per_rank)
+    incomplete = [
+        rung
+        for rung in RUNGS[:index]
+        if report["rungs"][str(rung)]["state"] != "sealed"
+    ]
+    if incomplete:
+        raise RuntimeScaleError(
+            f"runtime scale rung {environments_per_rank} requires sealed "
+            "predecessors: " + ", ".join(map(str, incomplete))
+        )
 
 
 def runtime_scale_environment(path: str | Path, environments_per_rank: int) -> dict[str, str]:
@@ -837,6 +1099,7 @@ def runtime_scale_environment(path: str | Path, environments_per_rank: int) -> d
     if environments_per_rank not in RUNGS:
         raise RuntimeScaleError("runtime scale rung must be one of 2,4,8,16,32")
     report = validate_runtime_scale(path)
+    _require_sealed_predecessors(report, environments_per_rank)
     rung_report = report["rungs"][str(environments_per_rank)]
     if rung_report["state"] != "empty":
         raise RuntimeScaleError(
@@ -977,6 +1240,7 @@ def seal_runtime_scale(path: str | Path, environments_per_rank: int) -> dict[str
     if environments_per_rank not in RUNGS:
         raise RuntimeScaleError("runtime scale rung must be one of 2,4,8,16,32")
     report = validate_runtime_scale(path)
+    _require_sealed_predecessors(report, environments_per_rank)
     state = report["rungs"][str(environments_per_rank)]["state"]
     if state == "sealed":
         return verify_runtime_scale(path, environments_per_rank)
@@ -998,6 +1262,7 @@ def verify_runtime_scale(path: str | Path, environments_per_rank: int) -> dict[s
     if environments_per_rank not in RUNGS:
         raise RuntimeScaleError("runtime scale rung must be one of 2,4,8,16,32")
     report = validate_runtime_scale(path)
+    _require_sealed_predecessors(report, environments_per_rank)
     rung = report["rungs"][str(environments_per_rank)]
     if rung["state"] != "sealed":
         raise RuntimeScaleError(
@@ -1014,6 +1279,7 @@ def verify_runtime_scale(path: str | Path, environments_per_rank: int) -> dict[s
         "rung_contract": rung["rung_contract"],
         "rung_contract_sha256": rung["rung_contract_sha256"],
         "evidence": rung["evidence"],
+        "scope": _capacity_scope(environments_per_rank),
         "source": report["source"],
         "prerequisite": report["prerequisite"],
     }

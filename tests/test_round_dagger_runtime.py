@@ -227,6 +227,17 @@ class RuntimeModeTest(unittest.TestCase):
             ),
             "live-isaac-v1",
         )
+        with self.assertRaisesRegex(RuntimeAdapterError, "unsupported"):
+            runtime_adapter_validation_evidence_path(
+                environment,
+                expected_acknowledgement=None,
+            )
+        with self.assertRaisesRegex(RuntimeAdapterError, "unsupported"):
+            runtime_adapter_validation_input_profile(
+                environment,
+                required=True,
+                expected_acknowledgement=None,
+            )
 
 
 class VectorEnvironmentAdapterTest(unittest.TestCase):

@@ -28,6 +28,9 @@ RUNTIME_ADAPTER_VALIDATION_ACK_ENV = (
 )
 RUNTIME_ADAPTER_VALIDATION_ACK = "paired-1x2-v1"
 RUNTIME_ADAPTER_SCALE_VALIDATION_ACK = "shadow-scale-2step-v1"
+_RUNTIME_ADAPTER_VALIDATION_ACKS = frozenset(
+    {RUNTIME_ADAPTER_VALIDATION_ACK, RUNTIME_ADAPTER_SCALE_VALIDATION_ACK}
+)
 RUNTIME_ADAPTER_EVIDENCE_ENV = "ROUND_DAGGER_RUNTIME_ADAPTER_EVIDENCE"
 RUNTIME_ADAPTER_INPUT_PROFILE_ENV = (
     "ROUND_DAGGER_RUNTIME_ADAPTER_INPUT_PROFILE"
@@ -121,6 +124,10 @@ def runtime_adapter_validation_evidence_path(
     responsibility immediately before its atomic publication.
     """
 
+    if expected_acknowledgement not in _RUNTIME_ADAPTER_VALIDATION_ACKS:
+        raise RuntimeAdapterError(
+            "runtime validation expected acknowledgement is unsupported"
+        )
     source = os.environ if environment is None else environment
     acknowledgement = source.get(RUNTIME_ADAPTER_VALIDATION_ACK_ENV)
     if acknowledgement != expected_acknowledgement:
@@ -172,6 +179,10 @@ def runtime_adapter_validation_input_profile(
     acknowledgement fails closed.
     """
 
+    if expected_acknowledgement not in _RUNTIME_ADAPTER_VALIDATION_ACKS:
+        raise RuntimeAdapterError(
+            "runtime validation expected acknowledgement is unsupported"
+        )
     source = os.environ if environment is None else environment
     raw = source.get(RUNTIME_ADAPTER_INPUT_PROFILE_ENV)
     if raw is None or not str(raw).strip():

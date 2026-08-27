@@ -80,10 +80,16 @@ class RuntimeScaleTest(unittest.TestCase):
         episode_steps = np.broadcast_to(
             np.arange(2, dtype=np.int64)[:, None], shape
         ).copy()
+        policy_rgb = np.zeros(
+            (2, environments, 324, 192, 3), dtype=np.uint8
+        )
+        for step in range(2):
+            for environment in range(environments):
+                value = 1 + step * 64 + environment
+                policy_rgb[step, environment].fill(value)
+                policy_rgb[step, environment, 0, 0, 0] = value + 1
         return {
-            "policy_rgb": np.zeros(
-                (2, environments, 324, 192, 3), dtype=np.uint8
-            ),
+            "policy_rgb": policy_rgb,
             "expert_actions": expert,
             "student_actions": student,
             "behavior_actions": student.copy(),
@@ -94,6 +100,32 @@ class RuntimeScaleTest(unittest.TestCase):
             "episode_ids": np.zeros(shape, dtype=np.int64),
             "episode_steps": episode_steps,
             "obs__actor_obs": np.zeros((2, environments, 3), dtype=np.float32),
+        }
+
+    @staticmethod
+    def _telemetry(step: int, environments: int):
+        return {
+            "step": step,
+            "metrics": {
+                "renderer/client_wall_ms": 9.0 + step,
+                "renderer/inference_ms": 7.0 + step,
+                "renderer/ms": 8.0 + step,
+                "renderer/parallel_batch_size": environments,
+                "renderer/parallel_batch_wall_ms": 10.0 + step,
+                "renderer/queue_ms": 0.25 + step,
+                "renderer/reference_provenance/configured_lag": 256,
+                "renderer/reference_provenance/request_step": step,
+                "renderer/reference_provenance/source_step": 0,
+                "renderer/reference_provenance_valid": 1,
+                "renderer/reference_source_anchor": 1,
+                "renderer/reference_source_client": 0,
+                "renderer/reference_source_generated_lag": 0,
+                "renderer/reference_source_idempotent_replay": 0,
+                "renderer/reference_source_unknown": 0,
+                "renderer/stream_step": step,
+                "rollout_frame_step": step,
+                "telemetry/view_count": 3,
+            },
         }
 
     @staticmethod
@@ -159,14 +191,27 @@ class RuntimeScaleTest(unittest.TestCase):
             "replay_export": {"successful": True, "published_shard_parts": 1},
         }
 
-    def _complete(self, environments: int, *, evidence: bool = True) -> None:
+    def _complete(
+        self,
+        environments: int,
+        *,
+        evidence: bool = True,
+        telemetry: bool = True,
+        degenerate_rgb: bool = False,
+        duplicate_rgb: bool = False,
+    ) -> None:
         plan, rung, ab_plan = self._documents(environments)
+        arrays = self._rollout_arrays(environments)
+        if degenerate_rgb:
+            arrays["policy_rgb"].fill(0)
+        if duplicate_rgb:
+            arrays["policy_rgb"][:, 1:] = arrays["policy_rgb"][:, :1]
         publish_rollout_shard(
             rung["cohort_dir"],
             rank=0,
             rollout_id=0,
             part_index=0,
-            arrays=self._rollout_arrays(environments),
+            arrays=arrays,
             campaign_id=plan["campaign_id"],
             macro_round=plan["macro_round"],
             cohort_index=rung["cohort_index"],
@@ -178,6 +223,13 @@ class RuntimeScaleTest(unittest.TestCase):
             beta_sha256=ab_plan["beta_sha256"],
             config_sha256=plan["config_sha256"],
         )
+        if telemetry:
+            scalar_dir = Path(rung["run_dir"]) / "telemetry" / "scalars"
+            for step in range(2):
+                publish_immutable_json(
+                    scalar_dir / f"step_{step:09d}.json",
+                    self._telemetry(step, environments),
+                )
         if evidence:
             publish_immutable_json(rung["evidence_path"], self._evidence(environments))
 
@@ -226,8 +278,13 @@ class RuntimeScaleTest(unittest.TestCase):
             )
             self.assertEqual(authorized["environments_per_rank"], environments)
             self.assertEqual(authorized["expected_transitions"], environments * 2)
+            self._complete(environments)
+            sealed = seal_runtime_scale(self.plan, environments)
+            self.assertEqual(sealed["scope"]["classification"], "bounded-shadow-execution-capacity-only")
 
     def test_authorization_rejects_plan_rung_and_environment_tampering(self) -> None:
+        self._complete(2)
+        seal_runtime_scale(self.plan, 2)
         environment = runtime_scale_environment(self.plan, 4)
         with self.assertRaisesRegex(RuntimeScaleError, "plan SHA-256"):
             authorize_runtime_scale(
@@ -258,6 +315,16 @@ class RuntimeScaleTest(unittest.TestCase):
         sealed = seal_runtime_scale(self.plan, 2)
         self.assertEqual(sealed["status"], "PASS")
         self.assertEqual(sealed["transition_count"], 4)
+        self.assertEqual(
+            sealed["evidence"]["telemetry"]["records"][0]["parallel_batch_size"],
+            2,
+        )
+        self.assertEqual(
+            sealed["evidence"]["policy_rgb_content"]["steps"][0][
+                "unique_environment_count"
+            ],
+            2,
+        )
         self.assertEqual(verify_runtime_scale(self.plan, 2)["status"], "PASS")
         with self.assertRaisesRegex(RuntimeScaleError, "sealed"):
             runtime_scale_environment(self.plan, 2)
@@ -269,6 +336,28 @@ class RuntimeScaleTest(unittest.TestCase):
         evidence["audit"]["num_envs"] = 2
         publish_immutable_json(rung["evidence_path"], evidence)
         with self.assertRaisesRegex(RuntimeScaleError, "audit"):
+            validate_runtime_scale(self.plan)
+
+    def test_rungs_require_every_predecessor_to_be_sealed(self) -> None:
+        with self.assertRaisesRegex(RuntimeScaleError, "sealed predecessors: 2"):
+            runtime_scale_environment(self.plan, 4)
+        self._complete(4)
+        with self.assertRaisesRegex(RuntimeScaleError, "sealed predecessors: 2"):
+            seal_runtime_scale(self.plan, 4)
+
+    def test_missing_telemetry_or_degenerate_rgb_fails_closed(self) -> None:
+        self._complete(2, telemetry=False)
+        with self.assertRaisesRegex(RuntimeScaleError, "scalar telemetry"):
+            validate_runtime_scale(self.plan)
+
+    def test_duplicate_or_zero_policy_rgb_fails_closed(self) -> None:
+        self._complete(2, degenerate_rgb=True)
+        with self.assertRaisesRegex(RuntimeScaleError, "degenerate range"):
+            validate_runtime_scale(self.plan)
+
+    def test_duplicate_policy_rgb_environments_fail_closed(self) -> None:
+        self._complete(2, duplicate_rgb=True)
+        with self.assertRaisesRegex(RuntimeScaleError, "not unique per environment"):
             validate_runtime_scale(self.plan)
 
     def test_cli_exposes_prepare_validate_environment_authorize_seal_verify(self) -> None:
