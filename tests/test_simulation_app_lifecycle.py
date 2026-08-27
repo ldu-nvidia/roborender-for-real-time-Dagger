@@ -153,11 +153,17 @@ class TrainEntrypointLifecycleContractTest(unittest.TestCase):
         }
 
         self.assertIn("_run_training", functions)
+        self.assertIn("_hydra_main", functions)
         self.assertIn("main", functions)
-        main_source = ast.get_source_segment(source, functions["main"])
+        hydra_main_source = ast.get_source_segment(source, functions["_hydra_main"])
         training_source = ast.get_source_segment(source, functions["_run_training"])
-        self.assertIn("with SimulationAppLifecycle() as simulation_lifecycle", main_source)
-        self.assertIn("return _run_training(config, simulation_lifecycle)", main_source)
+        self.assertIn(
+            "with SimulationAppLifecycle() as simulation_lifecycle",
+            hydra_main_source,
+        )
+        self.assertIn(
+            "return _run_training(config, simulation_lifecycle)", hydra_main_source
+        )
         self.assertIn("simulation_lifecycle.attach(simulation_app)", training_source)
         self.assertIn("trainer.train()", training_source)
         self.assertNotIn("simulation_app.close()", source)

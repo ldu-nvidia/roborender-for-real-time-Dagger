@@ -1116,9 +1116,16 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             'expected_sha256=os.environ.get("EXPECTED_TRAIN_CHECKPOINT_SHA256")',
             trainer,
         )
-        self.assertIn("require_expected_sha256=production_resume", trainer)
+        self.assertIn(
+            "trusted_checkpoint_consumer = production_resume or paired_evaluation",
+            trainer,
+        )
+        self.assertIn(
+            "require_expected_sha256=trusted_checkpoint_consumer",
+            trainer,
+        )
         self.assertIn('getattr(os, "O_NOFOLLOW", 0)', checkpoint_io)
-        self.assertIn("handle.seek(0)", checkpoint_io)
+        self.assertIn("snapshot.seek(0)", checkpoint_io)
         self.assertLess(
             checkpoint_io.index("actual_sha256 = digest.hexdigest()"),
             checkpoint_io.index("payload = torch_module.load("),

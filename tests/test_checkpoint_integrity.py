@@ -196,7 +196,14 @@ class CheckpointFileDescriptorTest(unittest.TestCase):
     def test_trainer_requires_digest_for_strict_production_resume(self):
         source = PPO_TRAINER.read_text(encoding="utf-8")
         self.assertIn('os.environ.get("RUN_PROFILE") == "production_256x300"', source)
-        self.assertIn("require_expected_sha256=production_resume", source)
+        self.assertIn(
+            "trusted_checkpoint_consumer = production_resume or paired_evaluation",
+            source,
+        )
+        self.assertIn(
+            "require_expected_sha256=trusted_checkpoint_consumer",
+            source,
+        )
         self.assertIn("load_verified_torch_checkpoint", source)
 
 
