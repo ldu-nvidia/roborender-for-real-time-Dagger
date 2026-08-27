@@ -36,6 +36,11 @@ class FakeImage3FServer:
                         "ok": True,
                         "protocol_version": client_module.PROTOCOL_VERSION,
                         "server_incarnation_id": self.incarnation,
+                        "capabilities": {
+                            "lagged_reference_history": True,
+                            "server_incarnation_binding": True,
+                            "reference_lag_max": 512,
+                        },
                     }
                 else:
                     step = int(request.get("step", 0))
@@ -69,6 +74,75 @@ class FakeImage3FServer:
                     }
                 client_module._send_msg(conn, response)
         self.server.close()
+
+    def start(self):
+        self.thread.start()
+
+
+class RestartBetweenRetryServer:
+    """Drop step zero, change incarnation, and reject the bound retry."""
+
+    def __init__(self):
+        self.first_incarnation = "a" * 32
+        self.second_incarnation = "b" * 32
+        self.inference_count = 0
+        self.render_requests = []
+        self.error = None
+        self.server = socket.socket()
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(2)
+        self.port = self.server.getsockname()[1]
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    @staticmethod
+    def _ping_response(incarnation):
+        return {
+            "ok": True,
+            "protocol_version": client_module.PROTOCOL_VERSION,
+            "server_incarnation_id": incarnation,
+            "capabilities": {
+                "lagged_reference_history": True,
+                "server_incarnation_binding": True,
+                "reference_lag_max": 512,
+            },
+        }
+
+    def _run(self):
+        try:
+            first, _ = self.server.accept()
+            with first:
+                handshake = client_module._recv_msg(first)
+                if handshake.get("cmd") != "ping":
+                    raise AssertionError("first stateful request was not a handshake")
+                client_module._send_msg(
+                    first, self._ping_response(self.first_incarnation)
+                )
+                render = client_module._recv_msg(first)
+                self.render_requests.append(render)
+                if render.get("expected_server_incarnation_id") != self.first_incarnation:
+                    raise AssertionError("first render was not bound to its handshake")
+                self.inference_count += 1
+                # Model a committed step-zero result whose response is lost.
+            second, _ = self.server.accept()
+            with second:
+                retry = client_module._recv_msg(second)
+                self.render_requests.append(retry)
+                if retry.get("expected_server_incarnation_id") != self.first_incarnation:
+                    raise AssertionError("retry lost the original incarnation binding")
+                client_module._send_msg(
+                    second,
+                    {
+                        "ok": False,
+                        "error": "server incarnation changed",
+                        "retryable": False,
+                        "server_incarnation_id": self.second_incarnation,
+                    },
+                )
+        except BaseException as exc:  # surfaced by the test thread join
+            self.error = exc
+        finally:
+            self.server.close()
 
     def start(self):
         self.thread.start()
@@ -111,6 +185,65 @@ class Image3FFrameClientTest(unittest.TestCase):
             client_module.Image3FFrameClient("127.0.0.1", 1)._bind_server_incarnation(
                 {}, required=True
             )
+
+    def test_ping_requires_exact_v3_stateful_capabilities(self):
+        client = client_module.Image3FFrameClient("127.0.0.1", 1)
+        base = {
+            "ok": True,
+            "protocol_version": client_module.PROTOCOL_VERSION,
+            "server_incarnation_id": "a" * 32,
+            "capabilities": {
+                "lagged_reference_history": True,
+                "server_incarnation_binding": True,
+                "reference_lag_max": 256,
+            },
+        }
+        client._validate_ping_response(base, required_reference_lag=256)
+        old = dict(base, protocol_version=2)
+        with self.assertRaisesRegex(
+            client_module.Image3FWireError, "protocol version 3"
+        ):
+            client_module.Image3FFrameClient(
+                "127.0.0.1", 1
+            )._validate_ping_response(old)
+        missing = dict(base, capabilities={"lagged_reference_history": True})
+        with self.assertRaisesRegex(
+            client_module.Image3FWireError, "incarnation binding"
+        ):
+            client_module.Image3FFrameClient(
+                "127.0.0.1", 1
+            )._validate_ping_response(missing)
+
+    def test_first_stateful_render_is_bound_before_lost_response_retry(self):
+        server = RestartBetweenRetryServer()
+        server.start()
+        client = client_module.Image3FFrameClient(
+            "127.0.0.1", server.port, timeout_s=2
+        )
+        image = np.zeros((2, 3, 3), dtype=np.uint8)
+        condition = {"head_color": image}
+        try:
+            with self.assertRaisesRegex(
+                client_module.Image3FWireError, "incarnation changed"
+            ):
+                client.render_frame(
+                    condition,
+                    condition,
+                    condition,
+                    prompt="scene",
+                    stream_id="run:rank0:env0",
+                    episode_id=0,
+                    step=0,
+                    reference_lag=3,
+                )
+        finally:
+            client.close()
+            server.thread.join(timeout=3)
+        self.assertFalse(server.thread.is_alive())
+        if server.error is not None:
+            raise server.error
+        self.assertEqual(server.inference_count, 1)
+        self.assertEqual(len(server.render_requests), 2)
 
     def test_production_output_contract_rejects_order_shape_and_dtype(self):
         good = {

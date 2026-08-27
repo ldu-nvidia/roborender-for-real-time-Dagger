@@ -28,6 +28,23 @@ gate defaults to five steps, TeaCache `0.3`, CFG `1.0`, and CUDA graph disabled,
 matching the validated SM120 release. All four expectations have explicit CLI
 overrides for controlled evaluations.
 
+Protocol v3 is deliberately a production tensor contract rather than a
+dimension-negotiating legacy endpoint. Every render must contain exactly
+`head_color`, `hand_left`, and `hand_right`; each depth tile is `uint8
+(240, 416)`, and each robot mask and previous-RGB tile is `uint8
+(240, 416, 3)`. The output contains the same three ordered RGB tiles. A
+stateful client performs and validates a ping handshake before transmitting
+step zero, binds the returned process-incarnation token to every render, and
+fails closed if a retry reaches a restarted process whose lag history is gone.
+
+The local fleet binds and advertises `127.0.0.1` by default. Each accepted
+connection has a 180-second read timeout, and each renderer permits at most
+256 concurrent connections. Controlled deployments may override these with
+`IMAGE3F_CLIENT_SOCKET_TIMEOUT_S` and `IMAGE3F_MAX_CONNECTIONS` within the
+server's validated ranges. The remote standalone and Slurm-array topologies
+explicitly opt into `0.0.0.0` and advertise their node hostname; they must run
+only on an isolated network until authenticated transport is supplied.
+
 The supervisor never calls `terminate()` or `kill()`. `stop` atomically writes
 the shared STOP request, then waits for every server to drain in-flight work,
 publish its hash-bound ACK, and exit zero. Only after all checks pass does the

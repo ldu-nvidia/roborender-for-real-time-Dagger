@@ -361,6 +361,7 @@ class Image3FFrameClient:
         self._anchor_object_ids: tuple[tuple[str, int], ...] | None = None
         self._anchor_signature: bytes | None = None
         self._server_incarnation_id: str | None = None
+        self._server_capabilities: dict[str, object] | None = None
         self.last_metadata: dict[str, object] = {}
 
     @classmethod
@@ -441,6 +442,50 @@ class Image3FFrameClient:
                 "cannot be continued safely"
             )
 
+    def _validate_ping_response(
+        self, response: Mapping[str, object], *, required_reference_lag: int = 0
+    ) -> None:
+        """Validate and bind the protocol-v3 stateful-server handshake."""
+
+        if response.get("ok") is not True:
+            raise Image3FWireError("Image3F protocol-v3 handshake was rejected")
+        if response.get("protocol_version") != PROTOCOL_VERSION:
+            raise Image3FWireError(
+                "Image3F ping response does not implement protocol version 3"
+            )
+        capabilities = response.get("capabilities")
+        if not isinstance(capabilities, dict):
+            raise Image3FWireError("Image3F ping capabilities are missing or malformed")
+        if capabilities.get("lagged_reference_history") is not True:
+            raise Image3FWireError("Image3F server lacks lagged reference history")
+        if capabilities.get("server_incarnation_binding") is not True:
+            raise Image3FWireError("Image3F server lacks incarnation binding")
+        try:
+            maximum_lag = int(capabilities.get("reference_lag_max", 0))
+        except (TypeError, ValueError) as exc:
+            raise Image3FWireError("Image3F maximum reference lag is malformed") from exc
+        if maximum_lag < int(required_reference_lag):
+            raise Image3FWireError(
+                f"Image3F maximum reference lag {maximum_lag} is below "
+                f"required {required_reference_lag}"
+            )
+        _validate_renderer_identity(response)
+        self._bind_server_incarnation(response, required=True)
+        self._server_capabilities = dict(capabilities)
+
+    def _handshake_locked(self, sock: socket.socket, *, required_reference_lag: int) -> None:
+        """Bind an incarnation before the first stateful render is transmitted."""
+
+        _send_msg(sock, {"cmd": "ping", "protocol_version": PROTOCOL_VERSION})
+        response = _recv_msg(sock)
+        if not isinstance(response, dict):
+            raise Image3FWireError(
+                f"malformed Image3F handshake: {type(response).__name__}"
+            )
+        self._validate_ping_response(
+            response, required_reference_lag=required_reference_lag
+        )
+
     def close(self) -> None:
         with self._lock:
             if self._socket is not None:
@@ -490,6 +535,15 @@ class Image3FFrameClient:
                     sock = self._connect()
                     request_payload = dict(payload)
                     request_payload.setdefault("protocol_version", PROTOCOL_VERSION)
+                    reference_lag = int(request_payload.get("reference_lag", 0))
+                    stateful_render = (
+                        request_payload.get("cmd") == "render_frame"
+                        and reference_lag > 0
+                    )
+                    if stateful_render and self._server_incarnation_id is None:
+                        self._handshake_locked(
+                            sock, required_reference_lag=reference_lag
+                        )
                     if self._server_incarnation_id is not None:
                         request_payload["expected_server_incarnation_id"] = (
                             self._server_incarnation_id
@@ -500,13 +554,12 @@ class Image3FFrameClient:
                         raise Image3FWireError(
                             f"malformed Image3F response: {type(response).__name__}"
                         )
-                    self._bind_server_incarnation(
-                        response,
-                        required=(
-                            request_payload.get("cmd") == "render_frame"
-                            and int(request_payload.get("reference_lag", 0)) > 0
-                        ),
-                    )
+                    if request_payload.get("cmd") == "ping":
+                        self._validate_ping_response(response)
+                    else:
+                        self._bind_server_incarnation(
+                            response, required=stateful_render
+                        )
                 if response.get("ok"):
                     return response
                 if response.get("retryable") and attempt < retries:

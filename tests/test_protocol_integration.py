@@ -84,6 +84,11 @@ class StoreBackedServer:
                             "ok": True,
                             "protocol_version": protocol.PROTOCOL_VERSION,
                             "server_incarnation_id": self.incarnation,
+                            "capabilities": {
+                                "lagged_reference_history": True,
+                                "server_incarnation_binding": True,
+                                "reference_lag_max": 512,
+                            },
                         },
                     )
                     continue

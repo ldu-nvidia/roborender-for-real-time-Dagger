@@ -36,6 +36,8 @@ VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right
 W, H = 416, 240
 PROTOCOL_VERSION = 3
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+DEFAULT_CLIENT_SOCKET_TIMEOUT_S = 180.0
+DEFAULT_MAX_CONNECTIONS = 256
 MAX_WIRE_NESTING = 32
 MAX_WIRE_ITEMS = 1_000_000
 
@@ -68,6 +70,43 @@ def _max_message_bytes():
     if value < 1024 or value > 1024 * 1024 * 1024:
         raise Image3FWireError(
             "IMAGE3F_MAX_MESSAGE_BYTES must be between 1 KiB and 1 GiB"
+        )
+    return value
+
+
+def _client_socket_timeout_s():
+    raw = os.environ.get(
+        "IMAGE3F_CLIENT_SOCKET_TIMEOUT_S", str(DEFAULT_CLIENT_SOCKET_TIMEOUT_S)
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise Image3FWireError(
+            "IMAGE3F_CLIENT_SOCKET_TIMEOUT_S must be numeric"
+        ) from exc
+    if not np.isfinite(value) or value < 1.0 or value > 3600.0:
+        raise Image3FWireError(
+            "IMAGE3F_CLIENT_SOCKET_TIMEOUT_S must be between 1 and 3600 seconds"
+        )
+    return value
+
+
+def _max_connections():
+    raw = os.environ.get("IMAGE3F_MAX_CONNECTIONS", str(DEFAULT_MAX_CONNECTIONS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise Image3FWireError("IMAGE3F_MAX_CONNECTIONS must be an integer") from exc
+    if value < 1 or value > 4096:
+        raise Image3FWireError("IMAGE3F_MAX_CONNECTIONS must be between 1 and 4096")
+    return value
+
+
+def _bind_host():
+    value = os.environ.get("IMAGE3F_BIND_HOST", "127.0.0.1").strip()
+    if not value or any(character.isspace() for character in value):
+        raise Image3FWireError(
+            "IMAGE3F_BIND_HOST must be one non-empty host token"
         )
     return value
 
@@ -387,6 +426,8 @@ def handle_conn(
                         "output_layout": "vertical",
                         "output_tile_shape_hwc": [H, W, 3],
                         "output_stacked_shape_hwc": [len(VIEW_MAP) * H, W, 3],
+                        "client_socket_timeout_s": connections.client_socket_timeout_s,
+                        "max_connections": connections.max_connections,
                     },
                     "runtime_identity": runtime_identity,
                     "renderer_identity": renderer_identity,
@@ -629,13 +670,19 @@ class ServerMetrics:
 class ConnectionRegistry:
     """Track live TCP handlers so STOP cannot race an in-flight request."""
 
-    def __init__(self):
+    def __init__(self, *, max_connections, client_socket_timeout_s):
         self._lock = threading.Lock()
         self._sockets = set()
         self._threads = set()
+        self.max_connections = int(max_connections)
+        self.client_socket_timeout_s = float(client_socket_timeout_s)
+        self.rejected_connections = 0
 
     def start_handler(self, sock, thread):
         with self._lock:
+            if len(self._threads) >= self.max_connections:
+                self.rejected_connections += 1
+                return False
             self._sockets.add(sock)
             self._threads.add(thread)
             try:
@@ -644,6 +691,7 @@ class ConnectionRegistry:
                 self._sockets.discard(sock)
                 self._threads.discard(thread)
                 raise
+            return True
 
     def remove(self, sock, thread):
         with self._lock:
@@ -684,10 +732,7 @@ class ConnectionRegistry:
 def create_tcp_server(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    bind_host = os.environ.get("IMAGE3F_BIND_HOST", "127.0.0.1").strip()
-    if not bind_host or any(character.isspace() for character in bind_host):
-        raise ValueError("IMAGE3F_BIND_HOST must be one non-empty host token")
-    srv.bind((bind_host, port))
+    srv.bind((_bind_host(), port))
     srv.listen(int(os.environ.get("IMAGE3F_LISTEN_BACKLOG", "256")))
     return srv, int(srv.getsockname()[1])
 
@@ -717,6 +762,7 @@ def tcp_listener(
                 return
             raise
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(connections.client_socket_timeout_s)
         handler = threading.Thread(
             target=handle_conn,
             args=(
@@ -734,7 +780,8 @@ def tcp_listener(
             ),
             daemon=True,
         )
-        connections.start_handler(sock, handler)
+        if not connections.start_handler(sock, handler):
+            sock.close()
 
 
 def acknowledge_stop(stop_controller):
@@ -790,7 +837,10 @@ def main():
     default_port = 18500 + int(job_digits or "0") % 1000
     requested_port = int(os.environ.get("IMAGE3F_PORT", str(default_port)))
     srv, port = create_tcp_server(requested_port)
-    connections = ConnectionRegistry()
+    connections = ConnectionRegistry(
+        max_connections=_max_connections(),
+        client_socket_timeout_s=_client_socket_timeout_s(),
+    )
     listener = threading.Thread(
         target=tcp_listener,
         args=(
@@ -811,6 +861,9 @@ def main():
     listener.start()
     import subprocess
     host = os.environ.get("IMAGE3F_ADVERTISE_HOST", "").strip()
+    bind_host = _bind_host()
+    if not host and bind_host != "0.0.0.0":
+        host = bind_host
     if not host:
         host = subprocess.run(
             ["hostname", "-f"], capture_output=True, text=True

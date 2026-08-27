@@ -19,5 +19,13 @@ export HOME=$HOME_OVERRIDE
 export PYTHONDONTWRITEBYTECODE=1
 export ENDPOINT_FILE=${ENDPOINT_FILE:-$FR_ROOT/image3f_server_endpoint.txt}
 export IMAGE3F_QUEUE=${IMAGE3F_QUEUE:-$FR_ROOT/image3f_queue}
+# This Slurm service is consumed by trainer/evaluation jobs on other nodes.
+# Remote exposure is explicit; the local round-based fleet remains loopback-only.
+export IMAGE3F_BIND_HOST=${IMAGE3F_BIND_HOST:-0.0.0.0}
+if [ -z "${IMAGE3F_ADVERTISE_HOST:-}" ]; then
+    IMAGE3F_ADVERTISE_HOST=$(hostname -f 2>/dev/null || hostname)
+fi
+[ -n "$IMAGE3F_ADVERTISE_HOST" ]
+export IMAGE3F_ADVERTISE_HOST
 rm -f $IMAGE3F_QUEUE/READY
 exec "$IMAGE3F_PYTHON" "$FR_ROOT/scripts/server/image3f_server.py"
