@@ -70,6 +70,24 @@ class PrefixOnlyPolicy(nn.Module):
         return {"actions": self.linear(features)}
 
 
+class ProbeRecordingPolicy(TinyPolicy):
+    """Tiny policy that records only the learner's eval-mode probe inputs."""
+
+    def __init__(self):
+        super().__init__()
+        self.probe_batches = []
+
+    def forward(self, observations):
+        if not self.training:
+            self.probe_batches.append(
+                {
+                    key: value.detach().cpu().clone()
+                    for key, value in observations.items()
+                }
+            )
+        return super().forward(observations)
+
+
 def tiny_policy_factory(_bundle):
     """Importable factory used by the torchrun/CLI smoke path."""
 
@@ -437,6 +455,31 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
                 / report["policy_bundle_manifest_path"]
             ).is_file()
         )
+
+    def test_initial_and_final_losses_use_the_identical_deterministic_probe(self):
+        model = ProbeRecordingPolicy()
+        result = train_from_replay(
+            model,
+            snapshot_path=self.snapshot_path,
+            config=_config(),
+            output_dir=self.root / "fixed-probe",
+            max_steps=7,
+            save_every=7,
+        )
+        self.assertEqual(len(model.probe_batches), 2)
+        self.assertEqual(
+            set(model.probe_batches[0]), set(model.probe_batches[1])
+        )
+        for key in model.probe_batches[0]:
+            torch.testing.assert_close(
+                model.probe_batches[0][key],
+                model.probe_batches[1][key],
+                rtol=0,
+                atol=0,
+            )
+        self.assertTrue(np.isfinite(result.initial_loss))
+        self.assertTrue(np.isfinite(result.final_loss))
+        self.assertNotEqual(result.initial_loss, result.final_loss)
 
     def test_reduced_width_actor_trains_only_the_expert_action_prefix(self):
         # Mirror the production 11-D VisionActor / 26-D replay contract.

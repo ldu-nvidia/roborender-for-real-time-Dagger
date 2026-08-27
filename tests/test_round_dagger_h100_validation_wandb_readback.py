@@ -120,6 +120,10 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
                 "world_size": 8,
             },
         ]
+        # Optimizer telemetry is deliberately a training-batch loss.  The
+        # result/checkpoint baseline is the separate deterministic eval probe
+        # and therefore need not equal the first optimizer row.
+        self.probe_initial_loss = 1.25
         self.full_telemetry = self.root / "full.jsonl"
         self.resumed_telemetry = self.root / "resumed.jsonl"
         payload = "".join(json.dumps(row, sort_keys=True) + "\n" for row in self.rows)
@@ -135,10 +139,16 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
         self.stopped_checkpoint.chmod(0o444)
 
         self.full_result = self._publish_result(
-            "full", self.full_checkpoint, initial_loss=1.0, final_loss=0.75
+            "full",
+            self.full_checkpoint,
+            initial_loss=self.probe_initial_loss,
+            final_loss=0.75,
         )
         self.resumed_result = self._publish_result(
-            "resumed", self.resumed_checkpoint, initial_loss=1.0, final_loss=0.75
+            "resumed",
+            self.resumed_checkpoint,
+            initial_loss=self.probe_initial_loss,
+            final_loss=0.75,
         )
         self.resume_evidence = self.root / "strict_resume.json"
         self._publish_resume_evidence()
@@ -180,7 +190,7 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
             "replay_snapshot_sha256": self.snapshot_sha,
             "replay_snapshot_file_sha256": self.snapshot_file_sha,
             "completed_steps": completed_steps,
-            "initial_loss": 1.0,
+            "initial_loss": self.probe_initial_loss,
             "world_size": 8,
             "model_state_dict": policy_state,
             "optimizer_state_dict": {"state": {}, "param_groups": []},
@@ -301,6 +311,8 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
         self.assertFalse(report["uninterrupted_comparator"]["wandb_enabled"])
         self.assertTrue(report["resumed_execution"]["wandb_enabled"])
         self.assertEqual(report["canonical_run"]["history_steps"], [1, 2])
+        self.assertEqual(report["initial_loss"], self.probe_initial_loss)
+        self.assertNotEqual(report["initial_loss"], self.rows[0]["loss"])
         self.assertEqual(
             report["stopped_checkpoint_sha256"],
             sha256_file(self.stopped_checkpoint),

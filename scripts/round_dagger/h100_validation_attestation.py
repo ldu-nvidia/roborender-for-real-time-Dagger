@@ -716,11 +716,9 @@ def build_attestation(
         != resumed_result_document["initial_loss"]
         or resumed_checkpoint_document["initial_loss"]
         != resumed_result_document["initial_loss"]
-        or full_result["initial_loss"] != uninterrupted_rows[0]["loss"]
-        or resumed_result_document["initial_loss"] != resumed_rows[0]["loss"]
     ):
         raise H100ValidationAttestationError(
-            "checkpoint, result, and telemetry loss lineage mismatch"
+            "checkpoint and result deterministic-probe loss lineage mismatch"
         )
 
     try:

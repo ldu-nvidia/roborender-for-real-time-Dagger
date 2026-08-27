@@ -56,6 +56,7 @@ TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 CUDA_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+_PROBE_SEED_DOMAIN = b"fast_roborender.round_dagger.loss_probe.v1"
 
 
 class LearnerError(RuntimeError):
@@ -875,6 +876,69 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
+def _probe_seed(seed: int, rank: int) -> int:
+    """Derive a stable RNG/sampling seed outside the optimizer schedule."""
+
+    digest = hashlib.sha256(
+        _PROBE_SEED_DOMAIN
+        + b":"
+        + str(_true_int(seed, "seed")).encode("ascii")
+        + b":"
+        + str(_true_int(rank, "rank")).encode("ascii")
+    ).digest()
+    # Keep the seed in the range accepted by every supported Torch backend.
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
+def _evaluate_loss_probe(
+    model: nn.Module,
+    *,
+    partition: ReplayPartition,
+    indices: Sequence[int],
+    adapter: PolicyAdapter,
+    device: torch.device,
+    train_action_slice: tuple[int, int] | None,
+    seed: int,
+    rank: int,
+    world_size: int,
+) -> float:
+    """Evaluate one immutable replay probe without perturbing training state.
+
+    The same rank-local examples, eval mode, and domain-separated RNG state are
+    used before and after optimization.  Saving and restoring all RNG streams
+    makes the probe observational: stochastic policy code cannot change the
+    subsequent optimizer trajectory or restart frontier.
+    """
+
+    prior_training = model.training
+    prior_rng_state = _rng_state()
+    try:
+        probe_seed = _probe_seed(seed, rank)
+        random.seed(probe_seed)
+        np.random.seed(probe_seed % (2**32))
+        torch.manual_seed(probe_seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(probe_seed)
+        model.eval()
+        observations, targets = partition.batch(indices, device=device)
+        with torch.no_grad():
+            loss = supervised_action_loss(
+                adapter.actions(model, observations),
+                targets,
+                train_action_slice,
+            )
+        if not torch.isfinite(loss):
+            raise LearnerError("non-finite deterministic loss probe")
+        scalar = loss.detach()
+    finally:
+        model.train(prior_training)
+        _restore_rng_state(prior_rng_state)
+    if world_size > 1:
+        torch.distributed.all_reduce(scalar, op=torch.distributed.ReduceOp.SUM)
+        scalar = scalar / world_size
+    return float(scalar.cpu())
+
+
 def _atomic_torch_save(path: Path, document: Mapping[str, Any]) -> None:
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -943,10 +1007,9 @@ def _checkpoint_document(
         "replay_snapshot_sha256": snapshot["snapshot_sha256"],
         "replay_snapshot_file_sha256": snapshot["file_sha256"],
         "completed_steps": completed_steps,
-        # This is the loss observed at optimizer step zero, before the first
-        # update.  Keeping it in the restart frontier prevents a resumed run
-        # from silently replacing the experiment baseline with the first loss
-        # seen after the interruption.
+        # This is the eval-mode loss on the deterministic replay probe before
+        # the first update.  Keeping it in the restart frontier prevents a
+        # resumed run from replacing the comparable experiment baseline.
         "initial_loss": initial_loss,
         "world_size": world_size,
         "model_state_dict": policy_state,
@@ -1257,7 +1320,24 @@ def train_from_replay(
         partition.transition_count, config.batch_size, seed=config.seed
     )
     adapter = adapter or MappingPolicyAdapter(config.output_key)
-    final_loss: float | None = None
+    probe_schedule = DeterministicBatchSchedule(
+        partition.transition_count,
+        config.batch_size,
+        seed=_probe_seed(config.seed, rank),
+    )
+    probe_indices = probe_schedule.indices(0)
+    if first_loss is None:
+        first_loss = _evaluate_loss_probe(
+            model,
+            partition=partition,
+            indices=probe_indices,
+            adapter=adapter,
+            device=device,
+            train_action_slice=config.train_action_slice,
+            seed=config.seed,
+            rank=rank,
+            world_size=world_size,
+        )
     model.train()
     for step in range(completed_steps, training_frontier):
         observations, targets = partition.batch(schedule.indices(step), device=device)
@@ -1273,9 +1353,6 @@ def train_from_replay(
             torch.distributed.all_reduce(scalar, op=torch.distributed.ReduceOp.SUM)
             scalar = scalar / world_size
         loss_value = float(scalar.cpu())
-        if first_loss is None:
-            first_loss = loss_value
-        final_loss = loss_value
         completed_steps = step + 1
         if rank == 0 and telemetry is not None:
             telemetry.log(
@@ -1352,22 +1429,21 @@ def train_from_replay(
         if world_size > 1:
             torch.distributed.barrier()
 
-    # Report a deterministic post-update loss.  This is deliberately an eval
-    # pass and is not serialized into the restart RNG frontier.
-    model.eval()
-    observations, targets = partition.batch(
-        schedule.indices(max(0, completed_steps - 1)), device=device
+    # Compare the updated policy on exactly the same examples, eval mode, and
+    # deterministic RNG stream as the pre-update baseline.  This probe is
+    # deliberately observational and is not serialized into the restart RNG
+    # frontier.
+    final_loss = _evaluate_loss_probe(
+        model,
+        partition=partition,
+        indices=probe_indices,
+        adapter=adapter,
+        device=device,
+        train_action_slice=config.train_action_slice,
+        seed=config.seed,
+        rank=rank,
+        world_size=world_size,
     )
-    with torch.no_grad():
-        evaluated = supervised_action_loss(
-            adapter.actions(model, observations), targets, config.train_action_slice
-        )
-    if world_size > 1:
-        torch.distributed.all_reduce(evaluated, op=torch.distributed.ReduceOp.SUM)
-        evaluated = evaluated / world_size
-    final_loss = float(evaluated.cpu())
-    if first_loss is None:
-        first_loss = final_loss
     return TrainResult(
         completed_steps=completed_steps,
         target_steps=max_steps,

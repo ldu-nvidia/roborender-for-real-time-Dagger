@@ -597,9 +597,7 @@ def readback(
         expected_checkpoint_sha256=resumed_checkpoint_sha,
     )
     if (
-        comparator_result_doc["initial_loss"] != comparator_rows[0]["loss"]
-        or resumed_result_doc["initial_loss"] != resumed_rows[0]["loss"]
-        or comparator_checkpoint_doc["initial_loss"]
+        comparator_checkpoint_doc["initial_loss"]
         != comparator_result_doc["initial_loss"]
         or stopped_checkpoint_doc["initial_loss"]
         != resumed_result_doc["initial_loss"]
@@ -607,7 +605,7 @@ def readback(
         != resumed_result_doc["initial_loss"]
     ):
         raise H100ValidationReadbackError(
-            "checkpoint, result, and telemetry initial losses differ"
+            "checkpoint and result deterministic-probe initial losses differ"
         )
     if (
         comparator_result_doc["initial_loss"]
