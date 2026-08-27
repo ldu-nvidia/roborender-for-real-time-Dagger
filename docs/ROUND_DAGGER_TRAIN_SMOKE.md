@@ -17,7 +17,8 @@ identity, and refuses to run without the explicit acknowledgement
 Run two cohorts concurrently, then reuse the GPUs for the second wave:
 
 ```bash
-cd /mnt/data1/ldu/research/fast_roborender
+REPO=$(git rev-parse --show-toplevel)
+cd "$REPO"
 PLAN=/mnt/data2/ldu/roborender_round_dagger_validation/actor_train_smoke_4cohort_1env_2step_v1/plan.json
 ROOT=/mnt/data2/ldu/roborender_round_dagger_validation/actor_train_smoke_4cohort_1env_2step_v1
 
@@ -47,7 +48,7 @@ wait "$pid3"
 Verify all four immutable seals and exact aggregate coverage:
 
 ```bash
-PYTHONPATH=/mnt/data1/ldu/research/fast_roborender \
+PYTHONPATH="$REPO" \
   /mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python \
   -m round_dagger.train_smoke validate --plan "$PLAN"
 ```

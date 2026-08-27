@@ -21,6 +21,9 @@ CAMPAIGN_CONTRACT = ROOT / "configs/round_dagger/production_campaign_256x300.jso
 LEARNER_CONTRACT = ROOT / "configs/round_dagger/production_learner_8xh100_500.json"
 SOURCE_SHA = "a" * 64
 RUNTIME_SHA = "b" * 64
+EVALUATION_CONFIG_SHA = (
+    "bd3d61082149e3b87855ea3ab396e7cae7479d9bfe9d9d3aab99c839353ed7a2"
+)
 # Independently cross-checked against prepare_gr00t_learner_bundle.prepare_bundle
 # in the Torch-enabled learner environment for this deterministic fixture.
 EXPECTED_DERIVED_BUNDLE_SHA = (
@@ -141,7 +144,7 @@ class ProductionLaunchTests(unittest.TestCase):
             teacher_sha256="943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38",
             renderer_sha256="a82f639a9038789db220793475dfce3eb5651ff3145287be748f387a20caeb9f",
             camera_mapping_sha256="53234dfe2eab9b1ae02df21e143f996ecde831aadb8aacb2e5f2df632d3d8d27",
-            training_config_sha256="e29857c6e4b51bc2241c6e1101c0bff12204ca6dc8d81070169d6b8927fe7933",
+            training_config_sha256=EVALUATION_CONFIG_SHA,
             beta_schedule={
                 "kind": "linear",
                 "start": 1.0,
@@ -188,7 +191,7 @@ class ProductionLaunchTests(unittest.TestCase):
             "learner_code_sha256": learner_code_sha,
             "learner_config_sha256": learner_config_sha or derived_bundle_sha,
             "learner_model_lineage_sha256": active["checkpoint_sha256"],
-            "evaluator_config_sha256": "e29857c6e4b51bc2241c6e1101c0bff12204ca6dc8d81070169d6b8927fe7933",
+            "evaluator_config_sha256": EVALUATION_CONFIG_SHA,
             "hooks": hooks,
         }
         config_path = self.base / "macro-round-000000.json"
@@ -254,7 +257,7 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(campaign["wandb"]["entity"], "nvidia")
         self.assertEqual(
             campaign["wandb"]["netrc"],
-            str(ROOT / "runtime/round_dagger_credentials/.netrc"),
+            str(production_launch.WANDB_NETRC),
         )
         self.assertEqual(learner["allocation"]["gpus_per_node"], 8)
         self.assertEqual(learner["allocation"]["global_batch_size"], 64)
@@ -396,7 +399,7 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertEqual(
             environment["ROUND_DAGGER_WANDB_NETRC"],
-            str(ROOT / "runtime/round_dagger_credentials/.netrc"),
+            str(production_launch.WANDB_NETRC),
         )
         self.assertEqual(environment["IMAGE_DAGGER_TELEMETRY_REQUIRE_VIDEO"], "1")
         self.assertEqual(

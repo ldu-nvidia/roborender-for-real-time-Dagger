@@ -19,7 +19,7 @@ digests.
 ```bash
 set -Eeuo pipefail
 
-ROOT=/mnt/data1/ldu/research/fast_roborender
+ROOT=$(git rev-parse --show-toplevel)
 GR00T_ROOT=$ROOT/GR00T-VisualSim2Real
 HOST_PY=/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python
 IMAGE=roborender-round-actor:isaaclab2.3.0-local-v2

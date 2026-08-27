@@ -9,7 +9,7 @@
 set -uo pipefail
 
 # Paths default to the OCI/Lustre layout; override any of them for another machine, e.g.
-#   ROOT=/mnt/data1/ldu/research/fast_roborender \
+#   ROOT=$(git rev-parse --show-toplevel) \
 #   IMAGE3F=/opt/roborender_image_model_accelerated \
 #   VIRAL_PY=$CONDA_PREFIX/bin/python  bash scripts/setup/check_env.sh
 ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}

@@ -41,7 +41,7 @@ Use a new sibling log path because the fleet directory itself must not exist
 before launch:
 
 ```bash
-ROOT=/mnt/data1/ldu/research/fast_roborender
+ROOT=$(git rev-parse --show-toplevel)
 FLEET=/mnt/data2/ldu/round_dagger/fleets/actor_round_000
 SUPERVISOR_LOG=${FLEET}.supervisor.log
 
@@ -88,6 +88,6 @@ status probing, STOP/ACK hashing, zero child exits, and endpoint cleanup without
 starting Image3F or allocating a GPU:
 
 ```bash
-cd /mnt/data1/ldu/research/fast_roborender
+cd "$(git rev-parse --show-toplevel)"
 python -m unittest -v tests.test_local_image3f_fleet
 ```

@@ -71,6 +71,8 @@ SAFE_REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9_./-]+")
 VALIDATION_ROOT = Path("/mnt/data2/ldu/roborender_round_dagger_validation")
 BOOTSTRAP_ROOT = VALIDATION_ROOT / "fresh_bootstrap_v5_20260825T0456Z"
 FLEET_ROOT = VALIDATION_ROOT / "fleet_two_gpu_provenance_v2"
+PRODUCTION_ASSET_ROOT = Path("/mnt/data2/ldu/roborender_round_dagger_assets")
+WANDB_NETRC = Path("/mnt/data2/ldu/roborender_round_dagger_credentials/.netrc")
 CAMERA_ACCEPTANCE = (
     VALIDATION_ROOT
     / "production_inputs_v1/camera/camera_calibration_acceptance.json"
@@ -86,10 +88,10 @@ TEACHER_CHECKPOINT = REPOSITORY_ROOT / TEACHER_CHECKPOINT_RELATIVE
 PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE = Path(
     "configs/round_dagger/production_campaign_256x300.json"
 )
-ANCHOR_POOL = REPOSITORY_ROOT / "runtime/hsg_stage_transfer/anchor_pool_2048"
+ANCHOR_POOL = PRODUCTION_ASSET_ROOT / "anchor_pool_2048"
 EVALUATION_CONFIG = (
     VALIDATION_ROOT
-    / "actor_train_smoke_4cohort_1env_2step_v1/cohort_00/run/config.yaml"
+    / "production_inputs_v2/evaluation/config.yaml"
 )
 OCI_STAGE_ROOT = Path(
     "/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/"
@@ -497,7 +499,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
             "authorization_scope": "team",
             "project": "roborender-round-dagger",
             "python": "/opt/round-dagger-rtx/bin/python",
-            "netrc": str(REPOSITORY_ROOT / "runtime/round_dagger_credentials/.netrc"),
+            "netrc": str(WANDB_NETRC),
         },
         "actor W&B identity",
     )
@@ -517,7 +519,7 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
     _require_equal(evaluation["hydra_config_path"], str(EVALUATION_CONFIG), "evaluation Hydra config path")
     _require_equal(
         evaluation["hydra_config_sha256"],
-        "e29857c6e4b51bc2241c6e1101c0bff12204ca6dc8d81070169d6b8927fe7933",
+        "bd3d61082149e3b87855ea3ab396e7cae7479d9bfe9d9d3aab99c839353ed7a2",
         "evaluation Hydra config identity",
     )
     _require_equal(
