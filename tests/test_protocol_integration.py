@@ -88,6 +88,14 @@ class StoreBackedServer:
                                 "lagged_reference_history": True,
                                 "server_incarnation_binding": True,
                                 "reference_lag_max": 512,
+                                "output_views": [
+                                    "head_color",
+                                    "hand_left",
+                                    "hand_right",
+                                ],
+                                "output_layout": "vertical",
+                                "output_tile_shape_hwc": [240, 416, 3],
+                                "output_stacked_shape_hwc": [720, 416, 3],
                             },
                         },
                     )
