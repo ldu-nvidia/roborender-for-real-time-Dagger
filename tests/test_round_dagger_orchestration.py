@@ -24,6 +24,7 @@ from round_dagger.orchestration import (
     _public_wandb_config,
     validate_production_topology,
 )
+from round_dagger.seed_policy import derive_actor_seed_contract
 from scripts.scaling import wandb_run_watcher
 from tests.policy_bundle_helpers import publish_policy_bundle
 
@@ -166,6 +167,7 @@ class FakeBackend:
 
     def _report(self, index):
         start = index * ENVIRONMENTS_PER_COHORT
+        global_env_ids = list(range(start, start + ENVIRONMENTS_PER_COHORT))
         return {
             "campaign_id": self.campaign["campaign_id"],
             "macro_round": 0,
@@ -174,10 +176,8 @@ class FakeBackend:
             "sealed": True,
             "expected_ranks": [0, 1],
             "ranks": [0, 1],
-            "expected_global_env_ids": list(
-                range(start, start + ENVIRONMENTS_PER_COHORT)
-            ),
-            "global_env_ids": list(range(start, start + ENVIRONMENTS_PER_COHORT)),
+            "expected_global_env_ids": global_env_ids,
+            "global_env_ids": global_env_ids,
             "expected_transitions": TRANSITIONS_PER_COHORT,
             "transition_count": TRANSITIONS_PER_COHORT,
             "policy_sha256": SHA["policy"],
@@ -187,6 +187,17 @@ class FakeBackend:
             "beta_sha256": SHA["beta"],
             "config_sha256": SHA["training"],
             "cohort_sha256": f"{index + 1:064x}",
+            "actor_seed_contract": derive_actor_seed_contract(
+                campaign_id=self.campaign["campaign_id"],
+                macro_round=0,
+                cohort_index=index,
+                expected_ranks=[0, 1],
+                expected_global_env_ids=global_env_ids,
+            ),
+            "physical_teacher_trajectory_sha256_by_global_env": {
+                str(global_env_id): f"{global_env_id + 1:064x}"
+                for global_env_id in global_env_ids
+            },
         }
 
     def complete_cohort(self, path):

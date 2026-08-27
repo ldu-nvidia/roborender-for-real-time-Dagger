@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from round_dagger import artifacts
+from round_dagger.seed_policy import derive_actor_seed_contract
 from scripts.round_dagger.verify_anchor_pool import (
     AnchorPoolError,
     AnchorRecord,
@@ -219,6 +220,13 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
             ),
             beta_sha256="5" * 64,
             config_sha256="6" * 64,
+            actor_seed_contract=derive_actor_seed_contract(
+                campaign_id="production-collect-dry-run",
+                macro_round=0,
+                cohort_index=0,
+                expected_ranks=[0, 1],
+                expected_global_env_ids=list(range(64)),
+            ),
         )
 
     def tearDown(self) -> None:

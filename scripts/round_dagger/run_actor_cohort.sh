@@ -126,6 +126,43 @@ if contract.get("action_contract") != {
     raise SystemExit("cohort action contract mismatch")
 PY
 
+mapfile -t ACTOR_SEEDS < <(
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+        "$ROUND_DAGGER_COHORT_DIR/contract.json" "$ACTOR_RANK" <<'PY'
+import sys
+
+from round_dagger.artifacts import load_strict_json
+from round_dagger.seed_policy import rank_seed_assignment, validate_actor_seed_contract
+
+path, rank = sys.argv[1:]
+contract = load_strict_json(path)
+seed_contract = validate_actor_seed_contract(
+    contract.get("actor_seed_contract"),
+    campaign_id=contract["campaign_id"],
+    macro_round=contract["macro_round"],
+    cohort_index=contract["cohort_index"],
+    expected_ranks=contract["expected_ranks"],
+    expected_global_env_ids=contract["expected_global_env_ids"],
+)
+assignment = rank_seed_assignment(seed_contract, int(rank))
+print(seed_contract["simulator_base_seed"])
+print(assignment["simulator_seed"])
+print(assignment["generation_seed"])
+PY
+)
+[[ ${#ACTOR_SEEDS[@]} == 3 ]] || {
+    echo "actor seed contract did not resolve exactly three runtime values" >&2
+    exit 2
+}
+export ROUND_DAGGER_SIMULATOR_BASE_SEED=${ACTOR_SEEDS[0]}
+export ROUND_DAGGER_SIMULATOR_SEED=${ACTOR_SEEDS[1]}
+export ROUND_DAGGER_GENERATION_SEED=${ACTOR_SEEDS[2]}
+[[ $((10#$ROUND_DAGGER_SIMULATOR_BASE_SEED + 10#$ACTOR_RANK)) == \
+    10#$ROUND_DAGGER_SIMULATOR_SEED ]] || {
+    echo "actor simulator seed does not match trainer rank-offset semantics" >&2
+    exit 2
+}
+
 EXPECTED_RENDERERS=${ROUND_DAGGER_EXPECTED_RENDERERS:-2}
 EP_LIST=$(python3 - "$IMAGE3F_ENDPOINT_MANIFEST" "$EXPECTED_RENDERERS" <<'PY'
 import json
@@ -206,6 +243,7 @@ unset MASTER_ADDR MASTER_PORT
 COMMAND=(
     "$GR00T_PYTHON" "$GR00T_ROOT/gr00t/rl/train_agent_trl.py"
     +exp=loco_manip/wsdpt_round_actor_3view
+    seed="$ROUND_DAGGER_SIMULATOR_BASE_SEED"
     num_envs=32 algo.config.num_steps_per_env=300
     algo.config.num_learning_epochs=0
     algo.config.rollout_with_teacher_num_steps=0
@@ -217,6 +255,7 @@ COMMAND=(
     ++algo.config.videogen.beta_end="$ROUND_DAGGER_BETA"
     ++algo.config.videogen.beta_decay_iters=1
     ++algo.config.videogen.reference_lag=256
+    algo.config.videogen.seed="$ROUND_DAGGER_GENERATION_SEED"
     algo.trl.num_total_batches=1 algo.trl.total_episodes=null
     checkpoint="$ROUND_DAGGER_POLICY_CHECKPOINT" resume=false
     teacher_actor_path="$ROUND_DAGGER_TEACHER_CHECKPOINT"

@@ -35,6 +35,7 @@ from round_dagger import (
     policy_bundle,
     promotion,
     replay,
+    seed_policy,
     state,
 )
 from scripts.round_dagger import verify_sealed_source_snapshot as source_seal
@@ -863,6 +864,16 @@ class ProductionBackend:
         cohort_index: int,
     ) -> None:
         start = cohort_index * ENVIRONMENTS_PER_COHORT
+        expected_global_env_ids = list(
+            range(start, start + ENVIRONMENTS_PER_COHORT)
+        )
+        actor_seed_contract = seed_policy.derive_actor_seed_contract(
+            campaign_id=campaign["campaign_id"],
+            macro_round=self.config.macro_round,
+            cohort_index=cohort_index,
+            expected_ranks=EXPECTED_ACTOR_RANKS,
+            expected_global_env_ids=expected_global_env_ids,
+        )
         artifacts.create_cohort(
             path,
             campaign_id=campaign["campaign_id"],
@@ -870,7 +881,7 @@ class ProductionBackend:
             cohort_index=cohort_index,
             purpose="train",
             expected_ranks=EXPECTED_ACTOR_RANKS,
-            expected_global_env_ids=list(range(start, start + ENVIRONMENTS_PER_COHORT)),
+            expected_global_env_ids=expected_global_env_ids,
             expected_transitions=TRANSITIONS_PER_COHORT,
             view_contract={
                 "dtype": "uint8",
@@ -885,6 +896,7 @@ class ProductionBackend:
             renderer_sha256=contract["renderer_sha256"],
             beta_sha256=contract["beta_sha256"],
             config_sha256=contract["training_config_sha256"],
+            actor_seed_contract=actor_seed_contract,
         )
 
     def _actor_run_dir(self, path: Path) -> Path | None:
@@ -1351,6 +1363,16 @@ def _validate_cohort_report(
     cohort_index: int,
 ) -> None:
     start = cohort_index * ENVIRONMENTS_PER_COHORT
+    expected_global_env_ids = list(
+        range(start, start + ENVIRONMENTS_PER_COHORT)
+    )
+    expected_seed_contract = seed_policy.derive_actor_seed_contract(
+        campaign_id=campaign["campaign_id"],
+        macro_round=config.macro_round,
+        cohort_index=cohort_index,
+        expected_ranks=EXPECTED_ACTOR_RANKS,
+        expected_global_env_ids=expected_global_env_ids,
+    )
     expected = {
         "campaign_id": campaign["campaign_id"],
         "macro_round": config.macro_round,
@@ -1359,10 +1381,8 @@ def _validate_cohort_report(
         "sealed": True,
         "expected_ranks": list(EXPECTED_ACTOR_RANKS),
         "ranks": list(EXPECTED_ACTOR_RANKS),
-        "expected_global_env_ids": list(
-            range(start, start + ENVIRONMENTS_PER_COHORT)
-        ),
-        "global_env_ids": list(range(start, start + ENVIRONMENTS_PER_COHORT)),
+        "expected_global_env_ids": expected_global_env_ids,
+        "global_env_ids": expected_global_env_ids,
         "expected_transitions": TRANSITIONS_PER_COHORT,
         "transition_count": TRANSITIONS_PER_COHORT,
         "policy_sha256": contract["policy_checkpoint_sha256"],
@@ -1371,11 +1391,26 @@ def _validate_cohort_report(
         "renderer_sha256": contract["renderer_sha256"],
         "beta_sha256": contract["beta_sha256"],
         "config_sha256": contract["training_config_sha256"],
+        "actor_seed_contract": expected_seed_contract,
     }
     mismatches = [key for key, value in expected.items() if report.get(key) != value]
     if mismatches:
         raise OrchestrationError(
             f"cohort {cohort_index} failed exact production postconditions: {mismatches}"
+        )
+    fingerprints = report.get(
+        "physical_teacher_trajectory_sha256_by_global_env"
+    )
+    if (
+        not isinstance(fingerprints, Mapping)
+        or set(fingerprints) != {str(item) for item in expected_global_env_ids}
+        or any(
+            not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+            for value in fingerprints.values()
+        )
+    ):
+        raise OrchestrationError(
+            f"cohort {cohort_index} lacks exact physical/teacher trajectory provenance"
         )
 
 

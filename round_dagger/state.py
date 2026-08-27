@@ -1042,6 +1042,50 @@ def _verified_collection_cohorts(
         reports[index] = (report, relative)
     if set(reports) != set(range(campaign["cohort_count"])):
         raise StateError("collection cohort indices are not exactly 0..cohort_count-1")
+    seed_provenance = [
+        "actor_seed_contract" in reports[index][0]
+        for index in range(campaign["cohort_count"])
+    ]
+    if any(seed_provenance) and not all(seed_provenance):
+        raise StateError(
+            "collection mixes cohorts with and without actor seed provenance"
+        )
+    if all(seed_provenance):
+        simulator_seeds: dict[int, tuple[int, int]] = {}
+        generation_seeds: dict[int, tuple[int, int]] = {}
+        trajectory_digests: dict[str, tuple[int, str]] = {}
+        for index in range(campaign["cohort_count"]):
+            report = reports[index][0]
+            seed_contract = report["actor_seed_contract"]
+            for assignment in seed_contract["assignments"]:
+                rank = int(assignment["rank"])
+                simulator_seed = int(assignment["simulator_seed"])
+                generation_seed = int(assignment["generation_seed"])
+                if simulator_seed in simulator_seeds:
+                    previous = simulator_seeds[simulator_seed]
+                    raise StateError(
+                        "collection reuses simulator seed "
+                        f"{simulator_seed} across cohort/rank {previous} and {(index, rank)}"
+                    )
+                if generation_seed in generation_seeds:
+                    previous = generation_seeds[generation_seed]
+                    raise StateError(
+                        "collection reuses Image3F generation seed "
+                        f"{generation_seed} across cohort/rank {previous} and {(index, rank)}"
+                    )
+                simulator_seeds[simulator_seed] = (index, rank)
+                generation_seeds[generation_seed] = (index, rank)
+            fingerprints = report[
+                "physical_teacher_trajectory_sha256_by_global_env"
+            ]
+            for global_env_id, digest in fingerprints.items():
+                if digest in trajectory_digests:
+                    previous = trajectory_digests[digest]
+                    raise StateError(
+                        "collection contains a repeated physical/teacher trajectory "
+                        f"for cohort/env {previous} and {(index, global_env_id)}"
+                    )
+                trajectory_digests[digest] = (index, global_env_id)
     entries = [
         {
             "cohort_index": index,

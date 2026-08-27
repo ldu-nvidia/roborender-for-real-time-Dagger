@@ -27,6 +27,8 @@ from typing import Any, BinaryIO
 
 import numpy as np
 
+from round_dagger.seed_policy import ActorSeedError, validate_actor_seed_contract
+
 
 COHORT_CONTRACT_SCHEMA = "fast_roborender.round_dagger.cohort_contract.v1"
 SHARD_SCHEMA = "fast_roborender.round_dagger.rollout_shard.v1"
@@ -81,6 +83,11 @@ _REFERENCE_PROVENANCE_ARRAYS = {
     "conditioning_depth_nonzero_fraction",
     "conditioning_mask_nonzero_fraction",
 }
+
+_ACTOR_SEED_FIELD = "actor_seed_contract"
+_TRAJECTORY_FINGERPRINT_FIELD = (
+    "physical_teacher_trajectory_sha256_by_global_env"
+)
 
 _CONTRACT_KEYS = {
     "schema",
@@ -468,7 +475,12 @@ def _validate_action_contract(value: Any) -> dict[str, Any]:
 
 
 def _validate_contract(document: Any) -> dict[str, Any]:
-    contract = _require_exact_keys(document, _CONTRACT_KEYS, "cohort contract")
+    if not isinstance(document, Mapping):
+        raise ArtifactError("cohort contract must be a mapping")
+    keys = _CONTRACT_KEYS | (
+        {_ACTOR_SEED_FIELD} if _ACTOR_SEED_FIELD in document else set()
+    )
+    contract = _require_exact_keys(document, keys, "cohort contract")
     if contract["schema"] != COHORT_CONTRACT_SCHEMA:
         raise ArtifactError("cohort contract schema mismatch")
     _require_token(contract["campaign_id"], "campaign_id")
@@ -496,6 +508,18 @@ def _validate_contract(document: Any) -> dict[str, Any]:
     _validate_action_contract(contract["action_contract"])
     for field in _DIGEST_FIELDS:
         _require_sha256(contract[field], field)
+    if _ACTOR_SEED_FIELD in contract:
+        try:
+            validate_actor_seed_contract(
+                contract[_ACTOR_SEED_FIELD],
+                campaign_id=contract["campaign_id"],
+                macro_round=contract["macro_round"],
+                cohort_index=contract["cohort_index"],
+                expected_ranks=ranks,
+                expected_global_env_ids=envs,
+            )
+        except ActorSeedError as exc:
+            raise ArtifactError(f"invalid actor seed contract: {exc}") from exc
     return contract
 
 
@@ -517,6 +541,7 @@ def create_cohort(
     renderer_sha256: str,
     beta_sha256: str,
     config_sha256: str,
+    actor_seed_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create an immutable cohort contract and its empty shard directory."""
 
@@ -554,6 +579,8 @@ def create_cohort(
         "beta_sha256": beta_sha256,
         "config_sha256": config_sha256,
     }
+    if actor_seed_contract is not None:
+        contract[_ACTOR_SEED_FIELD] = dict(actor_seed_contract)
     contract = _validate_contract(contract)
     publish_immutable_json(cohort_dir / CONTRACT_FILENAME, contract)
     _ensure_directory(cohort_dir / SHARD_DIRECTORY)
@@ -587,6 +614,49 @@ def _finite_numeric(array: np.ndarray, label: str) -> None:
         raise ArtifactError(f"{label} must have a numeric or bool dtype")
     if np.issubdtype(array.dtype, np.inexact) and not np.isfinite(array).all():
         raise ArtifactError(f"{label} contains non-finite values")
+
+
+def _physical_teacher_trajectory_fingerprints(
+    arrays: Mapping[str, np.ndarray], env_vector: np.ndarray
+) -> dict[str, str]:
+    """Hash state/teacher trajectories without cohort or logical-env identity.
+
+    Excluding rendered RGB and student/behavior actions makes this a direct gate
+    for duplicated physical simulator trajectories and expert labels.  Excluding
+    ``global_env_ids`` is intentional: otherwise assigning the same rollout a
+    new logical ID would defeat the duplicate detector.
+    """
+
+    keys = tuple(
+        key
+        for key in (
+            "obs__actor_obs",
+            "expert_actions",
+            "episode_steps",
+            "dones",
+        )
+        if key in arrays
+    )
+    result: dict[str, str] = {}
+    for env_index, raw_global_env_id in enumerate(env_vector.tolist()):
+        digest = hashlib.sha256(
+            b"fast_roborender.round_dagger.physical_teacher_trajectory.v1\x00"
+        )
+        for key in keys:
+            array = np.ascontiguousarray(arrays[key][:, env_index])
+            fields = (
+                key.encode("ascii"),
+                array.dtype.str.encode("ascii"),
+                json.dumps(
+                    list(array.shape), separators=(",", ":"), allow_nan=False
+                ).encode("ascii"),
+                array.tobytes(order="C"),
+            )
+            for field in fields:
+                digest.update(len(field).to_bytes(8, "big"))
+                digest.update(field)
+        result[str(int(raw_global_env_id))] = digest.hexdigest()
+    return result
 
 
 def _validate_arrays(
@@ -845,6 +915,9 @@ def _validate_arrays(
         "transition_count": steps * envs,
         "global_env_ids": sorted(actual_envs),
         "transition_keys": transition_keys,
+        "physical_teacher_trajectory_sha256_by_global_env": (
+            _physical_teacher_trajectory_fingerprints(canonical, env_vector)
+        ),
     }
 
 
@@ -1147,6 +1220,9 @@ def _verify_rollout_shard(sidecar_path: Path) -> dict[str, Any]:
         "part_index": manifest["part_index"],
         "global_env_ids": manifest["global_env_ids"],
         "_transition_keys": validated["transition_keys"],
+        "_physical_teacher_trajectory_sha256_by_global_env": validated[
+            "physical_teacher_trajectory_sha256_by_global_env"
+        ],
         "_manifest": manifest,
     }
 
@@ -1195,7 +1271,11 @@ def _cohort_logical_id(contract: Mapping[str, Any]) -> str:
 
 def _validate_and_summarize_shards(
     cohort_dir: Path, contract: Mapping[str, Any], contract_sha: str
-) -> tuple[list[dict[str, Any]], set[tuple[int, int, int]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    set[tuple[int, int, int]],
+    dict[str, str],
+]:
     reports = [_verify_rollout_shard(path) for path in discover_rollout_shards(cohort_dir)]
     if not reports:
         raise ArtifactError("cannot seal an empty cohort")
@@ -1205,6 +1285,7 @@ def _validate_and_summarize_shards(
     ranks: set[int] = set()
     transitions = 0
     public_reports: list[dict[str, Any]] = []
+    trajectory_fingerprints: dict[str, str] = {}
     for report in reports:
         identity = (report["rank"], report["rollout_id"], report["part_index"])
         if identity in identities:
@@ -1224,6 +1305,15 @@ def _validate_and_summarize_shards(
         transition_keys |= report["_transition_keys"]
         ranks.add(report["rank"])
         transitions += report["transition_count"]
+        shard_fingerprints = report[
+            "_physical_teacher_trajectory_sha256_by_global_env"
+        ]
+        expected_fingerprint_keys = {str(item) for item in shard_envs}
+        if set(shard_fingerprints) != expected_fingerprint_keys:
+            raise ArtifactError(
+                "physical/teacher trajectory fingerprints do not cover shard environments"
+            )
+        trajectory_fingerprints.update(shard_fingerprints)
         public_reports.append(
             {key: value for key, value in report.items() if not key.startswith("_")}
         )
@@ -1242,17 +1332,24 @@ def _validate_and_summarize_shards(
         )
     if len(transition_keys) != transitions:
         raise ArtifactError("cohort transition identities are not unique")
+    if set(trajectory_fingerprints) != {str(item) for item in envs_seen}:
+        raise ArtifactError(
+            "physical/teacher trajectory fingerprint coverage is incomplete"
+        )
     public_reports.sort(key=lambda item: item["shard_id"])
-    return public_reports, transition_keys
+    return public_reports, transition_keys, dict(sorted(trajectory_fingerprints.items()))
 
 
 def _build_seal(
-    contract: Mapping[str, Any], contract_sha: str, shards: Sequence[Mapping[str, Any]]
+    contract: Mapping[str, Any],
+    contract_sha: str,
+    shards: Sequence[Mapping[str, Any]],
+    trajectory_fingerprints: Mapping[str, str],
 ) -> dict[str, Any]:
     transition_count = sum(int(shard["transition_count"]) for shard in shards)
     ranks = sorted({int(shard["rank"]) for shard in shards})
     envs = sorted({int(item) for shard in shards for item in shard["global_env_ids"]})
-    return {
+    seal = {
         "schema": COHORT_SCHEMA,
         "campaign_id": contract["campaign_id"],
         "macro_round": contract["macro_round"],
@@ -1272,10 +1369,27 @@ def _build_seal(
         "shards": [dict(shard) for shard in shards],
         **{field: contract[field] for field in _DIGEST_FIELDS},
     }
+    if _ACTOR_SEED_FIELD in contract:
+        seal[_ACTOR_SEED_FIELD] = dict(contract[_ACTOR_SEED_FIELD])
+        seal[_TRAJECTORY_FINGERPRINT_FIELD] = dict(trajectory_fingerprints)
+    return seal
 
 
 def _validate_seal(document: Any) -> dict[str, Any]:
-    seal = _require_exact_keys(document, _SEAL_KEYS, "cohort seal")
+    if not isinstance(document, Mapping):
+        raise ArtifactError("cohort seal must be a mapping")
+    has_seed = _ACTOR_SEED_FIELD in document
+    has_fingerprints = _TRAJECTORY_FINGERPRINT_FIELD in document
+    if has_seed != has_fingerprints:
+        raise ArtifactError(
+            "cohort seed and physical/teacher fingerprint provenance must be complete"
+        )
+    keys = _SEAL_KEYS | (
+        {_ACTOR_SEED_FIELD, _TRAJECTORY_FINGERPRINT_FIELD}
+        if has_seed
+        else set()
+    )
+    seal = _require_exact_keys(document, keys, "cohort seal")
     if seal["schema"] != COHORT_SCHEMA or seal["sealed"] is not True:
         raise ArtifactError("cohort seal schema or sealed flag is invalid")
     _require_token(seal["campaign_id"], "campaign_id")
@@ -1300,6 +1414,32 @@ def _validate_seal(document: Any) -> dict[str, Any]:
     _require_int(seal["expected_transitions"], "expected_transitions", minimum=1)
     _require_sorted_unique_ints(seal["ranks"], "ranks")
     _require_sorted_unique_ints(seal["global_env_ids"], "global_env_ids")
+    if has_seed:
+        try:
+            validate_actor_seed_contract(
+                seal[_ACTOR_SEED_FIELD],
+                campaign_id=seal["campaign_id"],
+                macro_round=seal["macro_round"],
+                cohort_index=seal["cohort_index"],
+                expected_ranks=seal["expected_ranks"],
+                expected_global_env_ids=seal["expected_global_env_ids"],
+            )
+        except ActorSeedError as exc:
+            raise ArtifactError(f"invalid sealed actor seed contract: {exc}") from exc
+        fingerprints = seal[_TRAJECTORY_FINGERPRINT_FIELD]
+        expected_fingerprint_keys = {
+            str(item) for item in seal["expected_global_env_ids"]
+        }
+        if (
+            not isinstance(fingerprints, Mapping)
+            or set(fingerprints) != expected_fingerprint_keys
+        ):
+            raise ArtifactError(
+                "sealed physical/teacher fingerprints must cover every environment"
+            )
+        for global_env_id, digest in fingerprints.items():
+            _require_int(int(global_env_id), "trajectory fingerprint global_env_id")
+            _require_sha256(digest, "physical/teacher trajectory SHA-256")
     if not isinstance(seal["shards"], list) or not seal["shards"]:
         raise ArtifactError("cohort seal must contain shards")
     shard_ids: list[str] = []
@@ -1338,8 +1478,12 @@ def seal_cohort(cohort_dir: str | os.PathLike[str]) -> dict[str, Any]:
     if (root / SEAL_FILENAME).exists():
         return verify_cohort(root)
     contract, contract_sha = _load_contract(root)
-    reports, _ = _validate_and_summarize_shards(root, contract, contract_sha)
-    seal = _build_seal(contract, contract_sha, reports)
+    reports, _, trajectory_fingerprints = _validate_and_summarize_shards(
+        root, contract, contract_sha
+    )
+    seal = _build_seal(
+        contract, contract_sha, reports, trajectory_fingerprints
+    )
     _validate_seal(seal)
     publish_immutable_json(root / SEAL_FILENAME, seal)
     return verify_cohort(root)
@@ -1365,8 +1509,12 @@ def verify_cohort(path: str | os.PathLike[str]) -> dict[str, Any]:
     contract, contract_sha = _load_contract(root)
     if seal["contract_sha256"] != contract_sha:
         raise ArtifactError("cohort seal references a different contract")
-    reports, _ = _validate_and_summarize_shards(root, contract, contract_sha)
-    expected_seal = _build_seal(contract, contract_sha, reports)
+    reports, _, trajectory_fingerprints = _validate_and_summarize_shards(
+        root, contract, contract_sha
+    )
+    expected_seal = _build_seal(
+        contract, contract_sha, reports, trajectory_fingerprints
+    )
     if seal != expected_seal:
         raise ArtifactError("cohort seal does not exactly match verified shard contents")
     report = dict(seal)

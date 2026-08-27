@@ -24,11 +24,17 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from round_dagger import artifacts as _artifacts
+from round_dagger.seed_policy import ActorSeedError, validate_actor_seed_contract
 
 
 LEDGER_SCHEMA = "fast_roborender.round_dagger.replay_ledger.v1"
 SNAPSHOT_SCHEMA = "fast_roborender.round_dagger.replay_snapshot.v1"
 COHORT_SCHEMA = "fast_roborender.round_dagger.cohort.v1"
+
+_ACTOR_SEED_FIELD = "actor_seed_contract"
+_TRAJECTORY_FINGERPRINT_FIELD = (
+    "physical_teacher_trajectory_sha256_by_global_env"
+)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
@@ -175,6 +181,54 @@ def _cohort_record(path: Path) -> dict[str, Any]:
     action_contract = _exact_mapping(
         document.get("action_contract"), "action_contract"
     )
+    has_seed = _ACTOR_SEED_FIELD in document
+    has_fingerprints = _TRAJECTORY_FINGERPRINT_FIELD in document
+    if has_seed != has_fingerprints:
+        raise ReplayError(
+            "cohort seed and physical/teacher trajectory provenance is incomplete"
+        )
+    actor_seed_contract: dict[str, Any] | None = None
+    trajectory_fingerprints: dict[str, str] | None = None
+    if has_seed:
+        actor_seed_contract = _exact_mapping(
+            document[_ACTOR_SEED_FIELD], _ACTOR_SEED_FIELD
+        )
+        raw_fingerprints = document[_TRAJECTORY_FINGERPRINT_FIELD]
+        if not isinstance(raw_fingerprints, Mapping) or not raw_fingerprints:
+            raise ReplayError(
+                "physical/teacher trajectory fingerprints must be a non-empty mapping"
+            )
+        trajectory_fingerprints = {}
+        for global_env_id, digest in raw_fingerprints.items():
+            if not isinstance(global_env_id, str) or not global_env_id.isdigit():
+                raise ReplayError("trajectory fingerprint environment ID is malformed")
+            trajectory_fingerprints[global_env_id] = _sha256(
+                digest, "physical/teacher trajectory SHA-256"
+            )
+        assignments = actor_seed_contract.get("assignments")
+        if not isinstance(assignments, list):
+            raise ReplayError("actor seed contract assignments are malformed")
+        try:
+            ranks = sorted(int(item["rank"]) for item in assignments)
+            environments = sorted(
+                int(global_env_id)
+                for item in assignments
+                for global_env_id in item["global_env_ids"]
+            )
+            validate_actor_seed_contract(
+                actor_seed_contract,
+                campaign_id=campaign_id,
+                macro_round=macro_round,
+                cohort_index=cohort_index,
+                expected_ranks=ranks,
+                expected_global_env_ids=environments,
+            )
+        except (ActorSeedError, KeyError, TypeError, ValueError) as exc:
+            raise ReplayError(f"invalid actor seed provenance: {exc}") from exc
+        if set(trajectory_fingerprints) != {str(item) for item in environments}:
+            raise ReplayError(
+                "physical/teacher trajectory fingerprints do not cover seeded environments"
+            )
     raw_shards = document.get("shards")
     if not isinstance(raw_shards, list) or not raw_shards:
         raise ReplayError("sealed cohort must contain at least one shard")
@@ -292,7 +346,7 @@ def _cohort_record(path: Path) -> dict[str, Any]:
     declared_logical_id = document.get("logical_id")
     if declared_logical_id is not None and declared_logical_id != logical_id:
         raise ReplayError("cohort logical_id does not match its identity fields")
-    return {
+    record = {
         "logical_id": logical_id,
         "campaign_id": campaign_id,
         "macro_round": macro_round,
@@ -306,6 +360,71 @@ def _cohort_record(path: Path) -> dict[str, Any]:
         "action_contract": action_contract,
         "shards": shards,
     }
+    if actor_seed_contract is not None and trajectory_fingerprints is not None:
+        record[_ACTOR_SEED_FIELD] = actor_seed_contract
+        record[_TRAJECTORY_FINGERPRINT_FIELD] = trajectory_fingerprints
+    return record
+
+
+def _stored_seed_provenance(path: str, expected_sha256: str) -> tuple[Any, Any]:
+    manifest = Path(path)
+    if manifest.is_symlink() or not manifest.is_file():
+        raise ReplayError("accepted cohort manifest is missing or unsafe")
+    if _sha256_file(manifest) != expected_sha256:
+        raise ReplayError("accepted cohort manifest changed after ingestion")
+    document = _verified_document(manifest)
+    return document.get(_ACTOR_SEED_FIELD), document.get(
+        _TRAJECTORY_FINGERPRINT_FIELD
+    )
+
+
+def _reject_repeated_round_provenance(
+    connection: sqlite3.Connection, record: Mapping[str, Any]
+) -> None:
+    """Reject repeated RNG streams or physical trajectories in one macro-round."""
+
+    current_seed = record.get(_ACTOR_SEED_FIELD)
+    current_fingerprints = record.get(_TRAJECTORY_FINGERPRINT_FIELD)
+    rows = connection.execute(
+        "SELECT cohort_index, cohort_manifest_path, manifest_sha256 FROM cohorts "
+        "WHERE campaign_id = ? AND macro_round = ? AND purpose = ?",
+        (record["campaign_id"], record["macro_round"], record["purpose"]),
+    ).fetchall()
+    if not rows:
+        return
+    for row in rows:
+        stored_seed, stored_fingerprints = _stored_seed_provenance(
+            row["cohort_manifest_path"], row["manifest_sha256"]
+        )
+        if (current_seed is None) != (stored_seed is None):
+            raise ReplayError(
+                "macro-round mixes cohorts with and without actor seed provenance"
+            )
+        if current_seed is None:
+            continue
+        current_simulator = {
+            int(item["simulator_seed"]) for item in current_seed["assignments"]
+        }
+        current_generation = {
+            int(item["generation_seed"]) for item in current_seed["assignments"]
+        }
+        stored_simulator = {
+            int(item["simulator_seed"]) for item in stored_seed["assignments"]
+        }
+        stored_generation = {
+            int(item["generation_seed"]) for item in stored_seed["assignments"]
+        }
+        if current_simulator & stored_simulator:
+            raise ReplayError("macro-round reuses an actor simulator seed")
+        if current_generation & stored_generation:
+            raise ReplayError("macro-round reuses an Image3F generation seed")
+        duplicate_trajectories = set(current_fingerprints.values()) & set(
+            stored_fingerprints.values()
+        )
+        if duplicate_trajectories:
+            raise ReplayError(
+                "macro-round contains repeated physical/teacher trajectories"
+            )
 
 
 class ReplayLedger:
@@ -432,6 +551,8 @@ class ReplayLedger:
                     "manifest_sha256": record["manifest_sha256"],
                     "transition_count": existing["transition_count"],
                 }
+
+            _reject_repeated_round_provenance(connection, record)
 
             contract = connection.execute(
                 "SELECT manifest_schema, view_contract_json, action_contract_json "
@@ -582,17 +703,26 @@ class ReplayLedger:
                 (row["logical_id"],),
             ).fetchall()
             shards = [dict(shard) for shard in shard_rows]
-            cohorts.append(
-                {
-                    "logical_id": row["logical_id"],
-                    "macro_round": row["macro_round"],
-                    "cohort_index": row["cohort_index"],
-                    "cohort_manifest_path": row["cohort_manifest_path"],
-                    "manifest_sha256": row["manifest_sha256"],
-                    "transition_count": row["transition_count"],
-                    "shards": shards,
-                }
+            cohort = {
+                "logical_id": row["logical_id"],
+                "macro_round": row["macro_round"],
+                "cohort_index": row["cohort_index"],
+                "cohort_manifest_path": row["cohort_manifest_path"],
+                "manifest_sha256": row["manifest_sha256"],
+                "transition_count": row["transition_count"],
+                "shards": shards,
+            }
+            seed_contract, trajectory_fingerprints = _stored_seed_provenance(
+                row["cohort_manifest_path"], row["manifest_sha256"]
             )
+            if (seed_contract is None) != (trajectory_fingerprints is None):
+                raise ReplayError(
+                    "accepted cohort seed/trajectory provenance is incomplete"
+                )
+            if seed_contract is not None:
+                cohort[_ACTOR_SEED_FIELD] = seed_contract
+                cohort[_TRAJECTORY_FINGERPRINT_FIELD] = trajectory_fingerprints
+            cohorts.append(cohort)
             round_key = str(row["macro_round"])
             cohort_key = f"{row['macro_round']}:{row['cohort_index']}"
             by_round[round_key] = by_round.get(round_key, 0) + row["transition_count"]
@@ -707,6 +837,10 @@ def load_snapshot(
     resolved_shards: list[dict[str, Any]] = []
     by_round: dict[str, int] = {}
     by_round_cohort: dict[str, int] = {}
+    seed_presence_by_round: dict[int, set[bool]] = {}
+    simulator_seeds_by_round: dict[int, set[int]] = {}
+    generation_seeds_by_round: dict[int, set[int]] = {}
+    trajectory_digests_by_round: dict[int, set[str]] = {}
     total = 0
     for cohort_number, raw_cohort in enumerate(raw_cohorts):
         if not isinstance(raw_cohort, Mapping):
@@ -720,8 +854,14 @@ def load_snapshot(
             "transition_count",
             "shards",
         }
-        if set(raw_cohort) != required_cohort:
+        extended_cohort = required_cohort | {
+            _ACTOR_SEED_FIELD,
+            _TRAJECTORY_FINGERPRINT_FIELD,
+        }
+        cohort_keys = set(raw_cohort)
+        if cohort_keys != required_cohort and cohort_keys != extended_cohort:
             raise ReplayError("snapshot cohort has unexpected or missing fields")
+        has_seed = _ACTOR_SEED_FIELD in raw_cohort
         logical_id = str(raw_cohort["logical_id"])
         if logical_id in logical_ids:
             raise ReplayError("snapshot contains a duplicate cohort logical ID")
@@ -751,6 +891,73 @@ def load_snapshot(
         if _sha256_file(cohort_manifest) != manifest_sha:
             raise ReplayError("snapshot cohort manifest digest mismatch at load")
         cohort_root = cohort_manifest.parent
+        stored_seed, stored_fingerprints = _stored_seed_provenance(
+            str(cohort_manifest), manifest_sha
+        )
+        if has_seed:
+            seed_contract = _exact_mapping(
+                raw_cohort[_ACTOR_SEED_FIELD], "snapshot actor seed contract"
+            )
+            fingerprints = _exact_mapping(
+                raw_cohort[_TRAJECTORY_FINGERPRINT_FIELD],
+                "snapshot physical/teacher trajectory fingerprints",
+            )
+            if seed_contract != stored_seed or fingerprints != stored_fingerprints:
+                raise ReplayError(
+                    "snapshot seed/trajectory provenance differs from cohort manifest"
+                )
+            assignments = seed_contract.get("assignments")
+            if not isinstance(assignments, list):
+                raise ReplayError("snapshot actor seed assignments are malformed")
+            try:
+                ranks = sorted(int(item["rank"]) for item in assignments)
+                environments = sorted(
+                    int(global_env_id)
+                    for item in assignments
+                    for global_env_id in item["global_env_ids"]
+                )
+                validate_actor_seed_contract(
+                    seed_contract,
+                    campaign_id=document["campaign_id"],
+                    macro_round=macro_round,
+                    cohort_index=cohort_index,
+                    expected_ranks=ranks,
+                    expected_global_env_ids=environments,
+                )
+            except (ActorSeedError, KeyError, TypeError, ValueError) as exc:
+                raise ReplayError(f"snapshot actor seed provenance is invalid: {exc}") from exc
+            if set(fingerprints) != {str(item) for item in environments}:
+                raise ReplayError(
+                    "snapshot trajectory fingerprints do not cover seeded environments"
+                )
+            for digest in fingerprints.values():
+                _sha256(digest, "snapshot physical/teacher trajectory SHA-256")
+            simulator = {int(item["simulator_seed"]) for item in assignments}
+            generation = {int(item["generation_seed"]) for item in assignments}
+            trajectory = set(fingerprints.values())
+            observed_simulator = simulator_seeds_by_round.setdefault(macro_round, set())
+            observed_generation = generation_seeds_by_round.setdefault(macro_round, set())
+            observed_trajectories = trajectory_digests_by_round.setdefault(
+                macro_round, set()
+            )
+            if observed_simulator & simulator:
+                raise ReplayError("snapshot macro-round reuses an actor simulator seed")
+            if observed_generation & generation:
+                raise ReplayError(
+                    "snapshot macro-round reuses an Image3F generation seed"
+                )
+            if observed_trajectories & trajectory:
+                raise ReplayError(
+                    "snapshot macro-round repeats a physical/teacher trajectory"
+                )
+            observed_simulator.update(simulator)
+            observed_generation.update(generation)
+            observed_trajectories.update(trajectory)
+        elif stored_seed is not None or stored_fingerprints is not None:
+            raise ReplayError(
+                "snapshot omitted seed/trajectory provenance from its cohort manifest"
+            )
+        seed_presence_by_round.setdefault(macro_round, set()).add(has_seed)
 
         raw_shards = raw_cohort["shards"]
         if not isinstance(raw_shards, list) or not raw_shards:
@@ -822,6 +1029,10 @@ def load_snapshot(
 
     if actual_pairs != expected_pairs:
         raise ReplayError("snapshot does not contain a complete ordered round range")
+    if any(len(values) != 1 for values in seed_presence_by_round.values()):
+        raise ReplayError(
+            "snapshot macro-round mixes seeded and legacy cohort provenance"
+        )
     if _true_int(document["transition_count"], "snapshot transition_count") != total:
         raise ReplayError("snapshot total transition count mismatch")
     if document["counts_by_round"] != by_round:
