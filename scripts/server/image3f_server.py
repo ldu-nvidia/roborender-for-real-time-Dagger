@@ -43,23 +43,43 @@ DROID_PARAMS = {
 }
 
 
-def reference_provenance(*, step: int, lag: int, source: str) -> dict[str, object]:
+def reference_provenance(
+    *, step: int, lag: int, source: str, reference_sha256: str
+) -> dict[str, object]:
     """Build a strict proof of the RGB reference selected by the history store."""
 
     step = int(step)
     lag = int(lag)
-    expected_source = "anchor" if step < lag else f"generated_t-{lag}"
+    if step == 0:
+        expected_source = "bootstrap_anchor"
+        kind = "bootstrap_anchor"
+        source_step = -1
+    elif step < lag:
+        expected_source = "generated_episode_frame0"
+        kind = "generated"
+        source_step = 0
+    else:
+        expected_source = f"generated_t-{lag}"
+        kind = "generated"
+        source_step = step - lag
     if source != expected_source:
         raise RuntimeError(
             "reference history/source mismatch: "
             f"step={step} lag={lag} expected={expected_source!r} got={source!r}"
         )
+    if (
+        not isinstance(reference_sha256, str)
+        or len(reference_sha256) != 64
+        or any(value not in "0123456789abcdef" for value in reference_sha256)
+    ):
+        raise RuntimeError("reference SHA-256 is malformed")
     return {
         "schema": REFERENCE_PROVENANCE_SCHEMA,
         "request_step": step,
         "configured_lag": lag,
-        "kind": "anchor" if step < lag else "generated",
-        "source_step": 0 if step < lag else step - lag,
+        "kind": kind,
+        "source_step": source_step,
+        "reference_sha256": reference_sha256,
     }
 
 
@@ -248,16 +268,19 @@ def handle_conn(
                         raise ValueError(
                             f"reference_lag {reference_lag} exceeds server maximum {max_lag}"
                         )
-                    replay = references.replay_with_source(
+                    replay = references.replay_with_provenance(
                         stream_id=stream_id,
                         episode_id=episode_id,
                         step=step,
                         request_id=request_id,
                     )
                     if replay is not None:
-                        replay_views, replay_source = replay
+                        replay_views, replay_source, replay_reference_sha256 = replay
                         provenance = reference_provenance(
-                            step=step, lag=reference_lag, source=replay_source
+                            step=step,
+                            lag=reference_lag,
+                            source=replay_source,
+                            reference_sha256=replay_reference_sha256,
                         )
                         metrics.record_replay()
                         _send_msg(sock, {
@@ -270,18 +293,23 @@ def handle_conn(
                             "inference_ms": 0.0,
                             "reference_source": replay_source,
                             "reference_provenance": provenance,
+                            "generated_sha256": references.image_mapping_sha256(
+                                replay_views
+                            ),
                             "renderer_identity_sha256": renderer_identity_sha256,
                             "stream_step": step,
                             "replayed": True,
                         })
                         continue
-                    prev, reference_source = references.prepare(
+                    prev, reference_source, reference_sha256 = (
+                        references.prepare_with_provenance(
                         stream_id=stream_id,
                         episode_id=episode_id,
                         step=step,
                         lag=reference_lag,
                         anchor=prev,
                         request_id=request_id,
+                        )
                     )
                     prepared = True
                 order = [v for _, v in VIEW_MAP]
@@ -319,11 +347,15 @@ def handle_conn(
                     )
                     prepared = False
                 out = {v: encode_array(image) for v, image in out_arrays.items()}
+                generated_sha256 = references.image_mapping_sha256(out_arrays)
                 ms = (time.perf_counter() - t0) * 1000
                 metrics.record(ms=ms, queue_ms=queue_ms, inference_ms=inference_ms)
                 provenance = (
                     reference_provenance(
-                        step=step, lag=reference_lag, source=reference_source
+                        step=step,
+                        lag=reference_lag,
+                        source=reference_source,
+                        reference_sha256=reference_sha256,
                     )
                     if reference_lag
                     else None
@@ -336,6 +368,7 @@ def handle_conn(
                     "inference_ms": inference_ms,
                     "reference_source": reference_source,
                     "reference_provenance": provenance,
+                    "generated_sha256": generated_sha256,
                     "renderer_identity_sha256": renderer_identity_sha256,
                     "stream_step": step if reference_lag else None,
                 })

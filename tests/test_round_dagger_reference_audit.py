@@ -14,12 +14,16 @@ from round_dagger.reference_audit import (
 
 def write_scalar(root: Path, *, step: int, lag: int) -> None:
     generated = step >= lag
+    bootstrap = step == 0
+    frame_zero = 0 < step < lag
     metrics = {
         "renderer/reference_provenance_valid": 1,
         "renderer/reference_provenance/request_step": step,
         "renderer/reference_provenance/configured_lag": lag,
-        "renderer/reference_provenance/source_step": step - lag if generated else 0,
-        "renderer/reference_source_anchor": int(not generated),
+        "renderer/reference_provenance/source_step": step - lag if generated else (-1 if bootstrap else 0),
+        "renderer/reference_source_anchor": int(bootstrap),
+        "renderer/reference_source_bootstrap_anchor": int(bootstrap),
+        "renderer/reference_source_generated_frame0": int(frame_zero),
         "renderer/reference_source_generated_lag": int(generated),
         "renderer/reference_source_client": 0,
         "renderer/reference_source_idempotent_replay": 0,
@@ -39,7 +43,8 @@ class ReferenceAuditTest(unittest.TestCase):
             for step in range(5):
                 write_scalar(root, step=step, lag=3)
             report = audit_reference_telemetry(root, lag=3, expected_steps=5)
-            self.assertEqual(report["anchor_step_count"], 3)
+            self.assertEqual(report["bootstrap_anchor_step_count"], 1)
+            self.assertEqual(report["generated_frame_zero_step_count"], 2)
             self.assertEqual(report["generated_step_count"], 2)
             self.assertEqual(report["first_generated_request_step"], 3)
             self.assertEqual(report["last_generated_source_step"], 1)

@@ -10,6 +10,45 @@ def frame(value):
 
 
 class LaggedReferenceStoreTest(unittest.TestCase):
+    def test_exact_lag256_boundary_selection_and_digest_chain(self):
+        store = LaggedReferenceStore()
+        anchor = frame(99)
+        observed = {}
+        for step in range(258):
+            reference, source, digest = store.prepare_with_provenance(
+                stream_id="env0",
+                episode_id="ep0",
+                step=step,
+                lag=256,
+                anchor=anchor,
+                request_id=f"request-{step}",
+            )
+            if step in {0, 1, 255, 256, 257}:
+                observed[step] = (
+                    source,
+                    int(reference["head_color"][0, 0, 0]),
+                    digest,
+                )
+            store.commit(
+                stream_id="env0",
+                episode_id="ep0",
+                step=step,
+                generated=frame(step % 256),
+                request_id=f"request-{step}",
+            )
+        self.assertEqual(
+            [(step, observed[step][0], observed[step][1]) for step in observed],
+            [
+                (0, "bootstrap_anchor", 99),
+                (1, "generated_episode_frame0", 0),
+                (255, "generated_episode_frame0", 0),
+                (256, "generated_t-256", 0),
+                (257, "generated_t-256", 1),
+            ],
+        )
+        self.assertEqual(observed[1][2], store.image_mapping_sha256(frame(0)))
+        self.assertEqual(observed[257][2], store.image_mapping_sha256(frame(1)))
+
     def test_lag_contract(self):
         store = LaggedReferenceStore(max_streams=2)
         anchor = frame(99)
@@ -26,8 +65,18 @@ class LaggedReferenceStoreTest(unittest.TestCase):
                 stream_id="env0", episode_id="ep0", step=step, generated=frame(step),
                 request_id=f"request-{step}",
             )
-        self.assertEqual(sources, ["anchor", "anchor", "anchor", "generated_t-3", "generated_t-3", "generated_t-3"])
-        self.assertEqual(values, [99, 99, 99, 0, 1, 2])
+        self.assertEqual(
+            sources,
+            [
+                "bootstrap_anchor",
+                "generated_episode_frame0",
+                "generated_episode_frame0",
+                "generated_t-3",
+                "generated_t-3",
+                "generated_t-3",
+            ],
+        )
+        self.assertEqual(values, [99, 0, 0, 0, 1, 2])
         self.assertEqual(store.stats()["frames"], 3)
 
     def test_episode_reset_requires_step_zero(self):
@@ -49,7 +98,7 @@ class LaggedReferenceStoreTest(unittest.TestCase):
             stream_id="env0", episode_id=0, step=0, lag=3, anchor=frame(1),
             request_id="request-0-retry",
         )
-        self.assertEqual(source, "anchor")
+        self.assertEqual(source, "bootstrap_anchor")
         self.assertEqual(int(reference["head_color"][0, 0, 0]), 1)
 
     def test_rejects_out_of_order_and_parallel_same_stream(self):
@@ -105,7 +154,13 @@ class LaggedReferenceStoreTest(unittest.TestCase):
             stream_id="env0", episode_id=0, step=0, request_id="request-0"
         )
         self.assertIsNotNone(replay_with_source)
-        self.assertEqual(replay_with_source[1], "anchor")
+        self.assertEqual(replay_with_source[1], "bootstrap_anchor")
+        replay_with_provenance = store.replay_with_provenance(
+            stream_id="env0", episode_id=0, step=0, request_id="request-0"
+        )
+        self.assertEqual(
+            replay_with_provenance[2], store.image_mapping_sha256(frame(1))
+        )
         self.assertIsNone(
             store.replay(
                 stream_id="env0", episode_id=0, step=0, request_id="different"

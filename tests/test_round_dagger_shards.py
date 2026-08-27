@@ -67,6 +67,43 @@ def rollout_arrays(env_ids=(0,), *, steps=3, episode_offset=0):
     }
 
 
+def add_reference_provenance(arrays, *, lag=2):
+    steps, envs = arrays["episode_steps"].shape
+    generated = np.empty((steps, envs, 32), dtype=np.uint8)
+    reference = np.empty_like(generated)
+    kinds = np.empty((steps, envs), dtype=np.uint8)
+    source_steps = np.empty((steps, envs), dtype=np.int64)
+    for time_index in range(steps):
+        generated[time_index] = time_index + 1
+        episode_step = int(arrays["episode_steps"][time_index, 0])
+        if episode_step == 0:
+            kinds[time_index] = 1
+            source_steps[time_index] = -1
+            reference[time_index] = 99
+        elif episode_step < lag:
+            kinds[time_index] = 2
+            source_steps[time_index] = 0
+            reference[time_index] = generated[0]
+        else:
+            kinds[time_index] = 3
+            source_steps[time_index] = episode_step - lag
+            reference[time_index] = generated[episode_step - lag]
+    arrays.update(
+        reference_kinds=kinds,
+        reference_lags=np.full((steps, envs), lag, dtype=np.int64),
+        reference_source_steps=source_steps,
+        reference_sha256=reference,
+        generated_sha256=generated,
+        conditioning_depth_nonzero_fraction=np.full(
+            (steps, envs, 3), 0.75, dtype=np.float32
+        ),
+        conditioning_mask_nonzero_fraction=np.full(
+            (steps, envs, 3), 0.1, dtype=np.float32
+        ),
+    )
+    return arrays
+
+
 class ArtifactTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -271,6 +308,72 @@ class RolloutArrayValidationTest(ArtifactTestCase):
             arrays["observation_is_raytraced"][1, 0] = True
 
         self.assert_bad(change_raytraced_mid_episode, "constant within each episode")
+
+    def test_episode_steps_must_be_contiguous_and_reset_only_after_done(self):
+        self.assert_bad(
+            lambda arrays: arrays["episode_steps"].__setitem__((1, 0), 2),
+            "episode steps must be contiguous",
+        )
+
+        def reset_without_done(arrays):
+            arrays["episode_ids"][2, 0] += 1
+            arrays["episode_steps"][2, 0] = 0
+
+        self.assert_bad(reset_without_done, "episode steps must be contiguous")
+
+    def test_reference_provenance_bundle_is_complete_and_digest_chained(self):
+        valid = add_reference_provenance(rollout_arrays((0,)))
+        self.publish(0, 0, (0,), arrays=valid)
+
+        other = self.root / "other-reference"
+        artifacts.create_cohort(
+            other,
+            expected_ranks=(0,),
+            expected_global_env_ids=(0,),
+            expected_transitions=3,
+            view_contract=VIEW_CONTRACT,
+            action_contract=ACTION_CONTRACT,
+            **IDENTITY,
+            **SHA,
+        )
+        broken = add_reference_provenance(rollout_arrays((0,)))
+        broken["reference_sha256"][2, 0] = 7
+        with self.assertRaisesRegex(artifacts.ArtifactError, "digest does not match"):
+            artifacts.publish_rollout_shard(
+                other,
+                rank=0,
+                rollout_id=0,
+                part_index=0,
+                arrays=broken,
+                **IDENTITY,
+                **SHA,
+            )
+
+        incomplete = rollout_arrays((0,))
+        incomplete["reference_kinds"] = np.ones((3, 1), dtype=np.uint8)
+        with self.assertRaisesRegex(artifacts.ArtifactError, "bundle is incomplete"):
+            artifacts.publish_rollout_shard(
+                other,
+                rank=0,
+                rollout_id=0,
+                part_index=0,
+                arrays=incomplete,
+                **IDENTITY,
+                **SHA,
+            )
+
+        bad_coverage = add_reference_provenance(rollout_arrays((0,)))
+        bad_coverage["conditioning_depth_nonzero_fraction"][1, 0, 0] = np.nan
+        with self.assertRaisesRegex(artifacts.ArtifactError, "finite fractions"):
+            artifacts.publish_rollout_shard(
+                other,
+                rank=0,
+                rollout_id=0,
+                part_index=0,
+                arrays=bad_coverage,
+                **IDENTITY,
+                **SHA,
+            )
 
     def test_global_ids_may_be_constant_tb_but_not_change_with_time(self):
         arrays = rollout_arrays((0,))

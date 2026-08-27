@@ -3,7 +3,8 @@
 
 The fine-tuned Image3F model was trained with a lag-256 reference policy:
 
-* steps ``0..255`` use the episode's frame-0 RGB anchor;
+* step ``0`` uses an external RGB anchor only to bootstrap generation;
+* steps ``1..255`` use generated episode frame 0;
 * step ``t >= 256`` uses the generated RGB from ``t - 256``.
 
 Keeping this history in the renderer avoids retaining roughly 55 GiB of raw
@@ -14,6 +15,7 @@ node.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections import deque
@@ -32,14 +34,17 @@ class _StreamState:
     episode_id: str
     lag: int
     anchor: dict[str, np.ndarray] = field(default_factory=dict)
+    generated_frame_zero: dict[str, np.ndarray] | None = None
     next_step: int = 0
     pending_step: int | None = None
     pending_request_id: str | None = None
     pending_reference_source: str | None = None
+    pending_reference_sha256: str | None = None
     frames: deque[dict[str, np.ndarray]] = field(default_factory=deque)
     last_request_id: str | None = None
     last_generated: dict[str, np.ndarray] | None = None
     last_reference_source: str | None = None
+    last_reference_sha256: str | None = None
     last_access: float = field(default_factory=time.monotonic)
 
 
@@ -69,6 +74,25 @@ class LaggedReferenceStore:
                     f"{type(image).__name__} {getattr(image, 'shape', None)}"
                 )
 
+    @staticmethod
+    def image_mapping_sha256(images: Mapping[str, np.ndarray]) -> str:
+        """Hash exact ordered view names, array contracts, and RGB bytes."""
+
+        LaggedReferenceStore._validate_images(images, "images")
+        digest = hashlib.sha256()
+        for view in sorted(images):
+            image = np.ascontiguousarray(images[view])
+            for token in (
+                view.encode("utf-8"),
+                image.dtype.str.encode("ascii"),
+                repr(tuple(int(value) for value in image.shape)).encode("ascii"),
+            ):
+                digest.update(len(token).to_bytes(8, "big"))
+                digest.update(token)
+            digest.update(image.nbytes.to_bytes(8, "big"))
+            digest.update(memoryview(image))
+        return digest.hexdigest()
+
     def _evict_if_needed(self) -> None:
         while len(self._streams) >= self.max_streams:
             candidates = [
@@ -83,7 +107,7 @@ class LaggedReferenceStore:
             _, key = min(candidates)
             del self._streams[key]
 
-    def prepare(
+    def prepare_with_provenance(
         self,
         *,
         stream_id: str,
@@ -92,8 +116,8 @@ class LaggedReferenceStore:
         lag: int,
         anchor: Mapping[str, np.ndarray],
         request_id: str,
-    ) -> tuple[dict[str, np.ndarray], str]:
-        """Return the correct reference and reserve ``step`` for generation."""
+    ) -> tuple[dict[str, np.ndarray], str, str]:
+        """Return the effective reference, source, digest and reserve ``step``."""
         if not stream_id:
             raise ReferenceHistoryError("stream_id is required")
         step = int(step)
@@ -150,9 +174,16 @@ class LaggedReferenceStore:
                 raise ReferenceHistoryError(
                     f"episode anchor changed within stream {stream_id!r} episode {episode_id!r}"
                 )
-            if step < lag:
+            if step == 0:
                 reference = state.anchor
-                source = "anchor"
+                source = "bootstrap_anchor"
+            elif step < lag:
+                if state.generated_frame_zero is None:
+                    raise ReferenceHistoryError(
+                        f"stream {stream_id!r} has no committed generated frame 0"
+                    )
+                reference = state.generated_frame_zero
+                source = "generated_episode_frame0"
             else:
                 if len(state.frames) != lag:
                     raise ReferenceHistoryError(
@@ -160,11 +191,64 @@ class LaggedReferenceStore:
                     )
                 reference = state.frames[0]
                 source = f"generated_t-{lag}"
+            reference_sha256 = self.image_mapping_sha256(reference)
             state.pending_step = step
             state.pending_request_id = str(request_id)
             state.pending_reference_source = source
+            state.pending_reference_sha256 = reference_sha256
             state.last_access = time.monotonic()
-            return reference, source
+            return reference, source, reference_sha256
+
+    def prepare(
+        self,
+        *,
+        stream_id: str,
+        episode_id: str | int,
+        step: int,
+        lag: int,
+        anchor: Mapping[str, np.ndarray],
+        request_id: str,
+    ) -> tuple[dict[str, np.ndarray], str]:
+        """Backward-compatible pair-returning wrapper around strict preparation."""
+
+        reference, source, _ = self.prepare_with_provenance(
+            stream_id=stream_id,
+            episode_id=episode_id,
+            step=step,
+            lag=lag,
+            anchor=anchor,
+            request_id=request_id,
+        )
+        return reference, source
+
+    def replay_with_provenance(
+        self,
+        *,
+        stream_id: str,
+        episode_id: str | int,
+        step: int,
+        request_id: str,
+    ) -> tuple[dict[str, np.ndarray], str, str] | None:
+        """Return an idempotent output plus its effective reference proof."""
+
+        with self._lock:
+            state = self._streams.get(stream_id)
+            if (
+                state is not None
+                and state.episode_id == str(episode_id)
+                and state.next_step == int(step) + 1
+                and state.last_request_id == str(request_id)
+                and state.last_generated is not None
+                and state.last_reference_source is not None
+                and state.last_reference_sha256 is not None
+            ):
+                state.last_access = time.monotonic()
+                return (
+                    state.last_generated,
+                    state.last_reference_source,
+                    state.last_reference_sha256,
+                )
+            return None
 
     def replay_with_source(
         self,
@@ -175,19 +259,13 @@ class LaggedReferenceStore:
         request_id: str,
     ) -> tuple[dict[str, np.ndarray], str] | None:
         """Return a committed retry together with its effective reference source."""
-        with self._lock:
-            state = self._streams.get(stream_id)
-            if (
-                state is not None
-                and state.episode_id == str(episode_id)
-                and state.next_step == int(step) + 1
-                and state.last_request_id == str(request_id)
-                and state.last_generated is not None
-                and state.last_reference_source is not None
-            ):
-                state.last_access = time.monotonic()
-                return state.last_generated, state.last_reference_source
-            return None
+        replay = self.replay_with_provenance(
+            stream_id=stream_id,
+            episode_id=episode_id,
+            step=step,
+            request_id=request_id,
+        )
+        return (replay[0], replay[1]) if replay is not None else None
 
     def replay(
         self,
@@ -231,14 +309,21 @@ class LaggedReferenceStore:
             committed = {
                 view: np.ascontiguousarray(image).copy() for view, image in generated.items()
             }
+            if step == 0:
+                state.generated_frame_zero = committed
             state.frames.append(committed)
             state.last_generated = committed
             state.last_request_id = str(request_id)
             state.last_reference_source = state.pending_reference_source
+            state.last_reference_sha256 = state.pending_reference_sha256
             state.pending_step = None
             state.pending_request_id = None
             state.pending_reference_source = None
+            state.pending_reference_sha256 = None
             state.next_step = step + 1
+            if step >= state.lag:
+                # Frame zero has left the lag deque and can no longer be selected.
+                state.generated_frame_zero = None
             state.last_access = time.monotonic()
 
     def abort(self, *, stream_id: str, episode_id: str | int, step: int) -> None:
@@ -253,6 +338,7 @@ class LaggedReferenceStore:
                 state.pending_step = None
                 state.pending_request_id = None
                 state.pending_reference_source = None
+                state.pending_reference_sha256 = None
                 state.last_access = time.monotonic()
 
     def reset(self, stream_id: str) -> bool:

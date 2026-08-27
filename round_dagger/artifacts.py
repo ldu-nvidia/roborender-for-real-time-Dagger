@@ -69,6 +69,19 @@ _REQUIRED_ARRAYS = {
     "episode_steps",
 }
 
+# Added without changing the v1 shard schema so historical round-0 replay
+# remains readable. New actors publish this complete bundle; partial evidence
+# is rejected because it cannot prove the effective Image3F reference chain.
+_REFERENCE_PROVENANCE_ARRAYS = {
+    "reference_kinds",
+    "reference_lags",
+    "reference_source_steps",
+    "reference_sha256",
+    "generated_sha256",
+    "conditioning_depth_nonzero_fraction",
+    "conditioning_mask_nonzero_fraction",
+}
+
 _CONTRACT_KEYS = {
     "schema",
     "campaign_id",
@@ -586,10 +599,21 @@ def _validate_arrays(
     unknown = sorted(
         key
         for key in keys
-        if key not in _REQUIRED_ARRAYS and not (isinstance(key, str) and key.startswith("obs__"))
+        if key not in _REQUIRED_ARRAYS
+        and key not in _REFERENCE_PROVENANCE_ARRAYS
+        and not (isinstance(key, str) and key.startswith("obs__"))
     )
     if missing or unknown:
         raise ArtifactError(f"rollout arrays have missing={missing} unknown={unknown}")
+    supplied_reference_arrays = keys & _REFERENCE_PROVENANCE_ARRAYS
+    if supplied_reference_arrays and supplied_reference_arrays != _REFERENCE_PROVENANCE_ARRAYS:
+        missing_reference = sorted(
+            _REFERENCE_PROVENANCE_ARRAYS - supplied_reference_arrays
+        )
+        raise ArtifactError(
+            "rollout reference provenance bundle is incomplete: "
+            f"missing={missing_reference}"
+        )
     canonical: dict[str, np.ndarray] = {}
     for key, value in arrays.items():
         if not isinstance(key, str) or _ARRAY_KEY_RE.fullmatch(key) is None:
@@ -650,6 +674,8 @@ def _validate_arrays(
 
     raytraced = canonical["observation_is_raytraced"]
     episodes = canonical["episode_ids"]
+    dones = canonical["dones"]
+    episode_steps = canonical["episode_steps"]
     for env_index in range(envs):
         values_by_episode: dict[int, bool] = {}
         for time_index in range(steps):
@@ -661,13 +687,136 @@ def _validate_arrays(
                 )
             values_by_episode[episode] = value
 
+        if int(episode_steps[0, env_index]) != 0:
+            raise ArtifactError("every actor rollout must begin at episode step 0")
+        for time_index in range(1, steps):
+            previous_episode = int(episodes[time_index - 1, env_index])
+            current_episode = int(episodes[time_index, env_index])
+            previous_step = int(episode_steps[time_index - 1, env_index])
+            current_step = int(episode_steps[time_index, env_index])
+            if bool(dones[time_index - 1, env_index]):
+                if current_episode != previous_episode + 1 or current_step != 0:
+                    raise ArtifactError(
+                        "episode identity must increment and reset to step 0 after done"
+                    )
+            elif current_episode != previous_episode or current_step != previous_step + 1:
+                raise ArtifactError(
+                    "episode steps must be contiguous unless the previous transition is done"
+                )
+
+    if supplied_reference_arrays:
+        kinds = canonical["reference_kinds"]
+        lags = canonical["reference_lags"]
+        source_steps = canonical["reference_source_steps"]
+        reference_digests = canonical["reference_sha256"]
+        generated_digests = canonical["generated_sha256"]
+        depth_coverage = canonical["conditioning_depth_nonzero_fraction"]
+        mask_coverage = canonical["conditioning_mask_nonzero_fraction"]
+        view_count = len(contract["view_contract"]["views"])
+        for name, array, dtype, shape in (
+            ("reference_kinds", kinds, np.dtype(np.uint8), (steps, envs)),
+            ("reference_lags", lags, np.dtype(np.int64), (steps, envs)),
+            (
+                "reference_source_steps",
+                source_steps,
+                np.dtype(np.int64),
+                (steps, envs),
+            ),
+            (
+                "reference_sha256",
+                reference_digests,
+                np.dtype(np.uint8),
+                (steps, envs, 32),
+            ),
+            (
+                "generated_sha256",
+                generated_digests,
+                np.dtype(np.uint8),
+                (steps, envs, 32),
+            ),
+            (
+                "conditioning_depth_nonzero_fraction",
+                depth_coverage,
+                np.dtype(np.float32),
+                (steps, envs, view_count),
+            ),
+            (
+                "conditioning_mask_nonzero_fraction",
+                mask_coverage,
+                np.dtype(np.float32),
+                (steps, envs, view_count),
+            ),
+        ):
+            if array.dtype != dtype or tuple(array.shape) != shape:
+                raise ArtifactError(f"{name} must have dtype {dtype} and shape {shape}")
+        for name, coverage in (
+            ("conditioning_depth_nonzero_fraction", depth_coverage),
+            ("conditioning_mask_nonzero_fraction", mask_coverage),
+        ):
+            if not np.isfinite(coverage).all() or np.any(coverage < 0) or np.any(
+                coverage > 1
+            ):
+                raise ArtifactError(f"{name} must contain finite fractions in [0,1]")
+
+        for env_index in range(envs):
+            generated_by_episode_step: dict[tuple[int, int], np.ndarray] = {}
+            for time_index in range(steps):
+                raytraced_transition = bool(raytraced[time_index, env_index])
+                episode = int(episodes[time_index, env_index])
+                episode_step = int(episode_steps[time_index, env_index])
+                kind = int(kinds[time_index, env_index])
+                lag = int(lags[time_index, env_index])
+                source_step = int(source_steps[time_index, env_index])
+                reference_digest = reference_digests[time_index, env_index]
+                generated_digest = generated_digests[time_index, env_index]
+                if raytraced_transition:
+                    if (
+                        kind != 0
+                        or lag != 0
+                        or source_step != -1
+                        or np.any(reference_digest)
+                        or np.any(generated_digest)
+                        or np.any(depth_coverage[time_index, env_index])
+                        or np.any(mask_coverage[time_index, env_index])
+                    ):
+                        raise ArtifactError(
+                            "raytraced transitions must not claim Image3F provenance"
+                        )
+                    continue
+                if lag < 1 or not np.any(reference_digest) or not np.any(generated_digest):
+                    raise ArtifactError(
+                        "generated transitions require non-empty Image3F digest provenance"
+                    )
+                if episode_step == 0:
+                    expected_kind, expected_source_step = 1, -1
+                elif episode_step < lag:
+                    expected_kind, expected_source_step = 2, 0
+                else:
+                    expected_kind, expected_source_step = 3, episode_step - lag
+                if kind != expected_kind or source_step != expected_source_step:
+                    raise ArtifactError(
+                        "Image3F reference kind/source step violates fixed-lag policy"
+                    )
+                if source_step >= 0:
+                    source_key = (episode, source_step)
+                    if source_key not in generated_by_episode_step:
+                        raise ArtifactError(
+                            "Image3F reference source step is absent from earlier replay"
+                        )
+                    if not np.array_equal(
+                        reference_digest, generated_by_episode_step[source_key]
+                    ):
+                        raise ArtifactError(
+                            "Image3F reference digest does not match its generated source"
+                        )
+                generated_by_episode_step[(episode, episode_step)] = generated_digest.copy()
+
     expected_envs = set(contract["expected_global_env_ids"])
     actual_envs = {int(item) for item in env_vector.tolist()}
     if not actual_envs <= expected_envs:
         raise ArtifactError("shard contains global_env_ids outside the cohort contract")
 
     transition_keys: set[tuple[int, int, int]] = set()
-    episode_steps = canonical["episode_steps"]
     for time_index in range(steps):
         for env_index in range(envs):
             key = (
@@ -895,8 +1044,20 @@ def _validate_shard_manifest(document: Any) -> dict[str, Any]:
     _validate_view_contract(manifest["view_contract"])
     _validate_action_contract(manifest["action_contract"])
     metadata = _validate_array_metadata(manifest["arrays"])
-    if not _REQUIRED_ARRAYS <= set(metadata) or any(
-        key not in _REQUIRED_ARRAYS and not key.startswith("obs__") for key in metadata
+    metadata_keys = set(metadata)
+    supplied_reference_metadata = metadata_keys & _REFERENCE_PROVENANCE_ARRAYS
+    if (
+        not _REQUIRED_ARRAYS <= metadata_keys
+        or (
+            supplied_reference_metadata
+            and supplied_reference_metadata != _REFERENCE_PROVENANCE_ARRAYS
+        )
+        or any(
+            key not in _REQUIRED_ARRAYS
+            and key not in _REFERENCE_PROVENANCE_ARRAYS
+            and not key.startswith("obs__")
+            for key in metadata
+        )
     ):
         raise ArtifactError("shard arrays metadata has missing or unknown keys")
     payload = _require_exact_keys(

@@ -33,7 +33,17 @@ class FakeImage3FServer:
                 else:
                     step = int(request.get("step", 0))
                     lag = int(request.get("reference_lag", 0))
-                    source = "anchor" if step < lag else f"generated_t-{lag}"
+                    if step == 0:
+                        source, kind, source_step = "bootstrap_anchor", "bootstrap_anchor", -1
+                    elif step < lag:
+                        source, kind, source_step = "generated_episode_frame0", "generated", 0
+                    else:
+                        source, kind, source_step = f"generated_t-{lag}", "generated", step - lag
+                    decoded = {
+                        view: client_module._decode_array(value)
+                        for view, value in request["prev"].items()
+                    }
+                    digest = client_module._image_mapping_sha256(decoded)
                     response = {
                         "ok": True,
                         "views": request["prev"],
@@ -42,9 +52,11 @@ class FakeImage3FServer:
                             "schema": client_module.REFERENCE_PROVENANCE_SCHEMA,
                             "request_step": step,
                             "configured_lag": lag,
-                            "kind": "anchor" if step < lag else "generated",
-                            "source_step": 0 if step < lag else step - lag,
+                            "kind": kind,
+                            "source_step": source_step,
+                            "reference_sha256": digest,
                         },
+                        "generated_sha256": digest,
                         "stream_step": step,
                     }
                 client_module._send_msg(conn, response)
@@ -228,12 +240,13 @@ class Image3FFrameClientTest(unittest.TestCase):
         self.assertEqual(client.last_metadata["reference_provenance_valid"], True)
 
     def test_reference_provenance_gate_distinguishes_lag_boundary(self):
-        anchor = {
+        frame_zero = {
             "schema": client_module.REFERENCE_PROVENANCE_SCHEMA,
             "request_step": 255,
             "configured_lag": 256,
-            "kind": "anchor",
+            "kind": "generated",
             "source_step": 0,
+            "reference_sha256": "a" * 64,
         }
         generated = {
             "schema": client_module.REFERENCE_PROVENANCE_SCHEMA,
@@ -241,18 +254,19 @@ class Image3FFrameClientTest(unittest.TestCase):
             "configured_lag": 256,
             "kind": "generated",
             "source_step": 0,
+            "reference_sha256": "b" * 64,
         }
         self.assertEqual(
             client_module._validate_reference_provenance(
                 {
-                    "reference_source": "anchor",
-                    "reference_provenance": anchor,
+                    "reference_source": "generated_episode_frame0",
+                    "reference_provenance": frame_zero,
                     "stream_step": 255,
                 },
                 step=255,
                 lag=256,
             ),
-            anchor,
+            frame_zero,
         )
         self.assertEqual(
             client_module._validate_reference_provenance(
@@ -269,8 +283,8 @@ class Image3FFrameClientTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "provenance mismatch"):
             client_module._validate_reference_provenance(
                 {
-                    "reference_source": "anchor",
-                    "reference_provenance": anchor,
+                    "reference_source": "generated_episode_frame0",
+                    "reference_provenance": frame_zero,
                     "stream_step": 256,
                 },
                 step=256,

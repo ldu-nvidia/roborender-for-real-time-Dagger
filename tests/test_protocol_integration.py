@@ -33,10 +33,15 @@ class StoreBackedServer:
         self.thread.join(timeout=2)
 
     @staticmethod
-    def _reference_metadata(*, step, lag, source):
+    def _reference_metadata(*, step, lag, source, reference_sha256, generated):
         """Mirror the production server's exact lag-reference attestation."""
 
-        expected_source = "anchor" if step < lag else f"generated_t-{lag}"
+        if step == 0:
+            expected_source, kind, source_step = "bootstrap_anchor", "bootstrap_anchor", -1
+        elif step < lag:
+            expected_source, kind, source_step = "generated_episode_frame0", "generated", 0
+        else:
+            expected_source, kind, source_step = f"generated_t-{lag}", "generated", step - lag
         if source != expected_source:
             raise RuntimeError(
                 "reference history/source mismatch: "
@@ -48,9 +53,11 @@ class StoreBackedServer:
                 "schema": protocol.REFERENCE_PROVENANCE_SCHEMA,
                 "request_step": step,
                 "configured_lag": lag,
-                "kind": "anchor" if step < lag else "generated",
-                "source_step": 0 if step < lag else step - lag,
+                "kind": kind,
+                "source_step": source_step,
+                "reference_sha256": reference_sha256,
             },
+            "generated_sha256": protocol._image_mapping_sha256(generated),
             "stream_step": step,
         }
 
@@ -81,14 +88,14 @@ class StoreBackedServer:
                     view: protocol._decode_array(image)
                     for view, image in request["prev"].items()
                 }
-                replay = self.store.replay_with_source(
+                replay = self.store.replay_with_provenance(
                     stream_id=stream,
                     episode_id=episode,
                     step=step,
                     request_id=request_id,
                 )
                 if replay is not None:
-                    replay_views, reference_source = replay
+                    replay_views, reference_source, reference_sha256 = replay
                     self.replays += 1
                     protocol._send_msg(
                         conn,
@@ -103,19 +110,23 @@ class StoreBackedServer:
                                 step=step,
                                 lag=lag,
                                 source=reference_source,
+                                reference_sha256=reference_sha256,
+                                generated=replay_views,
                             ),
                         },
                     )
                     continue
                 prepared = False
                 try:
-                    reference, reference_source = self.store.prepare(
+                    reference, reference_source, reference_sha256 = (
+                        self.store.prepare_with_provenance(
                         stream_id=stream,
                         episode_id=episode,
                         step=step,
                         lag=lag,
                         anchor=anchor,
                         request_id=request_id,
+                        )
                     )
                     prepared = True
                     self.reference_values.append(
@@ -148,6 +159,8 @@ class StoreBackedServer:
                                 step=step,
                                 lag=lag,
                                 source=reference_source,
+                                reference_sha256=reference_sha256,
+                                generated=generated,
                             ),
                         },
                     )
@@ -181,11 +194,11 @@ class ProtocolIntegrationTest(unittest.TestCase):
                 self.assertEqual(int(output["head_color"][0, 0, 0]), step + 10)
                 metadata.append(dict(client.last_metadata))
             self.assertGreaterEqual(server.replays, 1)
-            self.assertEqual(server.reference_values[:4], [99, 99, 99, 10])
+            self.assertEqual(server.reference_values[:4], [99, 10, 10, 10])
             self.assertTrue(metadata[0]["replayed"])
-            self.assertEqual(metadata[0]["reference_source"], "anchor")
-            self.assertEqual(metadata[0]["reference_provenance"]["source_step"], 0)
-            self.assertEqual(metadata[2]["reference_source"], "anchor")
+            self.assertEqual(metadata[0]["reference_source"], "bootstrap_anchor")
+            self.assertEqual(metadata[0]["reference_provenance"]["source_step"], -1)
+            self.assertEqual(metadata[2]["reference_source"], "generated_episode_frame0")
             self.assertEqual(metadata[3]["reference_source"], "generated_t-3")
             self.assertEqual(metadata[3]["reference_provenance"]["kind"], "generated")
             self.assertEqual(metadata[3]["reference_provenance"]["source_step"], 0)
@@ -213,7 +226,7 @@ class ProtocolIntegrationTest(unittest.TestCase):
                 reference_lag=3,
             )
             self.assertEqual(int(output["head_color"][0, 0, 0]), 10)
-            self.assertEqual(client.last_metadata["reference_source"], "anchor")
+            self.assertEqual(client.last_metadata["reference_source"], "bootstrap_anchor")
             self.assertEqual(client.last_metadata["stream_step"], 0)
         finally:
             client.close()

@@ -169,6 +169,27 @@ def trainer_rollout_arrays(trainer: Any) -> dict[str, np.ndarray]:
         "episode_steps": _storage_array(storage, "round_episode_steps", steps)[
             ..., 0
         ].astype(np.int64, copy=False),
+        "reference_kinds": _storage_array(
+            storage, "round_reference_kinds", steps
+        )[..., 0].astype(np.uint8, copy=False),
+        "reference_lags": _storage_array(
+            storage, "round_reference_lags", steps
+        )[..., 0].astype(np.int64, copy=False),
+        "reference_source_steps": _storage_array(
+            storage, "round_reference_source_steps", steps
+        )[..., 0].astype(np.int64, copy=False),
+        "reference_sha256": _storage_array(
+            storage, "round_reference_sha256", steps
+        ).astype(np.uint8, copy=False),
+        "generated_sha256": _storage_array(
+            storage, "round_generated_sha256", steps
+        ).astype(np.uint8, copy=False),
+        "conditioning_depth_nonzero_fraction": _storage_array(
+            storage, "round_conditioning_depth_nonzero_fraction", steps
+        ).astype(np.float32, copy=False),
+        "conditioning_mask_nonzero_fraction": _storage_array(
+            storage, "round_conditioning_mask_nonzero_fraction", steps
+        ).astype(np.float32, copy=False),
     }
     # Preserve every configured non-vision policy input so the camera-free
     # learner can reconstruct the exact forward call without Isaac Lab.

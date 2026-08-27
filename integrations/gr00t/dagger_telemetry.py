@@ -242,7 +242,11 @@ def _reference_source_metrics(metadata: Mapping[str, object]) -> dict[str, int]:
 
     source = str(metadata.get("reference_source", "unknown"))
     categories = {
-        "anchor": source == "anchor",
+        # Keep the historical aggregate for existing dashboards while exposing
+        # the two semantically distinct pre-lag sources.
+        "anchor": source in {"anchor", "bootstrap_anchor"},
+        "bootstrap_anchor": source == "bootstrap_anchor",
+        "generated_frame0": source == "generated_episode_frame0",
         "generated_lag": source.startswith("generated_t-"),
         "idempotent_replay": source == "idempotent_replay",
         "client": source == "client",

@@ -57,6 +57,15 @@ def fake_trainer(*, steps=3, envs=4):
     episode_steps = np.broadcast_to(
         np.arange(steps, dtype=np.int64)[:, None, None], (steps, envs, 1)
     ).copy()
+    reference_kinds = np.full((steps, envs, 1), 2, dtype=np.uint8)
+    reference_kinds[0] = 1
+    reference_source_steps = np.zeros((steps, envs, 1), dtype=np.int64)
+    reference_source_steps[0] = -1
+    reference_digest = np.ones((steps, envs, 32), dtype=np.uint8)
+    reference_digest[0] = 9
+    generated_digest = np.empty((steps, envs, 32), dtype=np.uint8)
+    for step in range(steps):
+        generated_digest[step] = step + 1
     values = {
         "vision_obs": normalized,
         "gt_actions": expert,
@@ -70,6 +79,19 @@ def fake_trainer(*, steps=3, envs=4):
         "round_global_env_ids": ids,
         "round_episode_ids": np.zeros((steps, envs, 1), dtype=np.int64),
         "round_episode_steps": episode_steps,
+        "round_reference_kinds": reference_kinds,
+        "round_reference_lags": np.full(
+            (steps, envs, 1), 256, dtype=np.int64
+        ),
+        "round_reference_source_steps": reference_source_steps,
+        "round_reference_sha256": reference_digest,
+        "round_generated_sha256": generated_digest,
+        "round_conditioning_depth_nonzero_fraction": np.full(
+            (steps, envs, 3), 0.75, dtype=np.float32
+        ),
+        "round_conditioning_mask_nonzero_fraction": np.full(
+            (steps, envs, 3), 0.1, dtype=np.float32
+        ),
         "actor_obs": np.ones((steps, envs, 5), dtype=np.float32),
     }
     cameras = SimpleNamespace(image_mean=mean.tolist(), image_std=std.tolist())
@@ -96,6 +118,10 @@ class ActorConversionTest(unittest.TestCase):
         self.assertEqual(arrays["global_env_ids"].shape, (3, 4))
         self.assertEqual(arrays["expert_mask"].shape, (3, 4))
         self.assertEqual(arrays["obs__actor_obs"].shape, (3, 4, 5))
+        self.assertEqual(arrays["reference_sha256"].shape, (3, 4, 32))
+        self.assertEqual(
+            arrays["reference_kinds"][:, 0].tolist(), [1, 2, 2]
+        )
 
     def test_bad_normalization_and_incomplete_storage_fail_closed(self):
         with self.assertRaisesRegex(ActorExportError, "provided together"):

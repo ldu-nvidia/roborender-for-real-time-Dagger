@@ -27,7 +27,39 @@ import numpy as np
 
 
 PROTOCOL_VERSION = 2
-REFERENCE_PROVENANCE_SCHEMA = "image3f.reference_provenance.v1"
+REFERENCE_PROVENANCE_SCHEMA = "image3f.reference_provenance.v2"
+
+
+def _image_mapping_sha256(images: Mapping[str, np.ndarray]) -> str:
+    """Hash view names, exact array contracts, and bytes like the server."""
+
+    digest = hashlib.sha256()
+    if not images:
+        raise RuntimeError("Image3F image mapping is empty")
+    for view in sorted(images):
+        image = np.ascontiguousarray(images[view])
+        if image.ndim != 3 or image.shape[-1] != 3:
+            raise RuntimeError(f"Image3F image {view!r} is not HxWx3")
+        for token in (
+            view.encode("utf-8"),
+            image.dtype.str.encode("ascii"),
+            repr(tuple(int(value) for value in image.shape)).encode("ascii"),
+        ):
+            digest.update(len(token).to_bytes(8, "big"))
+            digest.update(token)
+        digest.update(image.nbytes.to_bytes(8, "big"))
+        digest.update(memoryview(image))
+    return digest.hexdigest()
+
+
+def _require_sha256(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"Image3F {label} is not a lowercase SHA-256")
+    return value
 
 
 def _logical_actor_rank() -> int:
@@ -121,20 +153,36 @@ def _validate_reference_provenance(
 
     step = int(step)
     lag = int(lag)
-    expected_source = "anchor" if step < lag else f"generated_t-{lag}"
+    if step == 0:
+        expected_source = "bootstrap_anchor"
+        kind = "bootstrap_anchor"
+        source_step = -1
+    elif step < lag:
+        expected_source = "generated_episode_frame0"
+        kind = "generated"
+        source_step = 0
+    else:
+        expected_source = f"generated_t-{lag}"
+        kind = "generated"
+        source_step = step - lag
     expected = {
         "schema": REFERENCE_PROVENANCE_SCHEMA,
         "request_step": step,
         "configured_lag": lag,
-        "kind": "anchor" if step < lag else "generated",
-        "source_step": 0 if step < lag else step - lag,
+        "kind": kind,
+        "source_step": source_step,
     }
     observed = response.get("reference_provenance")
-    if observed != expected:
+    if not isinstance(observed, Mapping):
+        raise RuntimeError("Image3F reference provenance is missing or malformed")
+    observed_without_digest = dict(observed)
+    reference_sha256 = observed_without_digest.pop("reference_sha256", None)
+    if observed_without_digest != expected:
         raise RuntimeError(
             "Image3F reference provenance mismatch: "
-            f"expected {expected!r}, got {observed!r}"
+            f"expected {expected!r} plus reference_sha256, got {observed!r}"
         )
+    _require_sha256(reference_sha256, "reference provenance digest")
     if response.get("reference_source") != expected_source:
         raise RuntimeError(
             "Image3F reference source mismatch: "
@@ -145,7 +193,7 @@ def _validate_reference_provenance(
             "Image3F stream step mismatch: "
             f"expected {step}, got {response.get('stream_step')!r}"
         )
-    return expected
+    return dict(observed)
 
 
 def _validate_renderer_identity(response: Mapping[str, object]) -> None:
@@ -392,6 +440,12 @@ class Image3FFrameClient:
             raise RuntimeError("Image3F response has no views")
         decoded = {view: _decode_array(image) for view, image in views.items()}
         _validate_output_views(decoded)
+        if reference_lag > 0:
+            generated_sha256 = _require_sha256(
+                response.get("generated_sha256"), "generated output digest"
+            )
+            if _image_mapping_sha256(decoded) != generated_sha256:
+                raise RuntimeError("Image3F generated output SHA-256 mismatch")
         return decoded
 
     def reset_stream(self) -> bool:

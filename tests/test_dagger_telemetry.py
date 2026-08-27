@@ -74,14 +74,15 @@ class DaggerTelemetryTest(unittest.TestCase):
                     "nested": {"server_ms": np.float32(8.25)},
                     "bad_nan": float("nan"),
                     "bad_inf": float("inf"),
-                    "reference_source": "anchor",
+                    "reference_source": "bootstrap_anchor",
                     "reference_provenance_valid": True,
                     "reference_provenance": {
-                        "schema": "image3f.reference_provenance.v1",
+                        "schema": "image3f.reference_provenance.v2",
                         "request_step": 0,
                         "configured_lag": 256,
-                        "kind": "anchor",
-                        "source_step": 0,
+                        "kind": "bootstrap_anchor",
+                        "source_step": -1,
+                        "reference_sha256": "a" * 64,
                     },
                 },
                 **common,
@@ -102,13 +103,19 @@ class DaggerTelemetryTest(unittest.TestCase):
             self.assertNotIn("renderer/bad_inf", document["metrics"])
             self.assertNotIn("renderer/reference_source", document["metrics"])
             self.assertEqual(document["metrics"]["renderer/reference_source_anchor"], 1)
+            self.assertEqual(
+                document["metrics"]["renderer/reference_source_bootstrap_anchor"], 1
+            )
+            self.assertEqual(
+                document["metrics"]["renderer/reference_source_generated_frame0"], 0
+            )
             self.assertEqual(document["metrics"]["renderer/reference_source_generated_lag"], 0)
             self.assertEqual(document["metrics"]["renderer/reference_provenance_valid"], 1)
             self.assertEqual(
                 document["metrics"]["renderer/reference_provenance/request_step"], 0
             )
             self.assertEqual(
-                document["metrics"]["renderer/reference_provenance/source_step"], 0
+                document["metrics"]["renderer/reference_provenance/source_step"], -1
             )
             self.assertEqual(document["metrics"]["rollout_frame_step"], 0)
             self.assertEqual(document["metrics"]["policy_update_index"], 0)

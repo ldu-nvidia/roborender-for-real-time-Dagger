@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed audit of Image3F fixed-lag reference telemetry."""
+"""Fail-closed audit of bootstrapped Image3F fixed-lag reference telemetry."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import numpy as np
 from round_dagger.artifacts import load_strict_json, sha256_file
 
 
-REFERENCE_AUDIT_SCHEMA = "fast_roborender.reference_lag_validation.v1"
+REFERENCE_AUDIT_SCHEMA = "fast_roborender.reference_lag_validation.v2"
 
 
 class ReferenceAuditError(RuntimeError):
@@ -122,7 +122,7 @@ def audit_reference_telemetry(
     expected_steps: int,
     rollout_shard: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
-    """Prove an uninterrupted anchor-to-generated transition from scalar files."""
+    """Prove bootstrap -> generated-frame-0 -> fixed-lag scalar telemetry."""
 
     directory = Path(scalar_dir).expanduser().resolve()
     if lag < 1:
@@ -135,7 +135,8 @@ def audit_reference_telemetry(
         raise ReferenceAuditError(f"unsafe or missing scalar directory: {directory}")
 
     chain = hashlib.sha256()
-    anchor_steps = 0
+    bootstrap_steps = 0
+    frame_zero_steps = 0
     generated_steps = 0
     for step in range(expected_steps):
         path = directory / f"step_{step:09d}.json"
@@ -149,7 +150,9 @@ def audit_reference_telemetry(
             raise ReferenceAuditError(f"scalar document metrics are malformed at {path}")
 
         generated = step >= lag
-        expected_source_step = step - lag if generated else 0
+        bootstrap = step == 0
+        frame_zero = 0 < step < lag
+        expected_source_step = step - lag if generated else (-1 if bootstrap else 0)
         _require_metric(metrics, "renderer/reference_provenance_valid", 1)
         _require_metric(metrics, "renderer/reference_provenance/request_step", step)
         _require_metric(metrics, "renderer/reference_provenance/configured_lag", lag)
@@ -158,7 +161,13 @@ def audit_reference_telemetry(
             "renderer/reference_provenance/source_step",
             expected_source_step,
         )
-        _require_metric(metrics, "renderer/reference_source_anchor", int(not generated))
+        _require_metric(metrics, "renderer/reference_source_anchor", int(bootstrap))
+        _require_metric(
+            metrics, "renderer/reference_source_bootstrap_anchor", int(bootstrap)
+        )
+        _require_metric(
+            metrics, "renderer/reference_source_generated_frame0", int(frame_zero)
+        )
         _require_metric(metrics, "renderer/reference_source_generated_lag", int(generated))
         _require_metric(metrics, "renderer/reference_source_client", 0)
         _require_metric(metrics, "renderer/reference_source_idempotent_replay", 0)
@@ -166,8 +175,10 @@ def audit_reference_telemetry(
         if generated:
             _require_metric(metrics, "renderer/reference_lag_frames", lag)
             generated_steps += 1
+        elif frame_zero:
+            frame_zero_steps += 1
         else:
-            anchor_steps += 1
+            bootstrap_steps += 1
 
         chain.update(step.to_bytes(8, "big", signed=False))
         chain.update(bytes.fromhex(sha256_file(path)))
@@ -177,7 +188,8 @@ def audit_reference_telemetry(
         "lag": lag,
         "expected_steps": expected_steps,
         "boundary_step": lag,
-        "anchor_step_count": anchor_steps,
+        "bootstrap_anchor_step_count": bootstrap_steps,
+        "generated_frame_zero_step_count": frame_zero_steps,
         "generated_step_count": generated_steps,
         "first_generated_request_step": lag,
         "first_generated_source_step": 0,
