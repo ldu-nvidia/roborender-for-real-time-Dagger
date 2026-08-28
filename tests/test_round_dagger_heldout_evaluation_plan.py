@@ -150,18 +150,45 @@ class HeldoutEvaluationPlanTest(unittest.TestCase):
         plan_sha = hashlib.sha256(self.plan_path.read_bytes()).hexdigest()
         cases = []
         for planned in plan["capture"]["cases"]:
+            condition = hashlib.sha256(
+                f"condition-{planned['global_case_index']}".encode()
+            ).hexdigest()
             cases.append(
                 {
                     **planned,
-                    "first_condition_sha256": hashlib.sha256(
-                        f"condition-{planned['global_case_index']}".encode()
+                    "first_condition_sha256": condition,
+                    "live_condition_sha256": condition,
+                    "live_reset_state_sha256": hashlib.sha256(
+                        f"reset-{planned['global_case_index']}".encode()
                     ).hexdigest(),
+                    "scenario_id": canonical_json_sha256(
+                        {
+                            "seed": planned["seed"],
+                            "env_index": planned["env_index"],
+                            "first_condition_sha256": condition,
+                        }
+                    ),
                 }
             )
+        bundles = [
+            {
+                "seed": seed,
+                "path": str(self.root / f"first_condition_seed{seed}.npz"),
+                "sha256": hashlib.sha256(f"bundle-{seed}".encode()).hexdigest(),
+                "size": 1,
+                "case_count": EVALUATION_MOTIONS_PER_SEED,
+                "source_pass_index": 1,
+            }
+            for seed in FIXED_SEEDS
+        ]
         evidence = {
             "schema": CAPTURE_EVIDENCE_SCHEMA,
             "plan_sha256": plan_sha,
             "cases": list(reversed(cases)),
+            "first_condition_bundles": bundles,
+            "first_condition_bundle_inventory_sha256": canonical_json_sha256(
+                bundles
+            ),
         }
         self.evidence_path.write_text(
             json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"

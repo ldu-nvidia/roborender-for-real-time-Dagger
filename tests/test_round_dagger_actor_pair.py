@@ -8,6 +8,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -57,6 +58,17 @@ def _production_data_lineage() -> dict:
         "collection_motion_count": 39,
         "heldout_motion_count": 256,
     }
+    bundles = [
+        {
+            "seed": seed,
+            "path": f"/immutable/first-condition-seed-{seed}.npz",
+            "sha256": f"{index + 1:x}" * 64,
+            "size": 1,
+            "case_count": 32,
+            "source_pass_index": 1,
+        }
+        for index, seed in enumerate((17, 29, 43, 59, 71, 89, 101, 127))
+    ]
     return derive_data_lineage(
         {
             "contract_sha256": "8" * 64,
@@ -65,6 +77,10 @@ def _production_data_lineage() -> dict:
                 "attestation_sha256": "a" * 64,
                 "evidence_sha256": "b" * 64,
                 "scenario_sha256": "c" * 64,
+                "first_condition_bundles": bundles,
+                "first_condition_bundle_inventory_sha256": (
+                    artifacts.canonical_json_sha256(bundles)
+                ),
             },
             "capture_provenance": {
                 "motion_split_manifest_sha256": motion_split[
@@ -555,7 +571,7 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "[[ \"$ROUND_DAGGER_WANDB_SIDECAR_OWNER\" == 1 ]]\n"
             "[[ \"$ROUND_DAGGER_WANDB_PAIR_LIFECYCLE\" == 1 ]]\n"
             f"[[ \"$rank_script\" == {str(WANDB_RANK_SCRIPT)!r} ]]\n"
-            f"/usr/bin/python3 {self.publisher!s} \"$ROUND_DAGGER_COHORT_DIR\" \"$rank\"\n"
+            f"{sys.executable} {self.publisher!s} \"$ROUND_DAGGER_COHORT_DIR\" \"$rank\"\n"
             "printf '0\\n' > \"$ROUND_DAGGER_WANDB_ACTOR_DONE_MARKER\"\n"
             "finish=\"$TRAIN_RUN_DIR/$ROUND_DAGGER_WANDB_PAIR_FINISH_MARKER\"\n"
             "for _ in $(seq 1 100); do\n"

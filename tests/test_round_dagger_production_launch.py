@@ -85,6 +85,27 @@ class ProductionLaunchTests(unittest.TestCase):
             evaluation_source_root
             / profile["motion_split"]["heldout_plan_relative_path"]
         )
+        bundle_root = self.base / "first-condition-bundles"
+        bundle_root.mkdir(exist_ok=True)
+        first_condition_bundles = []
+        for seed in (17, 29, 43, 59, 71, 89, 101, 127):
+            bundle_path = bundle_root / f"seed_{seed}.npz"
+            if not bundle_path.exists():
+                bundle_path.write_bytes(f"first-condition:{seed}\n".encode())
+                bundle_path.chmod(0o444)
+            first_condition_bundles.append(
+                {
+                    "seed": seed,
+                    "path": str(bundle_path),
+                    "sha256": artifacts.sha256_file(bundle_path),
+                    "size": bundle_path.stat().st_size,
+                    "case_count": 32,
+                    "source_pass_index": 1,
+                }
+            )
+        first_condition_inventory_sha = artifacts.canonical_json_sha256(
+            first_condition_bundles
+        )
         provenance = {
             "fast_roborender_revision": "1" * 40,
             "gr00t_revision": "2" * 40,
@@ -138,6 +159,10 @@ class ProductionLaunchTests(unittest.TestCase):
                 "scenario_sha256": profile["evaluation"][
                     "scenario_contract_sha256"
                 ],
+                "first_condition_bundles": first_condition_bundles,
+                "first_condition_bundle_inventory_sha256": (
+                    first_condition_inventory_sha
+                ),
             },
             "capture_provenance": provenance,
         }
@@ -564,6 +589,14 @@ class ProductionLaunchTests(unittest.TestCase):
             environment["ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256"],
             campaign["motion_split"]["heldout_plan_sha256"],
         )
+        self.assertEqual(
+            environment[
+                "ROUND_DAGGER_FIRST_CONDITION_BUNDLE_INVENTORY_SHA256"
+            ],
+            campaign["production_runtime_contract"]["live_capture"][
+                "first_condition_bundle_inventory_sha256"
+            ],
+        )
         self.assertNotIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK", environment)
         self.assertEqual(
             [
@@ -759,6 +792,21 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(load_campaign(self.base / "campaign")["policy_config_sha256"], deployment_sha)
         self.assertNotIn("learner_contract_sha256", plan)
         self.assertFalse(any("KEY" in name or "TOKEN" in name for name in environment))
+
+    def test_first_condition_bundle_inventory_is_rehashed_at_launch_boundary(self) -> None:
+        campaign, _, _, _ = self._materialized_campaign_fixture()
+        rows = production_launch._verify_first_condition_bundles(campaign)
+        self.assertEqual([row["seed"] for row in rows], [17, 29, 43, 59, 71, 89, 101, 127])
+
+        bundle = Path(rows[0]["path"])
+        bundle.chmod(0o644)
+        bundle.write_bytes(b"mutated first condition\n")
+        bundle.chmod(0o444)
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "size differs|bytes differ",
+        ):
+            production_launch._verify_first_condition_bundles(campaign)
 
     def test_static_deployment_contract_sha_is_rejected_as_round_bundle_sha(self) -> None:
         deployment_sha = artifacts.sha256_file(LEARNER_CONTRACT)

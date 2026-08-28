@@ -9,12 +9,16 @@ Usage: run_heldout_scenario_capture.sh --plan FILE --seed N --pass-index 1|2
        --checkpoint-sha256 SHA --evaluation-config FILE
        --motion-split FILE --motion-split-sha256 SHA
        --endpoint-dir DIR --expected-renderers N [--python PYTHON] [--smoke2]
+       [--first-condition-bundle FILE --first-condition-bundle-sha256 SHA]
 
 Production runs capture one real Image3F response for 32 planned environments,
 then exit before env.step.  --smoke2 runs exactly two planned environments and
 publishes explicitly non-release evidence.  Run production twice per seed with
 pass indices 1 and 2; round_dagger.scenario_capture attests the complete 8x32
-campaign.
+campaign. Pass 1 publishes the canonical condition bundle inside its fresh
+output directory. Pass 2 must be given that exact bundle and external SHA-256;
+it still performs a fresh simulator reset/render for diagnostics, but sends the
+captured request arrays to Image3F.
 
 The caller must provide the production identity environment variables checked
 below.  No identity is inferred from an interactive checkout.
@@ -36,6 +40,8 @@ ENDPOINT_DIR=
 EXPECTED_RENDERERS=
 PYTHON_BIN=python3
 SMOKE2=0
+FIRST_CONDITION_BUNDLE=
+FIRST_CONDITION_BUNDLE_SHA=
 while (($#)); do
     case "$1" in
         --plan) PLAN=${2:?}; shift 2 ;;
@@ -52,6 +58,8 @@ while (($#)); do
         --expected-renderers) EXPECTED_RENDERERS=${2:?}; shift 2 ;;
         --python) PYTHON_BIN=${2:?}; shift 2 ;;
         --smoke2) SMOKE2=1; shift ;;
+        --first-condition-bundle) FIRST_CONDITION_BUNDLE=${2:?}; shift 2 ;;
+        --first-condition-bundle-sha256) FIRST_CONDITION_BUNDLE_SHA=${2:?}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fatal "unknown argument: $1" ;;
     esac
@@ -66,6 +74,22 @@ done
 [[ $EXPECTED_RENDERERS =~ ^[1-9][0-9]*$ ]] || fatal "renderer count is invalid"
 [[ $CHECKPOINT_SHA =~ ^[0-9a-f]{64}$ ]] || fatal "checkpoint SHA is malformed"
 [[ $MOTION_SPLIT_SHA =~ ^[0-9a-f]{64}$ ]] || fatal "motion split SHA is malformed"
+if [[ $PASS_INDEX == 1 ]]; then
+    [[ -z $FIRST_CONDITION_BUNDLE && -z $FIRST_CONDITION_BUNDLE_SHA ]] || \
+        fatal "pass 1 creates its own first-condition bundle"
+else
+    [[ -n $FIRST_CONDITION_BUNDLE && -n $FIRST_CONDITION_BUNDLE_SHA ]] || \
+        fatal "pass 2 requires first-condition bundle path and SHA-256"
+    [[ $FIRST_CONDITION_BUNDLE_SHA =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "first-condition bundle SHA-256 is malformed"
+    [[ $FIRST_CONDITION_BUNDLE == /* && -f $FIRST_CONDITION_BUNDLE && \
+       ! -L $FIRST_CONDITION_BUNDLE ]] || \
+        fatal "first-condition bundle must be an absolute non-symlink regular file"
+    [[ $(stat -c '%A' "$FIRST_CONDITION_BUNDLE") != *w* ]] || \
+        fatal "first-condition bundle must have no write bits"
+    [[ $(sha256sum "$FIRST_CONDITION_BUNDLE" | awk '{print $1}') == \
+       "$FIRST_CONDITION_BUNDLE_SHA" ]] || fatal "first-condition bundle SHA mismatch"
+fi
 for path in "$PLAN" "$CHECKPOINT" "$EVALUATION_CONFIG" "$MOTION_SPLIT"; do
     [[ $path == /* && -f $path && ! -L $path ]] || \
         fatal "input must be an absolute non-symlink regular file: $path"
@@ -179,6 +203,11 @@ RUNTIME_OUTPUT="$OUTPUT_DIR/scenario_capture_runtime.json"
 BEFORE="$OUTPUT_DIR/renderer_before.json"
 AFTER="$OUTPUT_DIR/renderer_after.json"
 PASS_OUTPUT="$OUTPUT_DIR/scenario_capture_pass.json"
+if [[ $PASS_INDEX == 1 ]]; then
+    FIRST_CONDITION_BUNDLE="$OUTPUT_DIR/first_condition_bundle.npz"
+    [[ ! -e $FIRST_CONDITION_BUNDLE && ! -L $FIRST_CONDITION_BUNDLE ]] || \
+        fatal "first-condition bundle output is not fresh"
+fi
 
 # The pinned bootstrap bundle is mounted read-only in production, while the
 # upstream evaluator materializes loader-derived files beside its checkpoint.
@@ -291,6 +320,14 @@ export IMAGE3F_RUN_ID="$RUN_ID"
 export IMAGE3F_ENDPOINT_DIR="$ENDPOINT_DIR"
 export IMAGE3F_LOCAL_ENVS="$NUM_ENVS"
 export ROUND_DAGGER_SCENARIO_CAPTURE_PLAN_SHA256="$PLAN_SHA"
+export IMAGE_DAGGER_FIRST_CONDITION_BUNDLE="$FIRST_CONDITION_BUNDLE"
+if [[ $PASS_INDEX == 1 ]]; then
+    export IMAGE_DAGGER_FIRST_CONDITION_MODE=capture
+    unset IMAGE_DAGGER_FIRST_CONDITION_BUNDLE_SHA256
+else
+    export IMAGE_DAGGER_FIRST_CONDITION_MODE=replay
+    export IMAGE_DAGGER_FIRST_CONDITION_BUNDLE_SHA256="$FIRST_CONDITION_BUNDLE_SHA"
+fi
 
 (
     cd "$GR00T_ROOT"
@@ -343,6 +380,15 @@ fi
 
 [[ -f $RUNTIME_OUTPUT && ! -L $RUNTIME_OUTPUT ]] || \
     fatal "evaluator did not publish immutable scenario capture evidence"
+[[ -f $FIRST_CONDITION_BUNDLE && ! -L $FIRST_CONDITION_BUNDLE ]] || \
+    fatal "evaluator did not preserve the first-condition bundle"
+[[ $(stat -c '%A' "$FIRST_CONDITION_BUNDLE") != *w* ]] || \
+    fatal "first-condition bundle is writable"
+OBSERVED_FIRST_CONDITION_BUNDLE_SHA=$(sha256sum "$FIRST_CONDITION_BUNDLE" | awk '{print $1}')
+if [[ $PASS_INDEX == 2 && \
+      $OBSERVED_FIRST_CONDITION_BUNDLE_SHA != "$FIRST_CONDITION_BUNDLE_SHA" ]]; then
+    fatal "first-condition bundle changed during replay"
+fi
 "${probe[@]}" --write-report "$AFTER" >/dev/null
 
 attest=("$PYTHON_BIN" -m round_dagger.scenario_capture attest-pass

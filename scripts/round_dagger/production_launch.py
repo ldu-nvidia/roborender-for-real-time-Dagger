@@ -235,6 +235,93 @@ def _file_identity(path: Path, expected_sha: str, label: str) -> None:
         raise ProductionLaunchError(f"{label} bytes differ from the production contract")
 
 
+def _verify_first_condition_bundles(
+    campaign_contract: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    runtime = campaign_contract.get("production_runtime_contract")
+    if not isinstance(runtime, Mapping):
+        raise ProductionLaunchError(
+            "materialized campaign has no production runtime contract"
+        )
+    capture = runtime.get("live_capture")
+    if not isinstance(capture, Mapping):
+        raise ProductionLaunchError("production runtime contract has no live capture")
+    expected_keys = {
+        "seed",
+        "path",
+        "sha256",
+        "size",
+        "case_count",
+        "source_pass_index",
+    }
+    expected_seeds = [17, 29, 43, 59, 71, 89, 101, 127]
+    rows = capture.get("first_condition_bundles")
+    if not isinstance(rows, list) or len(rows) != len(expected_seeds):
+        raise ProductionLaunchError(
+            "first-condition bundle inventory is not exact eight-seed coverage"
+        )
+    inventory_sha = _require_sha(
+        capture.get("first_condition_bundle_inventory_sha256"),
+        "first-condition bundle inventory SHA-256",
+    )
+    if artifacts.canonical_json_sha256(rows) != inventory_sha:
+        raise ProductionLaunchError(
+            "first-condition bundle inventory digest is non-canonical"
+        )
+    lineage = campaign_contract.get("data_lineage")
+    heldout = lineage.get("heldout_evaluation") if isinstance(lineage, Mapping) else None
+    if (
+        not isinstance(heldout, Mapping)
+        or heldout.get("first_condition_bundle_inventory_sha256") != inventory_sha
+        or heldout.get("first_condition_bundles") != rows
+    ):
+        raise ProductionLaunchError(
+            "first-condition bundle inventory differs from durable data lineage"
+        )
+    normalized: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for index, (raw, seed) in enumerate(zip(rows, expected_seeds, strict=True)):
+        row = _exact(raw, expected_keys, f"first-condition bundle {index}")
+        if (
+            row["seed"] != seed
+            or type(row["size"]) is not int
+            or row["size"] < 1
+            or row["case_count"] != 32
+            or row["source_pass_index"] != 1
+        ):
+            raise ProductionLaunchError(
+                f"first-condition bundle for seed {seed} is malformed"
+            )
+        path = _regular(
+            _absolute(row["path"], f"first-condition bundle {seed}"),
+            f"first-condition bundle {seed}",
+        )
+        try:
+            if path.resolve(strict=True) != path:
+                raise ProductionLaunchError(
+                    f"first-condition bundle {seed} path is not canonical"
+                )
+        except OSError as exc:
+            raise ProductionLaunchError(
+                f"cannot resolve first-condition bundle {seed}"
+            ) from exc
+        if str(path) in seen_paths:
+            raise ProductionLaunchError("first-condition bundle paths are not unique")
+        seen_paths.add(str(path))
+        metadata = path.stat()
+        if stat.S_IMODE(metadata.st_mode) != 0o444:
+            raise ProductionLaunchError(
+                f"first-condition bundle {seed} mode must be exactly 0444"
+            )
+        if metadata.st_size != row["size"]:
+            raise ProductionLaunchError(
+                f"first-condition bundle {seed} size differs from inventory"
+            )
+        _file_identity(path, row["sha256"], f"first-condition bundle {seed}")
+        normalized.append(dict(row))
+    return normalized
+
+
 def _load_contract(path: Path, schema: str, keys: set[str], label: str) -> dict[str, Any]:
     _regular(path, label)
     try:
@@ -886,6 +973,7 @@ def _verify_static_inputs(campaign_contract: Mapping[str, Any]) -> None:
     split = campaign_contract["motion_split"]
     runtime_contract = campaign_contract.get("production_runtime_contract")
     if isinstance(runtime_contract, Mapping):
+        _verify_first_condition_bundles(campaign_contract)
         split_manifest = Path(runtime_contract["live_capture"]["split_manifest_path"])
         heldout_plan = Path(runtime_contract["live_capture"]["heldout_plan_path"])
     else:
@@ -1750,6 +1838,11 @@ def build_environment(
         "ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256": production_runtime[
             "live_capture"
         ]["evidence_sha256"],
+        "ROUND_DAGGER_FIRST_CONDITION_BUNDLE_INVENTORY_SHA256": (
+            production_runtime["live_capture"][
+                "first_condition_bundle_inventory_sha256"
+            ]
+        ),
         "ROUND_DAGGER_HELDOUT_EVALUATION_PLAN": str(
             Path(evaluation_source_root) / split["heldout_plan_relative_path"]
         ),
@@ -2046,6 +2139,10 @@ def validate_launch(
         "exported_environment_names": sorted(environment),
         "credentials_in_plan": False,
     }
+    # Re-hash every exact condition bundle as the final preflight operation.
+    # The evaluation hook mounts these same files read-only and repeats the
+    # check before contract publication, container launch, and after execution.
+    _verify_first_condition_bundles(campaign_contract)
     return environment, plan
 
 

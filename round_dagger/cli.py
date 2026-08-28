@@ -113,7 +113,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-lineage",
         type=_json_object_file,
         help=(
-            "absolute immutable production_data_lineage.v1 JSON; required for "
+            "absolute immutable production_data_lineage.v2 JSON; required for "
             "a production campaign and omitted for legacy experiments"
         ),
     )

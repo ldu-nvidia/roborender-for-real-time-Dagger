@@ -11,12 +11,19 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from round_dagger.artifacts import ArtifactError, canonical_json_sha256, sha256_file
 from round_dagger.evaluation import (
+    DEFAULT_THRESHOLDS,
+    IMAGE3F_RUNTIME_SCHEMA,
+    LEGACY_RUNTIME_SCHEMA,
     POLICY_VIEWS,
+    PRODUCTION_CONTRACT_SCHEMA,
+    PRODUCTION_OUTCOME_SCHEMA,
     RUNTIME_SCHEMA,
     _score,
+    _validate_first_condition_bundles,
     EvaluationError,
     EVALUATOR_RESULT_SCHEMA,
     attest_outcome,
@@ -186,6 +193,76 @@ class PairedEvaluationTest(unittest.TestCase):
         self.assertFalse(decision["meaningful_improvement_any"])
         self.assertFalse(decision["passed"])
 
+    def test_production_score_requires_live_reset_pairing_but_keeps_live_condition_diagnostic(self) -> None:
+        parent = []
+        candidate = []
+        for index in range(8):
+            common = {
+                "seed": 17,
+                "env_index": index,
+                "scenario_id": _sha(f"scenario:{index}"),
+                "first_condition_sha256": _sha(f"condition:{index}"),
+                "first_generated_sha256": _sha(f"generated:{index}"),
+                "success": index % 2 == 0,
+                "safety_violation": False,
+                "action_imitation_mse": 1.0,
+                "episode_length": 300,
+                "live_reset_state_sha256": _sha(f"reset:{index}"),
+            }
+            parent.append(
+                {**common, "live_condition_sha256": _sha(f"live:{index}")}
+            )
+            candidate.append(
+                {
+                    **common,
+                    "live_condition_sha256": _sha(
+                        f"live:{index}" if index < 5 else f"diagnostic:{index}"
+                    ),
+                }
+            )
+
+        metrics, _ = _score(parent, candidate, DEFAULT_THRESHOLDS)
+        self.assertEqual(metrics["paired_live_reset_state_matches"], 8.0)
+        self.assertEqual(metrics["paired_live_condition_matches"], 5.0)
+
+        candidate[0]["live_reset_state_sha256"] = _sha("different-reset")
+        with self.assertRaisesRegex(EvaluationError, "live reset-state"):
+            _score(parent, candidate, DEFAULT_THRESHOLDS)
+
+    def test_first_condition_inventory_rehashes_exact_read_only_files(self) -> None:
+        rows = []
+        for seed in (17, 29):
+            path = self.tmp / f"first-condition-{seed}.npz"
+            path.write_bytes(f"bundle:{seed}\n".encode())
+            path.chmod(0o444)
+            rows.append(
+                {
+                    "seed": seed,
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                    "case_count": 4,
+                    "source_pass_index": 1,
+                }
+            )
+        self.assertEqual(
+            _validate_first_condition_bundles(
+                rows,
+                expected_seeds=[17, 29],
+                expected_case_count=4,
+                verify_files=True,
+            ),
+            rows,
+        )
+        Path(rows[0]["path"]).chmod(0o644)
+        with self.assertRaisesRegex(EvaluationError, "read-only mode 0444"):
+            _validate_first_condition_bundles(
+                rows,
+                expected_seeds=[17, 29],
+                expected_case_count=4,
+                verify_files=True,
+            )
+
     def _raw_evidence(
         self,
         role: str,
@@ -280,7 +357,7 @@ class PairedEvaluationTest(unittest.TestCase):
                 "image3f_run_id": image3f_run_id,
             },
             "_roborender_paired_evaluation": {
-                "schema": RUNTIME_SCHEMA,
+                "schema": LEGACY_RUNTIME_SCHEMA,
                 "eval_relabel_enabled": True,
                 "policy_views": list(POLICY_VIEWS),
                 "view_layout": "vertical",
@@ -405,6 +482,186 @@ class PairedEvaluationTest(unittest.TestCase):
             output=outcome,
         )
         return outcome
+
+    def test_production_runtime_replay_evidence_attests_v6_outcome_and_rejects_stale_or_incomplete_data(self) -> None:
+        production_contract = json.loads(json.dumps(self.contract))
+        production_contract["schema"] = PRODUCTION_CONTRACT_SCHEMA
+        production_contract["contract_sha256"] = _sha("production-contract")
+        production_contract["data_lineage_sha256"] = _sha("production-lineage")
+        bundle_rows = []
+        for seed in production_contract["seeds"]:
+            bundle = self.tmp / f"production-first-condition-{seed}.npz"
+            bundle.write_bytes(f"production-bundle:{seed}\n".encode())
+            bundle.chmod(0o444)
+            bundle_rows.append(
+                {
+                    "seed": seed,
+                    "path": str(bundle),
+                    "sha256": sha256_file(bundle),
+                    "size": bundle.stat().st_size,
+                    "case_count": 4,
+                    "source_pass_index": 1,
+                }
+            )
+        production_contract["first_condition_bundles"] = bundle_rows
+        production_contract["first_condition_bundle_inventory_sha256"] = (
+            canonical_json_sha256(bundle_rows)
+        )
+
+        role = "parent"
+        seed = production_contract["seeds"][0]
+        metrics_path, before, after = self._raw_evidence(
+            role,
+            seed,
+            successes=[True, False, False, False],
+            safety=[False] * 4,
+            action_mse=1.0,
+        )
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        image3f_runtime = metrics["_roborender_image3f_eval"]
+        paired_runtime = metrics["_roborender_paired_evaluation"]
+        conditions = dict(image3f_runtime["first_condition_sha256_by_env"])
+        live_conditions = {
+            str(index): _sha(f"live-condition:{seed}:{index}")
+            for index in range(4)
+        }
+        reset_states = {
+            str(index): _sha(f"reset-state:{seed}:{index}")
+            for index in range(4)
+        }
+        selected_bundle = bundle_rows[0]
+        replay_fields = {
+            "first_condition_bundle_mode": "replay",
+            "first_condition_bundle_path": selected_bundle["path"],
+            "first_condition_bundle_sha256": selected_bundle["sha256"],
+            "first_condition_replay_count": 4,
+            "first_condition_replay_env_indices": [0, 1, 2, 3],
+        }
+        paired_runtime.update(
+            {
+                "schema": RUNTIME_SCHEMA,
+                **replay_fields,
+                "first_condition_sha256_by_env": conditions,
+                "live_condition_sha256_by_env": live_conditions,
+                "live_reset_state_sha256_by_env": reset_states,
+            }
+        )
+        image3f_runtime.update(
+            {
+                "schema": IMAGE3F_RUNTIME_SCHEMA,
+                **replay_fields,
+                "live_condition_sha256_by_env": live_conditions,
+                "live_reset_state_sha256_by_env": reset_states,
+            }
+        )
+        run_id = evaluation_run_id(
+            production_contract, role=role, seed=seed, attempt=1
+        )
+        metrics["_roborender_eval_adapter"]["image3f_run_id"] = run_id
+        metrics_path.write_text(json.dumps(metrics, sort_keys=True), encoding="utf-8")
+
+        with mock.patch(
+            "round_dagger.evaluation.load_contract",
+            return_value=production_contract,
+        ):
+            outcome = attest_outcome(
+                self.root,
+                contract_path=production_contract["contract_path"],
+                role=role,
+                seed=seed,
+                metrics_path=metrics_path,
+                renderer_before_path=before,
+                renderer_after_path=after,
+                image3f_run_id=run_id,
+                output="evaluation/production-replay/outcome.json",
+            )
+        self.assertEqual(outcome["schema"], PRODUCTION_OUTCOME_SCHEMA)
+        self.assertEqual(outcome["first_condition_bundle"], selected_bundle)
+        self.assertEqual(outcome["first_condition_replay_count"], 4)
+        self.assertEqual(outcome["first_condition_replay_env_indices"], [0, 1, 2, 3])
+        self.assertEqual(
+            outcome["episodes"][0]["live_reset_state_sha256"],
+            reset_states["0"],
+        )
+        self.assertNotEqual(
+            outcome["episodes"][0]["live_condition_sha256"],
+            outcome["episodes"][0]["first_condition_sha256"],
+            "the live condition is retained as a diagnostic, not replay identity",
+        )
+        loaded = load_outcome(
+            self.root,
+            outcome["outcome_path"],
+            contract=production_contract,
+            expected_role=role,
+            expected_seed=seed,
+        )
+        self.assertEqual(loaded["schema"], PRODUCTION_OUTCOME_SCHEMA)
+
+        stale_outcome = json.loads(
+            (self.root / outcome["outcome_path"]).read_text(encoding="utf-8")
+        )
+        stale_outcome["schema"] = (
+            "fast_roborender.round_dagger.paired_evaluation_outcome.v5"
+        )
+        stale_path = self.root / "evaluation/production-replay/stale-outcome.json"
+        stale_path.write_text(json.dumps(stale_outcome), encoding="utf-8")
+        with self.assertRaisesRegex(EvaluationError, "outcome schema mismatch"):
+            load_outcome(
+                self.root,
+                stale_path,
+                contract=production_contract,
+                expected_role=role,
+                expected_seed=seed,
+            )
+
+        invalid_variants = (
+            (
+                "stale-runtime-schema",
+                lambda document: document["_roborender_paired_evaluation"].__setitem__(
+                    "schema", LEGACY_RUNTIME_SCHEMA
+                ),
+                "runtime evidence differs",
+            ),
+            (
+                "incomplete-replay",
+                lambda document: document["_roborender_image3f_eval"].__setitem__(
+                    "first_condition_replay_count", 3
+                ),
+                "exactly once for every environment",
+            ),
+            (
+                "cross-layer-reset-mismatch",
+                lambda document: document["_roborender_image3f_eval"][
+                    "live_reset_state_sha256_by_env"
+                ].__setitem__("0", _sha("different-cross-layer-reset")),
+                "differs from Image3F runtime",
+            ),
+        )
+        for label, mutate, message in invalid_variants:
+            with self.subTest(label=label):
+                invalid = json.loads(json.dumps(metrics))
+                mutate(invalid)
+                metrics_path.write_text(
+                    json.dumps(invalid, sort_keys=True), encoding="utf-8"
+                )
+                with (
+                    mock.patch(
+                        "round_dagger.evaluation.load_contract",
+                        return_value=production_contract,
+                    ),
+                    self.assertRaisesRegex(EvaluationError, message),
+                ):
+                    attest_outcome(
+                        self.root,
+                        contract_path=production_contract["contract_path"],
+                        role=role,
+                        seed=seed,
+                        metrics_path=metrics_path,
+                        renderer_before_path=before,
+                        renderer_after_path=after,
+                        image3f_run_id=run_id,
+                        output=f"evaluation/production-replay/{label}.json",
+                    )
 
     def _run_launcher(
         self,
@@ -635,6 +892,19 @@ class PairedEvaluationTest(unittest.TestCase):
                 anchor_inventory_sha256=self.anchor_inventory_sha,
                 output="evaluation/bad-anchor-index-contract.json",
             )
+
+    def test_stale_production_contract_schema_is_rejected(self) -> None:
+        stale = json.loads(
+            (self.root / self.contract["contract_path"]).read_text(encoding="utf-8")
+        )
+        stale["schema"] = (
+            "fast_roborender.round_dagger.paired_evaluation_contract.v3"
+        )
+        path = self.root / "evaluation/stale-production-contract.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(stale), encoding="utf-8")
+        with self.assertRaisesRegex(EvaluationError, "contract schema mismatch"):
+            load_contract(self.root, path)
 
     def test_role_seed_and_retry_stream_namespaces_are_disjoint(self) -> None:
         run_ids = {
@@ -1104,7 +1374,7 @@ class PairedEvaluationTest(unittest.TestCase):
             self.gr00t,
             self.evaluation_inventory_sha,
         )
-        self.assertEqual(len(bundle["sources"]), 25)
+        self.assertEqual(len(bundle["sources"]), 26)
         self.assertIn(
             "gr00t/gr00t/rl/trl/trainer/anchor_io.py",
             {item["source"] for item in bundle["sources"]},
@@ -1457,6 +1727,7 @@ if args and args[0] == "-":
             "1", "4", os.environ["FAKE_TEACHER_SHA"],
             os.environ["FAKE_ANCHOR_POOL"], "1", "0",
             os.environ["FAKE_ANCHOR_SHA"],
+            "fast_roborender.round_dagger.paired_evaluation_contract.v2",
         ):
             print(value)
     elif len(args) == 2:

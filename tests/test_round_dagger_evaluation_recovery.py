@@ -318,7 +318,10 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
                         "image3f_run_id": run_id,
                     },
                     "_roborender_paired_evaluation": {
-                        "schema": evaluation.RUNTIME_SCHEMA,
+                        # Hardened recovery exercises the non-production v2
+                        # paired contract, whose runtime evidence remains the
+                        # explicit legacy-v1 shape (no canonical bundle rows).
+                        "schema": evaluation.LEGACY_RUNTIME_SCHEMA,
                         "eval_relabel_enabled": True,
                         "policy_views": list(evaluation.POLICY_VIEWS),
                         "view_layout": "vertical",

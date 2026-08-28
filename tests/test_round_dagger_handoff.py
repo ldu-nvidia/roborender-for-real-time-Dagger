@@ -46,6 +46,17 @@ def _production_data_lineage() -> dict:
         "collection_motion_count": 39,
         "heldout_motion_count": 256,
     }
+    bundles = [
+        {
+            "seed": seed,
+            "path": f"/immutable/first-condition-seed-{seed}.npz",
+            "sha256": f"{index + 1:x}" * 64,
+            "size": 1,
+            "case_count": 32,
+            "source_pass_index": 1,
+        }
+        for index, seed in enumerate((17, 29, 43, 59, 71, 89, 101, 127))
+    ]
     return derive_data_lineage(
         {
             "contract_sha256": "8" * 64,
@@ -54,6 +65,10 @@ def _production_data_lineage() -> dict:
                 "attestation_sha256": "a" * 64,
                 "evidence_sha256": "b" * 64,
                 "scenario_sha256": "c" * 64,
+                "first_condition_bundles": bundles,
+                "first_condition_bundle_inventory_sha256": (
+                    artifacts.canonical_json_sha256(bundles)
+                ),
             },
             "capture_provenance": {
                 "motion_split_manifest_sha256": motion_split[

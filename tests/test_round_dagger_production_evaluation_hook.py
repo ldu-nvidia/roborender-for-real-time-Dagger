@@ -11,9 +11,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from round_dagger.artifacts import sha256_file
+from round_dagger.artifacts import canonical_json_sha256, sha256_file
 from round_dagger.evaluation import DEFAULT_THRESHOLDS
 from round_dagger.production_data_lineage import (
+    RUNTIME_CONTRACT_SCHEMA,
     data_lineage_sha256,
     derive_data_lineage,
 )
@@ -157,8 +158,6 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         )
         self.capture_attestation = self.tmp / "capture_attestation.json"
         self.capture_evidence = self.tmp / "capture_evidence.json"
-        self.capture_attestation.write_text("{}\n", encoding="utf-8")
-        self.capture_evidence.write_text("{}\n", encoding="utf-8")
         camera_acceptance = self.tmp / "camera_acceptance.json"
         camera_acceptance.write_text(
             json.dumps({"reviewer": "fixture-reviewer"}) + "\n",
@@ -177,8 +176,45 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                         "sha256": sha256_file(path),
                     }
                 )
+        bundle_root = self.tmp / "first-condition-bundles"
+        bundle_root.mkdir()
+        first_condition_bundles = []
+        for seed in (17, 29, 43, 59, 71, 89, 101, 127):
+            path = bundle_root / f"seed_{seed}.npz"
+            path.write_bytes(f"first-condition:{seed}\n".encode())
+            path.chmod(0o444)
+            first_condition_bundles.append(
+                {
+                    "seed": seed,
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                    "case_count": 32,
+                    "source_pass_index": 1,
+                }
+            )
+        self.first_condition_bundles = first_condition_bundles
+        self.first_condition_bundle_inventory_sha = canonical_json_sha256(
+            first_condition_bundles
+        )
+        capture_inventory = {
+            "first_condition_bundles": first_condition_bundles,
+            "first_condition_bundle_inventory_sha256": (
+                self.first_condition_bundle_inventory_sha
+            ),
+        }
+        self.capture_attestation.write_text(
+            json.dumps(capture_inventory, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        self.capture_evidence.write_text(
+            json.dumps(capture_inventory, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
         runtime_contract_document = {
-            "schema": "fast_roborender.round_dagger.production_runtime_contract.v1",
+            "schema": RUNTIME_CONTRACT_SCHEMA,
             "status": "release_eligible",
             "invariant_profile_sha256": sha256_file(sealed_campaign_path),
             "camera_acceptance": {
@@ -205,6 +241,10 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                 "evidence_sha256": sha256_file(self.capture_evidence),
                 "scenario_path": str(scenario_path),
                 "scenario_sha256": sha256_file(scenario_path),
+                "first_condition_bundles": first_condition_bundles,
+                "first_condition_bundle_inventory_sha256": (
+                    self.first_condition_bundle_inventory_sha
+                ),
             },
         }
         self.runtime_contract = self.tmp / "production_runtime_contract.json"
@@ -264,6 +304,18 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "\"$FIXTURE_DATA_LINEAGE_SHA\"\n"
             "  exit 0\n"
             "fi\n"
+            "if [[ ${1:-} == -m && ${2:-} == round_dagger.evaluation "
+            "&& ${3:-} == prepare ]]; then\n"
+            "  output=\n"
+            "  while (($#)); do\n"
+            "    if [[ $1 == --output ]]; then output=$2; break; fi\n"
+            "    shift\n"
+            "  done\n"
+            "  [[ -n $output ]]\n"
+            "  mkdir -p \"$(dirname \"$output\")\"\n"
+            "  printf '{\"schema\":\"fixture-contract\"}\\n' >\"$output\"\n"
+            "  exit 0\n"
+            "fi\n"
             "for value in \"$@\"; do\n"
             "  case \"$value\" in\n"
             "    *verify_sealed_source_snapshot.py|*verify_anchor_pool.py) exit 0 ;;\n"
@@ -309,6 +361,9 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "ROUND_DAGGER_CAMPAIGN_CONTRACT": str(self.runtime_contract),
             "ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256": self.runtime_contract_sha,
             "ROUND_DAGGER_DATA_LINEAGE_SHA256": self.data_lineage_sha,
+            "ROUND_DAGGER_FIRST_CONDITION_BUNDLE_INVENTORY_SHA256": (
+                self.first_condition_bundle_inventory_sha
+            ),
             "ROUND_DAGGER_CAPTURE_ATTESTATION": str(
                 self.capture_attestation
             ),
@@ -463,6 +518,11 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.assertIn(campaign_mount, unescaped_stdout)
         self.assertIn(evaluation_mount, unescaped_stdout)
         self.assertIn(contract_mount, unescaped_stdout)
+        for row in self.first_condition_bundles:
+            self.assertIn(
+                f"type=bind,src={row['path']},dst={row['path']},readonly",
+                unescaped_stdout,
+            )
         self.assertIn("--tmpfs", unescaped_stdout)
         self.assertIn("/run/round-dagger-eval:rw,nosuid,nodev,noexec,size=1g", unescaped_stdout)
         self.assertNotIn("type=bind,src=/mnt/data2,dst=/mnt/data2", unescaped_stdout)
@@ -525,6 +585,19 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             f"--sealed-teacher-checkpoint {self.sealed_teacher}", invocation
         )
         self.assertIn("--require-teacher-readonly-mount", invocation)
+
+    def test_mutated_first_condition_bundle_fails_before_contract_publication(self) -> None:
+        bundle = Path(self.first_condition_bundles[0]["path"])
+        bundle.chmod(0o644)
+        bundle.write_bytes(b"mutated first-condition fixture\n")
+        bundle.chmod(0o444)
+        completed = self._run(dry_run=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "first-condition bundle inventory verification failed",
+            completed.stderr,
+        )
+        self.assertFalse(self.contract.exists())
 
     def test_candidate_manifest_and_image_id_mismatches_fail_closed(self) -> None:
         for key, value, message in (

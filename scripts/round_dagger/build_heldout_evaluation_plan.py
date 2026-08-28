@@ -40,8 +40,8 @@ from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Sequence
 
 PLAN_SCHEMA = "fast_roborender.round_dagger.heldout_motion_capture_plan.v2"
-CAPTURE_EVIDENCE_SCHEMA = "fast_roborender.round_dagger.motion_capture_evidence.v1"
-FINALIZATION_SCHEMA = "fast_roborender.round_dagger.motion_capture_finalization.v1"
+CAPTURE_EVIDENCE_SCHEMA = "fast_roborender.round_dagger.motion_capture_evidence.v2"
+FINALIZATION_SCHEMA = "fast_roborender.round_dagger.motion_capture_finalization.v2"
 CAPTURE_CONTRACT_SCHEMA = "fast_roborender.round_dagger.scenario_capture_contract.v1"
 NESTED_SPLIT_SCHEMA = "roborender.motion_split.v1"
 EXPECTED_MOTION_COUNT = 295
@@ -519,7 +519,20 @@ _PLANNED_CASE_KEYS = {
     "motion_relative_path",
     "motion_sha256",
 }
-_EVIDENCE_CASE_KEYS = _PLANNED_CASE_KEYS | {"first_condition_sha256"}
+_EVIDENCE_CASE_KEYS = _PLANNED_CASE_KEYS | {
+    "first_condition_sha256",
+    "live_condition_sha256",
+    "live_reset_state_sha256",
+    "scenario_id",
+}
+_BUNDLE_KEYS = {
+    "seed",
+    "path",
+    "sha256",
+    "size",
+    "case_count",
+    "source_pass_index",
+}
 
 
 def finalize_capture(
@@ -538,7 +551,13 @@ def finalize_capture(
     )
     plan, plan_payload = _load_json_file(manifest_path, "capture plan")
     evidence, evidence_payload = _load_json_file(evidence_path, "capture evidence")
-    if not isinstance(evidence, Mapping) or set(evidence) != {"schema", "plan_sha256", "cases"}:
+    if not isinstance(evidence, Mapping) or set(evidence) != {
+        "schema",
+        "plan_sha256",
+        "cases",
+        "first_condition_bundles",
+        "first_condition_bundle_inventory_sha256",
+    }:
         raise HeldoutPlanError("capture evidence fields are not exact")
     if evidence["schema"] != CAPTURE_EVIDENCE_SCHEMA:
         raise HeldoutPlanError("capture evidence schema mismatch")
@@ -563,7 +582,39 @@ def finalize_capture(
         normalized["first_condition_sha256"] = _sha(
             raw["first_condition_sha256"], "first-condition SHA-256"
         )
+        normalized["live_condition_sha256"] = _sha(
+            raw["live_condition_sha256"], "live-condition SHA-256"
+        )
+        normalized["live_reset_state_sha256"] = _sha(
+            raw["live_reset_state_sha256"], "live reset-state SHA-256"
+        )
+        normalized["scenario_id"] = _sha(raw["scenario_id"], "scenario ID")
+        if normalized["live_condition_sha256"] != normalized["first_condition_sha256"]:
+            raise HeldoutPlanError("source capture live/effective conditions differ")
         evidence_by_identity[identity] = normalized
+    bundles = evidence["first_condition_bundles"]
+    if not isinstance(bundles, list) or len(bundles) != len(FIXED_SEEDS):
+        raise HeldoutPlanError("capture evidence must bind exactly eight condition bundles")
+    normalized_bundles: list[dict[str, Any]] = []
+    for index, raw in enumerate(bundles):
+        if not isinstance(raw, Mapping) or set(raw) != _BUNDLE_KEYS:
+            raise HeldoutPlanError(f"condition bundle row {index} fields are not exact")
+        row = dict(raw)
+        if (
+            row["seed"] != FIXED_SEEDS[index]
+            or not isinstance(row["path"], str)
+            or not Path(row["path"]).is_absolute()
+            or type(row["size"]) is not int
+            or row["size"] <= 0
+            or row["case_count"] != EVALUATION_MOTIONS_PER_SEED
+            or row["source_pass_index"] != 1
+        ):
+            raise HeldoutPlanError("condition bundle inventory is not canonical 8x32")
+        row["sha256"] = _sha(row["sha256"], "condition bundle SHA-256")
+        normalized_bundles.append(row)
+    bundle_inventory_sha = _canonical_json_sha256(normalized_bundles)
+    if evidence["first_condition_bundle_inventory_sha256"] != bundle_inventory_sha:
+        raise HeldoutPlanError("condition bundle inventory SHA-256 mismatch")
     bindings: list[dict[str, Any]] = []
     scenarios: list[dict[str, Any]] = []
     for planned in plan["capture"]["cases"]:
@@ -579,6 +630,8 @@ def finalize_capture(
             "first_condition_sha256": actual["first_condition_sha256"],
         }
         scenario_id = _canonical_json_sha256(scenario_payload)
+        if actual["scenario_id"] != scenario_id:
+            raise HeldoutPlanError("capture evidence scenario ID is not condition-derived")
         scenarios.append(
             {
                 "seed": planned["seed"],
@@ -590,6 +643,8 @@ def finalize_capture(
             {
                 **planned,
                 "first_condition_sha256": actual["first_condition_sha256"],
+                "live_condition_sha256": actual["live_condition_sha256"],
+                "live_reset_state_sha256": actual["live_reset_state_sha256"],
                 "scenario_id": scenario_id,
             }
         )
@@ -609,6 +664,8 @@ def finalize_capture(
         "capture_evidence_case_inventory_sha256": _canonical_json_sha256(bindings),
         "scenario_contract_sha256": _sha256_bytes(scenario_payload),
         "scenario_id_algorithm": SCENARIO_ID_ALGORITHM,
+        "first_condition_bundles": normalized_bundles,
+        "first_condition_bundle_inventory_sha256": bundle_inventory_sha,
         "fixed_seeds": list(FIXED_SEEDS),
         "envs_per_seed": EVALUATION_MOTIONS_PER_SEED,
         "case_count": len(bindings),

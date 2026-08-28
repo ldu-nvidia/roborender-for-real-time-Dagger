@@ -38,7 +38,18 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
-def _contract(num_envs: int = 2, seed: int = 17) -> dict:
+def _contract(num_envs: int = 32, seed: int = 17) -> dict:
+    bundles = [
+        {
+            "seed": bundle_seed,
+            "path": f"/tmp/first-condition-{bundle_seed}.npz",
+            "sha256": _sha(f"bundle:{bundle_seed}"),
+            "size": 1,
+            "case_count": 32,
+            "source_pass_index": 1,
+        }
+        for bundle_seed in paired_runtime.EXPECTED_SEEDS
+    ]
     return {
         "schema": paired_runtime.CONTRACT_SCHEMA,
         "runtime": {
@@ -55,27 +66,60 @@ def _contract(num_envs: int = 2, seed: int = 17) -> dict:
             {"role": "candidate", "runtime_policy_sha256": _sha("candidate")},
         ],
         "scenario_cases": [
-            {"seed": seed, "env_index": env, "scenario_id": _sha(f"{seed}:{env}")}
+            {
+                "seed": seed,
+                "env_index": env,
+                "scenario_id": paired_runtime._scenario_id(
+                    seed, env, _sha(f"condition:{seed}:{env}")
+                ),
+            }
             for env in range(num_envs)
         ],
         "evaluation_config_sha256": _sha("config"),
         "evaluator_code_sha256": _sha("evaluator"),
+        "first_condition_bundles": bundles,
+        "first_condition_bundle_inventory_sha256": (
+            paired_runtime._canonical_sha256(bundles)
+        ),
     }
 
 
 def _accumulator(num_envs: int = 2, seed: int = 17) -> PairedEvaluationEvidence:
-    return PairedEvaluationEvidence.from_contract(
-        _contract(num_envs, seed),
+    return PairedEvaluationEvidence(
         num_envs=num_envs,
         generation_seed=seed,
+        scenario_ids_by_env={
+            env: paired_runtime._scenario_id(
+                seed, env, _sha(f"condition:{seed}:{env}")
+            )
+            for env in range(num_envs)
+        },
         runtime_policy_sha256=_sha("candidate"),
-        policy_views=POLICY_VIEWS,
-        view_layout="vertical",
-        raytraced_mix_prob=0.0,
-        reference_lag=256,
-        training_enabled=False,
-        eval_relabel_enabled=True,
-        one_episode_per_environment=True,
+        evaluation_config_sha256=_sha("config"),
+        evaluator_code_sha256=_sha("evaluator"),
+        first_condition_bundle_path=f"/tmp/first-condition-{seed}.npz",
+        first_condition_bundle_sha256=_sha(f"bundle:{seed}"),
+    )
+
+
+def _record_replay(
+    evidence: PairedEvaluationEvidence, num_envs: int = 2, seed: int = 17
+) -> None:
+    evidence.record_first_condition_replay_batch(
+        {
+            env: {
+                "first_condition_sha256": _sha(f"condition:{seed}:{env}"),
+                "live_condition_sha256": _sha(f"live-condition:{seed}:{env}"),
+                "live_reset_state_sha256": _sha(f"reset-state:{seed}:{env}"),
+            }
+            for env in range(num_envs)
+        }
+    )
+
+
+def _scenario(seed: int, env: int) -> str:
+    return paired_runtime._scenario_id(
+        seed, env, _sha(f"condition:{seed}:{env}")
     )
 
 
@@ -92,6 +136,7 @@ def _views(step: int, num_envs: int = 2) -> dict[int, dict[str, np.ndarray]]:
 class PairedEvaluationRuntimeTest(unittest.TestCase):
     def test_complete_evidence_emits_exact_gate_structure(self) -> None:
         evidence = _accumulator()
+        _record_replay(evidence)
         first_views = _views(0)
         evidence.record_generation_step(first_views)
         evidence.record_generation_step(_views(1))
@@ -105,14 +150,14 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
         )
         evidence.record_episode_outcome(
             1,
-            scenario_id=_sha("17:1"),
+            scenario_id=_scenario(17, 1),
             success=False,
             safety_violation=True,
             episode_length=2,
         )
         evidence.record_episode_outcome(
             0,
-            scenario_id=_sha("17:0"),
+            scenario_id=_scenario(17, 0),
             success=True,
             safety_violation=False,
             episode_length=2,
@@ -157,7 +202,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
             path = Path(temporary) / "contract.json"
             path.write_text(json.dumps(_contract()), encoding="utf-8")
             evidence = PairedEvaluationEvidence.from_environment(
-                num_envs=2,
+                num_envs=32,
                 generation_seed=17,
                 actual_runtime_policy_sha256=_sha("parent"),
                 policy_views=POLICY_VIEWS,
@@ -171,6 +216,9 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
                     "IMAGE_DAGGER_PAIRED_EVAL": "1",
                     "IMAGE_DAGGER_PAIRED_EVAL_CONTRACT": str(path),
                     "IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256": _sha("parent"),
+                    "IMAGE_DAGGER_FIRST_CONDITION_MODE": "replay",
+                    "IMAGE_DAGGER_FIRST_CONDITION_BUNDLE": "/tmp/first-condition-17.npz",
+                    "IMAGE_DAGGER_FIRST_CONDITION_BUNDLE_SHA256": _sha("bundle:17"),
                 },
             )
             self.assertEqual(evidence.runtime_policy_sha256, _sha("parent"))
@@ -179,7 +227,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
                 PairedEvaluationEvidenceError, "loaded runtime policy identity"
             ):
                 PairedEvaluationEvidence.from_environment(
-                    num_envs=2,
+                    num_envs=32,
                     generation_seed=17,
                     actual_runtime_policy_sha256=_sha("candidate"),
                     policy_views=POLICY_VIEWS,
@@ -193,6 +241,9 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
                         "IMAGE_DAGGER_PAIRED_EVAL": "1",
                         "IMAGE_DAGGER_PAIRED_EVAL_CONTRACT": str(path),
                         "IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256": _sha("parent"),
+                        "IMAGE_DAGGER_FIRST_CONDITION_MODE": "replay",
+                        "IMAGE_DAGGER_FIRST_CONDITION_BUNDLE": "/tmp/first-condition-17.npz",
+                        "IMAGE_DAGGER_FIRST_CONDITION_BUNDLE_SHA256": _sha("bundle:17"),
                     },
                 )
 
@@ -200,7 +251,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
                 PairedEvaluationEvidenceError, "actual evaluator runtime"
             ):
                 PairedEvaluationEvidence.from_environment(
-                    num_envs=2,
+                    num_envs=32,
                     generation_seed=17,
                     actual_runtime_policy_sha256=_sha("parent"),
                     policy_views=("head_color",),
@@ -214,11 +265,15 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
                         "IMAGE_DAGGER_PAIRED_EVAL": "1",
                         "IMAGE_DAGGER_PAIRED_EVAL_CONTRACT": str(path),
                         "IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256": _sha("parent"),
+                        "IMAGE_DAGGER_FIRST_CONDITION_MODE": "replay",
+                        "IMAGE_DAGGER_FIRST_CONDITION_BUNDLE": "/tmp/first-condition-17.npz",
+                        "IMAGE_DAGGER_FIRST_CONDITION_BUNDLE_SHA256": _sha("bundle:17"),
                     },
                 )
 
     def test_generation_is_transactional_and_requires_exact_coverage(self) -> None:
         evidence = _accumulator()
+        _record_replay(evidence)
         incomplete = _views(0)
         incomplete.pop(1)
         with self.assertRaisesRegex(PairedEvaluationEvidenceError, "every environment"):
@@ -232,6 +287,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
 
     def test_episode_rejects_missing_actions_wrong_length_and_scenario(self) -> None:
         evidence = _accumulator()
+        _record_replay(evidence)
         evidence.record_generation_step(_views(0))
         with self.assertRaisesRegex(PairedEvaluationEvidenceError, "scenario identity"):
             evidence.record_episode_outcome(
@@ -244,7 +300,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(PairedEvaluationEvidenceError, "no expert/student"):
             evidence.record_episode_outcome(
                 0,
-                scenario_id=_sha("17:0"),
+                scenario_id=_scenario(17, 0),
                 success=True,
                 safety_violation=False,
                 episode_length=1,
@@ -253,14 +309,14 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(PairedEvaluationEvidenceError, "episode length"):
             evidence.record_episode_outcome(
                 0,
-                scenario_id=_sha("17:0"),
+                scenario_id=_scenario(17, 0),
                 success=True,
                 safety_violation=False,
                 episode_length=2,
             )
         evidence.record_episode_outcome(
             0,
-            scenario_id=_sha("17:0"),
+            scenario_id=_scenario(17, 0),
             success=True,
             safety_violation=False,
             episode_length=1,
@@ -268,7 +324,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(PairedEvaluationEvidenceError, "duplicate"):
             evidence.record_episode_outcome(
                 0,
-                scenario_id=_sha("17:0"),
+                scenario_id=_scenario(17, 0),
                 success=True,
                 safety_violation=False,
                 episode_length=1,
@@ -276,6 +332,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
 
     def test_actions_reject_shape_nonfinite_and_post_episode_updates(self) -> None:
         evidence = _accumulator()
+        _record_replay(evidence)
         with self.assertRaisesRegex(PairedEvaluationEvidenceError, "identical shapes"):
             evidence.record_action_pair(0, [1.0, 2.0], [1.0])
         with self.assertRaisesRegex(PairedEvaluationEvidenceError, "finite"):
@@ -290,7 +347,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
         evidence.record_action_pair(0, [0.0], [0.0])
         evidence.record_episode_outcome(
             0,
-            scenario_id=_sha("17:0"),
+            scenario_id=_scenario(17, 0),
             success=True,
             safety_violation=False,
             episode_length=1,
@@ -300,11 +357,12 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
 
     def test_renderer_errors_and_incomplete_episode_coverage_fail_closed(self) -> None:
         evidence = _accumulator()
+        _record_replay(evidence)
         evidence.record_generation_step(_views(0))
         evidence.record_action_batch(np.zeros((2, 1)), np.zeros((2, 1)))
         evidence.record_episode_outcome(
             0,
-            scenario_id=_sha("17:0"),
+            scenario_id=_scenario(17, 0),
             success=True,
             safety_violation=False,
             episode_length=1,
@@ -313,7 +371,7 @@ class PairedEvaluationRuntimeTest(unittest.TestCase):
             evidence.finalize()
         evidence.record_episode_outcome(
             1,
-            scenario_id=_sha("17:1"),
+            scenario_id=_scenario(17, 1),
             success=False,
             safety_violation=False,
             episode_length=1,

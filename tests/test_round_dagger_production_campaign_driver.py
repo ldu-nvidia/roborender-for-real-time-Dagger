@@ -15,6 +15,11 @@ from round_dagger.production_campaign_driver import (
     materialize_orchestration_config,
     run_driver,
 )
+from round_dagger.production_data_lineage import (
+    DATA_LINEAGE_SCHEMA,
+    RUNTIME_CONTRACT_SCHEMA,
+)
+from round_dagger.scenario_capture import EXPECTED_SEEDS
 
 
 SHA = "a" * 64
@@ -277,8 +282,22 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
     def test_validate_consumes_real_runtime_evidence_from_distinct_evaluation_seal(
         self,
     ) -> None:
+        bundles = [
+            {
+                "seed": seed,
+                "path": f"/first-conditions/seed-{seed}.npz",
+                "sha256": artifacts.canonical_json_sha256(
+                    {"fixture": "first-condition-bundle", "seed": seed}
+                ),
+                "size": 1,
+                "case_count": 32,
+                "source_pass_index": 1,
+            }
+            for seed in EXPECTED_SEEDS
+        ]
+        bundle_inventory_sha256 = artifacts.canonical_json_sha256(bundles)
         runtime_evidence = {
-            "schema": "fast_roborender.round_dagger.production_runtime_contract.v1",
+            "schema": RUNTIME_CONTRACT_SCHEMA,
             "status": "release_eligible",
             "invariant_profile_sha256": "1" * 64,
             "camera_acceptance": {"path": "/camera.json", "sha256": "2" * 64},
@@ -302,6 +321,10 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
                 "evidence_sha256": "9" * 64,
                 "scenario_path": "/scenarios.json",
                 "scenario_sha256": "0" * 64,
+                "first_condition_bundles": bundles,
+                "first_condition_bundle_inventory_sha256": (
+                    bundle_inventory_sha256
+                ),
             },
         }
         self.contract.chmod(0o600)
@@ -311,6 +334,15 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             "campaign_id": "campaign",
             "topology": {"macro_round_count": 5},
             "evaluation": {"hydra_config_sha256": EVALUATOR},
+        }
+        lineage = {
+            "schema": DATA_LINEAGE_SCHEMA,
+            "heldout_evaluation": {
+                "first_condition_bundles": bundles,
+                "first_condition_bundle_inventory_sha256": (
+                    bundle_inventory_sha256
+                ),
+            },
         }
         aligned = DriverInputs(
             campaign_root=self.campaign_root,
@@ -334,7 +366,7 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             ),
             mock.patch(
                 "scripts.round_dagger.production_launch.materialize_campaign_contract",
-                return_value=(materialized, runtime_evidence, {"schema": "lineage"}),
+                return_value=(materialized, runtime_evidence, lineage),
             ) as materializer,
         ):
             observed, _, _ = aligned.validate()

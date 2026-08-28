@@ -222,9 +222,10 @@ print(d["anchor_pool"]["path"])
 print(d["anchor_pool"]["anchor_count"])
 print(d["anchor_pool"]["anchor_index"])
 print(d["anchor_pool"]["inventory_sha256"])
+print(d["schema"])
 PY
 )
-[[ ${#CONTRACT_FIELDS[@]} -eq 9 ]] || fatal "cannot read evaluation contract"
+[[ ${#CONTRACT_FIELDS[@]} -eq 10 ]] || fatal "cannot read evaluation contract"
 EXPECTED_CONFIG_SHA=${CONTRACT_FIELDS[0]}
 EXPECTED_EVALUATOR_SHA=${CONTRACT_FIELDS[1]}
 EXPECTED_RENDERERS=${CONTRACT_FIELDS[2]}
@@ -234,6 +235,8 @@ EXPECTED_ANCHOR_POOL=${CONTRACT_FIELDS[5]}
 EXPECTED_ANCHOR_COUNT=${CONTRACT_FIELDS[6]}
 EXPECTED_ANCHOR_INDEX=${CONTRACT_FIELDS[7]}
 EXPECTED_ANCHOR_INVENTORY_SHA=${CONTRACT_FIELDS[8]}
+CONTRACT_SCHEMA=${CONTRACT_FIELDS[9]}
+PRODUCTION_CONTRACT_SCHEMA=fast_roborender.round_dagger.paired_evaluation_contract.v4
 [[ $ANCHOR_POOL == "$EXPECTED_ANCHOR_POOL" && \
    $ANCHOR_COUNT == "$EXPECTED_ANCHOR_COUNT" && \
    $ANCHOR_INDEX == "$EXPECTED_ANCHOR_INDEX" && \
@@ -341,6 +344,22 @@ PY
     fi
 }
 
+verify_first_condition_bundle() {
+    local path=$1 expected_sha=$2 expected_size=$3
+    [[ $path == /* && -f $path && ! -L $path ]] || \
+        fatal "first-condition bundle must be an absolute non-symlink regular file"
+    [[ $expected_sha =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "first-condition bundle SHA is malformed"
+    [[ $expected_size =~ ^[1-9][0-9]*$ ]] || \
+        fatal "first-condition bundle size is malformed"
+    [[ $(stat -c %a "$path") == 444 ]] || \
+        fatal "first-condition bundle mode must be exactly 0444"
+    [[ $(stat -c %s "$path") == "$expected_size" ]] || \
+        fatal "first-condition bundle size mismatch"
+    [[ $(sha256sum "$path" | awk '{print $1}') == "$expected_sha" ]] || \
+        fatal "first-condition bundle SHA mismatch"
+}
+
 # Check the exact file presented to the process before any evaluation setup.
 # The same check runs immediately before each policy-role evaluator invocation,
 # closing the window for a mutable broad bind to replace the pinned teacher.
@@ -435,6 +454,27 @@ PHYSICAL_SAFETY_OVERRIDES=(
 while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_SHA; do
     [[ $ROLE == parent || $ROLE == candidate ]] || fatal "invalid role from contract"
     [[ $SEED =~ ^[0-9]+$ ]] || fatal "invalid seed from contract"
+    FIRST_CONDITION_ENV=()
+    FIRST_CONDITION_BUNDLE=
+    FIRST_CONDITION_BUNDLE_SHA=
+    FIRST_CONDITION_BUNDLE_SIZE=
+    if [[ $CONTRACT_SCHEMA == "$PRODUCTION_CONTRACT_SCHEMA" ]]; then
+        IFS=$'\t' read -r FIRST_CONDITION_BUNDLE FIRST_CONDITION_BUNDLE_SHA \
+            FIRST_CONDITION_BUNDLE_SIZE < <(
+                "$PYTHON_BIN" -m round_dagger.evaluation first-condition-bundle \
+                    --root "$ROOT" --contract "$CONTRACT" --seed "$SEED"
+            ) || fatal "cannot select first-condition bundle for seed $SEED"
+        [[ -n $FIRST_CONDITION_BUNDLE && -n $FIRST_CONDITION_BUNDLE_SHA && \
+           -n $FIRST_CONDITION_BUNDLE_SIZE ]] || \
+            fatal "first-condition bundle selection is incomplete"
+        verify_first_condition_bundle "$FIRST_CONDITION_BUNDLE" \
+            "$FIRST_CONDITION_BUNDLE_SHA" "$FIRST_CONDITION_BUNDLE_SIZE"
+        FIRST_CONDITION_ENV=(
+            IMAGE_DAGGER_FIRST_CONDITION_MODE=replay
+            IMAGE_DAGGER_FIRST_CONDITION_BUNDLE="$FIRST_CONDITION_BUNDLE"
+            IMAGE_DAGGER_FIRST_CONDITION_BUNDLE_SHA256="$FIRST_CONDITION_BUNDLE_SHA"
+        )
+    fi
     MOTION_OVERRIDES=()
     if ((MOTION_SPLIT_INPUTS)); then
         mapfile -t MOTION_BLOCK < <(
@@ -592,6 +632,7 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         fatal "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE must be pool or simulator_rgb"
     EVAL=(env IMAGE_DAGGER_PAIRED_EVAL=1
         IMAGE_DAGGER_EVAL_RELABEL=1
+        "${FIRST_CONDITION_ENV[@]}"
         IMAGE3F_RUN_ID="$IMAGE3F_EVAL_RUN_ID"
         IMAGE_DAGGER_PAIRED_EVAL_CONTRACT="$CONTRACT"
         IMAGE_DAGGER_EXPECT_RUNTIME_POLICY_SHA256="$RUNTIME_POLICY_SHA"
@@ -672,7 +713,15 @@ print(v)
             fatal "verified staged checkpoint SHA-256 is malformed"
         verify_anchor_pool
         verify_teacher
+        if [[ -n $FIRST_CONDITION_BUNDLE ]]; then
+            verify_first_condition_bundle "$FIRST_CONDITION_BUNDLE" \
+                "$FIRST_CONDITION_BUNDLE_SHA" "$FIRST_CONDITION_BUNDLE_SIZE"
+        fi
         EXPECTED_TRAIN_CHECKPOINT_SHA256="$STAGED_SHA" "${EVAL[@]}"
+        if [[ -n $FIRST_CONDITION_BUNDLE ]]; then
+            verify_first_condition_bundle "$FIRST_CONDITION_BUNDLE" \
+                "$FIRST_CONDITION_BUNDLE_SHA" "$FIRST_CONDITION_BUNDLE_SIZE"
+        fi
         verify_teacher
         verify_anchor_pool
         "${VERIFY_STAGE[@]}" >/dev/null || \

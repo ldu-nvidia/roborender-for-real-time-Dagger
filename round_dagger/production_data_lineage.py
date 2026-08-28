@@ -21,6 +21,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from round_dagger.first_condition_bundle import (
+    FirstConditionBundleError,
+    VIEWS as FIRST_CONDITION_VIEWS,
+    load_first_condition_bundle,
+)
+
 from round_dagger.scenario_capture import (
     ATTESTATION_SCHEMA,
     EXPECTED_ENVS_PER_SEED,
@@ -32,9 +38,9 @@ from round_dagger.scenario_capture import (
 
 
 RUNTIME_CONTRACT_SCHEMA = (
-    "fast_roborender.round_dagger.production_runtime_contract.v1"
+    "fast_roborender.round_dagger.production_runtime_contract.v2"
 )
-DATA_LINEAGE_SCHEMA = "fast_roborender.round_dagger.production_data_lineage.v1"
+DATA_LINEAGE_SCHEMA = "fast_roborender.round_dagger.production_data_lineage.v2"
 COLLECTION_POLICY_SCHEMA = (
     "fast_roborender.round_dagger.collection_assignment_policy.v1"
 )
@@ -76,8 +82,18 @@ _CAPTURE_KEYS = {
     "evidence_sha256",
     "scenario_path",
     "scenario_sha256",
+    "first_condition_bundles",
+    "first_condition_bundle_inventory_sha256",
 }
 _PASS_KEYS = {"seed", "pass_index", "path", "sha256"}
+_BUNDLE_KEYS = {
+    "seed",
+    "path",
+    "sha256",
+    "size",
+    "case_count",
+    "source_pass_index",
+}
 _LINEAGE_KEYS = {
     "schema",
     "runtime_contract_sha256",
@@ -114,6 +130,8 @@ _HELDOUT_KEYS = {
     "fixed_seeds",
     "environments_per_seed",
     "capture_attestation_schema",
+    "first_condition_bundles",
+    "first_condition_bundle_inventory_sha256",
 }
 _COHORT_ASSIGNMENT_KEYS = {
     "schema",
@@ -248,6 +266,63 @@ def _validate_capture_provenance(
     return normalized
 
 
+def _validate_first_condition_bundles(
+    value: Any,
+    *,
+    inventory_sha256: Any,
+    plan_sha256: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not isinstance(value, list) or len(value) != len(EXPECTED_SEEDS):
+        raise ProductionDataLineageError(
+            "live capture must bind exactly eight first-condition bundles"
+        )
+    rows: list[dict[str, Any]] = []
+    bundle_provenance: list[dict[str, Any]] = []
+    for index, raw in enumerate(value):
+        row = _exact(raw, _BUNDLE_KEYS, f"first_condition_bundles[{index}]")
+        seed = _integer(row["seed"], "first-condition bundle seed")
+        if seed != EXPECTED_SEEDS[index]:
+            raise ProductionDataLineageError(
+                "first-condition bundles are not in canonical fixed-seed order"
+            )
+        path = _absolute(row["path"], "first-condition bundle")
+        digest = _sha(row["sha256"], "first-condition bundle SHA-256")
+        size = _integer(row["size"], "first-condition bundle size", minimum=1)
+        if (
+            row["case_count"] != EXPECTED_ENVS_PER_SEED
+            or row["source_pass_index"] != 1
+        ):
+            raise ProductionDataLineageError(
+                "first-condition bundle row is not source-pass-1 32-case data"
+            )
+        try:
+            bundle = load_first_condition_bundle(
+                path,
+                expected_sha256=digest,
+                expected_seed=seed,
+                expected_env_count=EXPECTED_ENVS_PER_SEED,
+                expected_views=FIRST_CONDITION_VIEWS,
+                expected_plan_sha256=plan_sha256,
+            )
+        except FirstConditionBundleError as exc:
+            raise ProductionDataLineageError(
+                f"first-condition bundle deep verification failed: {exc}"
+            ) from exc
+        if bundle["size"] != size:
+            raise ProductionDataLineageError("first-condition bundle size mismatch")
+        rows.append(row)
+        # Do not retain the ~64 MiB request arrays for all eight seeds at once.
+        bundle_provenance.append(dict(bundle["provenance"]))
+    expected_inventory = _sha(
+        inventory_sha256, "first-condition bundle inventory SHA-256"
+    )
+    if canonical_json_sha256(rows) != expected_inventory:
+        raise ProductionDataLineageError(
+            "first-condition bundle inventory SHA-256 mismatch"
+        )
+    return rows, bundle_provenance
+
+
 def load_verified_runtime_contract(
     path: str | os.PathLike[str],
     *,
@@ -336,6 +411,12 @@ def load_verified_runtime_contract(
     if capture["heldout_plan_sha256"] != expected_plan:
         raise ProductionDataLineageError("runtime contract uses another held-out plan")
 
+    bundle_rows, bundle_provenance = _validate_first_condition_bundles(
+        capture["first_condition_bundles"],
+        inventory_sha256=capture["first_condition_bundle_inventory_sha256"],
+        plan_sha256=expected_plan,
+    )
+
     pass_rows = capture["pass_artifacts"]
     if not isinstance(pass_rows, list) or len(pass_rows) != 16:
         raise ProductionDataLineageError(
@@ -393,6 +474,9 @@ def load_verified_runtime_contract(
         "attestation_sha256": capture["attestation_sha256"],
         "capture_evidence_sha256": capture["evidence_sha256"],
         "scenario_contract_sha256": capture["scenario_sha256"],
+        "first_condition_bundle_inventory_sha256": capture[
+            "first_condition_bundle_inventory_sha256"
+        ],
         "case_count": 256,
         "status": "PASS",
         "release_eligible": True,
@@ -407,6 +491,9 @@ def load_verified_runtime_contract(
         or attestation.get("schema") != ATTESTATION_SCHEMA
         or attestation.get("release_eligible") is not True
         or attestation.get("case_count") != 256
+        or attestation.get("first_condition_bundles") != bundle_rows
+        or attestation.get("first_condition_bundle_inventory_sha256")
+        != capture["first_condition_bundle_inventory_sha256"]
     ):
         raise ProductionDataLineageError(
             "live capture attestation is not release-eligible 8x32 evidence"
@@ -416,6 +503,10 @@ def load_verified_runtime_contract(
         split_sha256=expected_split,
         plan_sha256=expected_plan,
     )
+    if any(item != provenance for item in bundle_provenance):
+        raise ProductionDataLineageError(
+            "first-condition bundle provenance differs from capture attestation"
+        )
 
     normalized = {
         **document,
@@ -510,6 +601,10 @@ def derive_data_lineage(
             "fixed_seeds": list(EXPECTED_SEEDS),
             "environments_per_seed": EXPECTED_ENVS_PER_SEED,
             "capture_attestation_schema": ATTESTATION_SCHEMA,
+            "first_condition_bundles": capture["first_condition_bundles"],
+            "first_condition_bundle_inventory_sha256": capture[
+                "first_condition_bundle_inventory_sha256"
+            ],
         },
     }
     return validate_data_lineage(lineage)
@@ -559,6 +654,7 @@ def validate_data_lineage(value: Any) -> dict[str, Any]:
         "capture_evidence_sha256",
         "scenario_contract_sha256",
         "capture_provenance_sha256",
+        "first_condition_bundle_inventory_sha256",
     ):
         _sha(heldout[key], f"held-out {key}")
     if (
@@ -570,6 +666,35 @@ def validate_data_lineage(value: Any) -> dict[str, Any]:
         raise ProductionDataLineageError(
             "held-out evaluation lineage is not exact release-eligible 8x32"
         )
+    rows = heldout["first_condition_bundles"]
+    if (
+        not isinstance(rows, list)
+        or len(rows) != len(EXPECTED_SEEDS)
+        or any(
+            not isinstance(row, Mapping)
+            or set(row) != _BUNDLE_KEYS
+            or row.get("seed") != EXPECTED_SEEDS[index]
+            or row.get("case_count") != EXPECTED_ENVS_PER_SEED
+            or row.get("source_pass_index") != 1
+            for index, row in enumerate(rows)
+        )
+        or canonical_json_sha256(rows)
+        != heldout["first_condition_bundle_inventory_sha256"]
+    ):
+        raise ProductionDataLineageError(
+            "held-out first-condition bundle inventory is not exact"
+        )
+    for row in rows:
+        _sha(row["sha256"], "held-out first-condition bundle SHA-256")
+        if (
+            not isinstance(row["path"], str)
+            or not Path(row["path"]).is_absolute()
+            or type(row["size"]) is not int
+            or row["size"] <= 0
+        ):
+            raise ProductionDataLineageError(
+                "held-out first-condition bundle row is malformed"
+            )
     return lineage
 
 
@@ -707,6 +832,36 @@ def _parse_pass_spec(value: str) -> dict[str, Any]:
     }
 
 
+def _parse_bundle_spec(value: str) -> dict[str, Any]:
+    try:
+        seed_text, path_text = value.split(":", 1)
+        seed = int(seed_text)
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError(
+            "first-condition bundle must be SEED:/absolute/path.npz"
+        ) from exc
+    path = Path(path_text)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            "first-condition bundle path must be absolute"
+        )
+    try:
+        size = path.stat().st_size
+        digest = sha256_file(path)
+    except (OSError, ProductionDataLineageError) as exc:
+        raise argparse.ArgumentTypeError(
+            "first-condition bundle cannot be inspected"
+        ) from exc
+    return {
+        "seed": seed,
+        "path": str(path),
+        "sha256": digest,
+        "size": size,
+        "case_count": EXPECTED_ENVS_PER_SEED,
+        "source_pass_index": 1,
+    }
+
+
 def _publish_runtime_contract(
     output: Path,
     document: Mapping[str, Any],
@@ -783,6 +938,13 @@ def _parser() -> argparse.ArgumentParser:
     materialize.add_argument("--capture-attestation", required=True)
     materialize.add_argument("--capture-evidence", required=True)
     materialize.add_argument("--scenario-contract", required=True)
+    materialize.add_argument(
+        "--first-condition-bundle",
+        action="append",
+        type=_parse_bundle_spec,
+        required=True,
+        help="repeat eight times as SEED:/absolute/first_condition_bundle.npz",
+    )
     materialize.add_argument("--output", type=Path, required=True)
 
     verify = commands.add_parser("verify")
@@ -797,6 +959,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         profile, profile_sha = _profile(args.invariant_profile)
         if args.command == "materialize":
+            first_condition_bundles = sorted(
+                args.first_condition_bundle, key=lambda row: row["seed"]
+            )
             document = {
                 "schema": RUNTIME_CONTRACT_SCHEMA,
                 "status": "release_eligible",
@@ -845,6 +1010,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         _absolute(args.scenario_contract, "scenario contract")
                     ),
                     "scenario_sha256": sha256_file(args.scenario_contract),
+                    "first_condition_bundles": first_condition_bundles,
+                    "first_condition_bundle_inventory_sha256": canonical_json_sha256(
+                        first_condition_bundles
+                    ),
                 },
             }
             digest, runtime = _publish_runtime_contract(

@@ -88,6 +88,7 @@ CAPTURE_ATTESTATION=${ROUND_DAGGER_CAPTURE_ATTESTATION:?missing ROUND_DAGGER_CAP
 CAPTURE_ATTESTATION_SHA=${ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256:?missing ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256}
 CAPTURE_EVIDENCE=${ROUND_DAGGER_CAPTURE_EVIDENCE:?missing ROUND_DAGGER_CAPTURE_EVIDENCE}
 CAPTURE_EVIDENCE_SHA=${ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256:?missing ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256}
+FIRST_CONDITION_BUNDLE_INVENTORY_SHA=${ROUND_DAGGER_FIRST_CONDITION_BUNDLE_INVENTORY_SHA256:?missing ROUND_DAGGER_FIRST_CONDITION_BUNDLE_INVENTORY_SHA256}
 
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "campaign ID is unsafe"
@@ -115,6 +116,8 @@ require_sha "$CAMPAIGN_CONTRACT_SHA" ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256
 require_sha "$DATA_LINEAGE_SHA" ROUND_DAGGER_DATA_LINEAGE_SHA256
 require_sha "$CAPTURE_ATTESTATION_SHA" ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256
 require_sha "$CAPTURE_EVIDENCE_SHA" ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256
+require_sha "$FIRST_CONDITION_BUNDLE_INVENTORY_SHA" \
+    ROUND_DAGGER_FIRST_CONDITION_BUNDLE_INVENTORY_SHA256
 require_directory "$CAMPAIGN_ROOT" "campaign root"
 [[ $REPOSITORY_ROOT == "$EVALUATION_SOURCE_ROOT" ]] || \
     fatal "production evaluation hook is not executing from the sealed source root"
@@ -284,26 +287,93 @@ RUNTIME_LINEAGE_SHA=$(
 ) || fatal "cannot parse runtime campaign lineage identity"
 [[ $RUNTIME_LINEAGE_SHA == "$DATA_LINEAGE_SHA" ]] || \
     fatal "runtime campaign lineage differs from durable round"
-$CONTROL_PYTHON - "$CAMPAIGN_CONTRACT" "$SCENARIO_CASES" \
-    "$SCENARIO_CASES_SHA" "$CAPTURE_ATTESTATION" "$CAPTURE_ATTESTATION_SHA" \
-    "$CAPTURE_EVIDENCE" "$CAPTURE_EVIDENCE_SHA" <<'PY' || \
-    fatal "evaluator inputs differ from external campaign contract"
+verify_first_condition_bundles() {
+    "$CONTROL_PYTHON" - "$CAMPAIGN_CONTRACT" "$CAMPAIGN_CONTRACT_SHA" \
+        "$SCENARIO_CASES" "$SCENARIO_CASES_SHA" \
+        "$CAPTURE_ATTESTATION" "$CAPTURE_ATTESTATION_SHA" \
+        "$CAPTURE_EVIDENCE" "$CAPTURE_EVIDENCE_SHA" \
+        "$FIRST_CONDITION_BUNDLE_INVENTORY_SHA" <<'PY'
+import hashlib
 import json
+import os
+import stat
 import sys
+from pathlib import Path
 
-with open(sys.argv[1], encoding="utf-8") as handle:
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+runtime_path = Path(sys.argv[1])
+if digest(runtime_path) != sys.argv[2]:
+    raise SystemExit("production runtime contract SHA mismatch")
+with runtime_path.open(encoding="utf-8") as handle:
     capture = json.load(handle)["live_capture"]
 expected = {
-    "scenario_path": sys.argv[2],
-    "scenario_sha256": sys.argv[3],
-    "attestation_path": sys.argv[4],
-    "attestation_sha256": sys.argv[5],
-    "evidence_path": sys.argv[6],
-    "evidence_sha256": sys.argv[7],
+    "scenario_path": sys.argv[3],
+    "scenario_sha256": sys.argv[4],
+    "attestation_path": sys.argv[5],
+    "attestation_sha256": sys.argv[6],
+    "evidence_path": sys.argv[7],
+    "evidence_sha256": sys.argv[8],
+    "first_condition_bundle_inventory_sha256": sys.argv[9],
 }
 if any(capture.get(key) != value for key, value in expected.items()):
-    raise SystemExit(1)
+    raise SystemExit("evaluator inputs differ from production runtime contract")
+rows = capture.get("first_condition_bundles")
+keys = {"seed", "path", "sha256", "size", "case_count", "source_pass_index"}
+seeds = [17, 29, 43, 59, 71, 89, 101, 127]
+if not isinstance(rows, list) or len(rows) != len(seeds):
+    raise SystemExit("first-condition bundle coverage is not exact 8-seed")
+if hashlib.sha256(json.dumps(
+    rows, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    allow_nan=False,
+).encode("utf-8")).hexdigest() != sys.argv[9]:
+    raise SystemExit("first-condition bundle inventory SHA mismatch")
+for index, (row, seed) in enumerate(zip(rows, seeds, strict=True)):
+    if not isinstance(row, dict) or set(row) != keys:
+        raise SystemExit(f"first-condition bundle row {index} fields differ")
+    if (row["seed"] != seed or row["case_count"] != 32
+            or row["source_pass_index"] != 1
+            or isinstance(row["size"], bool) or not isinstance(row["size"], int)
+            or row["size"] < 1):
+        raise SystemExit(f"first-condition bundle row {index} is malformed")
+    path = Path(row["path"])
+    if (not path.is_absolute() or path.is_symlink() or not path.is_file()
+            or path.resolve(strict=True) != path):
+        raise SystemExit(f"first-condition bundle {seed} path is unsafe")
+    metadata = path.stat()
+    if stat.S_IMODE(metadata.st_mode) != 0o444:
+        raise SystemExit(f"first-condition bundle {seed} mode is not 0444")
+    if metadata.st_size != row["size"] or digest(path) != row["sha256"]:
+        raise SystemExit(f"first-condition bundle {seed} bytes differ")
+for label, path_value, sha_value in (
+    ("capture attestation", sys.argv[5], sys.argv[6]),
+    ("capture evidence", sys.argv[7], sys.argv[8]),
+):
+    path = Path(path_value)
+    if digest(path) != sha_value:
+        raise SystemExit(f"{label} SHA mismatch")
+    with path.open(encoding="utf-8") as handle:
+        document = json.load(handle)
+    if (document.get("first_condition_bundles") != rows
+            or document.get("first_condition_bundle_inventory_sha256")
+            != sys.argv[9]):
+        raise SystemExit(f"{label} bundle inventory differs")
+for row in rows:
+    print(row["path"])
 PY
+}
+BUNDLE_PATH_OUTPUT=$(verify_first_condition_bundles) || \
+    fatal "first-condition bundle inventory verification failed"
+mapfile -t FIRST_CONDITION_BUNDLE_PATHS <<<"$BUNDLE_PATH_OUTPUT"
+[[ ${#FIRST_CONDITION_BUNDLE_PATHS[@]} -eq 8 ]] || \
+    fatal "first-condition bundle mount inventory is incomplete"
 printf '%s\n' "$RUNTIME_CONTRACT_REPORT"
 $CONTROL_PYTHON - "$SEALED_CAMPAIGN_CONTRACT" "$ANCHOR_POOL" \
     "$ANCHOR_COUNT" "$ANCHOR_INVENTORY_SHA" "$ANCHOR_SOURCE" <<'PY' || \
@@ -348,7 +418,8 @@ for path in "$REPOSITORY_ROOT" "$CAMPAIGN_ROOT" "$GR00T_SOURCE_ROOT" \
     "$MOTION_SPLIT" "$HELDOUT_PLAN" \
     "$TEACHER_CHECKPOINT" "$SEALED_TEACHER" "$ANCHOR_POOL" \
     "$SOURCE_INVENTORY" "$SOURCE_ATTESTATION" "$CAMPAIGN_CONTRACT" \
-    "$CAPTURE_ATTESTATION" "$CAPTURE_EVIDENCE"; do
+    "$CAPTURE_ATTESTATION" "$CAPTURE_EVIDENCE" \
+    "${FIRST_CONDITION_BUNDLE_PATHS[@]}"; do
     case "$path" in
         /mnt/data1|/mnt/data1/*|/mnt/data2|/mnt/data2/*) ;;
         *) fatal "container input is outside /mnt/data1 and /mnt/data2: $path" ;;
@@ -432,6 +503,8 @@ PREPARE=("$CONTROL_PYTHON" -m round_dagger.evaluation prepare
     --anchor-count "$ANCHOR_COUNT"
     --anchor-index "$ANCHOR_INDEX"
     --anchor-inventory-sha256 "$ANCHOR_INVENTORY_SHA"
+    --production-runtime-contract "$CAMPAIGN_CONTRACT"
+    --production-runtime-contract-sha256 "$CAMPAIGN_CONTRACT_SHA"
     --thresholds "$THRESHOLDS"
     --output "$CONTRACT")
 
@@ -446,6 +519,12 @@ while IFS= read -r name; do
             ;;
     esac
 done < <(compgen -e | LC_ALL=C sort)
+FIRST_CONDITION_BUNDLE_MOUNTS=()
+for path in "${FIRST_CONDITION_BUNDLE_PATHS[@]}"; do
+    FIRST_CONDITION_BUNDLE_MOUNTS+=(
+        --mount "type=bind,src=$path,dst=$path,readonly"
+    )
+done
 DOCKER_RUN=("$DOCKER" run --rm
     --name "$CONTAINER_NAME"
     --gpus '"device=0"'
@@ -464,6 +543,7 @@ DOCKER_RUN=("$DOCKER" run --rm
     --mount "type=bind,src=$ANCHOR_POOL,dst=$ANCHOR_POOL,readonly"
     --mount "type=bind,src=$SEALED_TEACHER,dst=$SEALED_TEACHER,readonly"
     --mount "type=bind,src=$SEALED_TEACHER,dst=$TEACHER_CHECKPOINT,readonly"
+    "${FIRST_CONDITION_BUNDLE_MOUNTS[@]}"
     --tmpfs /run/round-dagger-eval:rw,nosuid,nodev,noexec,size=1g
     --env "PYTHONPATH=$EVALUATION_SOURCE_ROOT:$GR00T_SOURCE_ROOT"
     --env "GR00T_ROOT=$GR00T_SOURCE_ROOT"
@@ -502,14 +582,22 @@ if ((DRY_RUN)); then
             --root "$CAMPAIGN_ROOT" --contract "$CONTRACT" >/dev/null || \
             fatal "existing paired evaluation contract is invalid"
     fi
+    verify_first_condition_bundles >/dev/null || \
+        fatal "first-condition bundles changed before dry-run mount plan"
     print_command "${PREPARE[@]}"
     print_command "${DOCKER_RUN[@]}"
     echo "PRODUCTION_PAIRED_EVALUATION_DRY_RUN_OK candidate_runtime_sha256=$CANDIDATE_RUNTIME_SHA evaluator_code_sha256=$EVALUATOR_CODE_SHA"
     exit 0
 fi
 
+verify_first_condition_bundles >/dev/null || \
+    fatal "first-condition bundles changed before contract publication"
 "${PREPARE[@]}" >/dev/null || fatal "paired evaluation contract preparation failed"
+verify_first_condition_bundles >/dev/null || \
+    fatal "first-condition bundles changed before container launch"
 "${DOCKER_RUN[@]}" || fatal "paired evaluation container failed"
+verify_first_condition_bundles >/dev/null || \
+    fatal "first-condition bundles changed during paired evaluation"
 verify_anchor_pool
 verify_evaluation_source
 # Re-read every outcome, renderer attestation, and raw metrics digest on the

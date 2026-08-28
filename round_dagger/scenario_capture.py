@@ -22,12 +22,17 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from round_dagger.first_condition_bundle import (
+    FirstConditionBundleError,
+    load_first_condition_bundle,
+)
+
 
 PLAN_SCHEMA = "fast_roborender.round_dagger.heldout_motion_capture_plan.v2"
-RUNTIME_SCHEMA = "fast_roborender.round_dagger.scenario_capture_runtime.v1"
-PASS_SCHEMA = "fast_roborender.round_dagger.scenario_capture_pass.v1"
-ATTESTATION_SCHEMA = "fast_roborender.round_dagger.scenario_capture_attestation.v1"
-EVIDENCE_SCHEMA = "fast_roborender.round_dagger.motion_capture_evidence.v1"
+RUNTIME_SCHEMA = "fast_roborender.round_dagger.scenario_capture_runtime.v2"
+PASS_SCHEMA = "fast_roborender.round_dagger.scenario_capture_pass.v2"
+ATTESTATION_SCHEMA = "fast_roborender.round_dagger.scenario_capture_attestation.v2"
+EVIDENCE_SCHEMA = "fast_roborender.round_dagger.motion_capture_evidence.v2"
 EXPECTED_SEEDS = (17, 29, 43, 59, 71, 89, 101, 127)
 EXPECTED_ENVS_PER_SEED = 32
 EXPECTED_CASES = 256
@@ -48,6 +53,8 @@ PLANNED_CASE_KEYS = {
 }
 RUNTIME_CASE_KEYS = PLANNED_CASE_KEYS | {
     "first_condition_sha256",
+    "live_condition_sha256",
+    "live_reset_state_sha256",
     "first_generated_sha256",
     "scenario_id",
 }
@@ -78,11 +85,28 @@ RUNTIME_KEYS = {
     "capture_profile",
     "release_eligible",
     "expected_env_count",
+    "first_condition_bundle",
     "cases",
     "execution",
     "runtime",
     "renderer_streams",
     "provenance",
+}
+RUNTIME_BUNDLE_KEYS = {
+    "mode",
+    "path",
+    "sha256",
+    "size",
+    "case_count",
+    "source_pass_index",
+}
+BUNDLE_INVENTORY_KEYS = {
+    "seed",
+    "path",
+    "sha256",
+    "size",
+    "case_count",
+    "source_pass_index",
 }
 EXECUTION_DOCUMENT = {
     "capture_mode": True,
@@ -321,6 +345,87 @@ def _scenario_id(seed: int, env_index: int, condition_sha: str) -> str:
     )
 
 
+def _validate_runtime_bundle(
+    runtime: Mapping[str, Any],
+    *,
+    plan_sha256: str,
+    expected_cases: Sequence[Mapping[str, Any]],
+    normalized_cases: Sequence[Mapping[str, Any]],
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    row = _exact(
+        runtime["first_condition_bundle"],
+        RUNTIME_BUNDLE_KEYS,
+        "runtime first-condition bundle",
+    )
+    pass_index = runtime["pass_index"]
+    expected_mode = "capture" if pass_index == 1 else "replay"
+    if row["mode"] != expected_mode:
+        raise ScenarioCaptureError("first-condition bundle mode differs from pass index")
+    if row["source_pass_index"] != 1:
+        raise ScenarioCaptureError("first-condition bundle source must be capture pass 1")
+    if row["case_count"] != len(expected_cases):
+        raise ScenarioCaptureError("first-condition bundle case count mismatch")
+    if type(row["size"]) is not int or row["size"] <= 0:
+        raise ScenarioCaptureError("first-condition bundle size is invalid")
+    path = row["path"]
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ScenarioCaptureError("first-condition bundle path must be absolute")
+    digest = _sha(row["sha256"], "first-condition bundle SHA-256")
+    try:
+        bundle = load_first_condition_bundle(
+            path,
+            expected_sha256=digest,
+            expected_seed=runtime["seed"],
+            expected_env_count=len(expected_cases),
+            expected_views=POLICY_VIEWS,
+            expected_plan_sha256=plan_sha256,
+        )
+    except FirstConditionBundleError as exc:
+        raise ScenarioCaptureError(f"first-condition bundle verification failed: {exc}") from exc
+    if bundle["size"] != row["size"]:
+        raise ScenarioCaptureError("first-condition bundle size changed")
+    if bundle["provenance"] != provenance:
+        raise ScenarioCaptureError("first-condition bundle provenance differs from runtime")
+    if [
+        {key: case[key] for key in PLANNED_CASE_KEYS}
+        for case in bundle["cases"]
+    ] != [dict(case) for case in expected_cases]:
+        raise ScenarioCaptureError("first-condition bundle assignment differs from plan")
+    for env_index, (case, bundled_case) in enumerate(
+        zip(normalized_cases, bundle["cases"], strict=True)
+    ):
+        if (
+            case["first_condition_sha256"]
+            != bundle["first_condition_sha256_by_env"][str(env_index)]
+            or case["first_condition_sha256"]
+            != bundled_case["first_condition_sha256"]
+            or case["scenario_id"] != bundled_case["scenario_id"]
+        ):
+            raise ScenarioCaptureError(
+                "runtime effective condition differs from first-condition bundle"
+            )
+        if (
+            case["live_reset_state_sha256"]
+            != bundle["live_reset_state_sha256_by_env"][str(env_index)]
+        ):
+            raise ScenarioCaptureError(
+                "live reset-state identity differs from first-condition bundle"
+            )
+        if pass_index == 1 and (
+            case["live_condition_sha256"] != case["first_condition_sha256"]
+        ):
+            raise ScenarioCaptureError(
+                "capture pass live condition identity differs from its bundle"
+            )
+    if pass_index == 1 and (
+        bundle["capture_run_id"] != runtime["capture_run_id"]
+        or bundle["capture_nonce"] != runtime["capture_nonce"]
+    ):
+        raise ScenarioCaptureError("first-condition bundle source run differs from pass 1")
+    return row
+
+
 def validate_runtime_document(
     document: Any,
     *,
@@ -369,6 +474,8 @@ def validate_runtime_document(
         if {key: case[key] for key in PLANNED_CASE_KEYS} != planned:
             raise ScenarioCaptureError("runtime capture assignment differs from plan")
         condition = _sha(case["first_condition_sha256"], "first condition SHA-256")
+        _sha(case["live_condition_sha256"], "live condition SHA-256")
+        _sha(case["live_reset_state_sha256"], "live reset-state SHA-256")
         _sha(case["first_generated_sha256"], "first generated SHA-256")
         if case["scenario_id"] != _scenario_id(seed, env_index, condition):
             raise ScenarioCaptureError("runtime scenario ID is not condition-derived")
@@ -431,6 +538,13 @@ def validate_runtime_document(
         "nested_split_manifest_sha256"
     ):
         raise ScenarioCaptureError("capture provenance split SHA mismatch")
+    _validate_runtime_bundle(
+        runtime,
+        plan_sha256=plan_sha256,
+        expected_cases=expected_cases,
+        normalized_cases=normalized_cases,
+        provenance=provenance,
+    )
     return runtime
 
 
@@ -615,11 +729,27 @@ def build_campaign_attestation(
     evidence_cases: list[dict[str, Any]] = []
     scenarios: list[dict[str, Any]] = []
     pass_inventory: list[dict[str, Any]] = []
+    bundle_inventory: list[dict[str, Any]] = []
     for seed in sorted(groups):
         first, first_hash = captures[(seed, 1)]
         second, second_hash = captures[(seed, 2)]
         first_runtime = first["runtime"]
         second_runtime = second["runtime"]
+        first_bundle = first_runtime["first_condition_bundle"]
+        second_bundle = second_runtime["first_condition_bundle"]
+        first_bundle_row = {
+            "seed": seed,
+            **{key: first_bundle[key] for key in BUNDLE_INVENTORY_KEYS - {"seed"}},
+        }
+        second_bundle_row = {
+            "seed": seed,
+            **{key: second_bundle[key] for key in BUNDLE_INVENTORY_KEYS - {"seed"}},
+        }
+        if first_bundle_row != second_bundle_row:
+            raise ScenarioCaptureError(
+                "capture/replay passes do not use the same first-condition bundle"
+            )
+        bundle_inventory.append(first_bundle_row)
         if first_runtime["capture_run_id"] == second_runtime["capture_run_id"]:
             raise ScenarioCaptureError("repeat capture reused its Image3F run namespace")
         if first_runtime["capture_nonce"] == second_runtime["capture_nonce"]:
@@ -638,6 +768,7 @@ def build_campaign_attestation(
         ):
             repeat_keys = {
                 "first_condition_sha256",
+                "live_reset_state_sha256",
                 "scenario_id",
             }
             if require_generated_repeat:
@@ -650,6 +781,9 @@ def build_campaign_attestation(
                 {
                     **{key: case_a[key] for key in PLANNED_CASE_KEYS},
                     "first_condition_sha256": case_a["first_condition_sha256"],
+                    "live_condition_sha256": case_a["live_condition_sha256"],
+                    "live_reset_state_sha256": case_a["live_reset_state_sha256"],
+                    "scenario_id": case_a["scenario_id"],
                 }
             )
             scenarios.append(
@@ -676,10 +810,20 @@ def build_campaign_attestation(
             )
     if canonical_provenance is None:
         raise ScenarioCaptureError("capture campaign has no provenance")
+    expected_bundle_seeds = list(sorted(groups))
+    if (
+        len(bundle_inventory) != len(expected_bundle_seeds)
+        or [row["seed"] for row in bundle_inventory] != expected_bundle_seeds
+        or any(set(row) != BUNDLE_INVENTORY_KEYS for row in bundle_inventory)
+    ):
+        raise ScenarioCaptureError("first-condition bundle inventory is not exact 8-seed coverage")
+    bundle_inventory_sha = canonical_sha256(bundle_inventory)
     evidence = {
         "schema": EVIDENCE_SCHEMA,
         "plan_sha256": plan_sha,
         "cases": evidence_cases,
+        "first_condition_bundles": bundle_inventory,
+        "first_condition_bundle_inventory_sha256": bundle_inventory_sha,
     }
     evidence_payload = canonical_bytes(evidence) + b"\n"
     scenario_payload = canonical_bytes(scenarios) + b"\n"
@@ -696,10 +840,14 @@ def build_campaign_attestation(
         "case_count": len(evidence_cases),
         "passes_per_seed": 2,
         "pass_artifacts": pass_inventory,
+        "first_condition_bundles": bundle_inventory,
+        "first_condition_bundle_inventory_sha256": bundle_inventory_sha,
         "repeatability": {
             "first_condition_sha256": True,
             "scenario_id": True,
             "first_generated_sha256": bool(require_generated_repeat),
+            "canonical_bundle_replay": True,
+            "live_reset_state_sha256": True,
         },
         "renderer_accounting": {
             "served_requests_per_pass": len(next(iter(groups.values()))),
@@ -756,6 +904,9 @@ def verify_campaign_outputs(
         "attestation_sha256": _sha_bytes(attestation_payload),
         "capture_evidence_sha256": _sha_bytes(evidence_payload),
         "scenario_contract_sha256": _sha_bytes(scenario_payload),
+        "first_condition_bundle_inventory_sha256": attestation[
+            "first_condition_bundle_inventory_sha256"
+        ],
         "case_count": attestation["case_count"],
     }
 

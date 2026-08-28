@@ -44,6 +44,7 @@ from round_dagger.state import (
 )
 from round_dagger.production_data_lineage import (
     ProductionDataLineageError,
+    RUNTIME_CONTRACT_SCHEMA,
     data_lineage_sha256,
     validate_data_lineage,
 )
@@ -51,15 +52,17 @@ from round_dagger.production_data_lineage import (
 LEGACY_CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v1"
 CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v2"
 PRODUCTION_CONTRACT_SCHEMA = (
-    "fast_roborender.round_dagger.paired_evaluation_contract.v3"
+    "fast_roborender.round_dagger.paired_evaluation_contract.v4"
 )
 OUTCOME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_outcome.v4"
 PRODUCTION_OUTCOME_SCHEMA = (
-    "fast_roborender.round_dagger.paired_evaluation_outcome.v5"
+    "fast_roborender.round_dagger.paired_evaluation_outcome.v6"
 )
 REPORT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_report.v2"
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_bundle.v2"
-RUNTIME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_runtime.v1"
+LEGACY_RUNTIME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_runtime.v1"
+RUNTIME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_runtime.v2"
+IMAGE3F_RUNTIME_SCHEMA = "fast_roborender.image3f_fixed_eval_runtime.v2"
 EVALUATOR_RESULT_SCHEMA = "fast_roborender.round_dagger.evaluator_result.v2"
 EVALUATOR_SOURCE_BUNDLE_SCHEMA = (
     "fast_roborender.round_dagger.evaluator_source_bundle.v2"
@@ -92,6 +95,7 @@ _REPOSITORY_EVALUATOR_SOURCES = (
     "round_dagger/artifacts.py",
     "round_dagger/evaluation.py",
     "round_dagger/evaluation_inputs.py",
+    "round_dagger/first_condition_bundle.py",
     "round_dagger/gr00t_policy.py",
     "round_dagger/policy_bundle.py",
     "round_dagger/promotion.py",
@@ -285,6 +289,14 @@ def _validate_thresholds(value: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 _CASE_KEYS = {"seed", "env_index", "scenario_id"}
+_FIRST_CONDITION_BUNDLE_KEYS = {
+    "seed",
+    "path",
+    "sha256",
+    "size",
+    "case_count",
+    "source_pass_index",
+}
 
 
 def _validate_cases(value: Any) -> list[dict[str, Any]]:
@@ -320,6 +332,233 @@ def _validate_cases(value: Any) -> list[dict[str, Any]]:
     return cases
 
 
+def _verified_external_file(
+    value: Any,
+    expected_sha256: Any,
+    label: str,
+    *,
+    expected_size: int | None = None,
+    require_read_only: bool = True,
+) -> Path:
+    if not isinstance(value, str) or not value or any(
+        character in value for character in ("\x00", "\t", "\n", "\r")
+    ):
+        raise EvaluationError(f"{label} path is unsafe")
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or any(part in {".", ".."} for part in path.parts)
+        or not path.is_file()
+        or path.is_symlink()
+    ):
+        raise EvaluationError(f"{label} must be an absolute regular non-symlink file")
+    try:
+        if path.resolve(strict=True) != path:
+            raise EvaluationError(f"{label} path is not canonical")
+    except OSError as exc:
+        raise EvaluationError(f"cannot resolve {label}") from exc
+    stat_result = path.stat()
+    if require_read_only and stat_result.st_mode & 0o777 != 0o444:
+        raise EvaluationError(f"{label} must have exact read-only mode 0444")
+    if expected_size is not None and stat_result.st_size != expected_size:
+        raise EvaluationError(f"{label} size differs from its inventory")
+    expected_sha = _sha(expected_sha256, f"{label} SHA-256")
+    if sha256_file(path) != expected_sha:
+        raise EvaluationError(f"{label} SHA-256 mismatch")
+    return path
+
+
+def _validate_first_condition_bundles(
+    value: Any,
+    *,
+    expected_seeds: Sequence[int],
+    expected_case_count: int,
+    verify_files: bool,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(expected_seeds):
+        raise EvaluationError(
+            "first-condition bundle inventory must contain exactly one row per seed"
+        )
+    rows: list[dict[str, Any]] = []
+    for index, raw in enumerate(value):
+        row = _exact(
+            raw,
+            _FIRST_CONDITION_BUNDLE_KEYS,
+            f"first_condition_bundles[{index}]",
+        )
+        seed = _integer(row["seed"], f"first-condition bundle {index} seed")
+        path = row["path"]
+        digest = _sha(row["sha256"], f"first-condition bundle {seed} SHA-256")
+        size = _integer(
+            row["size"], f"first-condition bundle {seed} size", minimum=1
+        )
+        case_count = _integer(
+            row["case_count"],
+            f"first-condition bundle {seed} case_count",
+            minimum=1,
+        )
+        source_pass = _integer(
+            row["source_pass_index"],
+            f"first-condition bundle {seed} source_pass_index",
+            minimum=1,
+        )
+        if case_count != expected_case_count or source_pass != 1:
+            raise EvaluationError(
+                "first-condition bundle is not a pass-1 exact evaluation block"
+            )
+        if verify_files:
+            _verified_external_file(
+                path,
+                digest,
+                f"first-condition bundle for seed {seed}",
+                expected_size=size,
+            )
+        elif (
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or any(part in {".", ".."} for part in Path(path).parts)
+        ):
+            raise EvaluationError("first-condition bundle path is unsafe")
+        rows.append(
+            {
+                "seed": seed,
+                "path": path,
+                "sha256": digest,
+                "size": size,
+                "case_count": case_count,
+                "source_pass_index": source_pass,
+            }
+        )
+    if [row["seed"] for row in rows] != list(expected_seeds):
+        raise EvaluationError(
+            "first-condition bundles are not in canonical evaluation-seed order"
+        )
+    if len({row["path"] for row in rows}) != len(rows):
+        raise EvaluationError("first-condition bundle paths are not unique")
+    return rows
+
+
+def _load_first_condition_bundles_from_runtime_contract(
+    *,
+    campaign: Mapping[str, Any],
+    runtime_contract_path: str | os.PathLike[str],
+    runtime_contract_sha256: str,
+    expected_seeds: Sequence[int],
+    expected_case_count: int,
+) -> tuple[list[dict[str, Any]], str]:
+    expected_runtime_sha = _sha(
+        runtime_contract_sha256, "production runtime contract SHA-256"
+    )
+    lineage = validate_data_lineage(campaign.get("data_lineage"))
+    if expected_runtime_sha != lineage["runtime_contract_sha256"]:
+        raise EvaluationError(
+            "first-condition runtime contract differs from durable data lineage"
+        )
+    runtime_path = _verified_external_file(
+        str(runtime_contract_path),
+        expected_runtime_sha,
+        "production runtime contract",
+    )
+    runtime_document = load_strict_json(runtime_path)
+    runtime_document = _exact(
+        runtime_document,
+        {
+            "schema",
+            "status",
+            "invariant_profile_sha256",
+            "camera_acceptance",
+            "renderer_fleet",
+            "live_capture",
+        },
+        "production runtime contract",
+    )
+    if (
+        runtime_document["schema"] != RUNTIME_CONTRACT_SCHEMA
+        or runtime_document["status"] != "release_eligible"
+        or runtime_document["invariant_profile_sha256"]
+        != lineage["invariant_profile_sha256"]
+    ):
+        raise EvaluationError(
+            "production runtime contract is not release-eligible schema v2"
+        )
+    live_capture = _exact(
+        runtime_document["live_capture"],
+        {
+            "split_manifest_path",
+            "split_manifest_sha256",
+            "heldout_plan_path",
+            "heldout_plan_sha256",
+            "pass_artifacts",
+            "attestation_path",
+            "attestation_sha256",
+            "evidence_path",
+            "evidence_sha256",
+            "scenario_path",
+            "scenario_sha256",
+            "first_condition_bundles",
+            "first_condition_bundle_inventory_sha256",
+        },
+        "production runtime live capture",
+    )
+    rows = _validate_first_condition_bundles(
+        live_capture.get("first_condition_bundles"),
+        expected_seeds=expected_seeds,
+        expected_case_count=expected_case_count,
+        verify_files=True,
+    )
+    inventory_sha = _sha(
+        live_capture.get("first_condition_bundle_inventory_sha256"),
+        "first-condition bundle inventory SHA-256",
+    )
+    if canonical_json_sha256(rows) != inventory_sha:
+        raise EvaluationError("first-condition bundle inventory SHA-256 mismatch")
+    lineage_heldout = lineage["heldout_evaluation"]
+    if (
+        live_capture["split_manifest_sha256"]
+        != lineage["motion_split"]["manifest_sha256"]
+        or live_capture["heldout_plan_sha256"]
+        != lineage["motion_split"]["heldout_plan_sha256"]
+        or live_capture["attestation_sha256"]
+        != lineage_heldout["capture_attestation_sha256"]
+        or live_capture["evidence_sha256"]
+        != lineage_heldout["capture_evidence_sha256"]
+        or live_capture["scenario_sha256"]
+        != lineage_heldout["scenario_contract_sha256"]
+    ):
+        raise EvaluationError(
+            "production runtime capture identities differ from durable data lineage"
+        )
+    lineage_inventory_sha = lineage_heldout.get(
+        "first_condition_bundle_inventory_sha256"
+    )
+    if (
+        lineage_inventory_sha != inventory_sha
+        or lineage_heldout.get("first_condition_bundles") != rows
+    ):
+        raise EvaluationError(
+            "first-condition bundle inventory differs from durable data lineage"
+        )
+    for path_key, sha_key, label in (
+        ("attestation_path", "attestation_sha256", "capture attestation"),
+        ("evidence_path", "evidence_sha256", "capture evidence"),
+    ):
+        evidence_path = _verified_external_file(
+            live_capture.get(path_key),
+            live_capture.get(sha_key),
+            label,
+        )
+        evidence = load_strict_json(evidence_path)
+        if not isinstance(evidence, Mapping) or (
+            evidence.get("first_condition_bundles") != rows
+            or evidence.get("first_condition_bundle_inventory_sha256")
+            != inventory_sha
+        ):
+            raise EvaluationError(
+                f"{label} first-condition bundle inventory differs from runtime contract"
+            )
+    return rows, inventory_sha
+
+
 _POLICY_KEYS = {
     "role",
     "version",
@@ -352,6 +591,8 @@ _CONTRACT_KEYS = _LEGACY_CONTRACT_KEYS | {"anchor_pool"}
 _PRODUCTION_CONTRACT_KEYS = _CONTRACT_KEYS | {
     "data_lineage",
     "data_lineage_sha256",
+    "first_condition_bundles",
+    "first_condition_bundle_inventory_sha256",
 }
 _ANCHOR_POOL_KEYS = {
     "path",
@@ -388,6 +629,8 @@ def create_contract(
     anchor_count: int,
     anchor_index: int,
     anchor_inventory_sha256: str,
+    production_runtime_contract_path: str | os.PathLike[str] | None = None,
+    production_runtime_contract_sha256: str | None = None,
     output: str | Path,
     thresholds: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -458,6 +701,38 @@ def create_contract(
         ),
     }
     production = campaign.get("schema") == PRODUCTION_CAMPAIGN_SCHEMA
+    first_condition_bundles: list[dict[str, Any]] | None = None
+    first_condition_bundle_inventory_sha256: str | None = None
+    if production:
+        if (
+            production_runtime_contract_path is None
+            or production_runtime_contract_sha256 is None
+        ):
+            raise EvaluationError(
+                "production evaluation requires the verified runtime contract"
+            )
+        try:
+            (
+                first_condition_bundles,
+                first_condition_bundle_inventory_sha256,
+            ) = _load_first_condition_bundles_from_runtime_contract(
+                campaign=campaign,
+                runtime_contract_path=production_runtime_contract_path,
+                runtime_contract_sha256=production_runtime_contract_sha256,
+                expected_seeds=seeds,
+                expected_case_count=envs_per_seed,
+            )
+        except ProductionDataLineageError as exc:
+            raise EvaluationError(
+                f"production first-condition data lineage is invalid: {exc}"
+            ) from exc
+    elif (
+        production_runtime_contract_path is not None
+        or production_runtime_contract_sha256 is not None
+    ):
+        raise EvaluationError(
+            "non-production evaluation cannot select a production runtime contract"
+        )
     contract = {
         "schema": PRODUCTION_CONTRACT_SCHEMA if production else CONTRACT_SCHEMA,
         "campaign_id": campaign["campaign_id"],
@@ -488,6 +763,10 @@ def create_contract(
     if production:
         contract["data_lineage"] = campaign["data_lineage"]
         contract["data_lineage_sha256"] = campaign["data_lineage_sha256"]
+        contract["first_condition_bundles"] = first_condition_bundles
+        contract["first_condition_bundle_inventory_sha256"] = (
+            first_condition_bundle_inventory_sha256
+        )
     _validate_contract_document(root, contract, bind_state=True)
     output_path, relative = _internal_path(root, output, "evaluation contract")
     _evaluation_root_for_contract(root, output_path, contract["macro_round"])
@@ -521,7 +800,7 @@ def _validate_contract_document(
         raise EvaluationError("paired evaluation contract schema mismatch")
     if production_campaign != (schema == PRODUCTION_CONTRACT_SCHEMA):
         raise EvaluationError(
-            "production campaign requires capture-bound evaluation contract v3"
+            "production campaign requires replay-bound evaluation contract v4"
         )
     if contract["campaign_id"] != campaign["campaign_id"] or contract[
         "campaign_sha256"
@@ -654,6 +933,32 @@ def _validate_contract_document(
             )
         if len(contract["scenario_cases"]) != 256:
             raise EvaluationError("production evaluation must contain 256 cases")
+        bundle_rows = _validate_first_condition_bundles(
+            contract["first_condition_bundles"],
+            expected_seeds=seeds,
+            expected_case_count=envs,
+            verify_files=True,
+        )
+        inventory_sha = _sha(
+            contract["first_condition_bundle_inventory_sha256"],
+            "first-condition bundle inventory SHA-256",
+        )
+        if (
+            bundle_rows != contract["first_condition_bundles"]
+            or canonical_json_sha256(bundle_rows) != inventory_sha
+        ):
+            raise EvaluationError(
+                "evaluation first-condition bundle inventory is non-canonical"
+            )
+        lineage_heldout = lineage["heldout_evaluation"]
+        if (
+            lineage_heldout.get("first_condition_bundle_inventory_sha256")
+            != inventory_sha
+            or lineage_heldout.get("first_condition_bundles") != bundle_rows
+        ):
+            raise EvaluationError(
+                "evaluation first-condition bundles differ from data lineage"
+            )
     contract["thresholds"] = _validate_thresholds(contract["thresholds"])
     return contract
 
@@ -759,7 +1064,11 @@ _EPISODE_KEYS = _RAW_PAIRED_EPISODE_KEYS | {
     "first_condition_sha256",
     "first_generated_sha256",
 }
-_IMAGE3F_RUNTIME_KEYS = {
+_PRODUCTION_EPISODE_KEYS = _EPISODE_KEYS | {
+    "live_condition_sha256",
+    "live_reset_state_sha256",
+}
+_LEGACY_IMAGE3F_RUNTIME_KEYS = {
     "schema",
     "eval_relabel_enabled",
     "raytraced_mix_prob",
@@ -770,6 +1079,39 @@ _IMAGE3F_RUNTIME_KEYS = {
     "generated_frames",
     "first_condition_sha256_by_env",
     "first_generated_sha256_by_env",
+}
+_PRODUCTION_IMAGE3F_RUNTIME_KEYS = _LEGACY_IMAGE3F_RUNTIME_KEYS | {
+    "first_condition_bundle_mode",
+    "first_condition_bundle_path",
+    "first_condition_bundle_sha256",
+    "first_condition_replay_count",
+    "first_condition_replay_env_indices",
+    "live_condition_sha256_by_env",
+    "live_reset_state_sha256_by_env",
+}
+_LEGACY_PAIRED_RUNTIME_KEYS = {
+    "schema",
+    "eval_relabel_enabled",
+    "policy_views",
+    "view_layout",
+    "raytraced_mix_prob",
+    "reference_lag",
+    "training_enabled",
+    "one_episode_per_environment",
+    "generation_seed",
+    "runtime_policy_sha256",
+    "evaluation_config_sha256",
+    "evaluator_code_sha256",
+}
+_PRODUCTION_PAIRED_RUNTIME_KEYS = _LEGACY_PAIRED_RUNTIME_KEYS | {
+    "first_condition_bundle_mode",
+    "first_condition_bundle_path",
+    "first_condition_bundle_sha256",
+    "first_condition_replay_count",
+    "first_condition_replay_env_indices",
+    "first_condition_sha256_by_env",
+    "live_condition_sha256_by_env",
+    "live_reset_state_sha256_by_env",
 }
 _FIXED_EPISODE_KEYS = {
     "env_index",
@@ -807,7 +1149,13 @@ _OUTCOME_KEYS = {
     "episodes",
     "source_artifacts",
 }
-_PRODUCTION_OUTCOME_KEYS = _OUTCOME_KEYS | {"data_lineage_sha256"}
+_PRODUCTION_OUTCOME_KEYS = _OUTCOME_KEYS | {
+    "data_lineage_sha256",
+    "first_condition_bundle",
+    "first_condition_bundle_inventory_sha256",
+    "first_condition_replay_count",
+    "first_condition_replay_env_indices",
+}
 _SOURCE_KEYS = {
     "metrics_path",
     "metrics_sha256",
@@ -822,6 +1170,28 @@ def _policy_for_role(contract: Mapping[str, Any], role: str) -> dict[str, Any]:
     if role not in {"parent", "candidate"}:
         raise EvaluationError("role must be parent or candidate")
     return next(dict(item) for item in contract["policies"] if item["role"] == role)
+
+
+def _first_condition_bundle_for_seed(
+    contract: Mapping[str, Any], seed: int
+) -> dict[str, Any]:
+    rows = contract.get("first_condition_bundles")
+    if not isinstance(rows, list):
+        raise EvaluationError("evaluation contract has no first-condition bundles")
+    matching = [row for row in rows if row.get("seed") == seed]
+    if len(matching) != 1:
+        raise EvaluationError(
+            "evaluation seed does not select exactly one first-condition bundle"
+        )
+    return dict(matching[0])
+
+
+def _validated_sha_map(
+    value: Any, expected_keys: set[str], label: str
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != expected_keys:
+        raise EvaluationError(f"{label} coverage is incomplete")
+    return {key: _sha(item, f"{label} for env {key}") for key, item in value.items()}
 
 
 def evaluation_run_id(
@@ -883,6 +1253,7 @@ def attest_outcome(
     contract = load_contract(root, contract_path)
     if contract["schema"] not in {CONTRACT_SCHEMA, PRODUCTION_CONTRACT_SCHEMA}:
         raise EvaluationError("legacy evaluation contracts are diagnostic-only")
+    production = contract["schema"] == PRODUCTION_CONTRACT_SCHEMA
     seed = _integer(seed, "seed")
     if seed not in contract["seeds"]:
         raise EvaluationError("seed is not in the immutable evaluation contract")
@@ -917,9 +1288,24 @@ def attest_outcome(
         raise EvaluationError(
             "evaluator metrics do not attest the intended Image3F run ID"
         )
-    runtime = metrics.get("_roborender_paired_evaluation")
+    expected_cases = [
+        item for item in contract["scenario_cases"] if item["seed"] == seed
+    ]
+    expected_env_keys = {str(index) for index in range(len(expected_cases))}
+    selected_bundle = (
+        _first_condition_bundle_for_seed(contract, seed) if production else None
+    )
+    runtime = _exact(
+        metrics.get("_roborender_paired_evaluation"),
+        (
+            _PRODUCTION_PAIRED_RUNTIME_KEYS
+            if production
+            else _LEGACY_PAIRED_RUNTIME_KEYS
+        ),
+        "paired evaluation runtime evidence",
+    )
     expected_runtime = {
-        "schema": RUNTIME_SCHEMA,
+        "schema": RUNTIME_SCHEMA if production else LEGACY_RUNTIME_SCHEMA,
         "eval_relabel_enabled": True,
         "policy_views": list(POLICY_VIEWS),
         "view_layout": "vertical",
@@ -932,8 +1318,38 @@ def attest_outcome(
         "evaluation_config_sha256": contract["evaluation_config_sha256"],
         "evaluator_code_sha256": contract["evaluator_code_sha256"],
     }
-    if runtime != expected_runtime:
+    if any(runtime.get(key) != value for key, value in expected_runtime.items()):
         raise EvaluationError("evaluator runtime evidence differs from paired contract")
+    paired_condition_hashes: dict[str, str] = {}
+    paired_live_condition_hashes: dict[str, str] = {}
+    paired_live_reset_state_hashes: dict[str, str] = {}
+    if production:
+        expected_indices = list(range(len(expected_cases)))
+        if (
+            runtime["first_condition_bundle_mode"] != "replay"
+            or runtime["first_condition_bundle_path"] != selected_bundle["path"]
+            or runtime["first_condition_bundle_sha256"] != selected_bundle["sha256"]
+            or runtime["first_condition_replay_count"] != len(expected_cases)
+            or runtime["first_condition_replay_env_indices"] != expected_indices
+        ):
+            raise EvaluationError(
+                "paired runtime first-condition replay differs from contract"
+            )
+        paired_condition_hashes = _validated_sha_map(
+            runtime["first_condition_sha256_by_env"],
+            expected_env_keys,
+            "paired runtime first condition SHA",
+        )
+        paired_live_condition_hashes = _validated_sha_map(
+            runtime["live_condition_sha256_by_env"],
+            expected_env_keys,
+            "paired runtime live condition SHA",
+        )
+        paired_live_reset_state_hashes = _validated_sha_map(
+            runtime["live_reset_state_sha256_by_env"],
+            expected_env_keys,
+            "paired runtime live reset-state SHA",
+        )
     generated_steps = _integer(
         metrics.get("generated_policy_steps"), "generated_policy_steps", minimum=1
     )
@@ -945,9 +1361,6 @@ def attest_outcome(
             "generated frame count differs from renderer request delta"
         )
 
-    expected_cases = [
-        item for item in contract["scenario_cases"] if item["seed"] == seed
-    ]
     if generated_frames != generated_steps * len(expected_cases):
         raise EvaluationError(
             "generated frame count is not one three-view request per environment step"
@@ -955,11 +1368,19 @@ def attest_outcome(
 
     image3f_runtime = _exact(
         metrics.get("_roborender_image3f_eval"),
-        _IMAGE3F_RUNTIME_KEYS,
+        (
+            _PRODUCTION_IMAGE3F_RUNTIME_KEYS
+            if production
+            else _LEGACY_IMAGE3F_RUNTIME_KEYS
+        ),
         "Image3F runtime evidence",
     )
     expected_image3f_runtime = {
-        "schema": "fast_roborender.image3f_fixed_eval_runtime.v1",
+        "schema": (
+            IMAGE3F_RUNTIME_SCHEMA
+            if production
+            else "fast_roborender.image3f_fixed_eval_runtime.v1"
+        ),
         "eval_relabel_enabled": True,
         "raytraced_mix_prob": RAYTRACED_MIX,
         "reference_lag": REFERENCE_LAG,
@@ -975,26 +1396,63 @@ def attest_outcome(
         raise EvaluationError(
             "Image3F runtime evidence differs from paired evaluation counters/config"
         )
-    expected_env_keys = {str(index) for index in range(len(expected_cases))}
-    condition_hashes = image3f_runtime["first_condition_sha256_by_env"]
-    generated_hashes = image3f_runtime["first_generated_sha256_by_env"]
-    if (
-        not isinstance(condition_hashes, Mapping)
-        or set(condition_hashes) != expected_env_keys
-        or not isinstance(generated_hashes, Mapping)
-        or set(generated_hashes) != expected_env_keys
-    ):
-        raise EvaluationError(
-            "Image3F first-condition/generated identity coverage is incomplete"
+    condition_hashes = _validated_sha_map(
+        image3f_runtime["first_condition_sha256_by_env"],
+        expected_env_keys,
+        "first condition SHA",
+    )
+    generated_hashes = _validated_sha_map(
+        image3f_runtime["first_generated_sha256_by_env"],
+        expected_env_keys,
+        "first generated SHA",
+    )
+    live_condition_hashes: dict[str, str] = {}
+    live_reset_state_hashes: dict[str, str] = {}
+    replay_env_indices: list[int] = []
+    replay_count = 0
+    if production:
+        expected_indices = list(range(len(expected_cases)))
+        if (
+            image3f_runtime["first_condition_bundle_mode"] != "replay"
+            or image3f_runtime["first_condition_bundle_path"]
+            != selected_bundle["path"]
+            or image3f_runtime["first_condition_bundle_sha256"]
+            != selected_bundle["sha256"]
+        ):
+            raise EvaluationError(
+                "Image3F first-condition replay bundle differs from paired contract"
+            )
+        replay_count = _integer(
+            image3f_runtime["first_condition_replay_count"],
+            "first-condition replay count",
         )
-    condition_hashes = {
-        key: _sha(value, f"first condition SHA for env {key}")
-        for key, value in condition_hashes.items()
-    }
-    generated_hashes = {
-        key: _sha(value, f"first generated SHA for env {key}")
-        for key, value in generated_hashes.items()
-    }
+        replay_env_indices = image3f_runtime["first_condition_replay_env_indices"]
+        if (
+            replay_count != len(expected_cases)
+            or not isinstance(replay_env_indices, list)
+            or replay_env_indices != expected_indices
+        ):
+            raise EvaluationError(
+                "first-condition replay did not occur exactly once for every environment"
+            )
+        live_condition_hashes = _validated_sha_map(
+            image3f_runtime["live_condition_sha256_by_env"],
+            expected_env_keys,
+            "live condition SHA",
+        )
+        live_reset_state_hashes = _validated_sha_map(
+            image3f_runtime["live_reset_state_sha256_by_env"],
+            expected_env_keys,
+            "live reset-state SHA",
+        )
+        if (
+            paired_condition_hashes != condition_hashes
+            or paired_live_condition_hashes != live_condition_hashes
+            or paired_live_reset_state_hashes != live_reset_state_hashes
+        ):
+            raise EvaluationError(
+                "paired runtime replay/state evidence differs from Image3F runtime"
+            )
 
     fixed_records = metrics.get("_roborender_fixed_seed_episodes")
     if not isinstance(fixed_records, list) or len(fixed_records) != len(expected_cases):
@@ -1085,6 +1543,11 @@ def attest_outcome(
             )
         episode["first_condition_sha256"] = condition_hashes[str(env_index)]
         episode["first_generated_sha256"] = generated_hashes[str(env_index)]
+        if production:
+            episode["live_condition_sha256"] = live_condition_hashes[str(env_index)]
+            episode["live_reset_state_sha256"] = live_reset_state_hashes[
+                str(env_index)
+            ]
         by_env[env_index] = episode
     episodes = [
         by_env[index] for index in range(len(expected_cases)) if index in by_env
@@ -1116,7 +1579,6 @@ def attest_outcome(
         "renderer_after_path": after_relative,
         "renderer_after_sha256": sha256_file(after_file),
     }
-    production = contract["schema"] == PRODUCTION_CONTRACT_SCHEMA
     outcome = {
         "schema": PRODUCTION_OUTCOME_SCHEMA if production else OUTCOME_SCHEMA,
         "contract_sha256": contract["contract_sha256"],
@@ -1144,6 +1606,12 @@ def attest_outcome(
     }
     if production:
         outcome["data_lineage_sha256"] = contract["data_lineage_sha256"]
+        outcome["first_condition_bundle"] = selected_bundle
+        outcome["first_condition_bundle_inventory_sha256"] = contract[
+            "first_condition_bundle_inventory_sha256"
+        ]
+        outcome["first_condition_replay_count"] = replay_count
+        outcome["first_condition_replay_env_indices"] = replay_env_indices
     output_path, relative = _internal_path(root, output, "paired outcome")
     digest = publish_immutable_json(output_path, outcome)
     return {**outcome, "outcome_path": relative, "outcome_sha256": digest}
@@ -1190,6 +1658,18 @@ def load_outcome(
     }
     if production:
         expected["data_lineage_sha256"] = contract["data_lineage_sha256"]
+        expected["first_condition_bundle"] = _first_condition_bundle_for_seed(
+            contract, expected_seed
+        )
+        expected["first_condition_bundle_inventory_sha256"] = contract[
+            "first_condition_bundle_inventory_sha256"
+        ]
+        expected["first_condition_replay_count"] = contract[
+            "num_envs_per_seed"
+        ]
+        expected["first_condition_replay_env_indices"] = list(
+            range(contract["num_envs_per_seed"])
+        )
     if any(outcome.get(key) != value for key, value in expected.items()):
         raise EvaluationError("paired outcome identity/provenance mismatch")
     image3f_run_id = _validate_evaluation_run_id(
@@ -1228,7 +1708,11 @@ def load_outcome(
     if not isinstance(episodes, list) or len(episodes) != len(expected_cases):
         raise EvaluationError("outcome episode coverage is incomplete")
     for expected_case, raw in zip(expected_cases, episodes, strict=True):
-        episode = _exact(raw, _EPISODE_KEYS, "outcome episode")
+        episode = _exact(
+            raw,
+            _PRODUCTION_EPISODE_KEYS if production else _EPISODE_KEYS,
+            "outcome episode",
+        )
         if (
             episode["env_index"] != expected_case["env_index"]
             or episode["seed"] != expected_seed
@@ -1247,6 +1731,14 @@ def load_outcome(
         )
         for view in POLICY_VIEWS:
             _sha(views[view], f"generated {view} SHA")
+        _sha(episode["first_condition_sha256"], "outcome first condition SHA")
+        _sha(episode["first_generated_sha256"], "outcome first generated SHA")
+        if production:
+            _sha(episode["live_condition_sha256"], "outcome live condition SHA")
+            _sha(
+                episode["live_reset_state_sha256"],
+                "outcome live reset-state SHA",
+            )
     return {
         **outcome,
         "outcome_path": relative,
@@ -1320,6 +1812,26 @@ def _score(
         )
         if any(left[key] != right[key] for key in identity):
             raise EvaluationError("parent/candidate outcomes are not case-paired")
+        reset_fields_present = (
+            "live_reset_state_sha256" in left,
+            "live_reset_state_sha256" in right,
+        )
+        live_fields_present = (
+            "live_condition_sha256" in left,
+            "live_condition_sha256" in right,
+        )
+        if reset_fields_present[0] != reset_fields_present[1] or (
+            reset_fields_present[0]
+            and left["live_reset_state_sha256"]
+            != right["live_reset_state_sha256"]
+        ):
+            raise EvaluationError(
+                "parent/candidate live reset-state evidence is not case-paired"
+            )
+        if live_fields_present[0] != live_fields_present[1]:
+            raise EvaluationError(
+                "parent/candidate live-condition diagnostics are incomplete"
+            )
     parent_success = _mean([float(item["success"]) for item in parent])
     candidate_success = _mean([float(item["success"]) for item in candidate])
     parent_safety = _mean([float(item["safety_violation"]) for item in parent])
@@ -1372,6 +1884,14 @@ def _score(
         "paired_initial_generated_matches": float(len(parent)),
         "renderer_errors": 0.0,
     }
+    if parent and "live_reset_state_sha256" in parent[0]:
+        metrics["paired_live_reset_state_matches"] = float(len(parent))
+        metrics["paired_live_condition_matches"] = float(
+            sum(
+                left["live_condition_sha256"] == right["live_condition_sha256"]
+                for left, right in zip(parent, candidate, strict=True)
+            )
+        )
     decision = {
         "passed": passed,
         "meaningful_improvement": meaningful,
@@ -1661,6 +2181,8 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--anchor-count", type=int, required=True)
     prepare.add_argument("--anchor-index", type=int, required=True)
     prepare.add_argument("--anchor-inventory-sha256", required=True)
+    prepare.add_argument("--production-runtime-contract")
+    prepare.add_argument("--production-runtime-contract-sha256")
     prepare.add_argument("--thresholds")
     prepare.add_argument("--output", required=True)
 
@@ -1671,6 +2193,11 @@ def _parser() -> argparse.ArgumentParser:
     cases = sub.add_parser("list-cases")
     cases.add_argument("--root", required=True)
     cases.add_argument("--contract", required=True)
+
+    bundle_for_seed = sub.add_parser("first-condition-bundle")
+    bundle_for_seed.add_argument("--root", required=True)
+    bundle_for_seed.add_argument("--contract", required=True)
+    bundle_for_seed.add_argument("--seed", type=int, required=True)
 
     run_id = sub.add_parser("run-id")
     run_id.add_argument("--root", required=True)
@@ -1750,6 +2277,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 anchor_count=args.anchor_count,
                 anchor_index=args.anchor_index,
                 anchor_inventory_sha256=args.anchor_inventory_sha256,
+                production_runtime_contract_path=(
+                    args.production_runtime_contract
+                ),
+                production_runtime_contract_sha256=(
+                    args.production_runtime_contract_sha256
+                ),
                 output=args.output,
                 thresholds=thresholds,
             )
@@ -1770,6 +2303,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                         )
                     )
+            return 0
+        elif args.command == "first-condition-bundle":
+            contract = load_contract(args.root, args.contract)
+            if contract["schema"] != PRODUCTION_CONTRACT_SCHEMA:
+                raise EvaluationError(
+                    "first-condition replay is required only for production contracts"
+                )
+            bundle = _first_condition_bundle_for_seed(contract, args.seed)
+            print(
+                "\t".join(
+                    (
+                        bundle["path"],
+                        bundle["sha256"],
+                        str(bundle["size"]),
+                    )
+                )
+            )
             return 0
         elif args.command == "run-id":
             contract = load_contract(args.root, args.contract)

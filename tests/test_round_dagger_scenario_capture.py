@@ -6,10 +6,12 @@ import copy
 import ast
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from round_dagger.production_data_lineage import (
     ProductionDataLineageError,
@@ -77,9 +79,96 @@ class ScenarioCaptureTest(unittest.TestCase):
             "views": ["head_color", "hand_left", "hand_right"],
         }
         self.renderer_sha = canonical_sha256(self.renderer_identity)
+        self.bundle_registry = {}
+        self.bundle_patchers = [
+            mock.patch(
+                "round_dagger.scenario_capture.load_first_condition_bundle",
+                side_effect=self._load_fixture_bundle,
+            ),
+            mock.patch(
+                "round_dagger.production_data_lineage.load_first_condition_bundle",
+                side_effect=self._load_fixture_bundle,
+            ),
+        ]
+        for patcher in self.bundle_patchers:
+            patcher.start()
 
     def tearDown(self) -> None:
+        for patcher in reversed(self.bundle_patchers):
+            patcher.stop()
         self.temporary.cleanup()
+
+    def _load_fixture_bundle(
+        self,
+        path,
+        *,
+        expected_sha256,
+        expected_seed,
+        expected_env_count,
+        expected_views,
+        expected_plan_sha256=None,
+    ):
+        bundle = self.bundle_registry[str(path)]
+        self.assertEqual(bundle["sha256"], expected_sha256)
+        self.assertEqual(bundle["seed"], expected_seed)
+        self.assertEqual(bundle["case_count"], expected_env_count)
+        self.assertEqual(tuple(expected_views), ("head_color", "hand_left", "hand_right"))
+        if expected_plan_sha256 is not None:
+            self.assertEqual(bundle["plan_sha256"], expected_plan_sha256)
+        return copy.deepcopy(bundle)
+
+    def _register_bundle(
+        self,
+        *,
+        seed,
+        plan_sha,
+        planned_cases,
+        runtime_cases,
+        provenance,
+        source_run_id,
+        source_nonce,
+    ):
+        path = self.root / f"first_condition_seed{seed}_{plan_sha[:12]}.npz"
+        if not path.exists():
+            path.write_bytes(f"fixture-bundle-{seed}-{plan_sha}".encode("ascii"))
+            os.chmod(path, 0o444)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        bundle_cases = [
+            {
+                **planned,
+                "first_condition_sha256": runtime_case["first_condition_sha256"],
+                "scenario_id": runtime_case["scenario_id"],
+            }
+            for planned, runtime_case in zip(planned_cases, runtime_cases, strict=True)
+        ]
+        self.bundle_registry[str(path)] = {
+            "path": str(path),
+            "sha256": digest,
+            "size": path.stat().st_size,
+            "seed": seed,
+            "case_count": len(planned_cases),
+            "plan_sha256": plan_sha,
+            "capture_run_id": source_run_id,
+            "capture_nonce": source_nonce,
+            "provenance": copy.deepcopy(provenance),
+            "cases": bundle_cases,
+            "first_condition_sha256_by_env": {
+                str(index): case["first_condition_sha256"]
+                for index, case in enumerate(runtime_cases)
+            },
+            "live_reset_state_sha256_by_env": {
+                str(index): case["live_reset_state_sha256"]
+                for index, case in enumerate(runtime_cases)
+            },
+        }
+        return {
+            "mode": "capture",
+            "path": str(path),
+            "sha256": digest,
+            "size": path.stat().st_size,
+            "case_count": len(planned_cases),
+            "source_pass_index": 1,
+        }
 
     def runtime(self, *, pass_index: int = 1):
         cases = []
@@ -90,6 +179,8 @@ class ScenarioCaptureTest(unittest.TestCase):
                 {
                     **planned,
                     "first_condition_sha256": condition,
+                    "live_condition_sha256": condition,
+                    "live_reset_state_sha256": sha(f"reset-{env_index}"),
                     "first_generated_sha256": sha(f"generated-{env_index}"),
                     "scenario_id": canonical_sha256(
                         {
@@ -117,6 +208,16 @@ class ScenarioCaptureTest(unittest.TestCase):
             "parent_checkpoint_sha256": sha("parent"),
             "parent_runtime_policy_sha256": sha("parent-runtime"),
         }
+        bundle = self._register_bundle(
+            seed=self.seed,
+            plan_sha=self.plan_sha,
+            planned_cases=self.plan["capture"]["cases"],
+            runtime_cases=cases,
+            provenance=provenance,
+            source_run_id="smoke-seed17-pass1",
+            source_nonce=f"{1:032x}",
+        )
+        bundle["mode"] = "capture" if pass_index == 1 else "replay"
         return {
             "schema": RUNTIME_SCHEMA,
             "plan_sha256": self.plan_sha,
@@ -127,6 +228,7 @@ class ScenarioCaptureTest(unittest.TestCase):
             "capture_profile": "smoke2",
             "release_eligible": False,
             "expected_env_count": 2,
+            "first_condition_bundle": bundle,
             "cases": cases,
             "execution": {
                 "capture_mode": True,
@@ -269,6 +371,10 @@ class ScenarioCaptureTest(unittest.TestCase):
                 {
                     **case,
                     "first_condition_sha256": condition,
+                    "live_condition_sha256": condition,
+                    "live_reset_state_sha256": sha(
+                        f"actual-plan-reset-{case['global_case_index']}"
+                    ),
                     "first_generated_sha256": sha(
                         f"actual-plan-generated-{case['global_case_index']}"
                     ),
@@ -281,6 +387,15 @@ class ScenarioCaptureTest(unittest.TestCase):
                     ),
                 }
             )
+        runtime["first_condition_bundle"] = self._register_bundle(
+            seed=EXPECTED_SEEDS[0],
+            plan_sha=plan_sha,
+            planned_cases=planned,
+            runtime_cases=runtime["cases"],
+            provenance=runtime["provenance"],
+            source_run_id=runtime["capture_run_id"],
+            source_nonce=runtime["capture_nonce"],
+        )
         runtime["runtime"]["motion_split_offset"] = planned[0]["global_case_index"]
         runtime_path = self.root / "checked_in_plan_smoke_runtime.json"
         before_path = self.root / "checked_in_plan_smoke_before.json"
@@ -301,6 +416,23 @@ class ScenarioCaptureTest(unittest.TestCase):
 
     def test_smoke_fails_closed_on_env_step_replay_and_condition_drift(self) -> None:
         capture = self.build_smoke_pass()
+        legacy = copy.deepcopy(capture)
+        legacy["runtime"]["schema"] = (
+            "fast_roborender.round_dagger.scenario_capture_runtime.v1"
+        )
+        legacy["runtime_artifact_sha256"] = hashlib.sha256(
+            (
+                json.dumps(legacy["runtime"], sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(ScenarioCaptureError, "runtime schema mismatch"):
+            validate_pass_document(
+                legacy,
+                plan=self.plan,
+                plan_sha256=self.plan_sha,
+                production=False,
+            )
         stepped = copy.deepcopy(capture)
         stepped["runtime"]["execution"]["env_step_calls"] = 1
         with self.assertRaisesRegex(ScenarioCaptureError, "non-stepping"):
@@ -383,6 +515,10 @@ class ScenarioCaptureTest(unittest.TestCase):
                         {
                             **planned,
                             "first_condition_sha256": condition,
+                            "live_condition_sha256": condition,
+                            "live_reset_state_sha256": sha(
+                                f"prod-reset-{planned['global_case_index']}"
+                            ),
                             "first_generated_sha256": sha(
                                 f"prod-generated-{planned['global_case_index']}"
                             ),
@@ -412,6 +548,16 @@ class ScenarioCaptureTest(unittest.TestCase):
                     "parent_checkpoint_sha256": sha("prod-parent"),
                     "parent_runtime_policy_sha256": sha("prod-parent-runtime"),
                 }
+                bundle = self._register_bundle(
+                    seed=seed,
+                    plan_sha=plan_sha,
+                    planned_cases=seed_cases,
+                    runtime_cases=runtime_cases,
+                    provenance=provenance,
+                    source_run_id=f"capture-seed{seed}-pass1",
+                    source_nonce=f"{seed_index * 2 + 1:032x}",
+                )
+                bundle["mode"] = "capture" if pass_index == 1 else "replay"
                 runtime = {
                     "schema": RUNTIME_SCHEMA,
                     "plan_sha256": plan_sha,
@@ -422,6 +568,7 @@ class ScenarioCaptureTest(unittest.TestCase):
                     "capture_profile": "production32",
                     "release_eligible": True,
                     "expected_env_count": 32,
+                    "first_condition_bundle": bundle,
                     "cases": runtime_cases,
                     "execution": {
                         "capture_mode": True,
@@ -501,7 +648,7 @@ class ScenarioCaptureTest(unittest.TestCase):
         self.assertTrue(attestation["release_eligible"])
         self.assertEqual(attestation["case_count"], 256)
         self.assertEqual(len(attestation["pass_artifacts"]), 16)
-        self.assertEqual(evidence["schema"], "fast_roborender.round_dagger.motion_capture_evidence.v1")
+        self.assertEqual(evidence["schema"], "fast_roborender.round_dagger.motion_capture_evidence.v2")
         self.assertEqual(len(evidence["cases"]), 256)
         self.assertTrue(all("first_condition_sha256" in case for case in evidence["cases"]))
         self.assertEqual(len(scenarios), 256)
@@ -582,6 +729,12 @@ class ScenarioCaptureTest(unittest.TestCase):
                 "scenario_sha256": hashlib.sha256(
                     scenario_path.read_bytes()
                 ).hexdigest(),
+                "first_condition_bundles": attestation[
+                    "first_condition_bundles"
+                ],
+                "first_condition_bundle_inventory_sha256": attestation[
+                    "first_condition_bundle_inventory_sha256"
+                ],
             },
         }
         runtime_contract_path = self.root / "production_runtime_contract.json"
@@ -603,6 +756,23 @@ class ScenarioCaptureTest(unittest.TestCase):
             expected_invariant_profile_sha256=sha("invariant-profile"),
             motion_split_contract=motion_split_contract,
         )
+        legacy_contract = copy.deepcopy(runtime_contract_document)
+        legacy_contract["schema"] = (
+            "fast_roborender.round_dagger.production_runtime_contract.v1"
+        )
+        legacy_contract_path = self.root / "legacy_production_runtime_contract.json"
+        canonical_file(legacy_contract_path, legacy_contract)
+        with self.assertRaisesRegex(
+            ProductionDataLineageError, "runtime contract schema mismatch"
+        ):
+            load_verified_runtime_contract(
+                legacy_contract_path,
+                expected_sha256=hashlib.sha256(
+                    legacy_contract_path.read_bytes()
+                ).hexdigest(),
+                expected_invariant_profile_sha256=sha("invariant-profile"),
+                motion_split_contract=motion_split_contract,
+            )
         lineage = derive_data_lineage(
             verified_runtime,
             motion_split_contract=motion_split_contract,
@@ -659,6 +829,19 @@ class ScenarioCaptureTest(unittest.TestCase):
         smoke_runtime["execution"]["renderer_requests_delta"] = 2
         smoke_runtime["runtime"]["num_envs"] = 2
         smoke_runtime["runtime"]["motion_split_limit"] = 2
+        smoke_runtime["first_condition_bundle"] = self._register_bundle(
+            seed=smoke_runtime["seed"],
+            plan_sha=plan_sha,
+            planned_cases=[
+                case
+                for case in cases
+                if case["seed"] == smoke_runtime["seed"]
+            ][:2],
+            runtime_cases=smoke_runtime["cases"],
+            provenance=smoke_runtime["provenance"],
+            source_run_id=smoke_runtime["capture_run_id"],
+            source_nonce=smoke_runtime["capture_nonce"],
+        )
         smoke_after = copy.deepcopy(smoke_before)
         smoke_after["selected"][0]["response"]["metrics"]["requests"] = 12
         smoke_runtime_path = self.root / "full_plan_smoke_runtime.json"
@@ -711,6 +894,8 @@ class ScenarioCaptureLauncherContractTest(unittest.TestCase):
             "--motion-split-sha256",
             "--expected-renderers",
             "--smoke2",
+            "--first-condition-bundle",
+            "--first-condition-bundle-sha256",
         ):
             self.assertIn(option, help_result.stdout)
 
@@ -777,6 +962,26 @@ class ScenarioCaptureLauncherContractTest(unittest.TestCase):
             self.assertIn(
                 f"++env.config.safety_thresholds.{name}={value}", source
             )
+
+    def test_pass_one_captures_and_pass_two_replays_one_immutable_bundle(self) -> None:
+        source = self.source
+        self.assertIn(
+            'export IMAGE_DAGGER_FIRST_CONDITION_BUNDLE="$FIRST_CONDITION_BUNDLE"',
+            source,
+        )
+        self.assertIn("export IMAGE_DAGGER_FIRST_CONDITION_MODE=capture", source)
+        self.assertIn("export IMAGE_DAGGER_FIRST_CONDITION_MODE=replay", source)
+        self.assertIn(
+            'export IMAGE_DAGGER_FIRST_CONDITION_BUNDLE_SHA256="$FIRST_CONDITION_BUNDLE_SHA"',
+            source,
+        )
+        self.assertIn(
+            'fatal "pass 2 requires first-condition bundle path and SHA-256"',
+            source,
+        )
+        self.assertIn(
+            'fatal "first-condition bundle changed during replay"', source
+        )
 
 
 if __name__ == "__main__":
