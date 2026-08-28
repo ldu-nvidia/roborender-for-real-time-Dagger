@@ -30,6 +30,10 @@ from round_dagger.seed_policy import ActorSeedError, validate_actor_seed_contrac
 LEDGER_SCHEMA = "fast_roborender.round_dagger.replay_ledger.v1"
 SNAPSHOT_SCHEMA = "fast_roborender.round_dagger.replay_snapshot.v1"
 COHORT_SCHEMA = "fast_roborender.round_dagger.cohort.v1"
+PRODUCTION_COHORT_SCHEMA = "fast_roborender.round_dagger.cohort.v2"
+SUPPORTED_COHORT_SCHEMAS = frozenset(
+    {COHORT_SCHEMA, PRODUCTION_COHORT_SCHEMA}
+)
 
 _ACTOR_SEED_FIELD = "actor_seed_contract"
 _TRAJECTORY_FINGERPRINT_FIELD = (
@@ -164,7 +168,7 @@ def _verified_document(path: Path) -> dict[str, Any]:
 def _cohort_record(path: Path) -> dict[str, Any]:
     document = _verified_document(path)
     schema = document.get("schema")
-    if schema != COHORT_SCHEMA:
+    if not isinstance(schema, str) or schema not in SUPPORTED_COHORT_SCHEMAS:
         raise ReplayError(f"unsupported cohort schema: {schema!r}")
     campaign_id = _identifier(document.get("campaign_id"), "campaign_id")
     macro_round = _true_int(document.get("macro_round"), "macro_round")

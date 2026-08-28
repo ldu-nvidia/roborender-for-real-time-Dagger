@@ -1,6 +1,7 @@
 import hashlib
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -8,7 +9,14 @@ from unittest import mock
 import numpy as np
 
 from round_dagger import artifacts
+from round_dagger import orchestration
 from round_dagger import replay
+from round_dagger.orchestration import ProductionBackend
+from round_dagger.production_data_lineage import (
+    build_cohort_assignment,
+    derive_data_lineage,
+)
+from round_dagger.seed_policy import derive_actor_seed_contract
 
 
 def _view_contract():
@@ -22,6 +30,87 @@ def _view_contract():
 
 def _action_contract():
     return {"dtype": "float32", "shape": [16]}
+
+
+def _production_data_lineage():
+    motion_split = {
+        "manifest_sha256": (
+            "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834"
+        ),
+        "heldout_plan_sha256": "7" * 64,
+        "collection_role": "collection",
+        "evaluation_role": "eval",
+        "collection_motion_count": 39,
+        "heldout_motion_count": 256,
+    }
+    return derive_data_lineage(
+        {
+            "contract_sha256": "8" * 64,
+            "invariant_profile_sha256": "9" * 64,
+            "live_capture": {
+                "attestation_sha256": "a" * 64,
+                "evidence_sha256": "b" * 64,
+                "scenario_sha256": "c" * 64,
+            },
+            "capture_provenance": {
+                "motion_split_manifest_sha256": motion_split["manifest_sha256"],
+                "heldout_plan_sha256": motion_split["heldout_plan_sha256"],
+            },
+        },
+        motion_split_contract=motion_split,
+        topology={
+            "cohort_count": 4,
+            "actor_ranks_per_cohort": 2,
+            "environments_per_actor_rank": 32,
+            "active_environments": 64,
+        },
+    )
+
+
+_PRODUCTION_PROVENANCE = {
+    "policy_sha256": "1" * 64,
+    "runtime_policy_sha256": "2" * 64,
+    "teacher_sha256": "3" * 64,
+    "renderer_sha256": "4" * 64,
+    "beta_sha256": "5" * 64,
+    "config_sha256": "6" * 64,
+}
+
+
+def _publish_minimal_production_shards(
+    cohort, *, campaign_id, cohort_index, global_env_ids
+):
+    for rank, global_env_id in enumerate(global_env_ids):
+        expert_actions = np.full(
+            (1, 1, 2), float(global_env_id + 1), dtype=np.float32
+        )
+        arrays = {
+            "policy_rgb": np.full(
+                (1, 1, 6, 4, 3), global_env_id + 1, dtype=np.uint8
+            ),
+            "expert_actions": expert_actions,
+            "student_actions": np.zeros((1, 1, 2), dtype=np.float32),
+            "behavior_actions": expert_actions.copy(),
+            "expert_mask": np.ones((1, 1), dtype=np.bool_),
+            "dones": np.ones((1, 1), dtype=np.bool_),
+            "observation_is_raytraced": np.ones((1, 1), dtype=np.bool_),
+            "global_env_ids": np.array([global_env_id], dtype=np.int64),
+            "episode_ids": np.zeros((1, 1), dtype=np.int64),
+            "episode_steps": np.zeros((1, 1), dtype=np.int64),
+        }
+        artifacts.publish_rollout_shard(
+            cohort,
+            rank=rank,
+            rollout_id=0,
+            part_index=0,
+            arrays=arrays,
+            campaign_id=campaign_id,
+            macro_round=0,
+            cohort_index=cohort_index,
+            purpose="train",
+            **_PRODUCTION_PROVENANCE,
+        )
+    return artifacts.seal_cohort(cohort)
 
 
 def _cohort(
@@ -184,6 +273,31 @@ class ReplayLedgerIngestionTest(unittest.TestCase):
             counts = ledger.counts("campaign-a")
         self.assertEqual(counts["cohort_count"], 1)
         self.assertEqual(counts["transition_count"], 5)
+
+    def test_campaign_rejects_mixed_v1_and_v2_cohort_schemas(self):
+        for index, (first_schema, second_schema) in enumerate(
+            (
+                (replay.COHORT_SCHEMA, replay.PRODUCTION_COHORT_SCHEMA),
+                (replay.PRODUCTION_COHORT_SCHEMA, replay.COHORT_SCHEMA),
+            )
+        ):
+            first_document = _cohort(0, 0)
+            first_document["schema"] = first_schema
+            second_document = _cohort(0, 1)
+            second_document["schema"] = second_schema
+            first = self.artifacts.add(f"mixed-{index}-first.json", first_document)
+            second = self.artifacts.add(
+                f"mixed-{index}-second.json", second_document
+            )
+            with replay.ReplayLedger(self.root / f"mixed-{index}.sqlite3") as ledger:
+                ledger.ingest_cohort(first)
+                with self.assertRaisesRegex(
+                    replay.ReplayError, "schema/view/action"
+                ):
+                    ledger.ingest_cohort(second)
+                counts = ledger.counts("campaign-a")
+            self.assertEqual(counts["cohort_count"], 1)
+            self.assertEqual(counts["transition_count"], 5)
 
     def test_reused_shard_digest_rolls_back_without_partial_rows(self):
         first_document = _cohort(0, 0)
@@ -489,6 +603,155 @@ class RealArtifactReplayIntegrationTest(unittest.TestCase):
             payload = Path(loaded["resolved_shards"][0]["payload_path"])
             self.assertTrue(payload.is_file())
             self.assertEqual(artifacts.sha256_file(payload), seal["shards"][0]["payload_sha256"])
+
+    def test_production_backend_ingests_verified_v2_collection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign_id = "production-v2-ingest"
+            campaign = {"campaign_id": campaign_id}
+            lineage = _production_data_lineage()
+            round_contract = {
+                "policy_checkpoint_sha256": _PRODUCTION_PROVENANCE[
+                    "policy_sha256"
+                ],
+                "policy_runtime_sha256": _PRODUCTION_PROVENANCE[
+                    "runtime_policy_sha256"
+                ],
+                "teacher_sha256": _PRODUCTION_PROVENANCE["teacher_sha256"],
+                "renderer_sha256": _PRODUCTION_PROVENANCE["renderer_sha256"],
+                "beta_sha256": _PRODUCTION_PROVENANCE["beta_sha256"],
+                "training_config_sha256": _PRODUCTION_PROVENANCE[
+                    "config_sha256"
+                ],
+                "policy_image_shape": [6, 4, 3],
+                "view_names": ["head_color", "hand_left", "hand_right"],
+                "action_dim": 2,
+                "data_lineage": lineage,
+                "cohorts": [
+                    {
+                        "motion_assignment": build_cohort_assignment(
+                            lineage,
+                            cohort_index=cohort_index,
+                            expected_ranks=(0, 1),
+                        )
+                    }
+                    for cohort_index in range(4)
+                ],
+            }
+            backend = ProductionBackend(
+                types.SimpleNamespace(campaign_root=root, macro_round=0)
+            )
+            collection = {"cohorts": []}
+            with mock.patch.multiple(
+                orchestration,
+                ENVIRONMENTS_PER_COHORT=2,
+                TRANSITIONS_PER_COHORT=2,
+            ):
+                for cohort_index in range(4):
+                    cohort = (
+                        root
+                        / "rounds"
+                        / "macro_round_000000"
+                        / "cohorts"
+                        / f"cohort_{cohort_index:02d}"
+                    )
+                    backend.ensure_cohort_contract(
+                        cohort,
+                        campaign=campaign,
+                        contract=round_contract,
+                        cohort_index=cohort_index,
+                    )
+                    global_env_ids = [
+                        cohort_index * 2,
+                        cohort_index * 2 + 1,
+                    ]
+                    seal = _publish_minimal_production_shards(
+                        cohort,
+                        campaign_id=campaign_id,
+                        cohort_index=cohort_index,
+                        global_env_ids=global_env_ids,
+                    )
+                    self.assertEqual(
+                        seal["schema"], artifacts.PRODUCTION_COHORT_SCHEMA
+                    )
+                    collection["cohorts"].append(
+                        {
+                            "cohort_manifest_path": cohort.relative_to(root).as_posix()
+                        }
+                    )
+
+            with mock.patch.object(
+                backend, "load_campaign", return_value=campaign
+            ):
+                snapshot = backend.ingest_collection(collection)
+            self.assertEqual(
+                snapshot["cohort_manifest_schema"],
+                artifacts.PRODUCTION_COHORT_SCHEMA,
+            )
+            self.assertEqual(snapshot["cohort_count"], 4)
+            self.assertEqual(snapshot["transition_count"], 8)
+            loaded = backend.load_snapshot(
+                expected_file_sha256=snapshot["file_sha256"]
+            )
+            self.assertEqual(len(loaded["resolved_shards"]), 8)
+
+    def test_tampered_v2_lineage_is_rejected_before_ledger_insert(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign_id = "production-v2-invalid"
+            lineage = _production_data_lineage()
+            cohort = root / "cohort"
+            artifacts.create_cohort(
+                cohort,
+                campaign_id=campaign_id,
+                macro_round=0,
+                cohort_index=0,
+                purpose="train",
+                expected_ranks=[0, 1],
+                expected_global_env_ids=[0, 1],
+                expected_transitions=2,
+                view_contract={
+                    "dtype": "uint8",
+                    "layout": "vertical",
+                    "shape": [6, 4, 3],
+                    "views": ["head_color", "hand_left", "hand_right"],
+                },
+                action_contract={"dtype": "float32", "shape": [2]},
+                actor_seed_contract=derive_actor_seed_contract(
+                    campaign_id=campaign_id,
+                    macro_round=0,
+                    cohort_index=0,
+                    expected_ranks=[0, 1],
+                    expected_global_env_ids=[0, 1],
+                ),
+                data_lineage=lineage,
+                motion_assignment=build_cohort_assignment(
+                    lineage, cohort_index=0, expected_ranks=(0, 1)
+                ),
+                **_PRODUCTION_PROVENANCE,
+            )
+            _publish_minimal_production_shards(
+                cohort,
+                campaign_id=campaign_id,
+                cohort_index=0,
+                global_env_ids=[0, 1],
+            )
+            seal_path = cohort / artifacts.SEAL_FILENAME
+            seal = artifacts.load_strict_json(seal_path)
+            seal["data_lineage_sha256"] = "0" * 64
+            seal_path.chmod(0o600)
+            seal_path.write_text(
+                json.dumps(seal, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with replay.ReplayLedger(root / "ledger.sqlite3") as ledger:
+                with self.assertRaisesRegex(
+                    replay.ReplayError, "cohort verification failed"
+                ):
+                    ledger.ingest_cohort(cohort)
+                self.assertEqual(
+                    ledger.counts(campaign_id)["cohort_count"], 0
+                )
 
 
 if __name__ == "__main__":
