@@ -1407,6 +1407,12 @@ run_train_phase() {
             [ "$(tr -d "\r\n" < /opt/GR00T-VisualSim2Real/.source_revision)" = "$EXPECTED_GR00T_REVISION" ] || {
                 echo "FATAL: sealed trainer GR00T revision mismatch" >&2; exit 2;
             }
+            # train_agent_trl imports the production actor identity and safety
+            # contracts from the outer fast_roborender repository.  The broad
+            # STAGE_ROOT mount makes the sealed ROOT visible inside the
+            # container, but Python does not discover it merely because the
+            # nested GR00T checkout is the working directory.
+            export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
             cd /opt/GR00T-VisualSim2Real
             RANK_RENDER_SEED=$((BASE_RENDER_SEED + SLURM_PROCID))
             if [ "$TRAINER_RANKS" -eq 1 ]; then

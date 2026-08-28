@@ -1270,6 +1270,20 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         ):
             self.assertIn(contract, calibration_publish)
 
+    def test_hsg_trainer_can_import_outer_round_dagger_package(self):
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        trainer_body = packed.split(
+            "/usr/local/bin/roborender-trainer-sm100 bash -lc '", 1
+        )[1].split("exec accelerate launch", 1)[0]
+        self.assertIn(
+            'export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"',
+            trainer_body,
+        )
+        self.assertLess(
+            trainer_body.index('export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"'),
+            trainer_body.index("cd /opt/GR00T-VisualSim2Real"),
+        )
+
     def test_hsg_calibration_manifest_destination_exactly_binds_run_id(self):
         submit = (ROOT / "scripts/scaling/submit_hsg_gb200_smoke.sh").read_text()
         packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
