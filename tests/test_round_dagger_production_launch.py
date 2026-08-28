@@ -33,7 +33,7 @@ EVALUATION_CONFIG_SHA = (
 # Independently cross-checked against prepare_gr00t_learner_bundle.prepare_bundle
 # in the Torch-enabled learner environment for this deterministic fixture.
 EXPECTED_DERIVED_BUNDLE_SHA = (
-    "48a17f1675ead36d3925621be9248c2881769b5ccb32aad848c5d53008656187"
+    "3b452de0200f62866a65d6b5580d7ef3e2e7a704e33df0ff4330fffb9a75332f"
 )
 
 
@@ -285,7 +285,7 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         initialize_campaign(
             root,
-            campaign_id="roborender-dagger-256x512-v1",
+            campaign_id="dagger_prod_run1",
             bootstrap_policy_sha256=bootstrap["checkpoint_sha256"],
             bootstrap_policy_path=bootstrap["checkpoint_path"],
             target_environments=256,
@@ -315,7 +315,7 @@ class ProductionLaunchTests(unittest.TestCase):
             parent_checkpoint=checkpoint,
             expected_parent_checkpoint_sha256=active["checkpoint_sha256"],
             runtime_policy_sha256=active["runtime_policy_sha256"],
-            campaign_id="roborender-dagger-256x512-v1",
+            campaign_id="dagger_prod_run1",
             macro_round=0,
             code_sha256=SOURCE_SHA,
             learner_contract=learner_contract,
@@ -480,6 +480,56 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(learner["cluster"]["account"], "general_cs_infra__ngcsre")
         self.assertEqual(learner["cluster"]["partition"], "batch_singlenode")
         self.assertEqual(learner["cluster"]["qos"], "normal")
+
+    def test_source_owned_paths_rebind_to_the_executing_repository(self) -> None:
+        raw = artifacts.load_strict_json(CAMPAIGN_CONTRACT)
+        source_paths = (
+            (
+                raw["artifacts"]["teacher"]["checkpoint_path"],
+                production_launch.TEACHER_CHECKPOINT_RELATIVE,
+            ),
+            (
+                raw["actor_runtime"]["gr00t_root"],
+                production_launch.ACTOR_GR00T_ROOT_RELATIVE,
+            ),
+            (
+                raw["actor_runtime"]["pair_executor"],
+                production_launch.ACTOR_PAIR_EXECUTOR_RELATIVE,
+            ),
+            (
+                raw["actor_runtime"]["pair_rank_script"],
+                production_launch.ACTOR_PAIR_RANK_SCRIPT_RELATIVE,
+            ),
+        )
+        roots = {
+            Path(value).parents[len(relative.parts) - 1]
+            for value, relative in source_paths
+        }
+        self.assertEqual(len(roots), 1)
+
+        relocated = self.base / "relocated-fast-roborender"
+        with mock.patch.object(
+            production_launch, "REPOSITORY_ROOT", relocated
+        ):
+            materialized = production_launch.load_campaign_contract(
+                CAMPAIGN_CONTRACT
+            )
+        self.assertEqual(
+            materialized["artifacts"]["teacher"]["checkpoint_path"],
+            str(relocated / production_launch.TEACHER_CHECKPOINT_RELATIVE),
+        )
+        self.assertEqual(
+            materialized["actor_runtime"]["gr00t_root"],
+            str(relocated / production_launch.ACTOR_GR00T_ROOT_RELATIVE),
+        )
+        self.assertEqual(
+            materialized["actor_runtime"]["pair_executor"],
+            str(relocated / production_launch.ACTOR_PAIR_EXECUTOR_RELATIVE),
+        )
+        self.assertEqual(
+            materialized["actor_runtime"]["pair_rank_script"],
+            str(relocated / production_launch.ACTOR_PAIR_RANK_SCRIPT_RELATIVE),
+        )
 
     def test_evaluation_capacity_gate_rejects_legacy_sixteen_case_contract(self) -> None:
         scenarios = self.base / "scenarios.json"
@@ -879,7 +929,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 parent_checkpoint=checkpoint,
                 expected_parent_checkpoint_sha256=active["checkpoint_sha256"],
                 runtime_policy_sha256="f" * 64,
-                campaign_id="roborender-dagger-256x512-v1",
+                campaign_id="dagger_prod_run1",
                 macro_round=0,
                 code_sha256=SOURCE_SHA,
                 learner_contract=production_launch.load_learner_contract(
@@ -1104,14 +1154,14 @@ class ProductionLaunchTests(unittest.TestCase):
                 lambda document: document["artifacts"]["teacher"].__setitem__(
                     "checkpoint_path", "/tmp/substituted-teacher.pt"
                 ),
-                "teacher checkpoint path mismatch",
+                "teacher checkpoint path repository path binding mismatch",
             ),
             (
                 "actor",
                 lambda document: document["actor_runtime"].__setitem__(
                     "pair_executor", "/tmp/substituted-actor.sh"
                 ),
-                "actor runtime mismatch",
+                "actor pair executor repository path binding mismatch",
             ),
         ):
             with self.subTest(source_owned_path=label):
@@ -1149,11 +1199,61 @@ class ProductionLaunchTests(unittest.TestCase):
                 learner_contract_path=LEARNER_CONTRACT,
             )
 
+    def test_source_owned_path_binding_rejects_mixed_roots_traversal_and_suffixes(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "mixed-roots",
+                lambda document: document["artifacts"]["teacher"].__setitem__(
+                    "checkpoint_path",
+                    "/mnt/other/source/"
+                    + production_launch.TEACHER_CHECKPOINT_RELATIVE.as_posix(),
+                ),
+                "do not share one canonical source root",
+            ),
+            (
+                "traversal",
+                lambda document: document["actor_runtime"].__setitem__(
+                    "gr00t_root",
+                    "/mnt/data2/ldu/source/../GR00T-VisualSim2Real",
+                ),
+                "must be a normalized absolute path",
+            ),
+            (
+                "wrong-suffix",
+                lambda document: document["actor_runtime"].__setitem__(
+                    "pair_rank_script",
+                    "/mnt/data2/ldu/source/scripts/round_dagger/not-the-rank-script.sh",
+                ),
+                "actor pair rank script repository path binding mismatch",
+            ),
+        )
+        for name, mutate, expected_error in cases:
+            with self.subTest(name=name):
+                campaign = artifacts.load_strict_json(CAMPAIGN_CONTRACT)
+                mutate(campaign)
+                path = self.base / f"campaign-binding-{name}.json"
+                path.write_text(
+                    json.dumps(campaign, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    production_launch.ProductionLaunchError, expected_error
+                ):
+                    production_launch.load_campaign_contract(path)
+
     def test_shell_launcher_has_non_mutating_dry_run_and_no_secret_config(self) -> None:
         script = (ROOT / "scripts/round_dagger/launch_production_macro_round.sh").read_text()
         self.assertIn("PRODUCTION_MACRO_ROUND_DRY_RUN_OK", script)
         self.assertIn("--evaluation-sealed-source-root", script)
         self.assertIn("--evaluation-sealed-source-inventory-sha256", script)
+        self.assertIn("--learner-contract", script)
+        self.assertIn("--learner-contract-sha256", script)
+        self.assertIn(
+            "production_learner_8xh100_1200_dagger_prod_run1.json", script
+        )
+        self.assertIn("learner contract SHA-256 mismatch", script)
         self.assertIn("unset WANDB_API_KEY", script)
         self.assertIn('exec "$PYTHON" "$ORCHESTRATOR"', script)
         self.assertIn('PYTHON_REAL=$(realpath -e -- "$PYTHON")', script)

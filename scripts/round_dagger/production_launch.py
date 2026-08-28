@@ -91,7 +91,13 @@ TEACHER_CHECKPOINT_RELATIVE = Path(
     "penalty_bottle_lean_during_pick--3500.0_penalty_bottle_non_z_up_velocity_"
     "during_pick--1000.0-20251105_004910/model_step_044500.pt"
 )
-TEACHER_CHECKPOINT = REPOSITORY_ROOT / TEACHER_CHECKPOINT_RELATIVE
+ACTOR_GR00T_ROOT_RELATIVE = Path("GR00T-VisualSim2Real")
+ACTOR_PAIR_EXECUTOR_RELATIVE = Path(
+    "scripts/round_dagger/run_actor_rank_docker.sh"
+)
+ACTOR_PAIR_RANK_SCRIPT_RELATIVE = Path(
+    "scripts/round_dagger/run_actor_cohort_with_wandb.sh"
+)
 PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE = Path(
     "configs/round_dagger/production_campaign_256x512.json"
 )
@@ -172,6 +178,96 @@ def _absolute(value: Any, label: str) -> Path:
     if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
         raise ProductionLaunchError(f"{label} must be a normalized absolute path")
     return path
+
+
+def _source_binding_root(value: Any, relative: Path, label: str) -> Path:
+    """Return the legacy source root for one source-owned contract path.
+
+    The checked-in production profile predates relocatable source snapshots
+    and therefore records four repository-owned paths as absolute paths.  The
+    absolute prefix is not an artifact identity: the fixed relative suffix is.
+    Validate that encoding without consulting the legacy checkout (which may
+    no longer exist), then let the loader bind the suffix to the repository
+    that is actually executing this code.
+    """
+
+    path = _absolute(value, label)
+    if str(path) != value:
+        raise ProductionLaunchError(
+            f"{label} must be a lexically normalized absolute path"
+        )
+    relative_parts = relative.parts
+    if (
+        relative.is_absolute()
+        or not relative_parts
+        or len(path.parts) <= len(relative_parts)
+        or path.parts[-len(relative_parts) :] != relative_parts
+    ):
+        raise ProductionLaunchError(
+            f"{label} repository path binding mismatch: expected suffix "
+            f"{relative.as_posix()!r}"
+        )
+    root = Path(*path.parts[: -len(relative_parts)])
+    if (
+        not root.is_absolute()
+        or root == Path(root.anchor)
+        or str(root) != root.as_posix()
+    ):
+        raise ProductionLaunchError(
+            f"{label} repository path binding has an unsafe source root"
+        )
+    return root
+
+
+def _materialize_source_owned_paths(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebind exactly four validated source-owned paths to this checkout."""
+
+    bindings = (
+        (
+            ("artifacts", "teacher", "checkpoint_path"),
+            TEACHER_CHECKPOINT_RELATIVE,
+            "teacher checkpoint path",
+        ),
+        (
+            ("actor_runtime", "gr00t_root"),
+            ACTOR_GR00T_ROOT_RELATIVE,
+            "actor GR00T root",
+        ),
+        (
+            ("actor_runtime", "pair_executor"),
+            ACTOR_PAIR_EXECUTOR_RELATIVE,
+            "actor pair executor",
+        ),
+        (
+            ("actor_runtime", "pair_rank_script"),
+            ACTOR_PAIR_RANK_SCRIPT_RELATIVE,
+            "actor pair rank script",
+        ),
+    )
+    roots: list[Path] = []
+    for keys, relative, label in bindings:
+        value: Any = contract
+        for key in keys:
+            if not isinstance(value, Mapping) or key not in value:
+                raise ProductionLaunchError(
+                    f"{label} repository path binding is missing"
+                )
+            value = value[key]
+        roots.append(_source_binding_root(value, relative, label))
+    if len(set(roots)) != 1:
+        raise ProductionLaunchError(
+            "source-owned repository paths do not share one canonical source root"
+        )
+
+    materialized = copy.deepcopy(contract)
+    for keys, relative, _label in bindings:
+        target: dict[str, Any] = materialized
+        for key in keys[:-1]:
+            target = target[key]
+        target[keys[-1]] = str(REPOSITORY_ROOT / relative)
+    return materialized
 
 
 def _regular(path: Path, label: str) -> Path:
@@ -350,10 +446,11 @@ def _load_contract(
 
 
 def load_campaign_contract(path: Path) -> dict[str, Any]:
-    contract = _load_contract(
+    raw_contract = _load_contract(
         path, CAMPAIGN_CONTRACT_SCHEMA, CAMPAIGN_CONTRACT_KEYS, "campaign contract"
     )
-    _require_equal(contract["campaign_id"], "roborender-dagger-256x512-v1", "campaign ID")
+    contract = _materialize_source_owned_paths(raw_contract)
+    _require_equal(contract["campaign_id"], "dagger_prod_run1", "campaign ID")
     _require_equal(
         _exact(
             contract["topology"],
@@ -552,7 +649,11 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
         "teacher identity",
     )
     _absolute(teacher["checkpoint_path"], "teacher checkpoint")
-    _require_equal(teacher["checkpoint_path"], str(TEACHER_CHECKPOINT), "teacher checkpoint path")
+    _require_equal(
+        teacher["checkpoint_path"],
+        str(REPOSITORY_ROOT / TEACHER_CHECKPOINT_RELATIVE),
+        "teacher checkpoint path",
+    )
     renderer = _exact(
         artifacts_doc["renderer"],
         {"cohort_identity_sha256", "runtime_identity_sha256"},
@@ -658,10 +759,12 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
         actor_runtime,
         {
             "docker_bin": "/usr/bin/docker",
-            "gr00t_root": str(REPOSITORY_ROOT / "GR00T-VisualSim2Real"),
+            "gr00t_root": str(REPOSITORY_ROOT / ACTOR_GR00T_ROOT_RELATIVE),
             "gr00t_python": "/opt/round-dagger-rtx/bin/python",
-            "pair_executor": str(REPOSITORY_ROOT / "scripts/round_dagger/run_actor_rank_docker.sh"),
-            "pair_rank_script": str(REPOSITORY_ROOT / "scripts/round_dagger/run_actor_cohort_with_wandb.sh"),
+            "pair_executor": str(REPOSITORY_ROOT / ACTOR_PAIR_EXECUTOR_RELATIVE),
+            "pair_rank_script": str(
+                REPOSITORY_ROOT / ACTOR_PAIR_RANK_SCRIPT_RELATIVE
+            ),
             "gpu_ids": "0,1",
             "ipc": "private",
             "shm_size": "32g",

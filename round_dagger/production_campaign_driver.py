@@ -197,7 +197,8 @@ class DriverInputs:
             repository_root / "scripts/round_dagger/launch_production_macro_round.sh"
         )
         expected_learner = (
-            repository_root / "configs/round_dagger/production_learner_8xh100_1200.json"
+            repository_root
+            / "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json"
         )
         # The driver and actor hooks deliberately execute from the live RTX
         # checkout whose revisions are matched to the remote learner seal by
@@ -500,6 +501,10 @@ def _launcher_argv(inputs: DriverInputs, config_path: Path, *, dry_run: bool) ->
         str(inputs.campaign_contract),
         "--campaign-contract-sha256",
         inputs.campaign_contract_sha256,
+        "--learner-contract",
+        str(inputs.learner_contract),
+        "--learner-contract-sha256",
+        inputs.learner_contract_sha256,
         "--sealed-source-root",
         str(inputs.sealed_source_root),
         "--sealed-source-inventory-sha256",

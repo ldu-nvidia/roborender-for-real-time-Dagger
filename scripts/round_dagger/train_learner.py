@@ -111,6 +111,26 @@ def _rank() -> int:
     return 0
 
 
+def _wandb_resume_modes(arguments: argparse.Namespace) -> tuple[bool, bool]:
+    """Return strict W&B modes without changing ordinary production behavior."""
+
+    resume_must = (
+        arguments.resume_from is not None and arguments.wandb_run_id is not None
+    )
+    resume_never = bool(arguments.wandb_resume_never)
+    if resume_never and resume_must:
+        raise LearnerError(
+            "--wandb-resume-never cannot be combined with --resume-from"
+        )
+    if resume_never and (
+        arguments.wandb_project is None or arguments.wandb_run_id is None
+    ):
+        raise LearnerError(
+            "--wandb-resume-never requires --wandb-project and --wandb-run-id"
+        )
+    return resume_must, resume_never
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a policy from a sealed cumulative DAgger replay snapshot"
@@ -158,6 +178,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-project")
     parser.add_argument("--wandb-entity")
     parser.add_argument("--wandb-run-id")
+    parser.add_argument(
+        "--wandb-resume-never",
+        action="store_true",
+        help=(
+            "fail if the canonical W&B run ID already exists; validation-only "
+            "first-invocation protection against stale deterministic history"
+        ),
+    )
     parser.add_argument(
         "--no-publish-result",
         action="store_true",
@@ -229,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         raise LearnerError(
             "--validation-stop-at-step must be in [1, max_steps)"
         )
+    wandb_resume_must, wandb_resume_never = _wandb_resume_modes(arguments)
     bundle_mapping = config.to_mapping()
     if (
         config.initial_checkpoint_sha256 is not None
@@ -273,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     rank = _rank()
     wandb_config = {
         "campaign_id": config.campaign_id,
+        "round_dagger/campaign_id": config.campaign_id,
         "macro_round": config.macro_round,
         "learner_code_sha256": config.code_sha256,
         "learner_config_sha256": config.sha256,
@@ -362,10 +392,8 @@ def main(argv: list[str] | None = None) -> int:
         wandb_project=arguments.wandb_project,
         wandb_entity=arguments.wandb_entity,
         wandb_run_id=arguments.wandb_run_id,
-        wandb_resume_must=(
-            arguments.resume_from is not None
-            and arguments.wandb_run_id is not None
-        ),
+        wandb_resume_must=wandb_resume_must,
+        wandb_resume_never=wandb_resume_never,
         wandb_config=wandb_config,
     )
     result = None

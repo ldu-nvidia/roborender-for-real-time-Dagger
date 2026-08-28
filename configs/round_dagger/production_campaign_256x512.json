@@ -1,6 +1,6 @@
 {
   "schema": "fast_roborender.round_dagger.production_campaign_contract.v2",
-  "campaign_id": "roborender-dagger-256x512-v1",
+  "campaign_id": "dagger_prod_run1",
   "topology": {
     "target_environments": 256,
     "active_environments": 64,

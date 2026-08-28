@@ -538,16 +538,17 @@ class ImmutableLearnerBundleTest(unittest.TestCase):
         ):
             self.assertEqual(trainer.main(arguments), 0)
         self.assertTrue(telemetry_factory.call_args.kwargs["wandb_resume_must"])
+        wandb_config = telemetry_factory.call_args.kwargs["wandb_config"]
+        self.assertEqual(wandb_config["campaign_id"], "production-test")
         self.assertEqual(
-            telemetry_factory.call_args.kwargs["wandb_config"][
-                "replay_snapshot_file_sha256"
-            ],
+            wandb_config["round_dagger/campaign_id"], "production-test"
+        )
+        self.assertEqual(
+            wandb_config["replay_snapshot_file_sha256"],
             "a" * 64,
         )
         self.assertEqual(
-            telemetry_factory.call_args.kwargs["wandb_config"][
-                "replay_snapshot_sha256"
-            ],
+            wandb_config["replay_snapshot_sha256"],
             "b" * 64,
         )
 

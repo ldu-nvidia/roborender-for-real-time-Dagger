@@ -271,12 +271,22 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             artifacts.sha256_file(self.contract),
         )
 
-    def test_launcher_binds_external_runtime_contract_path_and_sha(self) -> None:
+    def test_launcher_binds_external_runtime_and_learner_contract_paths_and_shas(
+        self,
+    ) -> None:
         argv = _launcher_argv(self.inputs, self.base / "config.json", dry_run=False)
         self.assertEqual(argv[argv.index("--campaign-contract") + 1], str(self.contract))
         self.assertEqual(
             argv[argv.index("--campaign-contract-sha256") + 1],
             artifacts.sha256_file(self.contract),
+        )
+        self.assertEqual(
+            argv[argv.index("--learner-contract") + 1],
+            str(self.inputs.learner_contract),
+        )
+        self.assertEqual(
+            argv[argv.index("--learner-contract-sha256") + 1],
+            self.inputs.learner_contract_sha256,
         )
 
     def test_validate_consumes_real_runtime_evidence_from_distinct_evaluation_seal(
@@ -348,7 +358,8 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             campaign_root=self.campaign_root,
             campaign_contract=self.contract,
             campaign_contract_sha256=artifacts.sha256_file(self.contract),
-            learner_contract=ROOT / "configs/round_dagger/production_learner_8xh100_1200.json",
+            learner_contract=ROOT
+            / "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json",
             learner_contract_sha256="a" * 64,
             sealed_source_root=Path("/remote/sealed/source"),
             sealed_source_inventory_sha256=SHA,
@@ -383,7 +394,7 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             campaign_contract=self.contract,
             campaign_contract_sha256=artifacts.sha256_file(self.contract),
             learner_contract=ROOT
-            / "configs/round_dagger/production_learner_8xh100_1200.json",
+            / "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json",
             learner_contract_sha256="a" * 64,
             sealed_source_root=Path("/remote/sealed/source"),
             sealed_source_inventory_sha256=SHA,

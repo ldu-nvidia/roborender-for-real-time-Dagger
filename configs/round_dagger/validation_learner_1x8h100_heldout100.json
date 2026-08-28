@@ -1,0 +1,70 @@
+{
+  "schema": "fast_roborender.round_dagger.heldout100_validation_contract.v1",
+  "purpose": "live_h100_fixed256_step100_wandb_restart_gate",
+  "validation_target": {
+    "campaign_id": "dagger_prod_run1",
+    "macro_round": 0
+  },
+  "allocation": {
+    "nodes": 1,
+    "gpus_per_node": 8,
+    "gpu_architecture": "H100-SM90",
+    "backend": "nccl",
+    "batch_size_per_rank": 1,
+    "global_batch_size": 8
+  },
+  "optimization": {
+    "optimizer_steps": 100,
+    "save_every_steps": 5,
+    "intentional_stop_step": 50,
+    "learning_rate": 2.5e-5,
+    "weight_decay": 0.01,
+    "seed": 17,
+    "partition_seed": 23
+  },
+  "heldout_evaluation": {
+    "interval_steps": 100,
+    "required_optimizer_steps": [0, 100],
+    "case_count": 256,
+    "cohort_count": 8,
+    "source_root": "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1",
+    "snapshot_relative_path": "heldout_snapshot.json",
+    "snapshot_file_sha256": "cea0ee36b228c611635af8dd23b83db3bdaa0fcea493acd57379f080273fdbc8",
+    "snapshot_sha256": "c72e5b1329ad62f2286021efa757cae7a1d748d0bfb66b6c63642be25b72162f"
+  },
+  "quality_gate": {
+    "minimum_relative_action_mse_reduction": 0.001,
+    "require_final_loss_below_initial": true
+  },
+  "restart_validation": {
+    "uninterrupted_comparator": "required",
+    "wandb_lineage": "single_canonical_run",
+    "first_invocation_resume": "never",
+    "second_invocation_resume": "must",
+    "stale_history_policy": "fail_closed_no_adoption"
+  },
+  "cluster": {
+    "host": "oci-nrt",
+    "account": "general_cs_infra__ngcsre",
+    "partition": "batch_singlenode",
+    "qos": "normal",
+    "time_limit_minutes": 240
+  },
+  "container": {
+    "path": "/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build/containers/roborender-isaac-gr00t-x86_64-sm90-isaac5.1.sqsh",
+    "sha256": "f3391b76a66182618f9e71b67e89b0af2d758ffe16afdb164760fcbb4860ebe6",
+    "python": "/opt/viral-h100/bin/python"
+  },
+  "wandb": {
+    "mode": "online",
+    "expected_email": "ldu@nvidia.com",
+    "entity": "nvidia",
+    "authorization_scope": "team",
+    "project": "roborender-round-dagger-validation"
+  },
+  "production_target": {
+    "run_name": "dagger_prod_run1",
+    "learner_contract_path": "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json",
+    "learner_contract_sha256": "b25900118e34f514ecaa2b08bf423cd3ecad3e1c5ca081a95431867357e2f442"
+  }
+}

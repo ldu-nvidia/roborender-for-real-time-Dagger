@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -295,6 +296,217 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn("learner_run_identity.v2", bridge)
         self.assertIn("runtime_container_sha256=", bridge)
         self.assertIn("learner_contract_sha256=", bridge)
+        self.assertIn(
+            "ROUND_DAGGER_CAMPAIGN_ID == dagger_prod_run1 && $ROUND_DECIMAL == 0",
+            bridge,
+        )
+        self.assertIn("submit_oci_nrt_h100_heldout100.sh", bridge)
+        self.assertIn("BEGIN_HELDOUT100_GATE_EVIDENCE_VERIFIER", bridge)
+        self.assertIn("heldout100 gate evidence adopted", bridge)
+        self.assertIn("non-adoptable partial state", bridge)
+        self.assertIn("wait_for_heldout100_remote_completion", bridge)
+        empty_case = bridge.split('            empty)\n', 1)[1].split(
+            '                ;;', 1
+        )[0]
+        self.assertIn("submit_oci_nrt_h100_heldout100.sh", empty_case)
+        self.assertIn('if [[ $smoke_state == active:* ]]', empty_case)
+        self.assertIn("wait_for_heldout100_remote_completion", empty_case)
+        self.assertIn("sacct", bridge)
+        self.assertIn("evidence_state=$smoke_state", bridge)
+        self.assertIn("HELDOUT100_REMOTE_CAMPAIGN", bridge)
+        self.assertIn("isolated heldout100 campaign projection", bridge)
+        self.assertIn('--link-dest="$REMOTE_CAMPAIGN"', bridge)
+        self.assertIn(
+            'ROUND_DAGGER_HELDOUT100_REMOTE_CAMPAIGN_ROOT="$HELDOUT100_REMOTE_CAMPAIGN"',
+            bridge,
+        )
+        gate = bridge.index("if ((HELDOUT100_GATE_ENABLED)); then", bridge.index("BEGIN_HELDOUT100_GATE_EVIDENCE_VERIFIER"))
+        production_submit = bridge.index("sbatch --parsable", gate)
+        self.assertLess(gate, production_submit)
+        self.assertNotIn("rm -rf", bridge)
+
+    def test_heldout100_gate_evidence_adoption_is_identity_bound(self) -> None:
+        bridge = BRIDGE.read_text(encoding="utf-8")
+        marked = bridge.split(
+            "# BEGIN_HELDOUT100_GATE_EVIDENCE_VERIFIER\n", 1
+        )[1].split("# END_HELDOUT100_GATE_EVIDENCE_VERIFIER", 1)[0]
+        verifier = marked.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        sha = {
+            "code": "1" * 64,
+            "config": "2" * 64,
+            "identity": "3" * 64,
+            "validation": "4" * 64,
+            "production": "5" * 64,
+            "replay_file": "6" * 64,
+            "replay": "7" * 64,
+            "parent": "8" * 64,
+            "runtime": "9" * 64,
+            "container": "a" * 64,
+            "heldout_file": "b" * 64,
+            "heldout": "c" * 64,
+        }
+        run_id = f"rrd-m000000-id{sha['identity']}"
+        heldout_path = "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1/heldout_snapshot.json"
+        quality = {
+            "initial_action_mse": 2.0,
+            "final_action_mse": 1.0,
+            "absolute_action_mse_reduction": 1.0,
+            "relative_action_mse_reduction": 0.5,
+            "action_mae_delta": -0.1,
+            "action_rmse_delta": -0.1,
+            "action_cosine_delta": 0.1,
+        }
+        loss = {
+            "initial_loss": 2.0,
+            "final_loss": 1.0,
+            "absolute_loss_reduction": 1.0,
+            "relative_loss_reduction": 0.5,
+        }
+        readback = {
+            "schema": "fast_roborender.round_dagger.h100_heldout100_wandb_readback.v1",
+            "status": "PASS",
+            "account_email": "ldu@nvidia.com",
+            "entity": "nvidia",
+            "authorization_scope": "team",
+            "team_member": True,
+            "entity_is_team": True,
+            "personal": False,
+            "project": "roborender-round-dagger-validation",
+            "wandb_run_id": run_id,
+            "campaign_id": "dagger_prod_run1",
+            "macro_round": 0,
+            "learner_code_sha256": sha["code"],
+            "learner_config_sha256": sha["config"],
+            "learner_identity_sha256": sha["identity"],
+            "runtime_container_sha256": sha["container"],
+            "replay_snapshot_file_sha256": sha["replay_file"],
+            "replay_snapshot_sha256": sha["replay"],
+            "model_lineage_sha256": sha["parent"],
+            "parent_runtime_policy_sha256": sha["runtime"],
+            "learner_contract_sha256": sha["validation"],
+            "validation_contract_sha256": sha["validation"],
+            "heldout_snapshot_file_sha256": sha["heldout_file"],
+            "heldout_snapshot_sha256": sha["heldout"],
+            "heldout_case_count": 256,
+            "heldout_optimizer_steps": [0, 100],
+            "histories_identical": True,
+            "quality_histories_identical": True,
+            "quality_improvement_verified": True,
+            "loss_improvement_verified": True,
+            "strict_resume_verified": True,
+            "single_canonical_wandb_run": True,
+            "stale_wandb_history_policy": "fail_closed_no_adoption",
+            "quality_improvement": quality,
+            "loss_improvement": loss,
+            "remote": {
+                "state": "finished",
+                "training_history_steps": list(range(1, 101)),
+                "quality_history_steps": [0, 100],
+                "quality_key_count": 49,
+                "config_verified": True,
+                "quality_improvement_verified": True,
+            },
+        }
+        restart = {
+            "schema": "fast_roborender.round_dagger.restart_equivalence.v1",
+            "semantic_equivalent": True,
+            "expected_completed_steps": 100,
+            "uninterrupted_checkpoint": "/output/full/restart.pt",
+            "uninterrupted_checkpoint_sha256": "d" * 64,
+            "resumed_checkpoint": "/output/resumed/restart.pt",
+            "resumed_checkpoint_sha256": "d" * 64,
+            "results_equivalent": True,
+            "uninterrupted_result": "/output/full/result.json",
+            "uninterrupted_result_sha256": "e" * 64,
+            "resumed_result": "/output/resumed/result.json",
+            "resumed_result_sha256": "e" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "evidence"
+            evidence.mkdir()
+            readback_path = evidence / "heldout100_wandb_readback.json"
+            restart_path = evidence / "restart_equivalence.json"
+            readback_path.write_text(
+                json.dumps(readback, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            restart_path.write_text(
+                json.dumps(restart, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            attestation = {
+                "schema": "fast_roborender.round_dagger.oci_nrt_h100_heldout100_validation.v1",
+                "status": "PASS",
+                "purpose": "live_h100_fixed256_step100_wandb_restart_gate",
+                "campaign_id": "dagger_prod_run1",
+                "allocation": {
+                    "nodes": 1,
+                    "gpus_per_node": 8,
+                    "gpu_architecture": "H100-SM90",
+                    "backend": "nccl",
+                    "batch_size_per_rank": 1,
+                    "global_batch_size": 8,
+                },
+                "optimizer_steps": 100,
+                "intentional_stop_step": 50,
+                "heldout_optimizer_steps": [0, 100],
+                "heldout_case_count": 256,
+                "heldout_snapshot_path": heldout_path,
+                "heldout_snapshot_file_sha256": sha["heldout_file"],
+                "heldout_snapshot_sha256": sha["heldout"],
+                "validation_contract_sha256": sha["validation"],
+                "production_target_contract_sha256": sha["production"],
+                "learner_code_sha256": sha["code"],
+                "learner_config_sha256": sha["config"],
+                "learner_identity_sha256": sha["identity"],
+                "runtime_container_sha256": sha["container"],
+                "training_replay_snapshot_file_sha256": sha["replay_file"],
+                "training_replay_snapshot_sha256": sha["replay"],
+                "parent_checkpoint_sha256": sha["parent"],
+                "parent_runtime_policy_sha256": sha["runtime"],
+                "wandb_run_id": run_id,
+                "wandb_quality_key_count": 49,
+                "quality_improvement": quality,
+                "loss_improvement": loss,
+                "wandb_readback_sha256": artifacts.sha256_file(readback_path),
+                "restart_report_sha256": artifacts.sha256_file(restart_path),
+                "strict_resume_verified": True,
+                "uninterrupted_equivalence_verified": True,
+                "stale_wandb_history_policy": "fail_closed_no_adoption",
+                "quality_improvement_verified": True,
+                "loss_improvement_verified": True,
+            }
+            attestation_path = evidence / "success_attestation.json"
+            attestation_path.write_text(
+                json.dumps(attestation, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            for path in evidence.iterdir():
+                path.chmod(0o444)
+            evidence.chmod(0o555)
+            arguments = [
+                str(evidence), "dagger_prod_run1", "0", sha["code"],
+                sha["config"], sha["identity"], sha["validation"],
+                sha["production"], sha["replay_file"], sha["replay"],
+                sha["parent"], sha["runtime"], sha["container"], heldout_path,
+                sha["heldout_file"], sha["heldout"], run_id,
+            ]
+            valid = subprocess.run(
+                [sys.executable, "-", *arguments], input=verifier, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertIn("HELDOUT100_GATE_EVIDENCE_VERIFIED", valid.stdout)
+
+            attestation_path.chmod(0o644)
+            attestation["training_replay_snapshot_sha256"] = "f" * 64
+            attestation_path.write_text(
+                json.dumps(attestation, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            attestation_path.chmod(0o444)
+            tampered = subprocess.run(
+                [sys.executable, "-", *arguments], input=verifier, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertNotEqual(tampered.returncode, 0)
+            self.assertIn("training_replay_snapshot_sha256 differs", tampered.stderr)
 
     def test_container_launcher_supports_idempotent_finalization_recovery(self) -> None:
         launcher = (
@@ -524,9 +736,9 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
 
     def test_resumable_rsync_does_not_mix_append_with_delayed_updates(self) -> None:
         bridge = BRIDGE.read_text(encoding="utf-8")
-        self.assertEqual(bridge.count("--append-verify"), 2)
+        self.assertEqual(bridge.count("--append-verify"), 3)
         self.assertNotIn("--delay-updates", bridge)
-        self.assertEqual(bridge.count("--delete-delay"), 2)
+        self.assertEqual(bridge.count("--delete-delay"), 3)
         self.assertIn(
             '--stage "$REMOTE_STAGE" --destination "$REMOTE_CAMPAIGN"',
             bridge,

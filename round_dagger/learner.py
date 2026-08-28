@@ -1422,6 +1422,7 @@ class JsonlTelemetry:
         wandb_entity: str | None = None,
         wandb_run_id: str | None = None,
         wandb_resume_must: bool = False,
+        wandb_resume_never: bool = False,
         wandb_config: Mapping[str, Any] | None = None,
     ):
         self.path = (
@@ -1447,9 +1448,17 @@ class JsonlTelemetry:
         if self.heldout_path is not None:
             self.heldout_path.parent.mkdir(parents=True, exist_ok=True)
         if enabled and wandb_project:
+            if wandb_resume_must and wandb_resume_never:
+                raise LearnerError(
+                    "W&B resume='must' and resume='never' are mutually exclusive"
+                )
             if wandb_resume_must and not wandb_run_id:
                 raise LearnerError(
                     "strict W&B resume requires a durable prior run ID"
+                )
+            if wandb_resume_never and not wandb_run_id:
+                raise LearnerError(
+                    "W&B resume='never' requires a canonical run ID"
                 )
             try:
                 import wandb  # type: ignore
@@ -1461,7 +1470,11 @@ class JsonlTelemetry:
                     resume=(
                         "must"
                         if wandb_resume_must
-                        else ("allow" if wandb_run_id else None)
+                        else (
+                            "never"
+                            if wandb_resume_never
+                            else ("allow" if wandb_run_id else None)
+                        )
                     ),
                     config=dict(wandb_config or {}),
                 )

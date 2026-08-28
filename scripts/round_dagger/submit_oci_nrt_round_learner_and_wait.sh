@@ -256,6 +256,84 @@ for token in "$ROUND_DAGGER_CAMPAIGN_ID" "$ROUND_DAGGER_WANDB_PROJECT" \
     ((${#token} <= 128)) || fatal "campaign/W&B token exceeds 128 characters"
 done
 
+# The production campaign must prove the new fixed-256, optimizer-step-100
+# quality telemetry and strict restart path on the exact round-0 replay before
+# its 1200-step learner can start.  Keep this inside the existing train hook:
+# the orchestrator invokes us only after it has durably committed INGESTED, so
+# any validation failure leaves a resumable replay frontier and never forces a
+# second actor collection.
+HELDOUT100_GATE_ENABLED=0
+HELDOUT100_CONTRACT=
+HELDOUT100_CONTRACT_SHA256=
+HELDOUT100_CONFIG_SHA256=
+HELDOUT100_IDENTITY_SHA256=
+HELDOUT100_WANDB_RUN_ID=
+HELDOUT100_PRODUCTION_CONTRACT_SHA256=b25900118e34f514ecaa2b08bf423cd3ecad3e1c5ca081a95431867357e2f442
+if [[ $ROUND_DAGGER_CAMPAIGN_ID == dagger_prod_run1 && $ROUND_DECIMAL == 0 ]]; then
+    if [[ $ROUND_DAGGER_LEARNER_CONTRACT_SHA256 != \
+          "$HELDOUT100_PRODUCTION_CONTRACT_SHA256" ]]; then
+        # Historical unit fixtures use the campaign contract's production
+        # name with the legacy learner contract.  Permit only their explicitly
+        # untrusted, read-only bridge dry run; every executable dispatch for
+        # dagger_prod_run1 fails closed on contract substitution.
+        if [[ $DRY_RUN == 1 && ${ROUND_DAGGER_TRUSTED_TRAIN_DISPATCH:-0} != 1 ]]; then
+            :
+        else
+            fatal "dagger_prod_run1 round-0 learner contract is not the heldout100 production target"
+        fi
+    else
+    HELDOUT100_GATE_ENABLED=1
+    ((HELDOUT_ENABLED == 1)) || \
+        fatal "round-0 heldout100 gate requires the fixed held-out replay"
+    HELDOUT100_CONTRACT="$ROOT/configs/round_dagger/validation_learner_1x8h100_heldout100.json"
+    [[ -f $HELDOUT100_CONTRACT && ! -L $HELDOUT100_CONTRACT ]] || \
+        fatal "round-0 heldout100 validation contract is missing or unsafe"
+    HELDOUT100_CONTRACT_SHA256=$(sha256sum "$HELDOUT100_CONTRACT" | awk '{print $1}')
+    PYTHONPATH="$ROOT" "$PYTHON" \
+        "$ROOT/scripts/round_dagger/h100_heldout100_validation.py" contract \
+        --path "$HELDOUT100_CONTRACT" \
+        --sha256 "$HELDOUT100_CONTRACT_SHA256" \
+        --source-root "$ROOT" >/dev/null
+
+    HELDOUT100_BUNDLE_REPORT=$(PYTHONPATH="$ROOT" "$PYTHON" \
+        "$ROOT/scripts/round_dagger/prepare_gr00t_learner_bundle.py" \
+        --base-policy-spec "$ROUND_DAGGER_BASE_POLICY_SPEC" \
+        --parent-checkpoint "$ROUND_DAGGER_POLICY_CHECKPOINT" \
+        --expected-parent-checkpoint-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
+        --runtime-policy-sha256 "$ROUND_DAGGER_RUNTIME_POLICY_SHA256" \
+        --campaign-id "$ROUND_DAGGER_CAMPAIGN_ID" \
+        --macro-round "$ROUND_DECIMAL" \
+        --code-sha256 "$ROUND_DAGGER_LEARNER_CODE_SHA256" \
+        --batch-size 1 --max-steps 100 --save-every 5 \
+        --learning-rate 2.5e-5 --weight-decay 0.01 \
+        --seed 17 --partition-seed 23 \
+        --heldout-snapshot "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT" \
+        --heldout-eval-interval 100 \
+        --output "$CAMPAIGN_ROOT/rounds/macro_round_${ROUND_PADDED}/heldout100_bundle.dry-run.json" \
+        --dry-run)
+    HELDOUT100_CONFIG_SHA256=$(printf '%s\n' "$HELDOUT100_BUNDLE_REPORT" | \
+        "$PYTHON" -c 'import json,re,sys; value=json.load(sys.stdin).get("bundle_sha256"); assert isinstance(value,str) and re.fullmatch(r"[0-9a-f]{64}",value); print(value)') || \
+        fatal "cannot derive the round-0 heldout100 learner bundle identity"
+    mapfile -t HELDOUT100_IDENTITY < <(
+        "$PYTHON" "$ROOT/round_dagger/learner_identity.py" \
+            "$ROUND_DAGGER_CAMPAIGN_ID" "$ROUND_DECIMAL" \
+            "$ROUND_DAGGER_LEARNER_CODE_SHA256" "$HELDOUT100_CONFIG_SHA256" \
+            "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
+            "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" \
+            "$ROUND_DAGGER_POLICY_SHA256" "$ROUND_DAGGER_RUNTIME_POLICY_SHA256" \
+            "$REMOTE_CONTAINER_SHA" "$HELDOUT100_CONTRACT_SHA256"
+    )
+    ((${#HELDOUT100_IDENTITY[@]} == 2)) || \
+        fatal "round-0 heldout100 learner identity derivation failed"
+    HELDOUT100_IDENTITY_SHA256=${HELDOUT100_IDENTITY[0]}
+    HELDOUT100_WANDB_RUN_ID=${HELDOUT100_IDENTITY[1]}
+    [[ $HELDOUT100_IDENTITY_SHA256 =~ ^[0-9a-f]{64}$ && \
+       $HELDOUT100_WANDB_RUN_ID == \
+       "rrd-m000000-id${HELDOUT100_IDENTITY_SHA256}" ]] || \
+        fatal "round-0 heldout100 learner identity is malformed"
+    fi
+fi
+
 LEARNER_NAMESPACE=identity_${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}
 JOB_NAME="rr-rd-${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"
 LOCAL_HANDOFF="$HANDOFF_ROOT/$ROUND_DAGGER_CAMPAIGN_ID/macro_round_$ROUND_PADDED/$LEARNER_NAMESPACE"
@@ -272,6 +350,22 @@ REMOTE_SUCCESS_MARKER="$REMOTE_JOB_ROOT/learner_success.json"
 LOCAL_SUCCESS_MARKER="$LOCAL_HANDOFF/remote_learner_success.json"
 LOCAL_OUTPUT_INVENTORY="$LOCAL_HANDOFF/learner_output.inventory.json"
 TRANSFER_TOOL="$ROOT/scripts/round_dagger/remote_campaign_transfer.py"
+HELDOUT100_OUTPUT_RELATIVE=-
+if ((HELDOUT100_GATE_ENABLED)); then
+    HELDOUT100_NAMESPACE=identity_${HELDOUT100_IDENTITY_SHA256}
+    HELDOUT100_REMOTE_ROOT="$REMOTE_RUN/heldout100_gate/$HELDOUT100_NAMESPACE"
+    HELDOUT100_REMOTE_STAGE="$HELDOUT100_REMOTE_ROOT/.incoming-campaign-input"
+    HELDOUT100_REMOTE_CAMPAIGN="$HELDOUT100_REMOTE_ROOT/campaign_input"
+    HELDOUT100_REMOTE_JOB="$HELDOUT100_REMOTE_ROOT/job"
+    HELDOUT100_REMOTE_LOG="$HELDOUT100_REMOTE_ROOT/log"
+    HELDOUT100_LOCAL_OUTPUT="$CAMPAIGN_ROOT/rounds/macro_round_${ROUND_PADDED}/heldout100_gate/$HELDOUT100_NAMESPACE"
+    HELDOUT100_OUTPUT_RELATIVE=${HELDOUT100_LOCAL_OUTPUT#"$CAMPAIGN_ROOT"/}
+    # The dedicated smoke contract requires the writable bind source to be
+    # the canonical nested target in the otherwise read-only campaign mount.
+    HELDOUT100_REMOTE_OUTPUT="$HELDOUT100_REMOTE_CAMPAIGN/$HELDOUT100_OUTPUT_RELATIVE"
+    HELDOUT100_LOCAL_EVIDENCE="$LOCAL_HANDOFF/heldout100_gate_evidence"
+    HELDOUT100_JOB_NAME="rr-heldout100-${HELDOUT100_IDENTITY_SHA256:0:12}"
+fi
 
 if ((DRY_RUN)); then
     printf 'DRY_RUN identity=%s wandb_run_id=%s job_name=%s local_handoff=%q remote_run=%q\n' \
@@ -283,6 +377,10 @@ if ((DRY_RUN)); then
         "$REMOTE" "$ACCOUNT" "$PARTITION" "$ROUND_DAGGER_LEARNER_MAX_STEPS"
     printf 'DRY_RUN heldout_eval=%s cadence=%s\n' \
         "$HELDOUT_ENABLED" "${ROUND_DAGGER_HELDOUT_EVAL_INTERVAL:-disabled}"
+    if ((HELDOUT100_GATE_ENABLED)); then
+        printf 'DRY_RUN heldout100_gate=required-before-1200 identity=%s wandb_run_id=%s steps=100 stop=50 heldout_steps=0,100\n' \
+            "$HELDOUT100_IDENTITY_SHA256" "$HELDOUT100_WANDB_RUN_ID"
+    fi
     printf 'DRY_RUN mount %q at %q read-only; mount %q at %q writable\n' \
         "$REMOTE_CAMPAIGN" "$CAMPAIGN_ROOT" "$REMOTE_OUTPUT" \
         "$ROUND_DAGGER_LEARNER_OUTPUT_DIR"
@@ -365,25 +463,660 @@ ssh -o BatchMode=yes "$REMOTE" env PYTHONDONTWRITEBYTECODE=1 \
     python3 "$REMOTE_SOURCE/scripts/round_dagger/remote_campaign_transfer.py" publish \
     --stage "$REMOTE_STAGE" --destination "$REMOTE_CAMPAIGN" \
     --inventory "$REMOTE_INVENTORY" >/dev/null
+HELDOUT100_NEEDS_SEAL=0
+if ((HELDOUT100_GATE_ENABLED)) && \
+   [[ ! -e $HELDOUT100_LOCAL_EVIDENCE && ! -L $HELDOUT100_LOCAL_EVIDENCE ]]; then
+    # Never write smoke artifacts into the production campaign projection:
+    # its immutable inventory is re-verified inside the 1200-step container.
+    # Create an identity-scoped hard-link projection for the smoke instead.
+    smoke_projection_state=$(ssh -o BatchMode=yes "$REMOTE" bash -s -- \
+        "$HELDOUT100_REMOTE_ROOT" "$HELDOUT100_REMOTE_STAGE" \
+        "$HELDOUT100_REMOTE_CAMPAIGN" \
+        "$HELDOUT100_OUTPUT_RELATIVE" <<'REMOTE_HELDOUT100_PROJECTION_PREPARE'
+set -Eeuo pipefail
+root=$1; stage=$2; destination=$3; output_relative=$4
+case "$stage" in "$root"/.incoming-campaign-input) ;; *) exit 2 ;; esac
+case "$destination" in "$root"/campaign_input) ;; *) exit 2 ;; esac
+case "$output_relative" in /*|../*|*/../*|*/./*|*/..|*/.) exit 2 ;; esac
+mkdir -p "$root"
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+    [ -d "$destination" ] && [ ! -L "$destination" ] && \
+        [ ! -e "$stage" ] && [ ! -L "$stage" ] || exit 2
+    if [ -e "$destination/$output_relative" ] || \
+       [ -L "$destination/$output_relative" ]; then
+        [ -d "$destination/$output_relative" ] && \
+            [ ! -L "$destination/$output_relative" ] || exit 2
+        printf '%s\n' existing-output
+    else
+        printf '%s\n' existing-clean
+    fi
+else
+    if [ -e "$stage" ] || [ -L "$stage" ]; then
+        [ -d "$stage" ] && [ ! -L "$stage" ] || exit 2
+    else
+        mkdir "$stage"
+    fi
+    printf '%s\n' stage
+fi
+REMOTE_HELDOUT100_PROJECTION_PREPARE
+    ) || fatal "cannot prepare isolated heldout100 campaign projection"
+    case "$smoke_projection_state" in
+        stage)
+            rsync --archive --no-links --protect-args --partial --append-verify \
+                --delete-delay --link-dest="$REMOTE_CAMPAIGN" -- \
+                "$LOCAL_PROJECTION/" "$REMOTE:$HELDOUT100_REMOTE_STAGE/"
+            ssh -o BatchMode=yes "$REMOTE" env PYTHONDONTWRITEBYTECODE=1 \
+                python3 "$REMOTE_SOURCE/scripts/round_dagger/remote_campaign_transfer.py" \
+                publish --stage "$HELDOUT100_REMOTE_STAGE" \
+                --destination "$HELDOUT100_REMOTE_CAMPAIGN" \
+                --inventory "$REMOTE_INVENTORY" >/dev/null
+            HELDOUT100_NEEDS_SEAL=1
+            ;;
+        existing-clean) HELDOUT100_NEEDS_SEAL=1 ;;
+        existing-output) ;;
+        *) fatal "isolated heldout100 campaign projection state is malformed" ;;
+    esac
+fi
 LEARNER_OUTPUT_REL=${ROUND_DAGGER_LEARNER_OUTPUT_DIR#"$CAMPAIGN_ROOT"/}
 [[ $LEARNER_OUTPUT_REL != "$ROUND_DAGGER_LEARNER_OUTPUT_DIR" && \
    -n $LEARNER_OUTPUT_REL && $LEARNER_OUTPUT_REL != /* && \
    $LEARNER_OUTPUT_REL != ../* && $LEARNER_OUTPUT_REL != */../* ]] || \
     fatal "learner output is not a safe campaign-relative directory"
 ssh -o BatchMode=yes "$REMOTE" bash -s -- \
-    "$REMOTE_CAMPAIGN" "$LEARNER_OUTPUT_REL" <<'REMOTE_SEAL'
+    "$REMOTE_CAMPAIGN" "$LEARNER_OUTPUT_REL" \
+    - <<'REMOTE_SEAL'
 set -Eeuo pipefail
-root=$1; learner_relative=$2
+root=$1; learner_relative=$2; heldout_relative=$3
 [ -d "$root" ] && [ ! -L "$root" ] || exit 2
 # Pyxis requires a nested writable bind target to exist below the outer
 # read-only campaign mount.  Create it only in the remote projection; the
 # canonical RTX destination remains absent for atomic publication.
 mkdir -p "$root/$learner_relative"
 [ -d "$root/$learner_relative" ] && [ ! -L "$root/$learner_relative" ] || exit 2
+if [ "$heldout_relative" != - ]; then
+    case "$heldout_relative" in
+        /*|../*|*/../*|*/./*|*/..|*/.) exit 2 ;;
+    esac
+    mkdir -p "$root/$heldout_relative"
+    [ -d "$root/$heldout_relative" ] && \
+        [ ! -L "$root/$heldout_relative" ] || exit 2
+fi
 find "$root" -type f -exec chmod a-w {} +
 find "$root" -type d -exec chmod a-w {} +
-[ -z "$(find "$root" -perm /222 -print -quit)" ]
+# The heldout100 output is both the nested Pyxis target and its writable bind
+# source.  Re-open only that empty identity-scoped directory; every input file
+# and every other campaign directory remains immutable.
+if [ "$heldout_relative" != - ]; then
+    chmod u+rwx "$root/$heldout_relative"
+    [ -z "$(find "$root" -path "$root/$heldout_relative" -prune -o \
+        -perm /222 -print -quit)" ]
+else
+    [ -z "$(find "$root" -perm /222 -print -quit)" ]
+fi
 REMOTE_SEAL
+if ((HELDOUT100_NEEDS_SEAL)); then
+    ssh -o BatchMode=yes "$REMOTE" bash -s -- \
+        "$HELDOUT100_REMOTE_CAMPAIGN" \
+        "$HELDOUT100_OUTPUT_RELATIVE" <<'REMOTE_HELDOUT100_SEAL'
+set -Eeuo pipefail
+root=$1; output_relative=$2
+[ -d "$root" ] && [ ! -L "$root" ] || exit 2
+case "$output_relative" in
+    /*|../*|*/../*|*/./*|*/..|*/.) exit 2 ;;
+esac
+mkdir -p "$root/$output_relative"
+[ -d "$root/$output_relative" ] && [ ! -L "$root/$output_relative" ] || exit 2
+find "$root" -type f -exec chmod a-w {} +
+find "$root" -type d -exec chmod a-w {} +
+chmod u+rwx "$root/$output_relative"
+[ -z "$(find "$root" -path "$root/$output_relative" -prune -o \
+    -perm /222 -print -quit)" ]
+REMOTE_HELDOUT100_SEAL
+fi
+
+# BEGIN_HELDOUT100_GATE_EVIDENCE_VERIFIER
+verify_heldout100_gate_evidence() {
+    "$PYTHON" - "$@" <<'PY'
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+
+def fail(message):
+    raise SystemExit(f"heldout100 gate evidence rejected: {message}")
+
+
+def strict_object(path, label):
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"{label} is unavailable: {exc}")
+    if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+        fail(f"{label} is not a regular non-symlink file")
+    if info.st_mode & 0o222:
+        fail(f"{label} is mutable")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                fail(f"{label} contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    def constant(value):
+        fail(f"{label} contains non-finite constant {value!r}")
+
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=pairs,
+            parse_constant=constant,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{label} is malformed: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{label} is not a JSON object")
+    return value
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def expect(condition, message):
+    if not condition:
+        fail(message)
+
+
+def exact_values(document, expected, label):
+    for key, value in expected.items():
+        expect(document.get(key) == value, f"{label} {key} differs")
+
+
+def finite(value, label, *, nonnegative=False):
+    expect(
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value)),
+        f"{label} is not finite",
+    )
+    number = float(value)
+    expect(not nonnegative or number >= 0.0, f"{label} is negative")
+    return number
+
+
+(
+    evidence_value,
+    campaign_id,
+    macro_round_value,
+    learner_code_sha256,
+    learner_config_sha256,
+    learner_identity_sha256,
+    validation_contract_sha256,
+    production_contract_sha256,
+    replay_file_sha256,
+    replay_sha256,
+    parent_checkpoint_sha256,
+    parent_runtime_policy_sha256,
+    runtime_container_sha256,
+    heldout_snapshot_value,
+    heldout_file_sha256,
+    heldout_sha256,
+    wandb_run_id,
+) = sys.argv[1:]
+expect(macro_round_value == "0", "macro round is not exactly zero")
+sha_pattern = re.compile(r"[0-9a-f]{64}\Z")
+for label, value in (
+    ("learner code", learner_code_sha256),
+    ("learner config", learner_config_sha256),
+    ("learner identity", learner_identity_sha256),
+    ("validation contract", validation_contract_sha256),
+    ("production contract", production_contract_sha256),
+    ("training replay file", replay_file_sha256),
+    ("training replay semantic", replay_sha256),
+    ("parent checkpoint", parent_checkpoint_sha256),
+    ("parent runtime policy", parent_runtime_policy_sha256),
+    ("runtime container", runtime_container_sha256),
+    ("held-out file", heldout_file_sha256),
+    ("held-out semantic", heldout_sha256),
+):
+    expect(sha_pattern.fullmatch(value) is not None, f"{label} digest is malformed")
+expect(
+    wandb_run_id == f"rrd-m000000-id{learner_identity_sha256}",
+    "W&B run ID is not identity-bound",
+)
+
+evidence = Path(os.path.abspath(evidence_value))
+expect(not evidence.is_symlink() and evidence.is_dir(), "evidence root is unsafe")
+expect(not evidence.stat().st_mode & 0o222, "evidence root is mutable")
+expected_files = {
+    "success_attestation.json",
+    "heldout100_wandb_readback.json",
+    "restart_equivalence.json",
+}
+try:
+    children = {entry.name for entry in evidence.iterdir()}
+except OSError as exc:
+    fail(f"cannot inspect evidence root: {exc}")
+expect(children == expected_files, "evidence file set differs")
+attestation_path = evidence / "success_attestation.json"
+readback_path = evidence / "heldout100_wandb_readback.json"
+restart_path = evidence / "restart_equivalence.json"
+attestation = strict_object(attestation_path, "success attestation")
+readback = strict_object(readback_path, "W&B readback")
+restart = strict_object(restart_path, "restart-equivalence report")
+
+attestation_keys = {
+    "schema", "status", "purpose", "campaign_id", "allocation",
+    "optimizer_steps", "intentional_stop_step", "heldout_optimizer_steps",
+    "heldout_case_count", "heldout_snapshot_path",
+    "heldout_snapshot_file_sha256", "heldout_snapshot_sha256",
+    "validation_contract_sha256", "production_target_contract_sha256",
+    "learner_code_sha256", "learner_config_sha256",
+    "learner_identity_sha256", "runtime_container_sha256",
+    "training_replay_snapshot_file_sha256",
+    "training_replay_snapshot_sha256", "parent_checkpoint_sha256",
+    "parent_runtime_policy_sha256", "wandb_run_id",
+    "wandb_quality_key_count", "quality_improvement", "loss_improvement",
+    "wandb_readback_sha256", "restart_report_sha256",
+    "strict_resume_verified", "uninterrupted_equivalence_verified",
+    "stale_wandb_history_policy",
+    "quality_improvement_verified", "loss_improvement_verified",
+}
+expect(set(attestation) == attestation_keys, "success attestation field set differs")
+exact_values(
+    attestation,
+    {
+        "schema": "fast_roborender.round_dagger.oci_nrt_h100_heldout100_validation.v1",
+        "status": "PASS",
+        "purpose": "live_h100_fixed256_step100_wandb_restart_gate",
+        "campaign_id": campaign_id,
+        "allocation": {
+            "nodes": 1,
+            "gpus_per_node": 8,
+            "gpu_architecture": "H100-SM90",
+            "backend": "nccl",
+            "batch_size_per_rank": 1,
+            "global_batch_size": 8,
+        },
+        "optimizer_steps": 100,
+        "intentional_stop_step": 50,
+        "heldout_optimizer_steps": [0, 100],
+        "heldout_case_count": 256,
+        "heldout_snapshot_path": heldout_snapshot_value,
+        "heldout_snapshot_file_sha256": heldout_file_sha256,
+        "heldout_snapshot_sha256": heldout_sha256,
+        "validation_contract_sha256": validation_contract_sha256,
+        "production_target_contract_sha256": production_contract_sha256,
+        "learner_code_sha256": learner_code_sha256,
+        "learner_config_sha256": learner_config_sha256,
+        "learner_identity_sha256": learner_identity_sha256,
+        "runtime_container_sha256": runtime_container_sha256,
+        "training_replay_snapshot_file_sha256": replay_file_sha256,
+        "training_replay_snapshot_sha256": replay_sha256,
+        "parent_checkpoint_sha256": parent_checkpoint_sha256,
+        "parent_runtime_policy_sha256": parent_runtime_policy_sha256,
+        "wandb_run_id": wandb_run_id,
+        "wandb_quality_key_count": 49,
+        "strict_resume_verified": True,
+        "uninterrupted_equivalence_verified": True,
+        "stale_wandb_history_policy": "fail_closed_no_adoption",
+        "quality_improvement_verified": True,
+        "loss_improvement_verified": True,
+    },
+    "success attestation",
+)
+expect(
+    attestation["wandb_readback_sha256"] == digest(readback_path),
+    "W&B readback digest differs",
+)
+expect(
+    attestation["restart_report_sha256"] == digest(restart_path),
+    "restart report digest differs",
+)
+
+exact_values(
+    readback,
+    {
+        "schema": "fast_roborender.round_dagger.h100_heldout100_wandb_readback.v1",
+        "status": "PASS",
+        "account_email": "ldu@nvidia.com",
+        "entity": "nvidia",
+        "authorization_scope": "team",
+        "team_member": True,
+        "entity_is_team": True,
+        "personal": False,
+        "project": "roborender-round-dagger-validation",
+        "wandb_run_id": wandb_run_id,
+        "campaign_id": campaign_id,
+        "macro_round": 0,
+        "learner_code_sha256": learner_code_sha256,
+        "learner_config_sha256": learner_config_sha256,
+        "learner_identity_sha256": learner_identity_sha256,
+        "runtime_container_sha256": runtime_container_sha256,
+        "replay_snapshot_file_sha256": replay_file_sha256,
+        "replay_snapshot_sha256": replay_sha256,
+        "model_lineage_sha256": parent_checkpoint_sha256,
+        "parent_runtime_policy_sha256": parent_runtime_policy_sha256,
+        "learner_contract_sha256": validation_contract_sha256,
+        "validation_contract_sha256": validation_contract_sha256,
+        "heldout_snapshot_file_sha256": heldout_file_sha256,
+        "heldout_snapshot_sha256": heldout_sha256,
+        "heldout_case_count": 256,
+        "heldout_optimizer_steps": [0, 100],
+        "histories_identical": True,
+        "quality_histories_identical": True,
+        "quality_improvement_verified": True,
+        "loss_improvement_verified": True,
+        "strict_resume_verified": True,
+        "single_canonical_wandb_run": True,
+        "stale_wandb_history_policy": "fail_closed_no_adoption",
+    },
+    "W&B readback",
+)
+remote = readback.get("remote")
+expect(isinstance(remote, dict), "W&B remote readback is absent")
+exact_values(
+    remote,
+    {
+        "state": "finished",
+        "training_history_steps": list(range(1, 101)),
+        "quality_history_steps": [0, 100],
+        "quality_key_count": 49,
+        "config_verified": True,
+        "quality_improvement_verified": True,
+    },
+    "W&B remote readback",
+)
+
+quality = readback.get("quality_improvement")
+expect(
+    isinstance(quality, dict)
+    and set(quality)
+    == {
+        "initial_action_mse", "final_action_mse",
+        "absolute_action_mse_reduction", "relative_action_mse_reduction",
+        "action_mae_delta", "action_rmse_delta", "action_cosine_delta",
+    },
+    "quality-improvement payload differs",
+)
+initial_mse = finite(quality["initial_action_mse"], "initial action MSE", nonnegative=True)
+final_mse = finite(quality["final_action_mse"], "final action MSE", nonnegative=True)
+absolute_mse = finite(
+    quality["absolute_action_mse_reduction"],
+    "absolute action MSE reduction",
+)
+relative_mse = finite(
+    quality["relative_action_mse_reduction"],
+    "relative action MSE reduction",
+)
+expect(initial_mse > 0.0 and final_mse < initial_mse, "held-out MSE did not improve")
+expect(math.isclose(absolute_mse, initial_mse - final_mse, rel_tol=1e-12, abs_tol=1e-12), "absolute MSE reduction is inconsistent")
+expect(math.isclose(relative_mse, absolute_mse / initial_mse, rel_tol=1e-12, abs_tol=1e-12) and relative_mse >= 0.001, "relative MSE reduction gate did not pass")
+for key in ("action_mae_delta", "action_rmse_delta", "action_cosine_delta"):
+    finite(quality[key], key)
+
+loss = readback.get("loss_improvement")
+expect(
+    isinstance(loss, dict)
+    and set(loss)
+    == {"initial_loss", "final_loss", "absolute_loss_reduction", "relative_loss_reduction"},
+    "loss-improvement payload differs",
+)
+initial_loss = finite(loss["initial_loss"], "initial loss", nonnegative=True)
+final_loss = finite(loss["final_loss"], "final loss", nonnegative=True)
+absolute_loss = finite(loss["absolute_loss_reduction"], "absolute loss reduction")
+relative_loss = finite(loss["relative_loss_reduction"], "relative loss reduction")
+expect(initial_loss > 0.0 and final_loss < initial_loss, "deterministic-probe loss did not improve")
+expect(math.isclose(absolute_loss, initial_loss - final_loss, rel_tol=1e-12, abs_tol=1e-12), "absolute loss reduction is inconsistent")
+expect(math.isclose(relative_loss, absolute_loss / initial_loss, rel_tol=1e-12, abs_tol=1e-12), "relative loss reduction is inconsistent")
+expect(attestation["quality_improvement"] == quality, "attested quality improvement differs")
+expect(attestation["loss_improvement"] == loss, "attested loss improvement differs")
+
+restart_keys = {
+    "schema", "semantic_equivalent", "expected_completed_steps",
+    "uninterrupted_checkpoint", "uninterrupted_checkpoint_sha256",
+    "resumed_checkpoint", "resumed_checkpoint_sha256", "results_equivalent",
+    "uninterrupted_result", "uninterrupted_result_sha256",
+    "resumed_result", "resumed_result_sha256",
+}
+expect(set(restart) == restart_keys, "restart report field set differs")
+exact_values(
+    restart,
+    {
+        "schema": "fast_roborender.round_dagger.restart_equivalence.v1",
+        "semantic_equivalent": True,
+        "results_equivalent": True,
+        "expected_completed_steps": 100,
+    },
+    "restart report",
+)
+for key in (
+    "uninterrupted_checkpoint_sha256", "resumed_checkpoint_sha256",
+    "uninterrupted_result_sha256", "resumed_result_sha256",
+):
+    expect(sha_pattern.fullmatch(restart.get(key, "")) is not None, f"restart report {key} is malformed")
+for key in (
+    "uninterrupted_checkpoint", "resumed_checkpoint",
+    "uninterrupted_result", "resumed_result",
+):
+    expect(isinstance(restart.get(key), str) and restart[key].startswith("/"), f"restart report {key} is malformed")
+
+print("HELDOUT100_GATE_EVIDENCE_VERIFIED")
+PY
+}
+# END_HELDOUT100_GATE_EVIDENCE_VERIFIER
+
+heldout100_evidence_arguments=()
+if ((HELDOUT100_GATE_ENABLED)); then
+    heldout100_evidence_arguments=(
+        "$ROUND_DAGGER_CAMPAIGN_ID" "$ROUND_DECIMAL"
+        "$ROUND_DAGGER_LEARNER_CODE_SHA256" "$HELDOUT100_CONFIG_SHA256"
+        "$HELDOUT100_IDENTITY_SHA256" "$HELDOUT100_CONTRACT_SHA256"
+        "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256"
+        "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256"
+        "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256"
+        "$ROUND_DAGGER_POLICY_SHA256" "$ROUND_DAGGER_RUNTIME_POLICY_SHA256"
+        "$REMOTE_CONTAINER_SHA" "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT"
+        "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256"
+        "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256"
+        "$HELDOUT100_WANDB_RUN_ID"
+    )
+fi
+
+heldout100_remote_state() {
+    ssh -o BatchMode=yes "$REMOTE" bash -s -- \
+        "$HELDOUT100_REMOTE_OUTPUT" "$HELDOUT100_REMOTE_JOB" \
+        "$HELDOUT100_REMOTE_LOG" "$HELDOUT100_JOB_NAME" \
+        "$REMOTE_SLURM_BIN/squeue" <<'REMOTE_HELDOUT100_STATE'
+set -Eeuo pipefail
+output=$1; job=$2; log=$3; job_name=$4; squeue_bin=$5
+for path in "$output" "$job" "$log"; do
+    [ -d "$path" ] && [ ! -L "$path" ] && \
+        [ "$(realpath -e -- "$path")" = "$path" ] || exit 3
+done
+active_output=$("$squeue_bin" -h --name="$job_name" --format='%A')
+active=()
+while IFS= read -r item; do
+    [ -z "$item" ] || active+=("$item")
+done <<<"$active_output"
+[ "${#active[@]}" -le 1 ] || { printf '%s\n' unsafe; exit 3; }
+if [ "${#active[@]}" -eq 1 ]; then
+    [[ ${active[0]} =~ ^[0-9]+$ ]] || { printf '%s\n' unsafe; exit 3; }
+    printf 'active:%s\n' "${active[0]}"
+    exit 0
+fi
+attestation="$output/success_attestation.json"
+readback="$output/heldout100_wandb_readback.json"
+restart="$output/restart_equivalence.json"
+if [ -e "$attestation" ] || [ -L "$attestation" ] || \
+   [ -e "$readback" ] || [ -L "$readback" ] || \
+   [ -e "$restart" ] || [ -L "$restart" ]; then
+    for path in "$attestation" "$readback" "$restart"; do
+        [ -f "$path" ] && [ ! -L "$path" ] && \
+            [ -z "$(find "$path" -maxdepth 0 -perm /222 -print -quit)" ] || \
+            { printf '%s\n' partial; exit 0; }
+    done
+    printf '%s\n' complete
+elif [ -z "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit)" ] && \
+     [ -z "$(find "$job" -mindepth 1 -maxdepth 1 -print -quit)" ] && \
+     [ -z "$(find "$log" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    printf '%s\n' empty
+else
+    printf '%s\n' partial
+fi
+REMOTE_HELDOUT100_STATE
+}
+
+wait_for_heldout100_remote_completion() {
+    local smoke_state=$1 job_id polls accounting_output accounting state exit_code
+    [[ $smoke_state == active:* ]] || {
+        printf '%s\n' "$smoke_state"
+        return 0
+    }
+    job_id=${smoke_state#active:}
+    [[ $job_id =~ ^[0-9]+$ ]] || fatal "heldout100 active job ID is malformed"
+    polls=$(((18000 + POLL_SECONDS - 1) / POLL_SECONDS))
+    for ((poll=0; poll < polls; poll++)); do
+        sleep "$POLL_SECONDS"
+        smoke_state=$(heldout100_remote_state) || \
+            fatal "cannot poll recovered heldout100 gate"
+        [[ $smoke_state == active:* ]] || break
+        [[ ${smoke_state#active:} == "$job_id" ]] || \
+            fatal "heldout100 active job identity changed while polling"
+    done
+    if [[ $smoke_state != complete ]]; then
+        accounting=
+        for _ in {1..60}; do
+            accounting_output=$(ssh -o BatchMode=yes "$REMOTE" \
+                "$REMOTE_SLURM_BIN/sacct" -nP -X -j "$job_id" \
+                --format=State,ExitCode) || { sleep 2; continue; }
+            accounting=$(awk -F'|' 'NF>=2 {print $1 "|" $2; exit}' \
+                <<<"$accounting_output")
+            [[ -n $accounting ]] && break
+            sleep 2
+        done
+        if [[ -n $accounting ]]; then
+            state=${accounting%%|*}; state=${state%%+*}; exit_code=${accounting#*|}
+            echo "OCI-NRT heldout100 recovered allocation ended state=$state exit_code=$exit_code evidence_state=$smoke_state" >&2
+        else
+            echo "OCI-NRT heldout100 recovered allocation accounting unresolved evidence_state=$smoke_state" >&2
+        fi
+    fi
+    printf '%s\n' "$smoke_state"
+}
+
+if ((HELDOUT100_GATE_ENABLED)); then
+    if [[ -e $HELDOUT100_LOCAL_EVIDENCE || -L $HELDOUT100_LOCAL_EVIDENCE ]]; then
+        [[ -d $HELDOUT100_LOCAL_EVIDENCE && ! -L $HELDOUT100_LOCAL_EVIDENCE ]] || \
+            fatal "existing heldout100 local evidence is unsafe"
+        verify_heldout100_gate_evidence "$HELDOUT100_LOCAL_EVIDENCE" \
+            "${heldout100_evidence_arguments[@]}" >/dev/null || \
+            fatal "existing heldout100 evidence does not bind this exact run"
+        echo "OCI-NRT heldout100 gate evidence adopted identity=$HELDOUT100_IDENTITY_SHA256"
+    else
+        ssh -o BatchMode=yes "$REMOTE" bash -s -- \
+            "$HELDOUT100_REMOTE_OUTPUT" "$HELDOUT100_REMOTE_JOB" \
+            "$HELDOUT100_REMOTE_LOG" <<'REMOTE_HELDOUT100_PREPARE'
+set -Eeuo pipefail
+output=$1; job=$2; log=$3
+[ -d "$output" ] && [ ! -L "$output" ] && \
+    [ "$(realpath -e -- "$output")" = "$output" ] || exit 2
+for path in "$job" "$log"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        [ -d "$path" ] && [ ! -L "$path" ] || exit 2
+    else
+        mkdir -p "$path"
+    fi
+    [ "$(realpath -e -- "$path")" = "$path" ] || exit 2
+done
+chmod u+rwx "$output" "$job" "$log"
+REMOTE_HELDOUT100_PREPARE
+
+        smoke_state=$(heldout100_remote_state) || \
+            fatal "cannot determine remote heldout100 gate state"
+        case "$smoke_state" in
+            empty)
+                echo "OCI-NRT heldout100 gate submitting identity=$HELDOUT100_IDENTITY_SHA256"
+                ssh -o BatchMode=yes "$REMOTE" env \
+                    ROUND_DAGGER_HELDOUT100_SBATCH_BIN="$REMOTE_SLURM_BIN/sbatch" \
+                    ROUND_DAGGER_HELDOUT100_SOURCE_ROOT="$REMOTE_SOURCE" \
+                    ROUND_DAGGER_HELDOUT100_SOURCE_INVENTORY_SHA256="$REMOTE_SOURCE_INVENTORY_SHA" \
+                    ROUND_DAGGER_HELDOUT100_CONTAINER="$REMOTE_CONTAINER" \
+                    ROUND_DAGGER_HELDOUT100_CONTAINER_SHA256="$REMOTE_CONTAINER_SHA" \
+                    ROUND_DAGGER_HELDOUT100_REMOTE_CAMPAIGN_ROOT="$HELDOUT100_REMOTE_CAMPAIGN" \
+                    ROUND_DAGGER_HELDOUT100_LOCAL_CAMPAIGN_ROOT="$CAMPAIGN_ROOT" \
+                    ROUND_DAGGER_HELDOUT100_REMOTE_OUTPUT_ROOT="$HELDOUT100_REMOTE_OUTPUT" \
+                    ROUND_DAGGER_HELDOUT100_LOCAL_OUTPUT_ROOT="$HELDOUT100_LOCAL_OUTPUT" \
+                    ROUND_DAGGER_HELDOUT100_REMOTE_JOB_ROOT="$HELDOUT100_REMOTE_JOB" \
+                    ROUND_DAGGER_HELDOUT100_REMOTE_LOG_ROOT="$HELDOUT100_REMOTE_LOG" \
+                    ROUND_DAGGER_HELDOUT100_WANDB_NETRC="$REMOTE_NETRC" \
+                    ROUND_DAGGER_HELDOUT100_REPLAY_SNAPSHOT="$ROUND_DAGGER_REPLAY_SNAPSHOT" \
+                    ROUND_DAGGER_HELDOUT100_REPLAY_SNAPSHOT_FILE_SHA256="$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_REPLAY_SNAPSHOT_SHA256="$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_POLICY_CHECKPOINT="$ROUND_DAGGER_POLICY_CHECKPOINT" \
+                    ROUND_DAGGER_HELDOUT100_POLICY_SHA256="$ROUND_DAGGER_POLICY_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_POLICY_SPEC_SHA256="$ROUND_DAGGER_POLICY_SPEC_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_POLICY_MANIFEST_SHA256="$ROUND_DAGGER_POLICY_MANIFEST_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_RUNTIME_POLICY_SHA256="$ROUND_DAGGER_RUNTIME_POLICY_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_LEARNER_CONFIG_SHA256="$HELDOUT100_CONFIG_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_CONTRACT="$REMOTE_SOURCE/configs/round_dagger/validation_learner_1x8h100_heldout100.json" \
+                    ROUND_DAGGER_HELDOUT100_CONTRACT_SHA256="$HELDOUT100_CONTRACT_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_CAMPAIGN_ID="$ROUND_DAGGER_CAMPAIGN_ID" \
+                    ROUND_DAGGER_HELDOUT100_MACRO_ROUND="$ROUND_DECIMAL" \
+                    bash "$REMOTE_SOURCE/scripts/round_dagger/submit_oci_nrt_h100_heldout100.sh" >/dev/null || \
+                    fatal "OCI-NRT heldout100 gate allocation failed"
+                smoke_state=$(heldout100_remote_state) || \
+                    fatal "cannot determine post-allocation heldout100 gate state"
+                if [[ $smoke_state == active:* ]]; then
+                    smoke_state=$(wait_for_heldout100_remote_completion \
+                        "$smoke_state")
+                fi
+                ;;
+            active:*)
+                echo "OCI-NRT heldout100 gate waiting for recovered job ${smoke_state#active:}"
+                smoke_state=$(wait_for_heldout100_remote_completion \
+                    "$smoke_state")
+                ;;
+            complete) ;;
+            partial) fatal "remote heldout100 gate contains non-adoptable partial state" ;;
+            *) fatal "remote heldout100 gate state is malformed" ;;
+        esac
+        [[ $smoke_state == complete ]] || \
+            fatal "heldout100 gate did not reach an immutable completed state"
+
+        HELDOUT100_INCOMING=$(mktemp -d \
+            "$LOCAL_HANDOFF/.heldout100-evidence.incoming.XXXXXX") || \
+            fatal "cannot create heldout100 evidence staging directory"
+        for name in success_attestation.json heldout100_wandb_readback.json \
+                    restart_equivalence.json; do
+            rsync --archive --no-links --protect-args -- \
+                "$REMOTE:$HELDOUT100_REMOTE_OUTPUT/$name" \
+                "$HELDOUT100_INCOMING/$name"
+        done
+        chmod a-w "$HELDOUT100_INCOMING"
+        verify_heldout100_gate_evidence "$HELDOUT100_INCOMING" \
+            "${heldout100_evidence_arguments[@]}" >/dev/null || \
+            fatal "remote heldout100 evidence does not bind this exact run"
+        [[ ! -e $HELDOUT100_LOCAL_EVIDENCE && ! -L $HELDOUT100_LOCAL_EVIDENCE ]] || \
+            fatal "heldout100 evidence destination appeared during adoption"
+        mv "$HELDOUT100_INCOMING" "$HELDOUT100_LOCAL_EVIDENCE"
+        verify_heldout100_gate_evidence "$HELDOUT100_LOCAL_EVIDENCE" \
+            "${heldout100_evidence_arguments[@]}" >/dev/null || \
+            fatal "published heldout100 evidence failed re-verification"
+        echo "OCI-NRT heldout100 gate PASS identity=$HELDOUT100_IDENTITY_SHA256"
+    fi
+fi
 
 export_names=(
     ROUND_DAGGER_CAMPAIGN_ROOT ROUND_DAGGER_CAMPAIGN_ID
