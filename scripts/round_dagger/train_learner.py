@@ -36,7 +36,7 @@ from round_dagger.learner import (  # noqa: E402
     publish_learner_result,
     train_from_replay,
 )
-from round_dagger.replay import load_snapshot  # noqa: E402
+from round_dagger.replay import load_heldout_snapshot, load_snapshot  # noqa: E402
 
 
 def _symbol(specification: str) -> Any:
@@ -117,6 +117,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--bundle", required=True, type=Path)
     parser.add_argument("--snapshot", required=True, type=Path)
+    parser.add_argument(
+        "--heldout-snapshot",
+        type=Path,
+        help="immutable purpose=eval replay snapshot pinned by the learner bundle",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model-factory", required=True)
     parser.add_argument(
@@ -139,8 +144,17 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="must match the immutable learner bundle (defaults to its value)",
     )
+    parser.add_argument(
+        "--heldout-eval-interval",
+        type=int,
+        help=(
+            "must match heldout_eval_interval in the immutable learner bundle "
+            "(production target: 100)"
+        ),
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--telemetry-jsonl", type=Path)
+    parser.add_argument("--heldout-telemetry-jsonl", type=Path)
     parser.add_argument("--wandb-project")
     parser.add_argument("--wandb-entity")
     parser.add_argument("--wandb-run-id")
@@ -182,6 +196,26 @@ def main(argv: list[str] | None = None) -> int:
         raise LearnerError("--max-steps differs from the immutable learner bundle")
     if save_every != config.save_every:
         raise LearnerError("--save-every differs from the immutable learner bundle")
+    if config.heldout_evaluation_enabled != (
+        arguments.heldout_snapshot is not None
+    ):
+        raise LearnerError(
+            "--heldout-snapshot and immutable held-out bundle fields must be "
+            "supplied together"
+        )
+    if arguments.heldout_eval_interval is not None and (
+        arguments.heldout_eval_interval != config.heldout_eval_interval
+    ):
+        raise LearnerError(
+            "--heldout-eval-interval differs from the immutable learner bundle"
+        )
+    if (
+        arguments.heldout_telemetry_jsonl is not None
+        and not config.heldout_evaluation_enabled
+    ):
+        raise LearnerError(
+            "--heldout-telemetry-jsonl requires held-out evaluation"
+        )
     if (
         arguments.validation_stop_at_step is not None
         and not arguments.no_publish_result
@@ -244,6 +278,21 @@ def main(argv: list[str] | None = None) -> int:
         "learner_config_sha256": config.sha256,
         "model_lineage_sha256": config.model_lineage_sha256,
     }
+    if arguments.heldout_snapshot is not None:
+        heldout_identity = load_heldout_snapshot(
+            arguments.heldout_snapshot,
+            expected_file_sha256=config.heldout_snapshot_file_sha256,
+        )
+        if heldout_identity["snapshot_sha256"] != config.heldout_snapshot_sha256:
+            raise LearnerError("held-out replay snapshot semantic digest mismatch")
+        if heldout_identity["campaign_id"] != config.campaign_id:
+            raise LearnerError("held-out replay campaign differs from learner bundle")
+        wandb_config.update(
+            heldout_snapshot_file_sha256=heldout_identity["file_sha256"],
+            heldout_snapshot_sha256=heldout_identity["snapshot_sha256"],
+            heldout_eval_interval=config.heldout_eval_interval,
+            heldout_transitions=heldout_identity["transition_count"],
+        )
     identity_arguments = (
         arguments.learner_identity_sha256,
         arguments.runtime_container_sha256,
@@ -309,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     telemetry = JsonlTelemetry(
         arguments.telemetry_jsonl,
         enabled=rank == 0,
+        heldout_path=arguments.heldout_telemetry_jsonl,
         wandb_project=arguments.wandb_project,
         wandb_entity=arguments.wandb_entity,
         wandb_run_id=arguments.wandb_run_id,
@@ -330,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             resume_from=arguments.resume_from,
             expected_snapshot_file_sha256=arguments.expected_snapshot_file_sha256,
+            heldout_snapshot_path=arguments.heldout_snapshot,
             save_every=save_every,
             telemetry=telemetry,
             validation_stop_at_step=arguments.validation_stop_at_step,

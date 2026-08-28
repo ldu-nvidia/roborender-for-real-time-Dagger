@@ -29,7 +29,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from round_dagger import artifacts, policy_bundle, state  # noqa: E402
+from round_dagger import artifacts, policy_bundle, replay, state  # noqa: E402
 from round_dagger import motion_split_contract  # noqa: E402
 from round_dagger import production_data_lineage  # noqa: E402
 from round_dagger.gr00t_policy import (  # noqa: E402
@@ -322,13 +322,29 @@ def _verify_first_condition_bundles(
     return normalized
 
 
-def _load_contract(path: Path, schema: str, keys: set[str], label: str) -> dict[str, Any]:
+def _load_contract(
+    path: Path,
+    schema: str,
+    keys: set[str],
+    label: str,
+    *,
+    optional_keys: set[str] | None = None,
+) -> dict[str, Any]:
     _regular(path, label)
     try:
         document = artifacts.load_strict_json(path)
     except Exception as exc:
         raise ProductionLaunchError(f"cannot load strict {label}") from exc
-    result = _exact(document, keys, label)
+    optional = optional_keys or set()
+    if not isinstance(document, Mapping):
+        raise ProductionLaunchError(f"{label} must be a mapping")
+    actual = set(document)
+    if not keys <= actual or actual - keys - optional:
+        raise ProductionLaunchError(
+            f"{label} fields differ: missing={sorted(keys - actual)} "
+            f"unknown={sorted(actual - keys - optional)}"
+        )
+    result = dict(document)
     _require_equal(result["schema"], schema, f"{label} schema")
     return result
 
@@ -822,7 +838,11 @@ def materialize_campaign_contract(
 
 def load_learner_contract(path: Path) -> dict[str, Any]:
     contract = _load_contract(
-        path, LEARNER_CONTRACT_SCHEMA, LEARNER_CONTRACT_KEYS, "learner contract"
+        path,
+        LEARNER_CONTRACT_SCHEMA,
+        LEARNER_CONTRACT_KEYS,
+        "learner contract",
+        optional_keys={"heldout_evaluation"},
     )
     _require_equal(
         _exact(
@@ -839,12 +859,13 @@ def load_learner_contract(path: Path) -> dict[str, Any]:
         },
         "learner allocation",
     )
+    optimization = _exact(
+        contract["optimization"],
+        {"optimizer_steps", "save_every_steps", "learning_rate", "weight_decay", "seed", "partition_seed"},
+        "learner optimization",
+    )
     _require_equal(
-        _exact(
-            contract["optimization"],
-            {"optimizer_steps", "save_every_steps", "learning_rate", "weight_decay", "seed", "partition_seed"},
-            "learner optimization",
-        ),
+        optimization,
         {
             "optimizer_steps": 1200,
             "save_every_steps": 5,
@@ -922,6 +943,46 @@ def load_learner_contract(path: Path) -> dict[str, Any]:
         },
         "learner source",
     )
+    if "heldout_evaluation" in contract:
+        heldout = _exact(
+            contract["heldout_evaluation"],
+            {
+                "snapshot_path",
+                "snapshot_file_sha256",
+                "snapshot_sha256",
+                "interval_steps",
+            },
+            "learner held-out evaluation",
+        )
+        snapshot_path = _absolute(
+            heldout["snapshot_path"], "held-out replay snapshot"
+        )
+        _file_identity(
+            snapshot_path,
+            heldout["snapshot_file_sha256"],
+            "held-out replay snapshot",
+        )
+        _require_sha(
+            heldout["snapshot_sha256"],
+            "held-out replay snapshot semantic SHA-256",
+        )
+        _require_equal(
+            heldout["interval_steps"], 100, "held-out evaluation interval"
+        )
+        try:
+            heldout_snapshot = replay.load_heldout_snapshot(
+                snapshot_path,
+                expected_file_sha256=heldout["snapshot_file_sha256"],
+            )
+        except Exception as exc:
+            raise ProductionLaunchError(
+                f"held-out replay snapshot validation failed: {exc}"
+            ) from exc
+        _require_equal(
+            heldout_snapshot["snapshot_sha256"],
+            heldout["snapshot_sha256"],
+            "held-out replay snapshot semantic identity",
+        )
     return contract
 
 
@@ -1616,6 +1677,59 @@ def derive_learner_bundle_sha256(
     allocation = learner_contract["allocation"]
     optimization = learner_contract["optimization"]
     inputs = policy_spec["input_contract"]
+    heldout_fields: dict[str, Any] = {}
+    heldout_contract = learner_contract.get("heldout_evaluation")
+    if heldout_contract is not None:
+        heldout_path = _regular(
+            _absolute(
+                heldout_contract["snapshot_path"], "held-out replay snapshot"
+            ),
+            "held-out replay snapshot",
+        )
+        try:
+            heldout_snapshot = replay.load_heldout_snapshot(
+                heldout_path,
+                expected_file_sha256=heldout_contract[
+                    "snapshot_file_sha256"
+                ],
+            )
+        except Exception as exc:
+            raise ProductionLaunchError(
+                f"cannot derive held-out learner identity: {exc}"
+            ) from exc
+        _require_equal(
+            heldout_snapshot["campaign_id"], campaign_id, "held-out campaign"
+        )
+        _require_equal(
+            heldout_snapshot["snapshot_sha256"],
+            heldout_contract["snapshot_sha256"],
+            "held-out semantic identity",
+        )
+        _require_equal(
+            heldout_snapshot["view_contract"],
+            {
+                "dtype": "uint8",
+                "layout": "vertical",
+                "shape": list(VISION_SHAPE),
+                "views": ["head_color", "hand_left", "hand_right"],
+            },
+            "held-out view contract",
+        )
+        _require_equal(
+            heldout_snapshot["action_contract"],
+            {"dtype": "float32", "shape": [REPLAY_ACTION_DIM]},
+            "held-out action contract",
+        )
+        _require_equal(
+            heldout_contract["interval_steps"],
+            100,
+            "held-out evaluation interval",
+        )
+        heldout_fields = {
+            "heldout_snapshot_sha256": heldout_snapshot["snapshot_sha256"],
+            "heldout_snapshot_file_sha256": heldout_snapshot["file_sha256"],
+            "heldout_eval_interval": 100,
+        }
     bundle = {
         "schema": LEARNER_BUNDLE_SCHEMA,
         "campaign_id": campaign_id,
@@ -1638,6 +1752,7 @@ def derive_learner_bundle_sha256(
         "partition_seed": optimization["partition_seed"],
         "initial_checkpoint_sha256": actual_parent,
         "model_config": policy_spec,
+        **heldout_fields,
     }
     try:
         return artifacts.canonical_json_sha256(bundle)
@@ -1671,6 +1786,63 @@ def _validate_orchestration_and_campaign(
             "production campaign contains exactly five macro-rounds (0 through 4)"
         )
     root = _directory(configuration.campaign_root, "campaign root")
+    heldout_contract = learner_contract.get("heldout_evaluation")
+    if heldout_contract is not None:
+        heldout_path = _regular(
+            _absolute(
+                heldout_contract["snapshot_path"], "held-out replay snapshot"
+            ),
+            "held-out replay snapshot",
+        )
+        try:
+            heldout_relative = heldout_path.relative_to(root)
+        except ValueError as exc:
+            raise ProductionLaunchError(
+                "held-out replay snapshot must be inside the campaign"
+            ) from exc
+        if heldout_relative.parts and heldout_relative.parts[0] in {
+            "actors",
+            "operator",
+        }:
+            raise ProductionLaunchError(
+                "held-out replay snapshot is excluded from learner projection"
+            )
+        try:
+            heldout_snapshot = replay.load_heldout_snapshot(
+                heldout_path,
+                expected_file_sha256=heldout_contract[
+                    "snapshot_file_sha256"
+                ],
+            )
+        except Exception as exc:
+            raise ProductionLaunchError(
+                f"held-out replay snapshot validation failed: {exc}"
+            ) from exc
+        referenced_paths = [
+            *(
+                Path(item["cohort_manifest_path"])
+                for item in heldout_snapshot["cohorts"]
+            ),
+            *(
+                Path(item["shard_manifest_path"])
+                for item in heldout_snapshot["resolved_shards"]
+            ),
+            *(
+                Path(item["payload_path"])
+                for item in heldout_snapshot["resolved_shards"]
+            ),
+        ]
+        for referenced_path in referenced_paths:
+            try:
+                relative = referenced_path.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise ProductionLaunchError(
+                    "held-out replay artifact must be inside the campaign"
+                ) from exc
+            if relative.parts and relative.parts[0] in {"actors", "operator"}:
+                raise ProductionLaunchError(
+                    "held-out replay artifact is excluded from learner projection"
+                )
     _require_equal(configuration.actor_root, root / "actors", "orchestration actor root")
     _require_equal(configuration.learner_code_sha256, source_inventory_sha256, "learner/source identity")
     _require_equal(
@@ -1802,7 +1974,7 @@ def build_environment(
     container = learner_contract["container"]
     handoff = learner_contract["handoff"]
     optimization = learner_contract["optimization"]
-    return {
+    environment = {
         "ROUND_DAGGER_TEACHER_CHECKPOINT": artifact["teacher"]["checkpoint_path"],
         "ROUND_DAGGER_TEACHER_SHA256": artifact["teacher"]["checkpoint_sha256"],
         "ROUND_DAGGER_TEACHER_CHECKPOINT_RELATIVE": TEACHER_CHECKPOINT_RELATIVE.as_posix(),
@@ -1937,6 +2109,25 @@ def build_environment(
         "ROUND_DAGGER_LEARNER_SEED": str(optimization["seed"]),
         "ROUND_DAGGER_LEARNER_PARTITION_SEED": str(optimization["partition_seed"]),
     }
+    heldout = learner_contract.get("heldout_evaluation")
+    if heldout is not None:
+        environment.update(
+            {
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT": heldout[
+                    "snapshot_path"
+                ],
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256": heldout[
+                    "snapshot_file_sha256"
+                ],
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256": heldout[
+                    "snapshot_sha256"
+                ],
+                "ROUND_DAGGER_HELDOUT_EVAL_INTERVAL": str(
+                    heldout["interval_steps"]
+                ),
+            }
+        )
+    return environment
 
 
 def validate_launch(

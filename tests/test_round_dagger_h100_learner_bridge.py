@@ -244,6 +244,51 @@ def _production_snapshot(
     return snapshot_path, snapshot
 
 
+def _heldout_snapshot(
+    root: Path, *, parent_sha: str, runtime_sha: str
+) -> tuple[Path, dict]:
+    provenance = {
+        "campaign_id": "production-test",
+        "macro_round": 0,
+        "cohort_index": 99,
+        "purpose": "eval",
+        "policy_sha256": parent_sha,
+        "runtime_policy_sha256": runtime_sha,
+        "teacher_sha256": "5" * 64,
+        "renderer_sha256": "6" * 64,
+        "beta_sha256": "7" * 64,
+        "config_sha256": "8" * 64,
+    }
+    cohort = root / "heldout/cohort-99"
+    artifacts.create_cohort(
+        cohort,
+        expected_ranks=list(range(8)),
+        expected_global_env_ids=list(range(99, 107)),
+        expected_transitions=8,
+        view_contract={
+            "dtype": "uint8",
+            "layout": "vertical",
+            "shape": [324, 192, 3],
+            "views": ["head_color", "hand_left", "hand_right"],
+        },
+        action_contract={"dtype": "float32", "shape": [26]},
+        **provenance,
+    )
+    for rank, global_env_id in enumerate(range(99, 107)):
+        artifacts.publish_rollout_shard(
+            cohort,
+            rank=rank,
+            rollout_id=0,
+            part_index=0,
+            arrays=_rollout_arrays(global_env_id),
+            **provenance,
+        )
+    artifacts.seal_cohort(cohort)
+    snapshot_path = root / "heldout/snapshot.json"
+    snapshot = replay.build_heldout_snapshot([cohort], output=snapshot_path)
+    return snapshot_path, snapshot
+
+
 @unittest.skipIf(torch is None, "H100 learner bridge tests require PyTorch")
 class ImmutableLearnerBundleTest(unittest.TestCase):
     def setUp(self):
@@ -646,6 +691,45 @@ class H100LauncherDryRunTest(unittest.TestCase):
             "CUBLAS_WORKSPACE_CONFIG must be exactly :4096:8",
             completed.stderr,
         )
+
+    def test_dry_run_plumbs_exact_heldout_snapshot_and_100_step_cadence(self):
+        heldout_path, heldout = _heldout_snapshot(
+            self.root,
+            parent_sha=self.kwargs["expected_parent_checkpoint_sha256"],
+            runtime_sha=self.kwargs["runtime_policy_sha256"],
+        )
+        heldout_bundle = self.preparer.prepare_bundle(
+            **self.kwargs,
+            heldout_snapshot=heldout_path,
+            heldout_eval_interval=100,
+        )
+        environment = self._environment()
+        environment.update(
+            {
+                "ROUND_DAGGER_LEARNER_CONFIG_SHA256": heldout_bundle.sha256,
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT": str(heldout_path),
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256": heldout[
+                    "file_sha256"
+                ],
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256": heldout[
+                    "snapshot_sha256"
+                ],
+                "ROUND_DAGGER_HELDOUT_EVAL_INTERVAL": "100",
+            }
+        )
+        self._bind_identity(environment)
+        completed = self._launch(environment)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("H100_HELDOUT_PARTITION", completed.stderr)
+        self.assertIn("--heldout-snapshot", completed.stdout)
+        self.assertIn("--heldout-eval-interval 100", completed.stdout)
+        self.assertIn("heldout_eval=1 cadence=100", completed.stdout)
+
+        incomplete = self._environment()
+        incomplete["ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT"] = str(heldout_path)
+        rejected = self._launch(incomplete)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("supplied all-or-none", rejected.stderr)
 
     def test_dry_run_auto_resumes_only_a_matching_restart(self):
         self.output.mkdir()

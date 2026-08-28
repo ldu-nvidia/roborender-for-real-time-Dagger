@@ -103,8 +103,38 @@ fi
 mkdir -p "$TRAIN_DIR/logs" "$TRAIN_DIR/actor_pair_attempts"
 [ ! -L "$TRAIN_DIR" ] && [ ! -L "$TRAIN_DIR/logs" ] && \
     [ ! -L "$TRAIN_DIR/actor_pair_attempts" ] || {
-        echo "actor pair run directories must not be symbolic links" >&2; exit 2;
-    }
+    echo "actor pair run directories must not be symbolic links" >&2; exit 2;
+}
+
+# Derive policy-quality telemetry only from an exactly sealed cohort.  The
+# resulting scalar is a deterministic numeric projection that the existing
+# W&B sidecar can consume; its companion quality artifact binds every value to
+# the cohort seal and immutable shard digests.  A schema, lineage, or coverage
+# mismatch fails this actor-pair invocation closed.
+publish_student_quality() {
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m round_dagger.quality \
+            --cohort-dir "$COHORT_DIR" --run-dir "$TRAIN_DIR" \
+            --expected-campaign-id \
+                "${ROUND_DAGGER_CAMPAIGN_ID:?missing ROUND_DAGGER_CAMPAIGN_ID}" \
+            --expected-macro-round \
+                "${ROUND_DAGGER_MACRO_ROUND:?missing ROUND_DAGGER_MACRO_ROUND}" \
+            --expected-cohort-index \
+                "${ROUND_DAGGER_COHORT_INDEX:?missing ROUND_DAGGER_COHORT_INDEX}" \
+            --expected-beta \
+                "${ROUND_DAGGER_BETA:?missing ROUND_DAGGER_BETA}" \
+            --expected-policy-sha256 \
+                "${ROUND_DAGGER_POLICY_SHA256:?missing ROUND_DAGGER_POLICY_SHA256}" \
+            --expected-runtime-policy-sha256 \
+                "${ROUND_DAGGER_RUNTIME_POLICY_SHA256:?missing ROUND_DAGGER_RUNTIME_POLICY_SHA256}" \
+            --expected-teacher-sha256 \
+                "${ROUND_DAGGER_TEACHER_SHA256:?missing ROUND_DAGGER_TEACHER_SHA256}" \
+            --expected-renderer-sha256 "$RENDERER_SHA256" \
+            --expected-beta-sha256 \
+                "${ROUND_DAGGER_BETA_SHA256:?missing ROUND_DAGGER_BETA_SHA256}" \
+            --expected-config-sha256 \
+                "${ROUND_DAGGER_CONFIG_SHA256:?missing ROUND_DAGGER_CONFIG_SHA256}"
+}
 
 # Serialize lifecycle ownership for this cohort.  If the outer launcher dies,
 # a surviving rank retains the descriptor until it exits; a retry therefore
@@ -165,6 +195,9 @@ if [ "$SEALED" = 1 ]; then
             --timeout-s "${ROUND_DAGGER_IMAGE3F_RESET_TIMEOUT_S:-10}" \
             --retries "${ROUND_DAGGER_IMAGE3F_RESET_RETRIES:-3}"
     fi
+    if [ "$DRY_RUN" != 1 ]; then
+        publish_student_quality
+    fi
     printf '%s\n' "$STATUS_JSON"
     echo "ACTOR_PAIR_ALREADY_SEALED_STREAMS_CLEAN"
     exit 0
@@ -197,6 +230,7 @@ if [ "${#LAUNCH_RANKS[@]}" -eq 0 ]; then
     SEALED_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m round_dagger.actor_pair seal --cohort-dir "$COHORT_DIR")
     printf '%s\n' "$SEALED_JSON"
+    publish_student_quality
     echo "ACTOR_PAIR_RECOVERED_COMPLETE_STREAMS_CLEAN"
     exit 0
 fi
@@ -334,6 +368,47 @@ done
 # Always reap both actor processes.  A failure on one rank never causes this
 # launcher to signal or abandon the other rank.
 STATUSES=(0 0)
+LIFECYCLE_STATUS=0
+FINALIZED_BEFORE_WANDB_DRAIN=0
+PRE_DRAIN_FINALIZATION_STATUS=0
+CLEANUP_JSON=
+SEALED_JSON=
+QUALITY_JSON=
+
+# The rank-local primitive normally publishes this receipt immediately after
+# its exact immutable shard gate.  Repeating publication here closes the
+# custom-executor/test path and is byte-idempotent.  In W&B pair mode this must
+# happen before the owner is released, because its watcher is the only process
+# authorized to upload the common telemetry stream.
+record_successful_rank_lifecycle() {
+    local rank completion_path
+    for rank in 0 1; do
+        if [ "$DRY_RUN" != 1 ] && [ -n "${PIDS[$rank]}" ] && \
+           [ "${STATUSES[$rank]}" -eq 0 ]; then
+            printf -v completion_path '%s/rank_%04d_stream_completion.json' \
+                "$ATTEMPT_DIR" "$rank"
+            if ! PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+                python3 -m "$LIFECYCLE_MODULE" complete-rank \
+                    --output "$completion_path" --plan "$ATTEMPT_PLAN" \
+                    --cohort-dir "$COHORT_DIR" --rank "$rank" >/dev/null; then
+                echo "actor rank $rank exited zero without valid stream ownership evidence" >&2
+                LIFECYCLE_STATUS=1
+            fi
+        fi
+    done
+}
+
+finalize_completed_cohort() {
+    CLEANUP_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m "$LIFECYCLE_MODULE" cleanup \
+            --train-dir "$TRAIN_DIR" --cohort-dir "$COHORT_DIR" \
+            --timeout-s "${ROUND_DAGGER_IMAGE3F_RESET_TIMEOUT_S:-10}" \
+            --retries "${ROUND_DAGGER_IMAGE3F_RESET_RETRIES:-3}") || return $?
+    SEALED_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m round_dagger.actor_pair seal --cohort-dir "$COHORT_DIR") || return $?
+    QUALITY_JSON=$(publish_student_quality) || return $?
+}
+
 set +e
 if [ "$WANDB_PAIR" = 1 ]; then
     OWNER_PID=${PIDS[$WANDB_OWNER]}
@@ -350,10 +425,35 @@ if [ "$WANDB_PAIR" = 1 ]; then
         sleep 1
     done
     if [ -f "$WANDB_ACTOR_DONE" ] && [ ! -L "$WANDB_ACTOR_DONE" ]; then
+        OWNER_ACTOR_STATUS=$(tr -d '[:space:]' <"$WANDB_ACTOR_DONE")
+        if [[ "$OWNER_ACTOR_STATUS" =~ ^[0-9]+$ ]]; then
+            STATUSES[$WANDB_OWNER]=$OWNER_ACTOR_STATUS
+        else
+            echo "W&B owner actor-done marker is malformed" >&2
+            STATUSES[$WANDB_OWNER]=2
+        fi
+        # Keep the sidecar alive while exact rank completion, stream cleanup,
+        # the immutable cohort seal, and the quality projection are produced.
+        # Only then may the finish marker start its final stability-window
+        # drain, which proves the quality scalar was watcher-visible.
+        if [ "${STATUSES[0]}" -eq 0 ] && [ "${STATUSES[1]}" -eq 0 ]; then
+            record_successful_rank_lifecycle
+            if [ "$LIFECYCLE_STATUS" -eq 0 ]; then
+                if finalize_completed_cohort; then
+                    FINALIZED_BEFORE_WANDB_DRAIN=1
+                else
+                    PRE_DRAIN_FINALIZATION_STATUS=1
+                    echo "sealed quality finalization failed before W&B drain" >&2
+                fi
+            fi
+        fi
         : >"$WANDB_PAIR_FINISH"
     fi
     wait "$OWNER_PID"
-    STATUSES[$WANDB_OWNER]=$?
+    OWNER_WRAPPER_STATUS=$?
+    if [ "$OWNER_WRAPPER_STATUS" -ne 0 ]; then
+        STATUSES[$WANDB_OWNER]=$OWNER_WRAPPER_STATUS
+    fi
 else
     for rank in 0 1; do
         if [ -n "${PIDS[$rank]}" ]; then
@@ -373,34 +473,27 @@ if [ "$DRY_RUN" = 1 ]; then
     done
 fi
 
-# The rank-local primitive normally publishes this receipt immediately after
-# its exact immutable shard gate.  Repeating publication here closes the
-# custom-executor/test path and is byte-idempotent.
-LIFECYCLE_STATUS=0
-for rank in 0 1; do
-    if [ "$DRY_RUN" != 1 ] && [ -n "${PIDS[$rank]}" ] && \
-       [ "${STATUSES[$rank]}" -eq 0 ]; then
-        printf -v COMPLETION_PATH '%s/rank_%04d_stream_completion.json' "$ATTEMPT_DIR" "$rank"
-        if ! PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-            python3 -m "$LIFECYCLE_MODULE" complete-rank \
-                --output "$COMPLETION_PATH" --plan "$ATTEMPT_PLAN" \
-                --cohort-dir "$COHORT_DIR" --rank "$rank" >/dev/null; then
-            echo "actor rank $rank exited zero without valid stream ownership evidence" >&2
-            LIFECYCLE_STATUS=1
-        fi
-    fi
-done
+if [ "$FINALIZED_BEFORE_WANDB_DRAIN" != 1 ] && \
+   [ "$PRE_DRAIN_FINALIZATION_STATUS" -eq 0 ]; then
+    record_successful_rank_lifecycle
+fi
 
 if [ "${STATUSES[0]}" -ne 0 ] || [ "${STATUSES[1]}" -ne 0 ] || \
-   [ "$LIFECYCLE_STATUS" -ne 0 ]; then
-    if [ "$DRY_RUN" != 1 ] && ! PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+   [ "$LIFECYCLE_STATUS" -ne 0 ] || [ "$PRE_DRAIN_FINALIZATION_STATUS" -ne 0 ]; then
+    if [ "$DRY_RUN" != 1 ] && [ ! -e "$COHORT_DIR/seal.json" ] && \
+       ! PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m "$LIFECYCLE_MODULE" cleanup-attempt \
             --train-dir "$TRAIN_DIR" --plan "$ATTEMPT_PLAN" \
             --timeout-s "${ROUND_DAGGER_IMAGE3F_RESET_TIMEOUT_S:-10}" \
             --retries "${ROUND_DAGGER_IMAGE3F_RESET_RETRIES:-3}" >/dev/null; then
         echo "failed actor attempt also left unacknowledged stream cleanup" >&2
     fi
-    echo "actor pair failed: rank0=${STATUSES[0]} rank1=${STATUSES[1]}; cohort was not sealed" >&2
+    if [ -f "$COHORT_DIR/seal.json" ] && [ ! -L "$COHORT_DIR/seal.json" ]; then
+        SEAL_FAILURE_DETAIL="cohort sealed; downstream telemetry was not accepted"
+    else
+        SEAL_FAILURE_DETAIL="cohort was not sealed"
+    fi
+    echo "actor pair failed: rank0=${STATUSES[0]} rank1=${STATUSES[1]} lifecycle=$LIFECYCLE_STATUS quality_finalization=$PRE_DRAIN_FINALIZATION_STATUS; $SEAL_FAILURE_DETAIL" >&2
     echo "actor pair logs: ${LOGS[0]} ${LOGS[1]}" >&2
     exit 2
 fi
@@ -409,13 +502,10 @@ if [ "$DRY_RUN" = 1 ]; then
     exit 0
 fi
 
-CLEANUP_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m "$LIFECYCLE_MODULE" cleanup \
-        --train-dir "$TRAIN_DIR" --cohort-dir "$COHORT_DIR" \
-        --timeout-s "${ROUND_DAGGER_IMAGE3F_RESET_TIMEOUT_S:-10}" \
-        --retries "${ROUND_DAGGER_IMAGE3F_RESET_RETRIES:-3}")
+if [ "$FINALIZED_BEFORE_WANDB_DRAIN" != 1 ]; then
+    finalize_completed_cohort
+fi
 printf '%s\n' "$CLEANUP_JSON"
-SEALED_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m round_dagger.actor_pair seal --cohort-dir "$COHORT_DIR")
 printf '%s\n' "$SEALED_JSON"
+printf '%s\n' "$QUALITY_JSON"
 echo "ACTOR_PAIR_SEALED_STREAMS_CLEAN logs=${LOGS[0]},${LOGS[1]}"

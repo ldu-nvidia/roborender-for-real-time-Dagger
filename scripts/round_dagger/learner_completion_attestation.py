@@ -36,7 +36,7 @@ from round_dagger.learner_identity import (  # noqa: E402
     learner_wandb_run_id,
 )
 from round_dagger.policy_bundle import validate_policy_bundle_identity  # noqa: E402
-from round_dagger.replay import load_snapshot  # noqa: E402
+from round_dagger.replay import load_heldout_snapshot, load_snapshot  # noqa: E402
 from scripts.round_dagger import remote_learner_success  # noqa: E402
 
 
@@ -46,6 +46,9 @@ BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
 CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v3"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
+HELDOUT_TELEMETRY_SCHEMA = (
+    "fast_roborender.round_dagger.learner_heldout_telemetry.v1"
+)
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 ARTIFACT_NAMES = (
@@ -84,6 +87,16 @@ ATTESTATION_KEYS = {
 
 class CompletionAttestationError(RuntimeError):
     pass
+
+
+def _evaluation_steps(optimizer_steps: int, eval_interval: int) -> list[int]:
+    if type(optimizer_steps) is not int or optimizer_steps < 1:
+        raise CompletionAttestationError("optimizer steps must be positive")
+    if type(eval_interval) is not int or eval_interval < 1:
+        raise CompletionAttestationError("evaluation interval must be positive")
+    return sorted(
+        {0, *range(eval_interval, optimizer_steps + 1, eval_interval), optimizer_steps}
+    )
 
 
 def _sha(value: str, label: str) -> str:
@@ -197,6 +210,130 @@ def _telemetry_records(
     return by_step
 
 
+def _heldout_telemetry_records(
+    path: Path,
+    *,
+    campaign_id: str,
+    macro_round: int,
+    snapshot_file_sha256: str,
+    snapshot_sha256: str,
+    optimizer_steps: int,
+    eval_interval: int,
+    learned_action_indices: list[int],
+) -> dict[int, dict[str, Any]]:
+    """Validate every required held-out quality frontier, including step zero."""
+
+    if eval_interval != 100:
+        raise CompletionAttestationError(
+            "production held-out evaluation interval must be exactly 100"
+        )
+    expected_steps = set(_evaluation_steps(optimizer_steps, eval_interval))
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise CompletionAttestationError(
+            "cannot read held-out learner telemetry"
+        ) from exc
+    if not lines:
+        raise CompletionAttestationError("held-out learner telemetry is empty")
+    by_step: dict[int, dict[str, Any]] = {}
+    expected_counts: tuple[int, ...] | None = None
+    expected_per_action = {str(index) for index in learned_action_indices}
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CompletionAttestationError(
+                "held-out learner telemetry is malformed"
+            ) from exc
+        if not isinstance(row, Mapping):
+            raise CompletionAttestationError(
+                "held-out learner telemetry row is not a mapping"
+            )
+        step = row.get("optimizer_step")
+        counts = row.get("heldout_transitions_per_rank")
+        per_action = row.get("per_action")
+        if (
+            row.get("schema") != HELDOUT_TELEMETRY_SCHEMA
+            or row.get("campaign_id") != campaign_id
+            or row.get("macro_round") != macro_round
+            or type(step) is not int
+            or step not in expected_steps
+            or row.get("heldout_snapshot_file_sha256") != snapshot_file_sha256
+            or row.get("heldout_snapshot_sha256") != snapshot_sha256
+            or row.get("world_size") != 8
+            or not isinstance(counts, list)
+            or len(counts) != 8
+            or any(type(value) is not int or value < 1 for value in counts)
+            or row.get("heldout_transitions_rank") != counts[0]
+            or row.get("heldout_transitions_global") != sum(counts)
+            or row.get("learned_action_indices") != learned_action_indices
+            or not isinstance(per_action, Mapping)
+            or set(per_action) != expected_per_action
+        ):
+            raise CompletionAttestationError(
+                "held-out learner telemetry contract mismatch"
+            )
+        for metric in ("action_mse", "action_mae", "action_rmse", "action_cosine"):
+            value = row.get(metric)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise CompletionAttestationError(
+                    "held-out learner telemetry metric is non-finite"
+                )
+        if any(float(row[key]) < 0.0 for key in ("action_mse", "action_mae", "action_rmse")):
+            raise CompletionAttestationError(
+                "held-out learner telemetry error metric is negative"
+            )
+        if not -1.000001 <= float(row["action_cosine"]) <= 1.000001:
+            raise CompletionAttestationError(
+                "held-out learner telemetry cosine is out of range"
+            )
+        for metrics in per_action.values():
+            if not isinstance(metrics, Mapping) or set(metrics) != {
+                "mse", "mae", "rmse", "cosine"
+            }:
+                raise CompletionAttestationError(
+                    "held-out per-action telemetry fields mismatch"
+                )
+            for metric, value in metrics.items():
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or (metric != "cosine" and float(value) < 0.0)
+                    or (
+                        metric == "cosine"
+                        and not -1.000001 <= float(value) <= 1.000001
+                    )
+                ):
+                    raise CompletionAttestationError(
+                        "held-out per-action telemetry metric is invalid"
+                    )
+        observed_counts = tuple(counts)
+        if expected_counts is None:
+            expected_counts = observed_counts
+        elif observed_counts != expected_counts:
+            raise CompletionAttestationError(
+                "held-out replay partition changed between evaluations"
+            )
+        normalized = dict(row)
+        previous = by_step.get(step)
+        if previous is not None and previous != normalized:
+            raise CompletionAttestationError(
+                "held-out telemetry retry diverged"
+            )
+        by_step[step] = normalized
+    if set(by_step) != expected_steps:
+        raise CompletionAttestationError(
+            "held-out telemetry evaluation frontier coverage is incomplete"
+        )
+    return by_step
+
+
 def _wandb_readback(
     *,
     telemetry: dict[int, dict[str, Any]],
@@ -216,6 +353,10 @@ def _wandb_readback(
     run_id: str,
     expected_email: str,
     timeout_seconds: int,
+    heldout_telemetry: Mapping[int, Mapping[str, Any]] | None = None,
+    heldout_snapshot_file_sha256: str | None = None,
+    heldout_snapshot_sha256: str | None = None,
+    heldout_eval_interval: int | None = None,
 ) -> dict[str, Any]:
     try:
         from scripts.scaling.wandb_preflight import _load_wandb, query_identity
@@ -234,6 +375,7 @@ def _wandb_readback(
     deadline = time.monotonic() + timeout_seconds
     last_error = ""
     observed: set[int] = set()
+    heldout_observed: set[int] = set()
     state = ""
     while time.monotonic() < deadline:
         try:
@@ -265,35 +407,96 @@ def _wandb_readback(
                 raise CompletionAttestationError("W&B replay snapshot file identity mismatch")
             if config.get("replay_snapshot_sha256") != snapshot_sha256:
                 raise CompletionAttestationError("W&B replay snapshot identity mismatch")
+            if heldout_telemetry is not None:
+                if (
+                    config.get("heldout_snapshot_file_sha256")
+                    != heldout_snapshot_file_sha256
+                    or config.get("heldout_snapshot_sha256")
+                    != heldout_snapshot_sha256
+                    or config.get("heldout_eval_interval")
+                    != heldout_eval_interval
+                ):
+                    raise CompletionAttestationError(
+                        "W&B held-out evaluation identity mismatch"
+                    )
             observed = set()
+            heldout_observed = set()
             for row in run.scan_history(page_size=500):
                 if not isinstance(row, Mapping):
                     continue
                 step = row.get("optimizer_step")
                 local = telemetry.get(step) if type(step) is int else None
-                if local is None:
-                    continue
-                loss = row.get("loss")
-                if (
-                    not isinstance(loss, bool)
-                    and isinstance(loss, (int, float))
-                    and math.isfinite(float(loss))
-                    and row.get("schema") == TELEMETRY_SCHEMA
-                    and math.isclose(
-                        float(loss), float(local["loss"]), rel_tol=1e-12, abs_tol=1e-12
-                    )
-                    and row.get("campaign_id") == campaign_id
-                    and row.get("macro_round") == macro_round
-                    and row.get("world_size") == 8
-                    and row.get("replay_transitions_rank")
-                    == local["replay_transitions_rank"]
-                    and row.get("replay_transitions_per_rank")
-                    == local["replay_transitions_per_rank"]
-                    and row.get("replay_transitions_global")
-                    == local["replay_transitions_global"]
-                ):
-                    observed.add(step)
-            if state == "finished" and observed == set(telemetry):
+                if local is not None:
+                    loss = row.get("loss")
+                    if (
+                        not isinstance(loss, bool)
+                        and isinstance(loss, (int, float))
+                        and math.isfinite(float(loss))
+                        and row.get("schema") == TELEMETRY_SCHEMA
+                        and math.isclose(
+                            float(loss),
+                            float(local["loss"]),
+                            rel_tol=1e-12,
+                            abs_tol=1e-12,
+                        )
+                        and row.get("campaign_id") == campaign_id
+                        and row.get("macro_round") == macro_round
+                        and row.get("world_size") == 8
+                        and row.get("replay_transitions_rank")
+                        == local["replay_transitions_rank"]
+                        and row.get("replay_transitions_per_rank")
+                        == local["replay_transitions_per_rank"]
+                        and row.get("replay_transitions_global")
+                        == local["replay_transitions_global"]
+                    ):
+                        observed.add(step)
+                quality_step = row.get("optimizer_step")
+                if type(quality_step) is not int:
+                    quality_step = row.get("_step")
+                heldout_local = (
+                    heldout_telemetry.get(quality_step)
+                    if heldout_telemetry is not None
+                    and type(quality_step) is int
+                    else None
+                )
+                if heldout_local is not None:
+                    expected_quality = {
+                        "quality/heldout_action_mse": heldout_local["action_mse"],
+                        "quality/heldout_action_mae": heldout_local["action_mae"],
+                        "quality/heldout_action_rmse": heldout_local["action_rmse"],
+                        "quality/heldout_action_cosine": heldout_local[
+                            "action_cosine"
+                        ],
+                        "quality/heldout_transitions": heldout_local[
+                            "heldout_transitions_global"
+                        ],
+                    }
+                    for action_index, metrics in heldout_local["per_action"].items():
+                        for metric in ("mse", "mae", "rmse", "cosine"):
+                            expected_quality[
+                                f"quality/action_{action_index}/{metric}"
+                            ] = metrics[metric]
+                    if all(
+                        not isinstance(row.get(key), bool)
+                        and isinstance(row.get(key), (int, float))
+                        and math.isclose(
+                            float(row[key]),
+                            float(value),
+                            rel_tol=1e-12,
+                            abs_tol=1e-12,
+                        )
+                        for key, value in expected_quality.items()
+                    ):
+                        heldout_observed.add(quality_step)
+            heldout_complete = (
+                heldout_telemetry is None
+                or heldout_observed == set(heldout_telemetry)
+            )
+            if (
+                state == "finished"
+                and observed == set(telemetry)
+                and heldout_complete
+            ):
                 break
             last_error = "remote history incomplete"
         except CompletionAttestationError:
@@ -301,11 +504,18 @@ def _wandb_readback(
         except Exception as exc:
             last_error = type(exc).__name__
         time.sleep(5)
-    if state != "finished" or observed != set(telemetry):
+    if (
+        state != "finished"
+        or observed != set(telemetry)
+        or (
+            heldout_telemetry is not None
+            and heldout_observed != set(heldout_telemetry)
+        )
+    ):
         raise CompletionAttestationError(
             f"W&B completion readback failed ({last_error or 'timeout'})"
         )
-    return {
+    result = {
         "schema": READBACK_SCHEMA,
         "status": "PASS",
         "account_email": identity.email,
@@ -332,6 +542,14 @@ def _wandb_readback(
         "first_optimizer_step": min(observed),
         "last_optimizer_step": max(observed),
     }
+    if heldout_telemetry is not None:
+        result["heldout_evaluation"] = {
+            "snapshot_file_sha256": heldout_snapshot_file_sha256,
+            "snapshot_sha256": heldout_snapshot_sha256,
+            "eval_interval": heldout_eval_interval,
+            "verified_steps": sorted(heldout_observed),
+        }
+    return result
 
 
 def _validate_readback(
@@ -351,6 +569,11 @@ def _validate_readback(
     entity: str,
     project: str,
     run_id: str,
+    optimizer_steps: int = 500,
+    heldout_snapshot_file_sha256: str | None = None,
+    heldout_snapshot_sha256: str | None = None,
+    heldout_eval_interval: int | None = None,
+    heldout_verified_steps: list[int] | None = None,
 ) -> None:
     expected = {
         "schema": READBACK_SCHEMA,
@@ -375,10 +598,27 @@ def _validate_readback(
         "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_file_sha256": snapshot_file_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
-        "verified_optimizer_steps": 1200,
+        "verified_optimizer_steps": optimizer_steps,
         "first_optimizer_step": 1,
-        "last_optimizer_step": 1200,
+        "last_optimizer_step": optimizer_steps,
     }
+    heldout_values = (
+        heldout_snapshot_file_sha256,
+        heldout_snapshot_sha256,
+        heldout_eval_interval,
+        heldout_verified_steps,
+    )
+    if any(value is not None for value in heldout_values):
+        if any(value is None for value in heldout_values):
+            raise CompletionAttestationError(
+                "held-out W&B readback identity is incomplete"
+            )
+        expected["heldout_evaluation"] = {
+            "snapshot_file_sha256": heldout_snapshot_file_sha256,
+            "snapshot_sha256": heldout_snapshot_sha256,
+            "eval_interval": heldout_eval_interval,
+            "verified_steps": heldout_verified_steps,
+        }
     if dict(document) != expected:
         raise CompletionAttestationError("W&B completion readback mismatch")
 
@@ -416,6 +656,11 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         raise CompletionAttestationError("replay snapshot lineage mismatch")
     bundle_path = _output_file(output, args.bundle, "learner bundle")
     bundle = LearnerBundleConfig.load(bundle_path)
+    optimizer_steps = bundle.max_steps
+    if optimizer_steps not in {500, 1200}:
+        raise CompletionAttestationError(
+            "production learner optimizer steps must be 1200 or legacy 500"
+        )
     if bundle.sha256 != config_sha or sha256_file(bundle_path) != config_sha:
         raise CompletionAttestationError("learner bundle digest mismatch")
     if (
@@ -425,7 +670,6 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         or bundle.model_lineage_sha256 != parent_sha
         or bundle.initial_checkpoint_sha256 != parent_sha
         or bundle.batch_size != 8
-        or bundle.max_steps != 1200
         or bundle.save_every != 5
         or bundle.learning_rate != 2.5e-5
         or bundle.weight_decay != 0.01
@@ -433,6 +677,51 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         or bundle.partition_seed != 23
     ):
         raise CompletionAttestationError("production learner bundle contract mismatch")
+    heldout_arguments = (
+        args.heldout_snapshot,
+        args.heldout_snapshot_file_sha256,
+        args.heldout_snapshot_sha256,
+        args.heldout_eval_interval,
+    )
+    if any(value is not None for value in heldout_arguments) and any(
+        value is None for value in heldout_arguments
+    ):
+        raise CompletionAttestationError(
+            "held-out completion identity must be supplied all-or-none"
+        )
+    heldout_enabled = all(value is not None for value in heldout_arguments)
+    if bundle.heldout_evaluation_enabled != heldout_enabled:
+        raise CompletionAttestationError(
+            "learner bundle held-out mode differs from completion inputs"
+        )
+    heldout_snapshot = None
+    if heldout_enabled:
+        if args.heldout_eval_interval != 100:
+            raise CompletionAttestationError(
+                "production held-out evaluation interval must be exactly 100"
+            )
+        heldout_file_sha = _sha(
+            args.heldout_snapshot_file_sha256,
+            "held-out snapshot file SHA-256",
+        )
+        heldout_semantic_sha = _sha(
+            args.heldout_snapshot_sha256,
+            "held-out snapshot semantic SHA-256",
+        )
+        heldout_snapshot = load_heldout_snapshot(
+            _regular(Path(args.heldout_snapshot), "held-out replay snapshot"),
+            expected_file_sha256=heldout_file_sha,
+        )
+        if (
+            heldout_snapshot["snapshot_sha256"] != heldout_semantic_sha
+            or heldout_snapshot["campaign_id"] != campaign_id
+            or bundle.heldout_snapshot_file_sha256 != heldout_file_sha
+            or bundle.heldout_snapshot_sha256 != heldout_semantic_sha
+            or bundle.heldout_eval_interval != 100
+        ):
+            raise CompletionAttestationError(
+                "held-out replay snapshot/bundle identity mismatch"
+            )
     parent_runtime_sha = _sha(
         bundle.to_mapping()["model_config"]["runtime_policy_sha256"],
         "parent runtime policy SHA-256",
@@ -473,7 +762,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "replay_snapshot_sha256": snapshot_sha,
         "code_sha256": code_sha,
         "learner_config_sha256": config_sha,
-        "optimizer_steps": 1200,
+        "optimizer_steps": optimizer_steps,
     }
     if any(result.get(key) != value for key, value in expected_result.items()):
         raise CompletionAttestationError("learner result lineage mismatch")
@@ -518,7 +807,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "learner_contract_sha256": contract_sha,
         "replay_snapshot_sha256": snapshot_sha,
         "replay_snapshot_file_sha256": snapshot_file_sha,
-        "completed_steps": 1200,
+        "completed_steps": optimizer_steps,
         "world_size": 8,
         "homie_controller_sha256": policy_evidence[
             "homie_controller_sha256"
@@ -541,9 +830,25 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         telemetry_path,
         campaign_id=campaign_id,
         macro_round=args.macro_round,
-        optimizer_steps=1200,
+        optimizer_steps=optimizer_steps,
         replay_transitions_global=int(snapshot["transition_count"]),
     )
+    heldout_telemetry = None
+    heldout_telemetry_path = None
+    if heldout_snapshot is not None:
+        heldout_telemetry_path = _output_file(
+            output, args.heldout_telemetry, "held-out learner telemetry"
+        )
+        heldout_telemetry = _heldout_telemetry_records(
+            heldout_telemetry_path,
+            campaign_id=campaign_id,
+            macro_round=args.macro_round,
+            snapshot_file_sha256=heldout_snapshot["file_sha256"],
+            snapshot_sha256=heldout_snapshot["snapshot_sha256"],
+            optimizer_steps=optimizer_steps,
+            eval_interval=100,
+            learned_action_indices=list(range(*bundle.train_action_slice)),
+        )
     readback_document = _wandb_readback(
         telemetry=telemetry,
         campaign_id=campaign_id,
@@ -560,8 +865,19 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         entity=args.wandb_entity,
         project=args.wandb_project,
         run_id=args.wandb_run_id,
+        optimizer_steps=optimizer_steps,
         expected_email=args.wandb_expected_email,
         timeout_seconds=args.wandb_timeout_seconds,
+        heldout_telemetry=heldout_telemetry,
+        heldout_snapshot_file_sha256=(
+            None if heldout_snapshot is None else heldout_snapshot["file_sha256"]
+        ),
+        heldout_snapshot_sha256=(
+            None
+            if heldout_snapshot is None
+            else heldout_snapshot["snapshot_sha256"]
+        ),
+        heldout_eval_interval=(None if heldout_snapshot is None else 100),
     )
     readback_path = Path(os.path.abspath(Path(args.wandb_readback).expanduser()))
     if readback_path.parent != output or readback_path.is_symlink():
@@ -583,6 +899,18 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         entity=args.wandb_entity,
         project=args.wandb_project,
         run_id=args.wandb_run_id,
+        heldout_snapshot_file_sha256=(
+            None if heldout_snapshot is None else heldout_snapshot["file_sha256"]
+        ),
+        heldout_snapshot_sha256=(
+            None
+            if heldout_snapshot is None
+            else heldout_snapshot["snapshot_sha256"]
+        ),
+        heldout_eval_interval=(None if heldout_snapshot is None else 100),
+        heldout_verified_steps=(
+            None if heldout_telemetry is None else sorted(heldout_telemetry)
+        ),
     )
     artifacts = {
         "bundle": _artifact(bundle_path),
@@ -594,6 +922,8 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "telemetry": _artifact(telemetry_path),
         "wandb_readback": _artifact(readback_path),
     }
+    if heldout_telemetry_path is not None:
+        artifacts["heldout_telemetry"] = _artifact(heldout_telemetry_path)
     document = {
         "schema": SCHEMA,
         "status": "PASS",
@@ -611,7 +941,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "replay_snapshot_sha256": snapshot_sha,
         "world_size": 8,
         "batch_size_per_rank": 8,
-        "optimizer_steps": 1200,
+        "optimizer_steps": optimizer_steps,
         "save_every": 5,
         "artifacts": artifacts,
         "wandb": {
@@ -619,9 +949,20 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
             "project": args.wandb_project,
             "run_id": args.wandb_run_id,
             "run_state": "finished",
-            "verified_optimizer_steps": 1200,
+            "verified_optimizer_steps": optimizer_steps,
         },
     }
+    if heldout_snapshot is not None and heldout_telemetry is not None:
+        document["heldout_evaluation"] = {
+            "snapshot_file_sha256": heldout_snapshot["file_sha256"],
+            "snapshot_sha256": heldout_snapshot["snapshot_sha256"],
+            "eval_interval": 100,
+            "verified_steps": sorted(heldout_telemetry),
+            "transition_count": heldout_snapshot["transition_count"],
+        }
+        document["wandb"]["verified_heldout_steps"] = sorted(
+            heldout_telemetry
+        )
     attestation_path = Path(os.path.abspath(Path(args.attestation).expanduser()))
     if attestation_path.parent != output or attestation_path.is_symlink():
         raise CompletionAttestationError("completion attestation path is non-canonical")
@@ -652,8 +993,22 @@ def verify_attestation(
         raise CompletionAttestationError("completion attestation must be read-only")
     output = path.parent
     document = load_strict_json(path)
-    if not isinstance(document, Mapping) or set(document) != ATTESTATION_KEYS:
+    heldout_declared = isinstance(document, Mapping) and (
+        "heldout_evaluation" in document
+    )
+    expected_attestation_keys = set(ATTESTATION_KEYS)
+    if heldout_declared:
+        expected_attestation_keys.add("heldout_evaluation")
+    if (
+        not isinstance(document, Mapping)
+        or set(document) != expected_attestation_keys
+    ):
         raise CompletionAttestationError("completion attestation fields mismatch")
+    optimizer_steps = document.get("optimizer_steps")
+    if type(optimizer_steps) is not int or optimizer_steps < 1:
+        raise CompletionAttestationError(
+            "completion optimizer steps must be positive"
+        )
     expected = {
         "schema": SCHEMA,
         "status": "PASS",
@@ -677,7 +1032,7 @@ def verify_attestation(
         "replay_snapshot_sha256": _sha(snapshot_sha256, "snapshot SHA-256"),
         "world_size": 8,
         "batch_size_per_rank": 8,
-        "optimizer_steps": 1200,
+        "optimizer_steps": optimizer_steps,
         "save_every": 5,
     }
     if any(document.get(key) != value for key, value in expected.items()):
@@ -688,10 +1043,16 @@ def verify_attestation(
         "parent runtime policy SHA-256",
     )
     artifacts = document.get("artifacts")
-    if not isinstance(artifacts, Mapping) or set(artifacts) != set(ARTIFACT_NAMES):
+    expected_artifact_names = set(ARTIFACT_NAMES)
+    if heldout_declared:
+        expected_artifact_names.add("heldout_telemetry")
+    if (
+        not isinstance(artifacts, Mapping)
+        or set(artifacts) != expected_artifact_names
+    ):
         raise CompletionAttestationError("completion artifact inventory mismatch")
     resolved: dict[str, Path] = {}
-    for name in ARTIFACT_NAMES:
+    for name in sorted(expected_artifact_names):
         item = artifacts[name]
         if not isinstance(item, Mapping) or set(item) != {"path", "sha256"}:
             raise CompletionAttestationError("completion artifact entry mismatch")
@@ -713,7 +1074,7 @@ def verify_attestation(
         "learner_config_sha256": config_sha256,
         "model_lineage_sha256": parent_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
-        "optimizer_steps": 1200,
+        "optimizer_steps": optimizer_steps,
         "checkpoint_path": resolved["candidate"].name,
         "checkpoint_sha256": sha256_file(resolved["candidate"]),
         "runtime_policy_sha256": document["runtime_policy_sha256"],
@@ -742,7 +1103,7 @@ def verify_attestation(
         or bundle.get("model_lineage_sha256") != parent_sha256
         or bundle.get("initial_checkpoint_sha256") != parent_sha256
         or (bundle.get("batch_size"), bundle.get("max_steps"), bundle.get("save_every"))
-        != (8, 1200, 5)
+        != (8, optimizer_steps, 5)
         or bundle.get("learning_rate") != 2.5e-5
         or bundle.get("weight_decay") != 0.01
         or bundle.get("seed") != 17
@@ -758,6 +1119,80 @@ def verify_attestation(
     )
     if bundle_parent_runtime_sha256 != parent_runtime_sha256:
         raise CompletionAttestationError("attested parent runtime identity mismatch")
+    heldout_bundle_values = (
+        bundle.get("heldout_snapshot_file_sha256"),
+        bundle.get("heldout_snapshot_sha256"),
+        bundle.get("heldout_eval_interval"),
+    )
+    heldout_bundle_enabled = all(value is not None for value in heldout_bundle_values)
+    if any(value is not None for value in heldout_bundle_values) and not (
+        heldout_bundle_enabled
+    ):
+        raise CompletionAttestationError(
+            "attested learner bundle held-out identity is incomplete"
+        )
+    if heldout_bundle_enabled != heldout_declared:
+        raise CompletionAttestationError(
+            "held-out attestation mode differs from learner bundle"
+        )
+    heldout_records = None
+    heldout_summary = None
+    if heldout_declared:
+        heldout_summary = document.get("heldout_evaluation")
+        if not isinstance(heldout_summary, Mapping) or set(heldout_summary) != {
+            "snapshot_file_sha256",
+            "snapshot_sha256",
+            "eval_interval",
+            "verified_steps",
+            "transition_count",
+        }:
+            raise CompletionAttestationError(
+                "held-out completion summary fields mismatch"
+            )
+        expected_heldout_steps = _evaluation_steps(optimizer_steps, 100)
+        if (
+            heldout_summary.get("snapshot_file_sha256")
+            != bundle["heldout_snapshot_file_sha256"]
+            or heldout_summary.get("snapshot_sha256")
+            != bundle["heldout_snapshot_sha256"]
+            or heldout_summary.get("eval_interval") != 100
+            or bundle["heldout_eval_interval"] != 100
+            or heldout_summary.get("verified_steps") != expected_heldout_steps
+            or type(heldout_summary.get("transition_count")) is not int
+            or heldout_summary["transition_count"] < 1
+        ):
+            raise CompletionAttestationError(
+                "held-out completion summary mismatch"
+            )
+        train_action_slice = bundle.get("train_action_slice")
+        if (
+            not isinstance(train_action_slice, list)
+            or len(train_action_slice) != 2
+            or any(type(value) is not int for value in train_action_slice)
+        ):
+            raise CompletionAttestationError(
+                "attested learner action slice is malformed"
+            )
+        heldout_records = _heldout_telemetry_records(
+            resolved["heldout_telemetry"],
+            campaign_id=campaign_id,
+            macro_round=macro_round,
+            snapshot_file_sha256=bundle["heldout_snapshot_file_sha256"],
+            snapshot_sha256=bundle["heldout_snapshot_sha256"],
+            optimizer_steps=optimizer_steps,
+            eval_interval=100,
+            learned_action_indices=list(range(*train_action_slice)),
+        )
+        if (
+            sorted(heldout_records) != expected_heldout_steps
+            or next(iter(heldout_records.values()))[
+                "heldout_transitions_global"
+            ]
+            != heldout_summary["transition_count"]
+        ):
+            raise CompletionAttestationError(
+                "held-out telemetry differs from completion summary"
+            )
     provided_identity_sha256 = learner_identity_sha256
     computed_identity_sha256 = compute_learner_identity_sha256(
         campaign_id=campaign_id,
@@ -790,7 +1225,7 @@ def verify_attestation(
         "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_sha256": snapshot_sha256,
         "replay_snapshot_file_sha256": snapshot_file_sha256,
-        "completed_steps": 1200,
+        "completed_steps": optimizer_steps,
         "world_size": 8,
         "homie_controller_sha256": policy_evidence[
             "homie_controller_sha256"
@@ -802,14 +1237,17 @@ def verify_attestation(
     ):
         raise CompletionAttestationError("attested restart semantic identity mismatch")
     wandb = document.get("wandb")
-    if not isinstance(wandb, Mapping) or set(wandb) != {
+    expected_wandb_keys = {
         "entity", "project", "run_id", "run_state", "verified_optimizer_steps"
-    }:
+    }
+    if heldout_declared:
+        expected_wandb_keys.add("verified_heldout_steps")
+    if not isinstance(wandb, Mapping) or set(wandb) != expected_wandb_keys:
         raise CompletionAttestationError("W&B completion summary fields mismatch")
     if (
         wandb.get("entity") != "nvidia"
         or wandb.get("run_state") != "finished"
-        or wandb.get("verified_optimizer_steps") != 1200
+        or wandb.get("verified_optimizer_steps") != optimizer_steps
         or TOKEN_RE.fullmatch(str(wandb.get("project", ""))) is None
         or TOKEN_RE.fullmatch(str(wandb.get("run_id", ""))) is None
         or wandb.get("run_id")
@@ -817,6 +1255,11 @@ def verify_attestation(
             campaign_id=campaign_id,
             macro_round=macro_round,
             learner_identity_sha256=provided_identity_sha256,
+        )
+        or (
+            heldout_declared
+            and wandb.get("verified_heldout_steps")
+            != _evaluation_steps(optimizer_steps, 100)
         )
     ):
         raise CompletionAttestationError("W&B completion summary mismatch")
@@ -836,6 +1279,25 @@ def verify_attestation(
         entity=str(wandb["entity"]),
         project=str(wandb["project"]),
         run_id=str(wandb["run_id"]),
+        optimizer_steps=optimizer_steps,
+        heldout_snapshot_file_sha256=(
+            None
+            if heldout_summary is None
+            else str(heldout_summary["snapshot_file_sha256"])
+        ),
+        heldout_snapshot_sha256=(
+            None
+            if heldout_summary is None
+            else str(heldout_summary["snapshot_sha256"])
+        ),
+        heldout_eval_interval=(
+            None if heldout_summary is None else int(heldout_summary["eval_interval"])
+        ),
+        heldout_verified_steps=(
+            None
+            if heldout_summary is None
+            else list(heldout_summary["verified_steps"])
+        ),
     )
     return dict(document)
 
@@ -866,6 +1328,13 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--telemetry", default="telemetry.jsonl")
     publish.add_argument("--parent-checkpoint", required=True, type=Path)
     publish.add_argument("--snapshot", required=True, type=Path)
+    publish.add_argument("--heldout-snapshot", type=Path)
+    publish.add_argument("--heldout-snapshot-file-sha256")
+    publish.add_argument("--heldout-snapshot-sha256")
+    publish.add_argument("--heldout-eval-interval", type=int)
+    publish.add_argument(
+        "--heldout-telemetry", default="heldout_telemetry.jsonl"
+    )
     publish.add_argument("--wandb-readback", required=True, type=Path)
     publish.add_argument("--wandb-entity", required=True)
     publish.add_argument("--wandb-project", required=True)

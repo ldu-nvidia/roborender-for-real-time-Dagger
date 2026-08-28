@@ -53,6 +53,28 @@ required=(
 for name in "${required[@]}"; do
     [[ -n ${!name:-} ]] || fatal "missing required environment: $name"
 done
+heldout_names=(
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256
+    ROUND_DAGGER_HELDOUT_EVAL_INTERVAL
+)
+heldout_present=0
+for name in "${heldout_names[@]}"; do
+    [[ -z ${!name:-} ]] || heldout_present=$((heldout_present + 1))
+done
+((heldout_present == 0 || heldout_present == ${#heldout_names[@]})) || \
+    fatal "held-out replay environment must be supplied all-or-none"
+HELDOUT_ENABLED=0
+if ((heldout_present)); then
+    HELDOUT_ENABLED=1
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "held-out replay snapshot file SHA-256 is malformed"
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "held-out replay snapshot semantic SHA-256 is malformed"
+    [[ $ROUND_DAGGER_HELDOUT_EVAL_INTERVAL == 100 ]] || \
+        fatal "production held-out evaluation interval must be exactly 100"
+fi
 [[ $ROUND_DAGGER_WANDB_EXPECTED_EMAIL == ldu@nvidia.com && \
    $ROUND_DAGGER_WANDB_ENTITY == nvidia && \
    $ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE == team ]] || \
@@ -170,6 +192,20 @@ for index in "${!policy_local_paths[@]}"; do
     [[ $(sha256sum "$path" | awk '{print $1}') == "${policy_digests[$index]}" ]] || \
         fatal "active policy bundle digest mismatch"
 done
+if ((HELDOUT_ENABLED)); then
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT == \
+       "$ROUND_DAGGER_LOCAL_CAMPAIGN_ROOT"/* ]] || \
+        fatal "held-out replay snapshot is outside the campaign mount"
+    heldout_relative=${ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT#"$ROUND_DAGGER_LOCAL_CAMPAIGN_ROOT"/}
+    [[ -n $heldout_relative && $heldout_relative != ../* && \
+       $heldout_relative != */../* ]] || fatal "unsafe held-out replay relative path"
+    heldout_remote="$ROUND_DAGGER_REMOTE_CAMPAIGN_ROOT/$heldout_relative"
+    [[ -f $heldout_remote && ! -L $heldout_remote ]] || \
+        fatal "held-out replay snapshot is missing from remote campaign projection"
+    [[ $(sha256sum "$heldout_remote" | awk '{print $1}') == \
+       "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256" ]] || \
+        fatal "held-out replay snapshot digest mismatch"
+fi
 
 # Production source is immutable, non-symlinked, and contains no executable
 # bytecode.  This is deliberately rechecked inside the allocation.

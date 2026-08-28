@@ -27,6 +27,28 @@ required=(
 for name in "${required[@]}"; do
     [[ -n ${!name:-} ]] || fatal "missing required environment: $name"
 done
+heldout_names=(
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256
+    ROUND_DAGGER_HELDOUT_EVAL_INTERVAL
+)
+heldout_present=0
+for name in "${heldout_names[@]}"; do
+    [[ -z ${!name:-} ]] || heldout_present=$((heldout_present + 1))
+done
+((heldout_present == 0 || heldout_present == ${#heldout_names[@]})) || \
+    fatal "held-out replay environment must be supplied all-or-none"
+HELDOUT_ENABLED=0
+if ((heldout_present)); then
+    HELDOUT_ENABLED=1
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "held-out replay snapshot file SHA-256 is malformed"
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "held-out replay snapshot semantic SHA-256 is malformed"
+    [[ $ROUND_DAGGER_HELDOUT_EVAL_INTERVAL == 100 ]] || \
+        fatal "production held-out evaluation interval must be exactly 100"
+fi
 for name in ROUND_DAGGER_POLICY_SHA256 ROUND_DAGGER_RUNTIME_POLICY_SHA256 \
             ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256 \
             ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256 ROUND_DAGGER_LEARNER_CODE_SHA256 \
@@ -59,6 +81,15 @@ for path in \
     "$ROUND_DAGGER_BASE_POLICY_SPEC"; do
     [[ -f $path && ! -L $path ]] || fatal "unsafe or missing input file: $path"
 done
+if ((HELDOUT_ENABLED)); then
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT == /* && \
+       -f $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT && \
+       ! -L $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT ]] || \
+        fatal "held-out replay snapshot is missing or unsafe"
+    [[ $(sha256sum "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT" | awk '{print $1}') == \
+       "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256" ]] || \
+        fatal "held-out replay snapshot file SHA-256 mismatch"
+fi
 [[ -d $ROUND_DAGGER_CAMPAIGN_ROOT && ! -L $ROUND_DAGGER_CAMPAIGN_ROOT ]] || \
     fatal "campaign root is missing or unsafe"
 [[ ! -L $ROUND_DAGGER_LEARNER_OUTPUT_DIR ]] || fatal "learner output is a symlink"
@@ -161,6 +192,12 @@ PREPARE=(
     --output "$BUNDLE"
     --expected-bundle-sha256 "$ROUND_DAGGER_LEARNER_CONFIG_SHA256"
 )
+if ((HELDOUT_ENABLED)); then
+    PREPARE+=(
+        --heldout-snapshot "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT"
+        --heldout-eval-interval "$ROUND_DAGGER_HELDOUT_EVAL_INTERVAL"
+    )
+fi
 if [[ $DRY_RUN == 1 ]]; then
     "${PREPARE[@]}" --dry-run >/dev/null
 else
@@ -178,6 +215,7 @@ round_padded = sys.argv[2]
 targets = (
     "restart.pt",
     "telemetry.jsonl",
+    "heldout_telemetry.jsonl",
     f"learner_bundle_round_{round_padded}.json",
     f"candidate_round_{round_padded}.pt",
     f"candidate_round_{round_padded}.pt.policy_spec.json",
@@ -215,7 +253,11 @@ RESUME_PATH=$("$H100_PYTHON" - \
     "$ROUND_DAGGER_BASE_POLICY_SPEC" \
     "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256" \
     "$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
-    "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" <<'PY'
+    "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" \
+    "${ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT:-}" \
+    "${ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256:-}" \
+    "${ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256:-}" \
+    "${ROUND_DAGGER_HELDOUT_EVAL_INTERVAL:-}" <<'PY'
 import math
 import sys
 from collections.abc import Mapping, Sequence
@@ -228,7 +270,7 @@ from round_dagger.learner import (
     partition_shards,
 )
 from round_dagger.gr00t_policy import load_policy_spec
-from round_dagger.replay import load_snapshot
+from round_dagger.replay import load_heldout_snapshot, load_snapshot
 
 (
     bundle_path, dry_run, expected_bundle_sha, snapshot_path,
@@ -236,6 +278,7 @@ from round_dagger.replay import load_snapshot
     world_size, max_steps, restart_path, parent_policy_sha,
     runtime_policy_sha, partition_seed, base_policy_spec_path,
     learner_identity_sha, runtime_container_sha, learner_contract_sha,
+    heldout_path, heldout_file_sha, heldout_semantic_sha, heldout_interval,
 ) = sys.argv[1:]
 dry_run = dry_run == "1"
 macro_round = int(macro_round)
@@ -330,6 +373,67 @@ for cohort in current_cohorts:
     if any(manifest.get(key) != value for key, value in expected_current.items()):
         raise SystemExit("current-round replay provenance does not match active policy")
 
+heldout_values = (heldout_path, heldout_file_sha, heldout_semantic_sha, heldout_interval)
+if any(heldout_values) and not all(heldout_values):
+    raise SystemExit("held-out replay identity is incomplete")
+heldout_enabled = all(heldout_values)
+if bundle is not None and bundle.heldout_evaluation_enabled != heldout_enabled:
+    raise SystemExit("learner bundle held-out mode differs from launch environment")
+if heldout_enabled:
+    if heldout_interval != "100":
+        raise SystemExit("production held-out evaluation interval must be exactly 100")
+    heldout = load_heldout_snapshot(
+        heldout_path, expected_file_sha256=heldout_file_sha
+    )
+    if heldout["snapshot_sha256"] != heldout_semantic_sha:
+        raise SystemExit("held-out replay snapshot semantic digest mismatch")
+    if heldout["campaign_id"] != campaign_id:
+        raise SystemExit("held-out replay snapshot campaign mismatch")
+    if heldout["view_contract"] != snapshot["view_contract"]:
+        raise SystemExit("held-out replay view contract mismatch")
+    if heldout["action_contract"] != snapshot["action_contract"]:
+        raise SystemExit("held-out replay action contract mismatch")
+    if bundle is not None and (
+        bundle.heldout_snapshot_file_sha256 != heldout_file_sha
+        or bundle.heldout_snapshot_sha256 != heldout_semantic_sha
+        or bundle.heldout_eval_interval != 100
+    ):
+        raise SystemExit("learner bundle held-out identity mismatch")
+    if len(heldout["resolved_shards"]) < world_size:
+        raise SystemExit("fewer held-out replay shards than learner ranks")
+    heldout_assignments = [
+        partition_shards(
+            heldout["resolved_shards"],
+            rank=rank,
+            world_size=world_size,
+            seed=partition_seed,
+        )
+        for rank in range(world_size)
+    ]
+    if any(not assigned for assigned in heldout_assignments):
+        raise SystemExit("held-out replay partition leaves a learner rank empty")
+    training_manifest_shas = {
+        item["manifest_sha256"] for item in snapshot["resolved_shards"]
+    }
+    heldout_manifest_shas = {
+        item["manifest_sha256"] for item in heldout["resolved_shards"]
+    }
+    training_payload_shas = {
+        item["payload_sha256"] for item in snapshot["resolved_shards"]
+    }
+    heldout_payload_shas = {
+        item["payload_sha256"] for item in heldout["resolved_shards"]
+    }
+    if training_manifest_shas & heldout_manifest_shas:
+        raise SystemExit("training and held-out replay reuse a shard manifest")
+    if training_payload_shas & heldout_payload_shas:
+        raise SystemExit("training and held-out replay reuse a payload")
+    print(
+        "H100_HELDOUT_PARTITION "
+        f"transitions={heldout['transition_count']} cadence=100",
+        file=sys.stderr,
+    )
+
 restart = Path(restart_path)
 if not restart.exists() and not restart.is_symlink():
     print("")
@@ -404,6 +508,14 @@ COMMAND=(
     --device cuda
     --telemetry-jsonl "$ROUND_DAGGER_LEARNER_OUTPUT_DIR/telemetry.jsonl"
 )
+if ((HELDOUT_ENABLED)); then
+    COMMAND+=(
+        --heldout-snapshot "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT"
+        --heldout-eval-interval "$ROUND_DAGGER_HELDOUT_EVAL_INTERVAL"
+        --heldout-telemetry-jsonl \
+            "$ROUND_DAGGER_LEARNER_OUTPUT_DIR/heldout_telemetry.jsonl"
+    )
+fi
 [[ -z $RESUME_PATH ]] || COMMAND+=(--resume-from "$RESUME_PATH")
 
 WANDB_PROJECT=${ROUND_DAGGER_WANDB_PROJECT:-}
@@ -427,7 +539,7 @@ if [[ $DRY_RUN == 1 ]]; then
     printf 'DRY_RUN'
     printf ' %q' "${COMMAND[@]}"
     printf '\n'
-    echo "H100_LEARNER_DRY_RUN_OK bundle_sha256=$ROUND_DAGGER_LEARNER_CONFIG_SHA256 world_size=$WORLD_SIZE resume=${RESUME_PATH:-none} cuda_determinism=$CUBLAS_WORKSPACE_CONFIG"
+    echo "H100_LEARNER_DRY_RUN_OK bundle_sha256=$ROUND_DAGGER_LEARNER_CONFIG_SHA256 world_size=$WORLD_SIZE resume=${RESUME_PATH:-none} cuda_determinism=$CUBLAS_WORKSPACE_CONFIG heldout_eval=$HELDOUT_ENABLED cadence=${ROUND_DAGGER_HELDOUT_EVAL_INTERVAL:-disabled}"
     exit 0
 fi
 
@@ -552,12 +664,25 @@ fi
 [[ ! -L $WANDB_READBACK ]] || fatal "learner W&B readback is a symlink"
 [[ ! -e $WANDB_READBACK || -f $WANDB_READBACK ]] || \
     fatal "learner W&B readback is unsafe"
+HELDOUT_ATTESTATION_ARGS=()
+if ((HELDOUT_ENABLED)); then
+    HELDOUT_ATTESTATION_ARGS+=(
+        --heldout-snapshot "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT"
+        --heldout-snapshot-file-sha256 \
+            "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256"
+        --heldout-snapshot-sha256 \
+            "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256"
+        --heldout-eval-interval "$ROUND_DAGGER_HELDOUT_EVAL_INTERVAL"
+        --heldout-telemetry heldout_telemetry.jsonl
+    )
+fi
 "$H100_PYTHON" "$ROOT/scripts/round_dagger/learner_completion_attestation.py" publish \
     --attestation "$COMPLETION_ATTESTATION" \
     --result "$ROUND_DAGGER_LEARNER_RESULT" \
     --output-dir "$ROUND_DAGGER_LEARNER_OUTPUT_DIR" \
     --bundle "$(basename "$BUNDLE")" --restart restart.pt \
     --telemetry telemetry.jsonl \
+    "${HELDOUT_ATTESTATION_ARGS[@]}" \
     --parent-checkpoint "$ROUND_DAGGER_POLICY_CHECKPOINT" \
     --parent-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
     --snapshot "$ROUND_DAGGER_REPLAY_SNAPSHOT" \

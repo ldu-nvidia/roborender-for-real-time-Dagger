@@ -29,6 +29,9 @@ from round_dagger.seed_policy import ActorSeedError, validate_actor_seed_contrac
 
 LEDGER_SCHEMA = "fast_roborender.round_dagger.replay_ledger.v1"
 SNAPSHOT_SCHEMA = "fast_roborender.round_dagger.replay_snapshot.v1"
+HELDOUT_SNAPSHOT_SCHEMA = (
+    "fast_roborender.round_dagger.heldout_replay_snapshot.v1"
+)
 COHORT_SCHEMA = "fast_roborender.round_dagger.cohort.v1"
 PRODUCTION_COHORT_SCHEMA = "fast_roborender.round_dagger.cohort.v2"
 SUPPORTED_COHORT_SCHEMAS = frozenset(
@@ -758,6 +761,258 @@ class ReplayLedger:
         result["path"] = str(output_path)
         result["file_sha256"] = file_sha256
         return result
+
+
+def build_heldout_snapshot(
+    cohort_paths: Iterable[str | os.PathLike[str]],
+    *,
+    output: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Publish an immutable snapshot of explicitly selected eval cohorts.
+
+    Unlike cumulative training replay, held-out replay is an explicit frozen
+    selection.  Every input must be a sealed ``purpose=eval`` cohort.  The
+    snapshot binds the cohort manifests by digest; those manifests in turn
+    bind every shard manifest and NPZ payload.
+    """
+
+    records = [_cohort_record(Path(path)) for path in cohort_paths]
+    if not records:
+        raise ReplayError("held-out snapshot requires at least one eval cohort")
+    if any(record["purpose"] != "eval" for record in records):
+        raise ReplayError("held-out snapshot accepts only purpose='eval' cohorts")
+    records.sort(
+        key=lambda record: (
+            record["macro_round"],
+            record["cohort_index"],
+            record["logical_id"],
+        )
+    )
+    first = records[0]
+    logical_ids = [record["logical_id"] for record in records]
+    manifest_digests = [record["manifest_sha256"] for record in records]
+    if len(logical_ids) != len(set(logical_ids)):
+        raise ReplayError("held-out snapshot contains duplicate cohort identities")
+    if len(manifest_digests) != len(set(manifest_digests)):
+        raise ReplayError("held-out snapshot contains duplicate cohort manifests")
+    for record in records:
+        if record["campaign_id"] != first["campaign_id"]:
+            raise ReplayError("held-out cohorts span multiple campaigns")
+        if record["manifest_schema"] != first["manifest_schema"]:
+            raise ReplayError("held-out cohort schemas differ")
+        if record["view_contract"] != first["view_contract"]:
+            raise ReplayError("held-out cohort view contracts differ")
+        if record["action_contract"] != first["action_contract"]:
+            raise ReplayError("held-out cohort action contracts differ")
+
+    content: dict[str, Any] = {
+        "schema": HELDOUT_SNAPSHOT_SCHEMA,
+        "purpose": "eval",
+        "campaign_id": first["campaign_id"],
+        "cohort_manifest_schema": first["manifest_schema"],
+        "view_contract": first["view_contract"],
+        "action_contract": first["action_contract"],
+        "cohort_count": len(records),
+        "transition_count": sum(record["transition_count"] for record in records),
+        "cohorts": [
+            {
+                "logical_id": record["logical_id"],
+                "macro_round": record["macro_round"],
+                "cohort_index": record["cohort_index"],
+                "cohort_manifest_path": record["cohort_manifest_path"],
+                "manifest_sha256": record["manifest_sha256"],
+                "transition_count": record["transition_count"],
+            }
+            for record in records
+        ],
+    }
+    content["snapshot_sha256"] = _canonical_sha256(content)
+    output_path = Path(os.path.abspath(Path(output).expanduser()))
+    try:
+        file_sha256 = _publish_immutable_json(output_path, content)
+    except Exception as exc:
+        if isinstance(exc, ReplayError):
+            raise
+        raise ReplayError(
+            f"held-out replay snapshot publication failed: {exc}"
+        ) from exc
+    result = dict(content)
+    result["path"] = str(output_path)
+    result["file_sha256"] = file_sha256
+    return result
+
+
+def load_heldout_snapshot(
+    path: str | os.PathLike[str], *, expected_file_sha256: str | None = None
+) -> dict[str, Any]:
+    """Load and recursively revalidate an immutable held-out eval snapshot."""
+
+    snapshot_path = Path(os.path.abspath(Path(path).expanduser()))
+    if snapshot_path.is_symlink() or not snapshot_path.is_file():
+        raise ReplayError(
+            "held-out replay snapshot must be a regular non-symlink file"
+        )
+    actual_file_sha256 = _sha256_file(snapshot_path)
+    if expected_file_sha256 is not None and _sha256(
+        expected_file_sha256, "expected held-out snapshot file SHA-256"
+    ) != actual_file_sha256:
+        raise ReplayError("held-out replay snapshot file digest mismatch")
+    try:
+        document = _artifacts.load_strict_json(snapshot_path)
+    except Exception as exc:
+        raise ReplayError(
+            f"cannot load strict held-out replay snapshot: {exc}"
+        ) from exc
+    expected_fields = {
+        "schema",
+        "purpose",
+        "campaign_id",
+        "cohort_manifest_schema",
+        "view_contract",
+        "action_contract",
+        "cohort_count",
+        "transition_count",
+        "cohorts",
+        "snapshot_sha256",
+    }
+    if not isinstance(document, Mapping) or set(document) != expected_fields:
+        raise ReplayError(
+            "held-out replay snapshot has unexpected or missing fields"
+        )
+    document = dict(document)
+    if document["schema"] != HELDOUT_SNAPSHOT_SCHEMA:
+        raise ReplayError("held-out replay snapshot schema mismatch")
+    if document["purpose"] != "eval":
+        raise ReplayError("held-out replay snapshot purpose must be exactly 'eval'")
+    campaign_id = _identifier(
+        document["campaign_id"], "held-out snapshot campaign_id"
+    )
+    cohort_schema = document["cohort_manifest_schema"]
+    if cohort_schema != COHORT_SCHEMA:
+        raise ReplayError("held-out snapshot cohort schema mismatch")
+    view_contract = _exact_mapping(
+        document["view_contract"], "held-out snapshot view_contract"
+    )
+    action_contract = _exact_mapping(
+        document["action_contract"], "held-out snapshot action_contract"
+    )
+    declared_semantic_sha = _sha256(
+        document["snapshot_sha256"], "held-out snapshot semantic SHA-256"
+    )
+    semantic_body = dict(document)
+    semantic_body.pop("snapshot_sha256")
+    if _canonical_sha256(semantic_body) != declared_semantic_sha:
+        raise ReplayError("held-out replay snapshot semantic digest mismatch")
+
+    raw_cohorts = document["cohorts"]
+    if not isinstance(raw_cohorts, list) or not raw_cohorts:
+        raise ReplayError("held-out replay snapshot cohorts must be non-empty")
+    if _true_int(
+        document["cohort_count"], "held-out snapshot cohort_count", minimum=1
+    ) != len(raw_cohorts):
+        raise ReplayError("held-out replay snapshot cohort count mismatch")
+
+    resolved_shards: list[dict[str, Any]] = []
+    normalized_cohorts: list[dict[str, Any]] = []
+    logical_ids: set[str] = set()
+    cohort_digests: set[str] = set()
+    shard_manifest_digests: set[str] = set()
+    payload_digests: set[str] = set()
+    total = 0
+    for index, raw in enumerate(raw_cohorts):
+        expected_cohort_fields = {
+            "logical_id",
+            "macro_round",
+            "cohort_index",
+            "cohort_manifest_path",
+            "manifest_sha256",
+            "transition_count",
+        }
+        if not isinstance(raw, Mapping) or set(raw) != expected_cohort_fields:
+            raise ReplayError("held-out snapshot cohort is malformed")
+        manifest_path = Path(str(raw["cohort_manifest_path"]))
+        if not manifest_path.is_absolute():
+            raise ReplayError("held-out cohort manifest path must be absolute")
+        record = _cohort_record(manifest_path)
+        expected_record = {
+            "logical_id": raw["logical_id"],
+            "macro_round": raw["macro_round"],
+            "cohort_index": raw["cohort_index"],
+            "cohort_manifest_path": str(manifest_path),
+            "manifest_sha256": raw["manifest_sha256"],
+            "transition_count": raw["transition_count"],
+        }
+        actual_record = {key: record[key] for key in expected_record}
+        if actual_record != expected_record:
+            raise ReplayError(
+                f"held-out cohort {index} no longer matches its snapshot"
+            )
+        if record["purpose"] != "eval":
+            raise ReplayError("held-out snapshot referenced a non-eval cohort")
+        if record["campaign_id"] != campaign_id:
+            raise ReplayError("held-out cohort campaign mismatch")
+        if record["manifest_schema"] != cohort_schema:
+            raise ReplayError("held-out cohort schema mismatch")
+        if record["view_contract"] != view_contract:
+            raise ReplayError("held-out cohort view contract mismatch")
+        if record["action_contract"] != action_contract:
+            raise ReplayError("held-out cohort action contract mismatch")
+        if record["logical_id"] in logical_ids:
+            raise ReplayError("held-out snapshot has duplicate cohort identity")
+        if record["manifest_sha256"] in cohort_digests:
+            raise ReplayError("held-out snapshot has duplicate cohort manifest")
+        logical_ids.add(record["logical_id"])
+        cohort_digests.add(record["manifest_sha256"])
+        normalized_cohorts.append(dict(raw))
+        total += record["transition_count"]
+        for shard in record["shards"]:
+            if shard["manifest_sha256"] in shard_manifest_digests:
+                raise ReplayError(
+                    "held-out snapshot has duplicate shard manifest digest"
+                )
+            if shard["payload_sha256"] in payload_digests:
+                raise ReplayError("held-out snapshot has duplicate payload digest")
+            shard_manifest_digests.add(shard["manifest_sha256"])
+            payload_digests.add(shard["payload_sha256"])
+            cohort_root = Path(record["cohort_manifest_path"]).parent
+            resolved_shards.append(
+                {
+                    "logical_id": record["logical_id"],
+                    "macro_round": record["macro_round"],
+                    "cohort_index": record["cohort_index"],
+                    "shard_id": shard["shard_id"],
+                    "shard_manifest_path": str(
+                        (cohort_root / shard["shard_manifest_path"]).resolve(
+                            strict=True
+                        )
+                    ),
+                    "manifest_sha256": shard["manifest_sha256"],
+                    "payload_path": str(
+                        (cohort_root / shard["payload_path"]).resolve(strict=True)
+                    ),
+                    "payload_sha256": shard["payload_sha256"],
+                    "transition_count": shard["transition_count"],
+                }
+            )
+    expected_order = sorted(
+        normalized_cohorts,
+        key=lambda cohort: (
+            cohort["macro_round"], cohort["cohort_index"], cohort["logical_id"]
+        ),
+    )
+    if normalized_cohorts != expected_order:
+        raise ReplayError("held-out snapshot cohorts are not canonically ordered")
+    if _true_int(
+        document["transition_count"],
+        "held-out snapshot transition_count",
+        minimum=1,
+    ) != total:
+        raise ReplayError("held-out snapshot transition count mismatch")
+    result = dict(document)
+    result["path"] = str(snapshot_path)
+    result["file_sha256"] = actual_file_sha256
+    result["resolved_shards"] = resolved_shards
+    return result
 
 
 def load_snapshot(

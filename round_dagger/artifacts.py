@@ -21,7 +21,7 @@ import re
 import stat
 import tempfile
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
@@ -1286,7 +1286,9 @@ def _read_npz_arrays(path: Path, expected_sha: str) -> dict[str, np.ndarray]:
     return arrays
 
 
-def _verify_rollout_shard(sidecar_path: Path) -> dict[str, Any]:
+def _verify_rollout_shard(
+    sidecar_path: Path, *, include_arrays: bool = False
+) -> dict[str, Any]:
     sidecar_path = _absolute(sidecar_path)
     manifest = _validate_shard_manifest(load_strict_json(sidecar_path))
     if sidecar_path.name != f"{manifest['shard_id']}.json":
@@ -1336,7 +1338,7 @@ def _verify_rollout_shard(sidecar_path: Path) -> dict[str, Any]:
             raise ArtifactError(f"payload {key} does not match manifest")
     relative_sidecar = f"{SHARD_DIRECTORY}/{sidecar_path.name}"
     relative_payload = f"{SHARD_DIRECTORY}/{payload_path.name}"
-    return {
+    result = {
         "shard_id": manifest["shard_id"],
         "manifest_path": relative_sidecar,
         "manifest_sha256": sha256_file(sidecar_path),
@@ -1353,6 +1355,12 @@ def _verify_rollout_shard(sidecar_path: Path) -> dict[str, Any]:
         ],
         "_manifest": manifest,
     }
+    # Keep the normal verification/sealing path bounded to one shard's memory.
+    # Quality consumers may explicitly request the already-validated arrays;
+    # they are never retained by cohort-wide seal verification.
+    if include_arrays:
+        result["_arrays"] = validated["arrays"]
+    return result
 
 
 def verify_rollout_shard(sidecar_path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -1398,14 +1406,19 @@ def _cohort_logical_id(contract: Mapping[str, Any]) -> str:
 
 
 def _validate_and_summarize_shards(
-    cohort_dir: Path, contract: Mapping[str, Any], contract_sha: str
+    cohort_dir: Path,
+    contract: Mapping[str, Any],
+    contract_sha: str,
+    *,
+    shard_visitor: Callable[[Mapping[str, Any], Mapping[str, np.ndarray]], None]
+    | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     set[tuple[int, int, int]],
     dict[str, str],
 ]:
-    reports = [_verify_rollout_shard(path) for path in discover_rollout_shards(cohort_dir)]
-    if not reports:
+    sidecars = discover_rollout_shards(cohort_dir)
+    if not sidecars:
         raise ArtifactError("cannot seal an empty cohort")
     identities: set[tuple[int, int, int]] = set()
     envs_seen: set[int] = set()
@@ -1414,7 +1427,10 @@ def _validate_and_summarize_shards(
     transitions = 0
     public_reports: list[dict[str, Any]] = []
     trajectory_fingerprints: dict[str, str] = {}
-    for report in reports:
+    for sidecar in sidecars:
+        report = _verify_rollout_shard(
+            sidecar, include_arrays=shard_visitor is not None
+        )
         identity = (report["rank"], report["rollout_id"], report["part_index"])
         if identity in identities:
             raise ArtifactError(f"duplicate rank/rollout/part identity: {identity}")
@@ -1445,6 +1461,9 @@ def _validate_and_summarize_shards(
         public_reports.append(
             {key: value for key, value in report.items() if not key.startswith("_")}
         )
+        if shard_visitor is not None:
+            arrays = report.pop("_arrays")
+            shard_visitor(public_reports[-1], arrays)
 
     if sorted(ranks) != contract["expected_ranks"]:
         raise ArtifactError(
@@ -1667,9 +1686,12 @@ def _cohort_directory(path: str | os.PathLike[str]) -> Path:
     raise ArtifactError("verify_cohort expects a cohort directory or its seal.json")
 
 
-def verify_cohort(path: str | os.PathLike[str]) -> dict[str, Any]:
-    """Verify a sealed cohort and every referenced shard byte-for-byte."""
-
+def _verify_cohort(
+    path: str | os.PathLike[str],
+    *,
+    shard_visitor: Callable[[Mapping[str, Any], Mapping[str, np.ndarray]], None]
+    | None = None,
+) -> dict[str, Any]:
     root = _cohort_directory(path)
     _assert_tree_has_no_symlinks(root)
     seal_path = root / SEAL_FILENAME
@@ -1678,7 +1700,7 @@ def verify_cohort(path: str | os.PathLike[str]) -> dict[str, Any]:
     if seal["contract_sha256"] != contract_sha:
         raise ArtifactError("cohort seal references a different contract")
     reports, _, trajectory_fingerprints = _validate_and_summarize_shards(
-        root, contract, contract_sha
+        root, contract, contract_sha, shard_visitor=shard_visitor
     )
     expected_seal = _build_seal(
         contract, contract_sha, reports, trajectory_fingerprints
@@ -1689,6 +1711,29 @@ def verify_cohort(path: str | os.PathLike[str]) -> dict[str, Any]:
     report["cohort_sha256"] = sha256_file(seal_path)
     report["manifest_path"] = str(seal_path)
     return report
+
+
+def verify_cohort(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Verify a sealed cohort and every referenced shard byte-for-byte."""
+
+    return _verify_cohort(path)
+
+
+def visit_verified_cohort_shards(
+    path: str | os.PathLike[str],
+    visitor: Callable[[Mapping[str, Any], Mapping[str, np.ndarray]], None],
+) -> dict[str, Any]:
+    """Verify one sealed cohort while visiting each validated shard once.
+
+    The callback may accumulate derived statistics, but callers must not
+    publish them until this function returns: exact cohort coverage and the
+    immutable seal are checked after the final callback.  Array memory remains
+    bounded to one shard and payload bytes are read only once.
+    """
+
+    if not callable(visitor):
+        raise ArtifactError("verified cohort shard visitor must be callable")
+    return _verify_cohort(path, shard_visitor=visitor)
 
 
 __all__ = [
@@ -1710,4 +1755,5 @@ __all__ = [
     "discover_rollout_shards",
     "seal_cohort",
     "verify_cohort",
+    "visit_verified_cohort_shards",
 ]

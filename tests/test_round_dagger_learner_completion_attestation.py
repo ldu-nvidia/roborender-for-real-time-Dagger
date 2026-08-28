@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -228,6 +230,192 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
             "learner_contract_sha256": contract_sha,
             "learner_identity_sha256": identity_sha,
         }
+
+    def test_heldout_schedule_covers_zero_each_100_steps_and_final(self) -> None:
+        self.assertEqual(
+            completion._evaluation_steps(1200, 100),
+            list(range(0, 1201, 100)),
+        )
+        self.assertEqual(
+            completion._evaluation_steps(250, 100),
+            [0, 100, 200, 250],
+        )
+
+    def test_heldout_telemetry_requires_every_1200_step_frontier(self) -> None:
+        learned_actions = [0, 1]
+        rows = []
+        for step in completion._evaluation_steps(1200, 100):
+            rows.append(
+                {
+                    "schema": completion.HELDOUT_TELEMETRY_SCHEMA,
+                    "campaign_id": "campaign",
+                    "macro_round": 0,
+                    "optimizer_step": step,
+                    "heldout_snapshot_file_sha256": "a" * 64,
+                    "heldout_snapshot_sha256": "b" * 64,
+                    "world_size": 8,
+                    "heldout_transitions_rank": 2,
+                    "heldout_transitions_per_rank": [2] * 8,
+                    "heldout_transitions_global": 16,
+                    "learned_action_indices": learned_actions,
+                    "action_mse": 0.25,
+                    "action_mae": 0.4,
+                    "action_rmse": 0.5,
+                    "action_cosine": 0.75,
+                    "per_action": {
+                        str(index): {
+                            "mse": 0.25,
+                            "mae": 0.4,
+                            "rmse": 0.5,
+                            "cosine": 0.75,
+                        }
+                        for index in learned_actions
+                    },
+                }
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "heldout.jsonl"
+            self._write_telemetry(path, rows)
+            observed = completion._heldout_telemetry_records(
+                path,
+                campaign_id="campaign",
+                macro_round=0,
+                snapshot_file_sha256="a" * 64,
+                snapshot_sha256="b" * 64,
+                optimizer_steps=1200,
+                eval_interval=100,
+                learned_action_indices=learned_actions,
+            )
+            self.assertEqual(sorted(observed), list(range(0, 1201, 100)))
+
+            self._write_telemetry(path, rows[:-1])
+            with self.assertRaisesRegex(
+                completion.CompletionAttestationError,
+                "frontier coverage is incomplete",
+            ):
+                completion._heldout_telemetry_records(
+                    path,
+                    campaign_id="campaign",
+                    macro_round=0,
+                    snapshot_file_sha256="a" * 64,
+                    snapshot_sha256="b" * 64,
+                    optimizer_steps=1200,
+                    eval_interval=100,
+                    learned_action_indices=learned_actions,
+                )
+
+    def test_wandb_readback_accepts_step_zero_heldout_quality_row(self) -> None:
+        training = {
+            1: {
+                "loss": 0.5,
+                "replay_transitions_rank": 1,
+                "replay_transitions_per_rank": [1] * 8,
+                "replay_transitions_global": 8,
+            }
+        }
+        heldout_record = {
+            "action_mse": 0.25,
+            "action_mae": 0.4,
+            "action_rmse": 0.5,
+            "action_cosine": 0.75,
+            "heldout_transitions_global": 16,
+            "per_action": {
+                "0": {"mse": 0.25, "mae": 0.4, "rmse": 0.5, "cosine": 0.75}
+            },
+        }
+        config = {
+            "campaign_id": "campaign",
+            "macro_round": 0,
+            "learner_code_sha256": "1" * 64,
+            "learner_config_sha256": "2" * 64,
+            "learner_identity_sha256": "3" * 64,
+            "model_lineage_sha256": "4" * 64,
+            "parent_runtime_policy_sha256": "5" * 64,
+            "runtime_container_sha256": "6" * 64,
+            "learner_contract_sha256": "7" * 64,
+            "replay_snapshot_file_sha256": "8" * 64,
+            "replay_snapshot_sha256": "9" * 64,
+            "heldout_snapshot_file_sha256": "a" * 64,
+            "heldout_snapshot_sha256": "b" * 64,
+            "heldout_eval_interval": 100,
+        }
+        quality_row = {
+            "_step": 0,
+            "quality/heldout_action_mse": 0.25,
+            "quality/heldout_action_mae": 0.4,
+            "quality/heldout_action_rmse": 0.5,
+            "quality/heldout_action_cosine": 0.75,
+            "quality/heldout_transitions": 16,
+            "quality/action_0/mse": 0.25,
+            "quality/action_0/mae": 0.4,
+            "quality/action_0/rmse": 0.5,
+            "quality/action_0/cosine": 0.75,
+        }
+        training_row = {
+            "schema": completion.TELEMETRY_SCHEMA,
+            "campaign_id": "campaign",
+            "macro_round": 0,
+            "optimizer_step": 1,
+            "loss": 0.5,
+            "world_size": 8,
+            "replay_transitions_rank": 1,
+            "replay_transitions_per_rank": [1] * 8,
+            "replay_transitions_global": 8,
+        }
+
+        class FakeRun:
+            state = "finished"
+
+            def __init__(self) -> None:
+                self.config = config
+
+            @staticmethod
+            def scan_history(*, page_size: int):
+                self.assertEqual(page_size, 500)
+                return [quality_row, training_row]
+
+        fake_wandb = SimpleNamespace(
+            Api=lambda timeout: SimpleNamespace(run=lambda path: FakeRun())
+        )
+        identity = SimpleNamespace(
+            email="ldu@nvidia.com",
+            entity="nvidia",
+            authorization_scope="team",
+            team_member=True,
+            entity_is_team=True,
+            personal=False,
+        )
+        with mock.patch(
+            "scripts.scaling.wandb_preflight._load_wandb",
+            return_value=fake_wandb,
+        ), mock.patch(
+            "scripts.scaling.wandb_preflight.query_identity",
+            return_value=identity,
+        ):
+            readback = completion._wandb_readback(
+                telemetry=training,
+                campaign_id="campaign",
+                macro_round=0,
+                code_sha256="1" * 64,
+                config_sha256="2" * 64,
+                learner_identity_sha256="3" * 64,
+                parent_sha256="4" * 64,
+                parent_runtime_policy_sha256="5" * 64,
+                runtime_container_sha256="6" * 64,
+                learner_contract_sha256="7" * 64,
+                snapshot_file_sha256="8" * 64,
+                snapshot_sha256="9" * 64,
+                entity="nvidia",
+                project="project",
+                run_id="run",
+                expected_email="ldu@nvidia.com",
+                timeout_seconds=1,
+                heldout_telemetry={0: heldout_record},
+                heldout_snapshot_file_sha256="a" * 64,
+                heldout_snapshot_sha256="b" * 64,
+                heldout_eval_interval=100,
+            )
+        self.assertEqual(readback["heldout_evaluation"]["verified_steps"], [0])
 
     @staticmethod
     def _verify_args(fixture: dict[str, object]) -> dict[str, object]:

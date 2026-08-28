@@ -42,7 +42,7 @@ DIGESTS = {
     "runtime_policy_sha256": "2" * 64,
     "teacher_sha256": "3" * 64,
     "renderer_sha256": "4" * 64,
-    "beta_sha256": "5" * 64,
+    "beta_sha256": artifacts.canonical_json_sha256({"beta": 0.0}),
     "config_sha256": "6" * 64,
 }
 
@@ -153,7 +153,7 @@ class _ResetAckServer:
 def _arrays(rank: int) -> dict[str, np.ndarray]:
     steps, envs = 512, 32
     global_start = rank * envs
-    expert = np.ones((steps, envs, 2), dtype=np.float32)
+    expert = np.ones((steps, envs, 11), dtype=np.float32)
     student = np.zeros_like(expert)
     mask = np.zeros((steps, envs), dtype=np.bool_)
     return {
@@ -189,7 +189,7 @@ def _cohort(path: Path, *, image_shape: list[int] | None = None) -> None:
             "shape": image_shape or [6, 4, 3],
             "views": ["head_color", "hand_left", "hand_right"],
         },
-        action_contract={"dtype": "float32", "shape": [2]},
+        action_contract={"dtype": "float32", "shape": [11]},
         **DIGESTS,
     )
 
@@ -579,7 +579,8 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "  sleep 0.05\n"
             "done\n"
             "[ -f \"$finish\" ] && [ ! -L \"$finish\" ]\n"
-            "[ ! -e \"$ROUND_DAGGER_COHORT_DIR/seal.json\" ]\n"
+            "[ -f \"$ROUND_DAGGER_COHORT_DIR/seal.json\" ]\n"
+            "compgen -G \"$TRAIN_RUN_DIR/telemetry/scalars/*student_quality*.json\" >/dev/null\n"
             f"printf 'drained\\n' > {self.drained!s}\n",
             encoding="utf-8",
         )
@@ -605,7 +606,15 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "ROUND_DAGGER_ACTOR_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_ACTOR_PAIR_EXECUTOR": str(self.executor),
             "ROUND_DAGGER_WANDB_ENABLED": "1",
+            "ROUND_DAGGER_POLICY_SHA256": DIGESTS["policy_sha256"],
+            "ROUND_DAGGER_RUNTIME_POLICY_SHA256": DIGESTS[
+                "runtime_policy_sha256"
+            ],
+            "ROUND_DAGGER_TEACHER_SHA256": DIGESTS["teacher_sha256"],
             "ROUND_DAGGER_RENDERER_SHA256": DIGESTS["renderer_sha256"],
+            "ROUND_DAGGER_BETA": "0.0",
+            "ROUND_DAGGER_BETA_SHA256": DIGESTS["beta_sha256"],
+            "ROUND_DAGGER_CONFIG_SHA256": DIGESTS["config_sha256"],
             "IMAGE3F_ENDPOINT_MANIFEST": str(self.endpoint_manifest),
             "ROUND_DAGGER_EXPECTED_RENDERERS": "2",
             "ROUND_DAGGER_IMAGE3F_RESET_TIMEOUT_S": "1",
@@ -628,7 +637,7 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
         self.assertEqual(self.drained.read_text(encoding="utf-8"), "drained\n")
         seal = self.cohort / "seal.json"
         self.assertTrue(seal.is_file())
-        self.assertLessEqual(self.drained.stat().st_mtime_ns, seal.stat().st_mtime_ns)
+        self.assertLessEqual(seal.stat().st_mtime_ns, self.drained.stat().st_mtime_ns)
         self.assertTrue(artifacts.verify_cohort(self.cohort)["sealed"])
 
     def test_both_complete_but_unsealed_fails_without_telemetry_owner(self) -> None:

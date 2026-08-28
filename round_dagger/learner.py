@@ -51,13 +51,16 @@ from round_dagger.policy_identity import (
     runtime_policy_identity_sha256,
     validate_homie_controller_sha256,
 )
-from round_dagger.replay import load_snapshot
+from round_dagger.replay import load_heldout_snapshot, load_snapshot
 
 
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
 CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v3"
 RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
 TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
+HELDOUT_TELEMETRY_SCHEMA = (
+    "fast_roborender.round_dagger.learner_heldout_telemetry.v1"
+)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 CUDA_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
@@ -163,6 +166,9 @@ class LearnerBundleConfig:
     seed: int = 0
     partition_seed: int = 0
     initial_checkpoint_sha256: str | None = None
+    heldout_snapshot_sha256: str | None = None
+    heldout_snapshot_file_sha256: str | None = None
+    heldout_eval_interval: int | None = None
     model_config_json: str = "{}"
 
     @classmethod
@@ -190,6 +196,9 @@ class LearnerBundleConfig:
             "seed",
             "partition_seed",
             "initial_checkpoint_sha256",
+            "heldout_snapshot_sha256",
+            "heldout_snapshot_file_sha256",
+            "heldout_eval_interval",
             "model_config",
         }
         unknown = set(raw) - allowed
@@ -277,6 +286,30 @@ class LearnerBundleConfig:
         initial_sha = raw.get("initial_checkpoint_sha256")
         if initial_sha is not None:
             initial_sha = _require_sha256(initial_sha, "initial_checkpoint_sha256")
+        heldout_values = (
+            raw.get("heldout_snapshot_sha256"),
+            raw.get("heldout_snapshot_file_sha256"),
+            raw.get("heldout_eval_interval"),
+        )
+        if any(value is not None for value in heldout_values) and any(
+            value is None for value in heldout_values
+        ):
+            raise LearnerError(
+                "held-out evaluation fields must be supplied together"
+            )
+        heldout_snapshot_sha256 = None
+        heldout_snapshot_file_sha256 = None
+        heldout_eval_interval = None
+        if all(value is not None for value in heldout_values):
+            heldout_snapshot_sha256 = _require_sha256(
+                heldout_values[0], "heldout_snapshot_sha256"
+            )
+            heldout_snapshot_file_sha256 = _require_sha256(
+                heldout_values[1], "heldout_snapshot_file_sha256"
+            )
+            heldout_eval_interval = _true_int(
+                heldout_values[2], "heldout_eval_interval", minimum=1
+            )
         model_config = raw.get("model_config", {})
         if not isinstance(model_config, Mapping):
             raise LearnerError("model_config must be a mapping")
@@ -319,6 +352,9 @@ class LearnerBundleConfig:
             seed=_true_int(raw.get("seed", 0), "seed"),
             partition_seed=_true_int(raw.get("partition_seed", 0), "partition_seed"),
             initial_checkpoint_sha256=initial_sha,
+            heldout_snapshot_sha256=heldout_snapshot_sha256,
+            heldout_snapshot_file_sha256=heldout_snapshot_file_sha256,
+            heldout_eval_interval=heldout_eval_interval,
             model_config_json=model_config_json,
         )
 
@@ -354,7 +390,17 @@ class LearnerBundleConfig:
             "initial_checkpoint_sha256": self.initial_checkpoint_sha256,
             "model_config": json.loads(self.model_config_json),
         }
+        if self.heldout_snapshot_sha256 is not None:
+            result.update(
+                heldout_snapshot_sha256=self.heldout_snapshot_sha256,
+                heldout_snapshot_file_sha256=self.heldout_snapshot_file_sha256,
+                heldout_eval_interval=self.heldout_eval_interval,
+            )
         return result
+
+    @property
+    def heldout_evaluation_enabled(self) -> bool:
+        return self.heldout_snapshot_sha256 is not None
 
     @property
     def sha256(self) -> str:
@@ -720,6 +766,18 @@ def load_replay_partition(
         raise LearnerError(
             "learner macro_round does not match replay snapshot frontier"
         )
+    return _partition_loaded_snapshot(
+        snapshot, config, rank=rank, world_size=world_size
+    )
+
+
+def _partition_loaded_snapshot(
+    snapshot: Mapping[str, Any],
+    config: LearnerBundleConfig,
+    *,
+    rank: int,
+    world_size: int,
+) -> ReplayPartition:
     view_shape = tuple(snapshot["view_contract"].get("shape", ()))
     action_shape = snapshot["action_contract"].get("shape")
     if len(view_shape) != 3 or view_shape[-1] != 3:
@@ -785,6 +843,73 @@ def load_replay_partition(
     )
 
 
+def load_heldout_partition(
+    snapshot_path: str | os.PathLike[str],
+    config: LearnerBundleConfig,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+) -> ReplayPartition:
+    """Load one rank's immutable evaluation-only replay partition."""
+
+    if not config.heldout_evaluation_enabled:
+        raise LearnerError("learner bundle does not enable held-out evaluation")
+    rank = _true_int(rank, "rank")
+    world_size = _true_int(world_size, "world_size", minimum=1)
+    if rank >= world_size:
+        raise LearnerError("rank must be smaller than world_size")
+    try:
+        snapshot = load_heldout_snapshot(
+            snapshot_path,
+            expected_file_sha256=config.heldout_snapshot_file_sha256,
+        )
+    except Exception as exc:
+        raise LearnerError(
+            f"held-out replay snapshot validation failed: {exc}"
+        ) from exc
+    if snapshot["snapshot_sha256"] != config.heldout_snapshot_sha256:
+        raise LearnerError("held-out replay snapshot semantic digest mismatch")
+    if snapshot["campaign_id"] != config.campaign_id:
+        raise LearnerError("learner campaign does not match held-out replay")
+    return _partition_loaded_snapshot(
+        snapshot, config, rank=rank, world_size=world_size
+    )
+
+
+def _assert_training_and_heldout_are_disjoint(
+    training: Mapping[str, Any], heldout: Mapping[str, Any]
+) -> None:
+    """Reject any artifact identity reused across train and evaluation replay."""
+
+    if training["view_contract"] != heldout["view_contract"]:
+        raise LearnerError("training and held-out view contracts differ")
+    if training["action_contract"] != heldout["action_contract"]:
+        raise LearnerError("training and held-out action contracts differ")
+    train_cohorts = {item["manifest_sha256"] for item in training["cohorts"]}
+    heldout_cohorts = {item["manifest_sha256"] for item in heldout["cohorts"]}
+    train_shards = {
+        item["manifest_sha256"] for item in training["resolved_shards"]
+    }
+    heldout_shards = {
+        item["manifest_sha256"] for item in heldout["resolved_shards"]
+    }
+    train_payloads = {item["payload_sha256"] for item in training["resolved_shards"]}
+    heldout_payloads = {
+        item["payload_sha256"] for item in heldout["resolved_shards"]
+    }
+    overlaps = {
+        "cohort manifest": train_cohorts & heldout_cohorts,
+        "shard manifest": train_shards & heldout_shards,
+        "payload": train_payloads & heldout_payloads,
+    }
+    reused = [label for label, digests in overlaps.items() if digests]
+    if reused:
+        raise LearnerError(
+            "training and held-out replay reuse artifact identities: "
+            + ", ".join(reused)
+        )
+
+
 class DeterministicBatchSchedule:
     """Step-addressable shuffled batches, identical before and after restart."""
 
@@ -813,11 +938,11 @@ class DeterministicBatchSchedule:
         return result
 
 
-def supervised_action_loss(
+def _aligned_learned_actions(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     train_action_slice: tuple[int, int] | None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     if predictions.ndim < 1 or targets.ndim < 1:
         raise LearnerError("policy and expert actions must have an action dimension")
     if predictions.shape[:-1] != targets.shape[:-1]:
@@ -831,6 +956,7 @@ def supervised_action_loss(
                 "policy/expert action shapes differ without train_action_slice: "
                 f"{tuple(predictions.shape)} vs {tuple(targets.shape)}"
             )
+        action_indices = tuple(range(int(targets.shape[-1])))
     else:
         start, stop = train_action_slice
         if targets.shape[-1] < stop:
@@ -852,7 +978,188 @@ def supervised_action_loss(
                 "sliced policy/expert action shapes differ: "
                 f"{tuple(predictions.shape)} vs {tuple(targets.shape)}"
             )
+        action_indices = tuple(range(start, stop))
+    return predictions.float(), targets.float(), action_indices
+
+
+def supervised_action_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    train_action_slice: tuple[int, int] | None,
+) -> torch.Tensor:
+    predictions, targets, _action_indices = _aligned_learned_actions(
+        predictions, targets, train_action_slice
+    )
     return torch.mean(torch.square(predictions.float() - targets.float()))
+
+
+def evaluate_heldout_actions(
+    model: nn.Module,
+    *,
+    partition: ReplayPartition,
+    adapter: PolicyAdapter,
+    device: torch.device | str,
+    optimizer_step: int,
+) -> dict[str, Any]:
+    """Evaluate every held-out transition and globally reduce exact sums."""
+
+    optimizer_step = _true_int(optimizer_step, "optimizer_step")
+    device = torch.device(device)
+    rank, world_size = _distributed_context()
+    if rank != partition.rank or world_size != partition.world_size:
+        raise LearnerError("held-out partition does not match distributed context")
+    preserved_rng = _rng_state()
+    was_training = model.training
+    model.eval()
+    statistics: torch.Tensor | None = None
+    action_indices: tuple[int, ...] | None = None
+    try:
+        with torch.no_grad():
+            for start in range(0, partition.transition_count, partition.config.batch_size):
+                stop = min(
+                    start + partition.config.batch_size,
+                    partition.transition_count,
+                )
+                observations, targets = partition.batch(
+                    list(range(start, stop)), device=device
+                )
+                predictions = adapter.actions(_unwrap_model(model), observations)
+                predictions, targets, current_indices = _aligned_learned_actions(
+                    predictions, targets, partition.config.train_action_slice
+                )
+                if action_indices is None:
+                    action_indices = current_indices
+                    # Global scalars: squared error, absolute error, element
+                    # count, row cosine sum, row count.  Six per-dimension
+                    # accumulators follow: squared error, absolute error,
+                    # sample count, prediction/target dot product, prediction
+                    # norm squared, and target norm squared.
+                    statistics = torch.zeros(
+                        5 + 6 * len(action_indices),
+                        dtype=torch.float64,
+                        device=device,
+                    )
+                elif current_indices != action_indices:
+                    raise LearnerError(
+                        "held-out learned-action contract changed between batches"
+                    )
+                assert statistics is not None
+                flat_predictions = predictions.reshape(-1, predictions.shape[-1]).to(
+                    dtype=torch.float64
+                )
+                flat_targets = targets.reshape(-1, targets.shape[-1]).to(
+                    dtype=torch.float64
+                )
+                difference = flat_predictions - flat_targets
+                squared = torch.square(difference)
+                absolute = torch.abs(difference)
+                prediction_norm = torch.linalg.vector_norm(
+                    flat_predictions, dim=-1
+                )
+                target_norm = torch.linalg.vector_norm(flat_targets, dim=-1)
+                denominator = prediction_norm * target_norm
+                row_cosine = torch.zeros_like(denominator)
+                nonzero = denominator > 0.0
+                row_cosine[nonzero] = torch.sum(
+                    flat_predictions[nonzero] * flat_targets[nonzero], dim=-1
+                ) / denominator[nonzero]
+                row_cosine[
+                    (prediction_norm == 0.0) & (target_norm == 0.0)
+                ] = 1.0
+                row_cosine.clamp_(-1.0, 1.0)
+                statistics[0] += squared.sum()
+                statistics[1] += absolute.sum()
+                statistics[2] += squared.numel()
+                statistics[3] += row_cosine.sum()
+                statistics[4] += row_cosine.numel()
+                dimension = len(action_indices)
+                statistics[5 : 5 + dimension] += squared.sum(dim=0)
+                statistics[5 + dimension : 5 + 2 * dimension] += absolute.sum(dim=0)
+                statistics[5 + 2 * dimension : 5 + 3 * dimension] += (
+                    flat_predictions.shape[0]
+                )
+                statistics[5 + 3 * dimension : 5 + 4 * dimension] += (
+                    flat_predictions * flat_targets
+                ).sum(dim=0)
+                statistics[5 + 4 * dimension : 5 + 5 * dimension] += torch.square(
+                    flat_predictions
+                ).sum(dim=0)
+                statistics[5 + 5 * dimension : 5 + 6 * dimension] += torch.square(
+                    flat_targets
+                ).sum(dim=0)
+    finally:
+        model.train(was_training)
+        _restore_rng_state(preserved_rng)
+    if statistics is None or action_indices is None:
+        raise LearnerError("held-out replay evaluation produced no samples")
+    if world_size > 1:
+        torch.distributed.all_reduce(statistics, op=torch.distributed.ReduceOp.SUM)
+    dimension = len(action_indices)
+    element_count = float(statistics[2].item())
+    row_count = float(statistics[4].item())
+    if element_count <= 0.0 or row_count <= 0.0:
+        raise LearnerError("held-out metric reduction produced an empty population")
+    mse = float((statistics[0] / element_count).item())
+    mae = float((statistics[1] / element_count).item())
+    cosine = float((statistics[3] / row_count).item())
+    dimension_squared = statistics[5 : 5 + dimension]
+    dimension_absolute = statistics[5 + dimension : 5 + 2 * dimension]
+    dimension_count = statistics[5 + 2 * dimension : 5 + 3 * dimension]
+    dimension_dot = statistics[5 + 3 * dimension : 5 + 4 * dimension]
+    dimension_prediction_squared = statistics[
+        5 + 4 * dimension : 5 + 5 * dimension
+    ]
+    dimension_target_squared = statistics[
+        5 + 5 * dimension : 5 + 6 * dimension
+    ]
+    per_action: dict[str, dict[str, float]] = {}
+    for offset, action_index in enumerate(action_indices):
+        count = float(dimension_count[offset].item())
+        if count <= 0.0:
+            raise LearnerError("held-out per-action metric has zero samples")
+        action_mse = float((dimension_squared[offset] / count).item())
+        norm_product = float(
+            torch.sqrt(
+                dimension_prediction_squared[offset]
+                * dimension_target_squared[offset]
+            ).item()
+        )
+        if norm_product > 0.0:
+            action_cosine = max(
+                -1.0,
+                min(1.0, float(dimension_dot[offset].item()) / norm_product),
+            )
+        elif (
+            float(dimension_prediction_squared[offset].item()) == 0.0
+            and float(dimension_target_squared[offset].item()) == 0.0
+        ):
+            action_cosine = 1.0
+        else:
+            action_cosine = 0.0
+        per_action[str(action_index)] = {
+            "mse": action_mse,
+            "mae": float((dimension_absolute[offset] / count).item()),
+            "rmse": math.sqrt(action_mse),
+            "cosine": action_cosine,
+        }
+    return {
+        "schema": HELDOUT_TELEMETRY_SCHEMA,
+        "campaign_id": partition.config.campaign_id,
+        "macro_round": partition.config.macro_round,
+        "optimizer_step": optimizer_step,
+        "heldout_snapshot_sha256": partition.snapshot["snapshot_sha256"],
+        "heldout_snapshot_file_sha256": partition.snapshot["file_sha256"],
+        "heldout_transitions_rank": partition.transition_count,
+        "heldout_transitions_per_rank": list(partition.transition_counts_by_rank),
+        "heldout_transitions_global": partition.global_transition_count,
+        "world_size": world_size,
+        "learned_action_indices": list(action_indices),
+        "action_mse": mse,
+        "action_mae": mae,
+        "action_rmse": math.sqrt(mse),
+        "action_cosine": cosine,
+        "per_action": per_action,
+    }
 
 
 def _distributed_context() -> tuple[int, int]:
@@ -1110,6 +1417,7 @@ class JsonlTelemetry:
         path: str | os.PathLike[str] | None,
         *,
         enabled: bool,
+        heldout_path: str | os.PathLike[str] | None = None,
         wandb_project: str | None = None,
         wandb_entity: str | None = None,
         wandb_run_id: str | None = None,
@@ -1122,8 +1430,22 @@ class JsonlTelemetry:
             else None
         )
         self.wandb_run = None
+        if heldout_path is not None and not enabled:
+            self.heldout_path = None
+        elif heldout_path is not None:
+            self.heldout_path = Path(
+                os.path.abspath(Path(heldout_path).expanduser())
+            )
+        elif self.path is not None:
+            self.heldout_path = self.path.with_name(
+                f"{self.path.stem}.heldout{self.path.suffix}"
+            )
+        else:
+            self.heldout_path = None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.heldout_path is not None:
+            self.heldout_path.parent.mkdir(parents=True, exist_ok=True)
         if enabled and wandb_project:
             if wandb_resume_must and not wandb_run_id:
                 raise LearnerError(
@@ -1146,62 +1468,185 @@ class JsonlTelemetry:
             except Exception as exc:
                 raise LearnerError(f"W&B initialization failed: {exc}") from exc
 
-    def log(self, record: Mapping[str, Any]) -> None:
-        clean = dict(record)
+    @staticmethod
+    def _persist(path: Path | None, clean: Mapping[str, Any]) -> None:
+        if path is None:
+            return
+        clean = dict(clean)
         payload = (
             json.dumps(
                 clean, sort_keys=True, allow_nan=False, separators=(",", ":")
             )
             + "\n"
         ).encode("utf-8")
-        if self.path is not None:
-            # A scheduler can deliver SIGKILL while telemetry is being
-            # persisted.  Appending directly to JSONL can then leave a torn
-            # final line, permanently wedging completion attestation even
-            # though the last durable restart is valid.  The production log is
-            # small (1200 scalar rows), so rewrite it through a same-directory
-            # temporary and atomically replace the old inode.  A crash exposes
-            # either the complete previous log or the complete new log.
-            if self.path.is_symlink():
-                raise LearnerError("telemetry path must not be a symlink")
-            existing = b""
-            if self.path.exists():
-                if not self.path.is_file():
-                    raise LearnerError("telemetry path must be a regular file")
-                existing = self.path.read_bytes()
-                if existing and not existing.endswith(b"\n"):
-                    raise LearnerError("telemetry log has a torn final record")
-            descriptor, name = tempfile.mkstemp(
-                prefix=f".{self.path.name}.", dir=self.path.parent
+        # A scheduler can deliver SIGKILL while telemetry is being persisted.
+        # Appending directly to JSONL can then leave a torn final line,
+        # permanently wedging completion attestation even though the last
+        # durable restart is valid.  The production log is small (1200 scalar
+        # rows), so rewrite it through a same-directory temporary and
+        # atomically replace the old inode.  A crash exposes either the
+        # complete previous log or the complete new log.
+        if path.is_symlink():
+            raise LearnerError("telemetry path must not be a symlink")
+        existing = b""
+        if path.exists():
+            if not path.is_file():
+                raise LearnerError("telemetry path must be a regular file")
+            existing = path.read_bytes()
+            if existing and not existing.endswith(b"\n"):
+                raise LearnerError("telemetry log has a torn final record")
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(existing)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            os.chmod(
+                path,
+                stat.S_IRUSR
+                | stat.S_IWUSR
+                | stat.S_IRGRP
+                | stat.S_IROTH,
             )
-            temporary = Path(name)
+            directory = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
             try:
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(existing)
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self.path)
-                os.chmod(
-                    self.path,
-                    stat.S_IRUSR
-                    | stat.S_IWUSR
-                    | stat.S_IRGRP
-                    | stat.S_IROTH,
-                )
-                directory = os.open(
-                    self.path.parent,
-                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                )
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
+                os.fsync(directory)
             finally:
-                temporary.unlink(missing_ok=True)
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _heldout_wandb_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+        payload = {
+            "quality/heldout_action_mse": record["action_mse"],
+            "quality/heldout_action_mae": record["action_mae"],
+            "quality/heldout_action_rmse": record["action_rmse"],
+            "quality/heldout_action_cosine": record["action_cosine"],
+            "quality/heldout_transitions": record["heldout_transitions_global"],
+        }
+        per_action = record.get("per_action")
+        if not isinstance(per_action, Mapping):
+            raise LearnerError("held-out telemetry per_action must be a mapping")
+        for action_index, metrics in per_action.items():
+            if not isinstance(metrics, Mapping):
+                raise LearnerError("held-out per-action metrics must be mappings")
+            for metric in ("mse", "mae", "rmse", "cosine"):
+                payload[f"quality/action_{action_index}/{metric}"] = metrics[metric]
+        return payload
+
+    @staticmethod
+    def _heldout_record_already_persisted(
+        path: Path | None, record: Mapping[str, Any]
+    ) -> bool:
+        """Make replayed evaluation frontiers idempotent after restart."""
+
+        if path is None or not path.exists():
+            return False
+        if path.is_symlink() or not path.is_file():
+            raise LearnerError("held-out telemetry path is unsafe")
+        raw = path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            raise LearnerError("held-out telemetry log has a torn final record")
+        target_step = _true_int(record.get("optimizer_step"), "optimizer_step")
+        target_bytes = json.dumps(
+            dict(record),
+            sort_keys=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        seen: dict[int, bytes] = {}
+        for line_number, line in enumerate(raw.splitlines(), start=1):
+            try:
+                existing = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise LearnerError(
+                    f"held-out telemetry line {line_number} is invalid"
+                ) from exc
+            if (
+                not isinstance(existing, Mapping)
+                or existing.get("schema") != HELDOUT_TELEMETRY_SCHEMA
+            ):
+                raise LearnerError("held-out telemetry history schema mismatch")
+            step = _true_int(
+                existing.get("optimizer_step"),
+                f"held-out telemetry line {line_number} optimizer_step",
+            )
+            canonical = json.dumps(
+                dict(existing),
+                sort_keys=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if step in seen and seen[step] != canonical:
+                raise LearnerError(
+                    "held-out telemetry contains conflicting duplicate steps"
+                )
+            seen[step] = canonical
+        if target_step in seen:
+            if seen[target_step] != target_bytes:
+                raise LearnerError(
+                    "held-out telemetry changed across deterministic restart"
+                )
+            return True
+        if seen and target_step < max(seen):
+            raise LearnerError(
+                "held-out telemetry restart would create a missing historical step"
+            )
+        return False
+
+    def log(
+        self,
+        record: Mapping[str, Any],
+        *,
+        wandb_extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        clean = dict(record)
+        self._persist(self.path, clean)
         if self.wandb_run is not None:
             step = int(clean.get("optimizer_step", 0))
-            self.wandb_run.log(clean, step=step)
+            wandb_record = dict(clean)
+            if wandb_extra is not None:
+                duplicate = set(wandb_record) & set(wandb_extra)
+                if duplicate:
+                    raise LearnerError(
+                        "W&B telemetry extension duplicates base fields: "
+                        + ", ".join(sorted(duplicate))
+                    )
+                wandb_record.update(wandb_extra)
+            self.wandb_run.log(wandb_record, step=step)
+
+    def log_heldout(
+        self, record: Mapping[str, Any], *, log_wandb: bool = True
+    ) -> dict[str, Any]:
+        clean = dict(record)
+        if clean.get("schema") != HELDOUT_TELEMETRY_SCHEMA:
+            raise LearnerError("held-out telemetry schema mismatch")
+        already_persisted = self._heldout_record_already_persisted(
+            self.heldout_path, clean
+        )
+        if not already_persisted:
+            self._persist(self.heldout_path, clean)
+        wandb_payload = self._heldout_wandb_payload(clean)
+        # Local JSONL idempotence and remote delivery are separate frontiers.
+        # A process can be killed after the fsynced record is durable but
+        # before the W&B sender acknowledges it.  Re-log an identical due
+        # frontier on restart; the explicit optimizer step makes the update
+        # deterministic, while the local history still contains exactly one
+        # canonical row per step.
+        if log_wandb and self.wandb_run is not None:
+            self.wandb_run.log(
+                wandb_payload, step=int(clean.get("optimizer_step", 0))
+            )
+        return wandb_payload
 
     def close(self) -> None:
         if self.wandb_run is not None:
@@ -1231,6 +1676,7 @@ def train_from_replay(
     device: torch.device | str = "cpu",
     resume_from: str | os.PathLike[str] | None = None,
     expected_snapshot_file_sha256: str | None = None,
+    heldout_snapshot_path: str | os.PathLike[str] | None = None,
     save_every: int = 100,
     telemetry: JsonlTelemetry | None = None,
     validation_stop_at_step: int | None = None,
@@ -1284,6 +1730,22 @@ def train_from_replay(
         world_size=world_size,
         expected_snapshot_file_sha256=expected_snapshot_file_sha256,
     )
+    if config.heldout_evaluation_enabled != (heldout_snapshot_path is not None):
+        raise LearnerError(
+            "held-out snapshot path and immutable bundle configuration must "
+            "be supplied together"
+        )
+    heldout_partition = None
+    if heldout_snapshot_path is not None:
+        heldout_partition = load_heldout_partition(
+            heldout_snapshot_path,
+            config,
+            rank=rank,
+            world_size=world_size,
+        )
+        _assert_training_and_heldout_are_disjoint(
+            partition.snapshot, heldout_partition.snapshot
+        )
     model = model.to(device)
     if world_size > 1 and not isinstance(model, DistributedDataParallel):
         model = DistributedDataParallel(
@@ -1361,6 +1823,30 @@ def train_from_replay(
             world_size=world_size,
         )
     model.train()
+    # Re-evaluate a due restart frontier before taking another update.  This
+    # closes the crash window in which the checkpoint and local quality row are
+    # durable but the remote telemetry sender has not synchronized yet.  The
+    # JSONL writer verifies that a repeated frontier is byte-identical.
+    heldout_frontier_due = (
+        heldout_partition is not None
+        and config.heldout_eval_interval is not None
+        and (
+            completed_steps == 0
+            or completed_steps % config.heldout_eval_interval == 0
+            or completed_steps == max_steps
+        )
+    )
+    if heldout_frontier_due:
+        assert heldout_partition is not None
+        heldout_record = evaluate_heldout_actions(
+            model,
+            partition=heldout_partition,
+            adapter=adapter,
+            device=device,
+            optimizer_step=completed_steps,
+        )
+        if rank == 0 and telemetry is not None:
+            telemetry.log_heldout(heldout_record, log_wandb=True)
     for step in range(completed_steps, training_frontier):
         observations, targets = partition.batch(schedule.indices(step), device=device)
         optimizer.zero_grad(set_to_none=True)
@@ -1376,6 +1862,28 @@ def train_from_replay(
             scalar = scalar / world_size
         loss_value = float(scalar.cpu())
         completed_steps = step + 1
+        heldout_wandb: Mapping[str, Any] | None = None
+        heldout_due = (
+            heldout_partition is not None
+            and config.heldout_eval_interval is not None
+            and (
+                completed_steps % config.heldout_eval_interval == 0
+                or completed_steps == max_steps
+            )
+        )
+        if heldout_due:
+            assert heldout_partition is not None
+            heldout_record = evaluate_heldout_actions(
+                model,
+                partition=heldout_partition,
+                adapter=adapter,
+                device=device,
+                optimizer_step=completed_steps,
+            )
+            if rank == 0 and telemetry is not None:
+                heldout_wandb = telemetry.log_heldout(
+                    heldout_record, log_wandb=False
+                )
         if rank == 0 and telemetry is not None:
             telemetry.log(
                 {
@@ -1390,7 +1898,8 @@ def train_from_replay(
                     ),
                     "replay_transitions_global": partition.global_transition_count,
                     "world_size": world_size,
-                }
+                },
+                wandb_extra=heldout_wandb,
             )
         if (
             completed_steps % save_every == 0
@@ -1641,6 +2150,7 @@ __all__ = [
     "BUNDLE_SCHEMA",
     "CHECKPOINT_SCHEMA",
     "RESULT_SCHEMA",
+    "HELDOUT_TELEMETRY_SCHEMA",
     "LearnerError",
     "LearnerBundleConfig",
     "PolicyAdapter",
@@ -1651,7 +2161,9 @@ __all__ = [
     "TrainResult",
     "partition_shards",
     "load_replay_partition",
+    "load_heldout_partition",
     "supervised_action_loss",
+    "evaluate_heldout_actions",
     "CUDA_CUBLAS_WORKSPACE_CONFIG",
     "configure_deterministic_runtime",
     "train_from_replay",

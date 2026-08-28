@@ -41,6 +41,7 @@ from round_dagger.learner import (  # noqa: E402
     LearnerBundleConfig,
     LearnerError,
 )
+from round_dagger.replay import load_heldout_snapshot  # noqa: E402
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -91,6 +92,8 @@ def prepare_bundle(
     weight_decay: float,
     seed: int,
     partition_seed: int,
+    heldout_snapshot: Path | None = None,
+    heldout_eval_interval: int | None = None,
 ) -> LearnerBundleConfig:
     """Derive a canonical bundle without writing it."""
 
@@ -133,6 +136,29 @@ def prepare_bundle(
             "portable policy action contract is not production"
         )
 
+    heldout_fields: dict[str, object] = {}
+    if (heldout_snapshot is None) != (heldout_eval_interval is None):
+        raise BundlePreparationError(
+            "held-out snapshot and evaluation interval must be supplied together"
+        )
+    if heldout_snapshot is not None:
+        heldout_path = _absolute_file(heldout_snapshot, "held-out replay snapshot")
+        try:
+            heldout_identity = load_heldout_snapshot(heldout_path)
+        except Exception as exc:
+            raise BundlePreparationError(
+                f"held-out replay snapshot validation failed: {exc}"
+            ) from exc
+        if heldout_identity["campaign_id"] != campaign_id:
+            raise BundlePreparationError(
+                "held-out replay snapshot campaign mismatch"
+            )
+        heldout_fields = {
+            "heldout_snapshot_sha256": heldout_identity["snapshot_sha256"],
+            "heldout_snapshot_file_sha256": heldout_identity["file_sha256"],
+            "heldout_eval_interval": heldout_eval_interval,
+        }
+
     try:
         bundle = LearnerBundleConfig.from_mapping(
             {
@@ -160,6 +186,7 @@ def prepare_bundle(
                 "partition_seed": partition_seed,
                 "initial_checkpoint_sha256": actual_parent,
                 "model_config": derived_spec,
+                **heldout_fields,
             }
         )
     except LearnerError as exc:
@@ -185,6 +212,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", required=True, type=float)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--partition-seed", required=True, type=int)
+    parser.add_argument("--heldout-snapshot", type=Path)
+    parser.add_argument(
+        "--heldout-eval-interval",
+        type=int,
+        help="evaluation cadence in optimizer steps (production target: 100)",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--expected-bundle-sha256")
     parser.add_argument(
@@ -212,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=arguments.weight_decay,
         seed=arguments.seed,
         partition_seed=arguments.partition_seed,
+        heldout_snapshot=arguments.heldout_snapshot,
+        heldout_eval_interval=arguments.heldout_eval_interval,
     )
     expected = arguments.expected_bundle_sha256
     if expected is not None and bundle.sha256 != _sha256(
@@ -240,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 "macro_round": bundle.macro_round,
                 "max_steps": bundle.max_steps,
+                "heldout_eval_interval": bundle.heldout_eval_interval,
             },
             sort_keys=True,
             allow_nan=False,

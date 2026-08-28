@@ -29,6 +29,7 @@ if torch is not None:
         LearnerBundleConfig,
         LearnerError,
         configure_deterministic_runtime,
+        load_heldout_partition,
         load_replay_partition,
         partition_shards,
         publish_learner_result,
@@ -94,28 +95,39 @@ def tiny_policy_factory(_bundle):
     return TinyPolicy()
 
 
-def _config(*, model_lineage="a" * 64, mean=(0.5, 0.5, 0.5)):
-    return LearnerBundleConfig.from_mapping(
-        {
-            "schema": BUNDLE_SCHEMA,
-            "campaign_id": "learner-test",
-            "macro_round": 0,
-            "model_lineage_sha256": model_lineage,
-            "code_sha256": "b" * 64,
-            "rgb_mean": list(mean),
-            "rgb_std": [0.25, 0.25, 0.25],
-            "rgb_input_key": "vision_obs",
-            "rgb_layout": "NHWC",
-            "output_key": "actions",
-            "train_action_slice": [0, 1],
-            "batch_size": 8,
-            "learning_rate": 0.025,
-            "weight_decay": 0.0,
-            "seed": 17,
-            "partition_seed": 23,
-            "model_config": portable_policy_spec(model_lineage, "2" * 64),
-        }
-    )
+def _config(
+    *,
+    model_lineage="a" * 64,
+    mean=(0.5, 0.5, 0.5),
+    heldout_snapshot=None,
+    heldout_eval_interval=2,
+):
+    mapping = {
+        "schema": BUNDLE_SCHEMA,
+        "campaign_id": "learner-test",
+        "macro_round": 0,
+        "model_lineage_sha256": model_lineage,
+        "code_sha256": "b" * 64,
+        "rgb_mean": list(mean),
+        "rgb_std": [0.25, 0.25, 0.25],
+        "rgb_input_key": "vision_obs",
+        "rgb_layout": "NHWC",
+        "output_key": "actions",
+        "train_action_slice": [0, 1],
+        "batch_size": 8,
+        "learning_rate": 0.025,
+        "weight_decay": 0.0,
+        "seed": 17,
+        "partition_seed": 23,
+        "model_config": portable_policy_spec(model_lineage, "2" * 64),
+    }
+    if heldout_snapshot is not None:
+        mapping.update(
+            heldout_snapshot_sha256=heldout_snapshot["snapshot_sha256"],
+            heldout_snapshot_file_sha256=heldout_snapshot["file_sha256"],
+            heldout_eval_interval=heldout_eval_interval,
+        )
+    return LearnerBundleConfig.from_mapping(mapping)
 
 
 def _rollout_arrays(env_id, *, steps=8):
@@ -205,12 +217,126 @@ class LearnerFixture(unittest.TestCase):
                 expected_train_cohorts=1,
                 output=self.snapshot_path,
             )
+        self.eval_cohort = self.root / "eval-cohort"
+        artifacts.create_cohort(
+            self.eval_cohort,
+            campaign_id="learner-test",
+            macro_round=0,
+            cohort_index=0,
+            purpose="eval",
+            expected_ranks=[0],
+            expected_global_env_ids=[2, 3],
+            expected_transitions=16,
+            view_contract={
+                "dtype": "uint8",
+                "layout": "vertical",
+                "shape": [3, 2, 3],
+                "views": ["ext1", "ext2", "wrist"],
+            },
+            action_contract={"dtype": "float32", "shape": [2]},
+            **SHA,
+        )
+        for part, env_id in enumerate((2, 3)):
+            artifacts.publish_rollout_shard(
+                self.eval_cohort,
+                rank=0,
+                rollout_id=0,
+                part_index=part,
+                arrays=_rollout_arrays(env_id),
+                campaign_id="learner-test",
+                macro_round=0,
+                cohort_index=0,
+                purpose="eval",
+                **SHA,
+            )
+        artifacts.seal_cohort(self.eval_cohort)
+        self.heldout_snapshot_path = self.root / "heldout-snapshot.json"
+        self.heldout_snapshot = replay.build_heldout_snapshot(
+            [self.eval_cohort], output=self.heldout_snapshot_path
+        )
 
     def tearDown(self):
         self.temporary.cleanup()
 
 
 class ReplayInputContractTest(LearnerFixture):
+    def test_heldout_snapshot_is_eval_only_and_bundle_lineage_is_all_or_none(self):
+        with self.assertRaisesRegex(replay.ReplayError, "purpose='eval'"):
+            replay.build_heldout_snapshot(
+                [self.cohort], output=self.root / "invalid-heldout.json"
+            )
+        loaded = replay.load_heldout_snapshot(
+            self.heldout_snapshot_path,
+            expected_file_sha256=self.heldout_snapshot["file_sha256"],
+        )
+        self.assertEqual(loaded["purpose"], "eval")
+        self.assertEqual(loaded["transition_count"], 16)
+        self.assertTrue(
+            all("payload_path" in item for item in loaded["resolved_shards"])
+        )
+
+        raw = _config().to_mapping()
+        raw["heldout_snapshot_sha256"] = self.heldout_snapshot["snapshot_sha256"]
+        with self.assertRaisesRegex(LearnerError, "supplied together"):
+            LearnerBundleConfig.from_mapping(raw)
+
+    def test_heldout_partition_requires_exact_pinned_snapshot_identity(self):
+        config = _config(heldout_snapshot=self.heldout_snapshot)
+        partition = load_heldout_partition(self.heldout_snapshot_path, config)
+        self.assertEqual(partition.transition_count, 16)
+        wrong = config.to_mapping()
+        wrong["heldout_snapshot_sha256"] = "f" * 64
+        with self.assertRaisesRegex(LearnerError, "semantic digest mismatch"):
+            load_heldout_partition(
+                self.heldout_snapshot_path,
+                LearnerBundleConfig.from_mapping(wrong),
+            )
+
+    def test_training_rejects_heldout_snapshot_that_reuses_training_payload(self):
+        cohort = self.root / "overlap-eval"
+        artifacts.create_cohort(
+            cohort,
+            campaign_id="learner-test",
+            macro_round=1,
+            cohort_index=0,
+            purpose="eval",
+            expected_ranks=[0],
+            expected_global_env_ids=[0],
+            expected_transitions=8,
+            view_contract={
+                "dtype": "uint8",
+                "layout": "vertical",
+                "shape": [3, 2, 3],
+                "views": ["ext1", "ext2", "wrist"],
+            },
+            action_contract={"dtype": "float32", "shape": [2]},
+            **SHA,
+        )
+        artifacts.publish_rollout_shard(
+            cohort,
+            rank=0,
+            rollout_id=0,
+            part_index=0,
+            arrays=_rollout_arrays(0),
+            campaign_id="learner-test",
+            macro_round=1,
+            cohort_index=0,
+            purpose="eval",
+            **SHA,
+        )
+        artifacts.seal_cohort(cohort)
+        snapshot_path = self.root / "overlap-heldout.json"
+        snapshot = replay.build_heldout_snapshot([cohort], output=snapshot_path)
+        with self.assertRaisesRegex(LearnerError, "reuse artifact identities"):
+            train_from_replay(
+                TinyPolicy(),
+                snapshot_path=self.snapshot_path,
+                config=_config(heldout_snapshot=snapshot),
+                heldout_snapshot_path=snapshot_path,
+                output_dir=self.root / "must-not-train-on-overlap",
+                max_steps=1,
+            )
+
     def test_rgb_is_normalized_and_all_policy_observations_are_reconstructed(self):
         config = _config()
         partition = load_replay_partition(
@@ -695,6 +821,198 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         )
         self.assertTrue(
             all(item["replay_transitions_global"] == 16 for item in records)
+        )
+
+    def test_heldout_quality_is_logged_at_zero_interval_and_final(self):
+        training_path = self.root / "quality-telemetry" / "learner.jsonl"
+        heldout_path = self.root / "quality-telemetry" / "heldout.jsonl"
+        telemetry = JsonlTelemetry(
+            training_path,
+            heldout_path=heldout_path,
+            enabled=True,
+        )
+        try:
+            train_from_replay(
+                TinyPolicy(),
+                snapshot_path=self.snapshot_path,
+                config=_config(
+                    heldout_snapshot=self.heldout_snapshot,
+                    heldout_eval_interval=2,
+                ),
+                heldout_snapshot_path=self.heldout_snapshot_path,
+                output_dir=self.root / "quality-run",
+                max_steps=5,
+                save_every=5,
+                telemetry=telemetry,
+            )
+        finally:
+            telemetry.close()
+        training_records = [
+            json.loads(line) for line in training_path.read_text().splitlines()
+        ]
+        quality_records = [
+            json.loads(line) for line in heldout_path.read_text().splitlines()
+        ]
+        self.assertEqual(
+            [record["optimizer_step"] for record in training_records],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(
+            [record["optimizer_step"] for record in quality_records],
+            [0, 2, 4, 5],
+        )
+        self.assertTrue(all("action_mse" not in record for record in training_records))
+        for record in quality_records:
+            self.assertEqual(record["learned_action_indices"], [0])
+            self.assertEqual(set(record["per_action"]), {"0"})
+            self.assertEqual(record["heldout_transitions_global"], 16)
+            self.assertAlmostEqual(record["action_rmse"] ** 2, record["action_mse"])
+            self.assertTrue(np.isfinite(record["action_cosine"]))
+        resumed_telemetry = JsonlTelemetry(
+            None, heldout_path=heldout_path, enabled=True
+        )
+        resumed_telemetry.log_heldout(quality_records[-1], log_wandb=False)
+        self.assertEqual(len(heldout_path.read_text().splitlines()), 4)
+
+    def test_heldout_evaluation_does_not_change_training_or_rng_frontier(self):
+        initial = self._initial_state()
+        baseline = TinyPolicy()
+        baseline.load_state_dict(initial)
+        train_from_replay(
+            baseline,
+            snapshot_path=self.snapshot_path,
+            config=_config(),
+            output_dir=self.root / "quality-baseline",
+            max_steps=7,
+            save_every=7,
+        )
+        evaluated = TinyPolicy()
+        evaluated.load_state_dict(initial)
+        train_from_replay(
+            evaluated,
+            snapshot_path=self.snapshot_path,
+            config=_config(
+                heldout_snapshot=self.heldout_snapshot,
+                heldout_eval_interval=2,
+            ),
+            heldout_snapshot_path=self.heldout_snapshot_path,
+            output_dir=self.root / "quality-evaluated",
+            max_steps=7,
+            save_every=7,
+        )
+        for key, value in baseline.state_dict().items():
+            torch.testing.assert_close(
+                value, evaluated.state_dict()[key], rtol=0, atol=0
+            )
+
+    def test_heldout_quality_is_merged_into_one_wandb_record_per_step(self):
+        fake_run = types.SimpleNamespace(log=mock.Mock(), finish=mock.Mock())
+        fake_wandb = types.SimpleNamespace(
+            init=mock.Mock(return_value=fake_run),
+        )
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            telemetry = JsonlTelemetry(
+                None,
+                enabled=True,
+                wandb_project="quality-project",
+                wandb_run_id="quality-run",
+            )
+            try:
+                train_from_replay(
+                    TinyPolicy(),
+                    snapshot_path=self.snapshot_path,
+                    config=_config(
+                        heldout_snapshot=self.heldout_snapshot,
+                        heldout_eval_interval=2,
+                    ),
+                    heldout_snapshot_path=self.heldout_snapshot_path,
+                    output_dir=self.root / "quality-wandb",
+                    max_steps=2,
+                    save_every=2,
+                    telemetry=telemetry,
+                )
+            finally:
+                telemetry.close()
+        self.assertEqual(
+            [call.kwargs["step"] for call in fake_run.log.call_args_list],
+            [0, 1, 2],
+        )
+        initial_quality = fake_run.log.call_args_list[0].args[0]
+        final_combined = fake_run.log.call_args_list[2].args[0]
+        self.assertIn("quality/heldout_action_mse", initial_quality)
+        self.assertIn("loss", final_combined)
+        self.assertIn("quality/heldout_action_mse", final_combined)
+
+    def test_resume_relogs_due_heldout_frontier_without_duplicate_jsonl(self):
+        heldout_path = self.root / "quality-resume" / "heldout.jsonl"
+        config = _config(
+            heldout_snapshot=self.heldout_snapshot,
+            heldout_eval_interval=2,
+        )
+        partial_telemetry = JsonlTelemetry(
+            None, heldout_path=heldout_path, enabled=True
+        )
+        try:
+            partial = train_from_replay(
+                TinyPolicy(),
+                snapshot_path=self.snapshot_path,
+                config=config,
+                heldout_snapshot_path=self.heldout_snapshot_path,
+                output_dir=self.root / "quality-resume" / "run",
+                max_steps=4,
+                save_every=2,
+                telemetry=partial_telemetry,
+                validation_stop_at_step=2,
+            )
+        finally:
+            partial_telemetry.close()
+        self.assertEqual(
+            [
+                json.loads(line)["optimizer_step"]
+                for line in heldout_path.read_text().splitlines()
+            ],
+            [0, 2],
+        )
+
+        fake_run = types.SimpleNamespace(log=mock.Mock(), finish=mock.Mock())
+        fake_wandb = types.SimpleNamespace(init=mock.Mock(return_value=fake_run))
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            resumed_telemetry = JsonlTelemetry(
+                None,
+                heldout_path=heldout_path,
+                enabled=True,
+                wandb_project="quality-project",
+                wandb_run_id="quality-resume-run",
+                wandb_resume_must=True,
+            )
+            try:
+                train_from_replay(
+                    TinyPolicy(),
+                    snapshot_path=self.snapshot_path,
+                    config=config,
+                    heldout_snapshot_path=self.heldout_snapshot_path,
+                    output_dir=self.root / "quality-resume" / "run",
+                    max_steps=4,
+                    save_every=2,
+                    telemetry=resumed_telemetry,
+                    resume_from=partial.restart_checkpoint,
+                )
+            finally:
+                resumed_telemetry.close()
+
+        self.assertEqual(
+            [call.kwargs["step"] for call in fake_run.log.call_args_list],
+            [2, 3, 4],
+        )
+        self.assertIn(
+            "quality/heldout_action_mse", fake_run.log.call_args_list[0].args[0]
+        )
+        self.assertEqual(
+            [
+                json.loads(line)["optimizer_step"]
+                for line in heldout_path.read_text().splitlines()
+            ],
+            [0, 2, 4],
         )
 
     def test_jsonl_telemetry_append_is_atomic_across_replace_failure(self):

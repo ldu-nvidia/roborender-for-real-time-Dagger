@@ -192,7 +192,7 @@ def _bridge_environment(
         macro_round=macro_round,
         learner_identity_sha256=identity_sha256,
     )
-    return {
+    environment = {
         "DRY_RUN": "0",
         # Preserve a virtual-environment entry point.  Resolving its symlink
         # selects the base interpreter and silently drops the validated venv's
@@ -266,6 +266,25 @@ def _bridge_environment(
         ),
         "ROUND_DAGGER_WANDB_RUN_ID": run_id,
     }
+    heldout = learner_contract.get("heldout_evaluation")
+    if heldout is not None:
+        environment.update(
+            {
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT": str(
+                    heldout["snapshot_path"]
+                ),
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256": str(
+                    heldout["snapshot_file_sha256"]
+                ),
+                "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256": str(
+                    heldout["snapshot_sha256"]
+                ),
+                "ROUND_DAGGER_HELDOUT_EVAL_INTERVAL": str(
+                    heldout["interval_steps"]
+                ),
+            }
+        )
+    return environment
 
 
 def recover_ingested_learner(

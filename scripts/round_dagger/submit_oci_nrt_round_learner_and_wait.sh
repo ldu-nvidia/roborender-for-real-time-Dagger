@@ -79,6 +79,28 @@ for name in "${required[@]}"; do
     [[ ${!name} != *$'\n'* && ${!name} != *$'\r'* && ${!name} != *,* ]] || \
         fatal "unsafe value for $name"
 done
+heldout_names=(
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256
+    ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256
+    ROUND_DAGGER_HELDOUT_EVAL_INTERVAL
+)
+heldout_present=0
+for name in "${heldout_names[@]}"; do
+    [[ -z ${!name:-} ]] || heldout_present=$((heldout_present + 1))
+done
+((heldout_present == 0 || heldout_present == ${#heldout_names[@]})) || \
+    fatal "held-out replay environment must be supplied all-or-none"
+HELDOUT_ENABLED=0
+if ((heldout_present)); then
+    HELDOUT_ENABLED=1
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "held-out replay snapshot file SHA-256 is malformed"
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "held-out replay snapshot semantic SHA-256 is malformed"
+    [[ $ROUND_DAGGER_HELDOUT_EVAL_INTERVAL == 100 ]] || \
+        fatal "production held-out evaluation interval must be exactly 100"
+fi
 for name in ROUND_DAGGER_POLICY_SPEC_SHA256 ROUND_DAGGER_POLICY_MANIFEST_SHA256 \
             ROUND_DAGGER_POLICY_SHA256 ROUND_DAGGER_RUNTIME_POLICY_SHA256 \
             ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256 \
@@ -104,6 +126,50 @@ for path in "$CAMPAIGN_ROOT" "$ROUND_DAGGER_POLICY_CHECKPOINT" \
             "$ROUND_DAGGER_LEARNER_RESULT"; do
     safe_absolute_path "$path" || fatal "unsafe learner mount/input path"
 done
+if ((HELDOUT_ENABLED)); then
+    safe_absolute_path "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT" || \
+        fatal "unsafe held-out replay snapshot path"
+    [[ $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT == "$CAMPAIGN_ROOT"/* ]] || \
+        fatal "held-out replay snapshot must be inside the campaign"
+    [[ -f $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT && \
+       ! -L $ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT ]] || \
+        fatal "held-out replay snapshot is missing or unsafe"
+    [[ $(sha256sum "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT" | awk '{print $1}') == \
+       "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256" ]] || \
+        fatal "held-out replay snapshot file SHA mismatch"
+    PYTHONPATH="$ROOT" "$PYTHON" - \
+        "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT" \
+        "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256" \
+        "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256" \
+        "$ROUND_DAGGER_CAMPAIGN_ID" "$CAMPAIGN_ROOT" <<'PY'
+import sys
+from pathlib import Path
+from round_dagger.replay import load_heldout_snapshot
+
+path, file_sha, semantic_sha, campaign_id, campaign_root = sys.argv[1:]
+snapshot = load_heldout_snapshot(path, expected_file_sha256=file_sha)
+if snapshot["snapshot_sha256"] != semantic_sha:
+    raise SystemExit("held-out replay snapshot semantic digest mismatch")
+if snapshot["campaign_id"] != campaign_id:
+    raise SystemExit("held-out replay snapshot campaign mismatch")
+root = Path(campaign_root).resolve(strict=True)
+referenced = [
+    *(Path(item["cohort_manifest_path"]) for item in snapshot["cohorts"]),
+    *(Path(item["shard_manifest_path"]) for item in snapshot["resolved_shards"]),
+    *(Path(item["payload_path"]) for item in snapshot["resolved_shards"]),
+]
+for referenced_path in referenced:
+    resolved = referenced_path.resolve(strict=True)
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit("held-out replay artifact is outside the campaign") from exc
+    if relative.parts and relative.parts[0] in {"actors", "operator"}:
+        raise SystemExit(
+            "held-out replay artifact would be excluded from learner projection"
+        )
+PY
+fi
 for file in "$ROUND_DAGGER_POLICY_CHECKPOINT" "$ROUND_DAGGER_POLICY_SPEC" \
             "$ROUND_DAGGER_POLICY_MANIFEST" "$ROUND_DAGGER_REPLAY_SNAPSHOT"; do
     [[ -f $file && ! -L $file ]] || fatal "required learner input is missing or unsafe"
@@ -213,8 +279,10 @@ if ((DRY_RUN)); then
         "$JOB_NAME" "$LOCAL_HANDOFF" "$REMOTE_RUN"
     printf 'DRY_RUN local_campaign=%q projection=learner-inputs-only\n' \
         "$CAMPAIGN_ROOT"
-    printf 'DRY_RUN remote_host=%s account=%s partition=%s gpus=8 updates=1200 save_every=5\n' \
-        "$REMOTE" "$ACCOUNT" "$PARTITION"
+    printf 'DRY_RUN remote_host=%s account=%s partition=%s gpus=8 updates=%s save_every=5\n' \
+        "$REMOTE" "$ACCOUNT" "$PARTITION" "$ROUND_DAGGER_LEARNER_MAX_STEPS"
+    printf 'DRY_RUN heldout_eval=%s cadence=%s\n' \
+        "$HELDOUT_ENABLED" "${ROUND_DAGGER_HELDOUT_EVAL_INTERVAL:-disabled}"
     printf 'DRY_RUN mount %q at %q read-only; mount %q at %q writable\n' \
         "$REMOTE_CAMPAIGN" "$CAMPAIGN_ROOT" "$REMOTE_OUTPUT" \
         "$ROUND_DAGGER_LEARNER_OUTPUT_DIR"
@@ -257,6 +325,16 @@ for source in "$ROUND_DAGGER_POLICY_CHECKPOINT" "$ROUND_DAGGER_POLICY_SPEC" \
        $(sha256sum "$projected" | awk '{print $1}') ]] || \
         fatal "projected learner input differs from canonical campaign"
 done
+if ((HELDOUT_ENABLED)); then
+    source=$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT
+    relative=${source#"$CAMPAIGN_ROOT"/}
+    projected="$LOCAL_PROJECTION/$relative"
+    [[ -f $projected && ! -L $projected ]] || \
+        fatal "projection omitted held-out replay snapshot"
+    [[ $(sha256sum "$source" | awk '{print $1}') == \
+       $(sha256sum "$projected" | awk '{print $1}') ]] || \
+        fatal "projected held-out replay snapshot differs from canonical campaign"
+fi
 
 ssh -o BatchMode=yes "$REMOTE" env PYTHONDONTWRITEBYTECODE=1 \
     python3 "$REMOTE_SOURCE/scripts/round_dagger/verify_sealed_source_snapshot.py" \
@@ -330,6 +408,9 @@ export_names=(
     ROUND_DAGGER_WANDB_ENTITY ROUND_DAGGER_WANDB_RUN_ID
     ROUND_DAGGER_WANDB_EXPECTED_EMAIL ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE
 )
+if ((HELDOUT_ENABLED)); then
+    export_names+=("${heldout_names[@]}")
+fi
 exports="PATH=$REMOTE_SLURM_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 for name in "${export_names[@]}"; do exports+=",$name=${!name}"; done
 exports+=",ROUND_DAGGER_REMOTE_SOURCE_ROOT=$REMOTE_SOURCE"
