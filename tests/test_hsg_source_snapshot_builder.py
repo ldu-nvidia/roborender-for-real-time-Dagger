@@ -1,7 +1,9 @@
 from pathlib import Path
+import hashlib
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -13,6 +15,9 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.script = (ROOT / "scripts/scaling/stage_hsg_source_snapshot.sh").read_text()
+        cls.receiver = (
+            ROOT / "scripts/scaling/receive_source_snapshot_archive.sh"
+        ).read_text()
 
     def test_payload_uses_committed_blobs_and_verified_lfs_objects(self):
         self.assertIn('git -C "$repo" ls-files --stage -z', self.script)
@@ -42,7 +47,7 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
     def test_local_and_remote_content_digests_are_required(self):
         self.assertGreaterEqual(self.script.count("tree-hash"), 4)
         self.assertIn("deterministic_archive_sha256", self.script)
-        self.assertIn('[ "$archive_actual" = "$archive_expected" ]', self.script)
+        self.assertIn('[ "$archive_actual" = "$archive_expected" ]', self.receiver)
         self.assertIn('[ -z "$(find "$temporary" -perm /222', self.script)
         self.assertIn("inventory_sha256", self.script)
         self.assertIn("REMOTE_VERIFY", self.script)
@@ -51,13 +56,141 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
         self.assertIn("ssh stat awk wc cmp dd grep unlink zstd", self.script)
         self.assertIn("[ -x /usr/bin/zstd ]", self.script)
         self.assertIn("zstd -q -1 -T0 -c", self.script)
-        self.assertIn("/usr/bin/zstd -q -d -c | tar -xf -", self.script)
+        self.assertIn("TRANSPORT_SHA256", self.script)
+        self.assertIn("receive_source_snapshot_archive.sh", self.script)
+        self.assertIn(
+            'transport_actual=$(sha256sum "$archive"', self.receiver
+        )
+        self.assertIn(
+            'archive_actual=$(/usr/bin/zstd -q -d -c "$archive"', self.receiver
+        )
+        remote_verify = self.script.split("<<'REMOTE_VERIFY'", 1)[1]
+        self.assertNotIn("tar --sort=name", remote_verify)
         self.assertIn("REMOTE_SEED_ROOT", self.script)
         self.assertIn('cp -a --reflink=auto "$canonical_seed/."', self.script)
         self.assertIn(
             'case "$canonical_seed" in "$output_root"/fast_roborender_*_sealed',
             self.script,
         )
+
+    def test_transport_verification_does_not_reconstruct_archive_with_remote_tar(self):
+        with tempfile.TemporaryDirectory(prefix="rr_snapshot_transport_") as temporary:
+            root = Path(temporary)
+            payload = root / "payload.txt"
+            payload.write_text("cross-version archive payload\n", encoding="utf-8")
+            canonical = root / "canonical.tar"
+            with tarfile.open(canonical, "w", format=tarfile.PAX_FORMAT) as archive:
+                info = archive.gettarinfo(str(payload), arcname="payload.txt")
+                info.uid = 123
+                info.gid = 456
+                info.mtime = 1_700_000_000
+                with payload.open("rb") as handle:
+                    archive.addfile(info, handle)
+            compressed = root / "canonical.tar.zst"
+            with compressed.open("wb") as output:
+                subprocess.run(
+                    ["/usr/bin/zstd", "-q", "-1", "-c", str(canonical)],
+                    check=True,
+                    stdout=output,
+                )
+            archive_sha = hashlib.sha256(canonical.read_bytes()).hexdigest()
+            transport_sha = hashlib.sha256(compressed.read_bytes()).hexdigest()
+            destination = root / "destination"
+            destination.mkdir()
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts/scaling/receive_source_snapshot_archive.sh"),
+                    str(compressed),
+                    str(destination),
+                    transport_sha,
+                    archive_sha,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(compressed.exists())
+            self.assertEqual(
+                (destination / "payload.txt").read_text(encoding="utf-8"),
+                "cross-version archive payload\n",
+            )
+            reconstructed = subprocess.run(
+                [
+                    "/usr/bin/tar",
+                    "--sort=name",
+                    "--mtime=@0",
+                    "--owner=0",
+                    "--group=0",
+                    "--numeric-owner",
+                    "-cf",
+                    "-",
+                    "-C",
+                    str(destination),
+                    ".",
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+            ).stdout
+            self.assertNotEqual(hashlib.sha256(reconstructed).hexdigest(), archive_sha)
+
+    def test_transport_receiver_rejects_compressed_and_canonical_tampering(self):
+        with tempfile.TemporaryDirectory(prefix="rr_snapshot_transport_bad_") as temporary:
+            root = Path(temporary)
+            canonical = root / "canonical.tar"
+            payload = root / "payload.txt"
+            payload.write_text("payload\n", encoding="utf-8")
+            with tarfile.open(canonical, "w") as archive:
+                archive.add(payload, arcname="payload.txt")
+            original = root / "original.tar.zst"
+            with original.open("wb") as output:
+                subprocess.run(
+                    ["/usr/bin/zstd", "-q", "-1", "-c", str(canonical)],
+                    check=True,
+                    stdout=output,
+                )
+            archive_sha = hashlib.sha256(canonical.read_bytes()).hexdigest()
+            transport_sha = hashlib.sha256(original.read_bytes()).hexdigest()
+
+            for label, expected_transport, expected_archive, error in (
+                (
+                    "transport",
+                    "0" * 64,
+                    archive_sha,
+                    "compressed source transport SHA-256 mismatch",
+                ),
+                (
+                    "archive",
+                    transport_sha,
+                    "0" * 64,
+                    "canonical source archive SHA-256 mismatch",
+                ),
+            ):
+                archive = root / f"{label}.tar.zst"
+                shutil.copy2(original, archive)
+                destination = root / f"destination_{label}"
+                destination.mkdir()
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(
+                            ROOT
+                            / "scripts/scaling/receive_source_snapshot_archive.sh"
+                        ),
+                        str(archive),
+                        str(destination),
+                        expected_transport,
+                        expected_archive,
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assertTrue(archive.exists())
+                self.assertEqual(list(destination.iterdir()), [])
 
     def test_publication_is_atomic_and_never_overwrites(self):
         self.assertIn('[ ! -e "$LOCAL_PUBLICATION" ]', self.script)

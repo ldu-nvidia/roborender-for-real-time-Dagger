@@ -40,6 +40,7 @@ LOCAL_ATTESTATION=
 LOCAL_INVENTORY_TEMP=
 LOCAL_INVENTORY=
 LOCAL_LOCK=
+LOCAL_TRANSPORT_ARCHIVE=
 LOCAL_LOCK_OWNED=0
 LOCAL_DESTINATION_OWNED=0
 LOCAL_ATTESTATION_OWNED=0
@@ -51,6 +52,7 @@ REMOTE_ATTESTATION=
 REMOTE_INVENTORY_TEMP=
 REMOTE_INVENTORY=
 REMOTE_LOCK=
+REMOTE_TRANSPORT_ARCHIVE=
 INDEX_LISTS=()
 
 cleanup_incomplete_publication() {
@@ -62,16 +64,17 @@ cleanup_incomplete_publication() {
                 "$REMOTE_OUTPUT_ROOT" "$REMOTE_TEMPORARY" "$REMOTE_DESTINATION" \
                 "$REMOTE_ATTESTATION_TEMP" "$REMOTE_ATTESTATION" \
                 "$REMOTE_INVENTORY_TEMP" "$REMOTE_INVENTORY" "$REMOTE_LOCK" \
+                "$REMOTE_TRANSPORT_ARCHIVE" \
                 <<'REMOTE_CLEANUP' || true
 set -Eeuo pipefail
 root=$1; temporary=$2; destination=$3
 attestation_temporary=$4; attestation=$5; inventory_temporary=$6; inventory=$7
-lock=$8
+lock=$8; transport_archive=$9
 case "$temporary" in "$root"/.fast_roborender_*_sealed.uploading.*) ;; *) exit 2 ;; esac
 case "$destination" in "$root"/fast_roborender_*_sealed) ;; *) exit 2 ;; esac
 if [ ! -e "$destination" ]; then
     for path in "$attestation_temporary" "$attestation" \
-                "$inventory_temporary" "$inventory"; do
+                "$inventory_temporary" "$inventory" "$transport_archive"; do
         [ ! -e "$path" ] || unlink "$path"
     done
     # A TERM can race the remote extraction process. Retry after restoring
@@ -100,6 +103,13 @@ REMOTE_CLEANUP
         for path in "${INDEX_LISTS[@]}"; do
             [ ! -e "$path" ] || unlink "$path"
         done
+        if [ -n "$LOCAL_TRANSPORT_ARCHIVE" ]; then
+            case "$LOCAL_TRANSPORT_ARCHIVE" in
+                "$LOCAL_OUTPUT_ROOT"/.fast_roborender_*_sealed.transport.*) \
+                    [ ! -e "$LOCAL_TRANSPORT_ARCHIVE" ] || \
+                        unlink "$LOCAL_TRANSPORT_ARCHIVE" ;;
+            esac
+        fi
         for directory in "$LOCAL_PUBLICATION_TEMP"; do
             [ -z "$directory" ] && continue
             case "$directory" in
@@ -454,14 +464,15 @@ REMOTE_ATTESTATION_TEMP=$REMOTE_OUTPUT_ROOT/.${SNAPSHOT_NAME}.attestation.upload
 REMOTE_INVENTORY=$REMOTE_OUTPUT_ROOT/${SNAPSHOT_NAME}.inventory.json
 REMOTE_INVENTORY_TEMP=$REMOTE_OUTPUT_ROOT/.${SNAPSHOT_NAME}.inventory.uploading.$$.json
 REMOTE_LOCK=$REMOTE_OUTPUT_ROOT/.${SNAPSHOT_NAME}.publish.lock
+REMOTE_TRANSPORT_ARCHIVE=$REMOTE_OUTPUT_ROOT/.${SNAPSHOT_NAME}.transport.uploading.$$.tar.zst
 ssh -o BatchMode=yes "$HSG_HOST" /bin/bash -s -- "$STAGE_ROOT" "$REMOTE_OUTPUT_ROOT" \
     "$REMOTE_DESTINATION" "$REMOTE_TEMPORARY" "$REMOTE_ATTESTATION" \
     "$REMOTE_ATTESTATION_TEMP" "$REMOTE_INVENTORY" "$REMOTE_INVENTORY_TEMP" \
-    "$REMOTE_LOCK" "$REMOTE_SEED_ROOT" <<'REMOTE_PREPARE'
+    "$REMOTE_LOCK" "$REMOTE_SEED_ROOT" "$REMOTE_TRANSPORT_ARCHIVE" <<'REMOTE_PREPARE'
 set -Eeuo pipefail
 stage_root=$1; output_root=$2; destination=$3; temporary=$4
 attestation=$5; attestation_temporary=$6; inventory=$7; inventory_temporary=$8
-lock=$9; seed=${10}
+lock=$9; seed=${10}; transport_archive=${11}
 lock_owned=0
 cleanup_prepare() {
     local rc=$?
@@ -484,7 +495,7 @@ mkdir -p "$output_root"
 mkdir "$lock"
 lock_owned=1
 for path in "$destination" "$temporary" "$attestation" "$attestation_temporary" \
-            "$inventory" "$inventory_temporary"; do
+            "$inventory" "$inventory_temporary" "$transport_archive"; do
     [ ! -e "$path" ]
 done
 mkdir "$temporary"
@@ -500,9 +511,25 @@ fi
 REMOTE_PREPARE
 REMOTE_PREPARED=1
 if [ "$REMOTE_SEED_ROOT" = NONE ]; then
-    tar -cf - -C "$LOCAL_DESTINATION" . | zstd -q -1 -T0 -c | \
-        ssh -o BatchMode=yes "$HSG_HOST" \
-            "/bin/bash -c '/usr/bin/zstd -q -d -c | tar -xf - -C \"$REMOTE_TEMPORARY\"'"
+    LOCAL_TRANSPORT_ARCHIVE=$(mktemp \
+        "$LOCAL_OUTPUT_ROOT/.${SNAPSHOT_NAME}.transport.XXXXXX")
+    tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+        -cf - -C "$LOCAL_DESTINATION" . | zstd -q -1 -T0 -c \
+        > "$LOCAL_TRANSPORT_ARCHIVE"
+    [ "$(zstd -q -d -c "$LOCAL_TRANSPORT_ARCHIVE" | sha256sum | awk '{print $1}')" = \
+      "$ARCHIVE_SHA256" ] || fatal "local transport archive identity mismatch"
+    TRANSPORT_SHA256=$(sha256sum "$LOCAL_TRANSPORT_ARCHIVE" | awk '{print $1}')
+    chmod 0444 "$LOCAL_TRANSPORT_ARCHIVE"
+    rsync -a --checksum --no-owner --no-group \
+        --rsync-path=/usr/bin/rsync \
+        -e "ssh -o BatchMode=yes" \
+        "$LOCAL_TRANSPORT_ARCHIVE" "$HSG_HOST:$REMOTE_TRANSPORT_ARCHIVE"
+    ssh -o BatchMode=yes "$HSG_HOST" /bin/bash -s -- \
+        "$REMOTE_TRANSPORT_ARCHIVE" "$REMOTE_TEMPORARY" \
+        "$TRANSPORT_SHA256" "$ARCHIVE_SHA256" \
+        < "$LOCAL_DESTINATION/scripts/scaling/receive_source_snapshot_archive.sh"
+    unlink "$LOCAL_TRANSPORT_ARCHIVE"
+    LOCAL_TRANSPORT_ARCHIVE=
 else
     rsync -a --checksum --delete --no-owner --no-group \
         --rsync-path=/usr/bin/rsync \
@@ -544,9 +571,6 @@ gr00t_tree_actual=$(PYTHONDONTWRITEBYTECODE=1 python3 \
 [ "$fast_tree_actual" = "$fast_tree_expected" ]
 [ "$gr00t_tree_actual" = "$gr00t_tree_expected" ]
 [ "$(sha256sum "$inventory_temporary" | awk '{print $1}')" = "$inventory_expected" ]
-archive_actual=$(tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-    -cf - -C "$temporary" . | sha256sum | awk '{print $1}')
-[ "$archive_actual" = "$archive_expected" ]
 python3 - "$attestation_temporary" "$snapshot_name" "$fast_revision" \
     "$gr00t_revision" "$fast_tree_expected" "$gr00t_tree_expected" \
     "$inventory_expected" "$archive_expected" <<'PY'
