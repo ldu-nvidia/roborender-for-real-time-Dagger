@@ -23,6 +23,11 @@ from round_dagger.actor_pair import (
     seal_actor_pair,
 )
 from round_dagger.image3f_lifecycle import create_attempt_plan, record_rank_completion
+from round_dagger.production_data_lineage import (
+    build_cohort_assignment,
+    data_lineage_sha256,
+    derive_data_lineage,
+)
 from round_dagger.seed_policy import derive_actor_seed_contract
 from tests.test_round_dagger_handoff import publish_policy_bundle
 
@@ -39,6 +44,45 @@ DIGESTS = {
     "beta_sha256": "5" * 64,
     "config_sha256": "6" * 64,
 }
+
+
+def _production_data_lineage() -> dict:
+    motion_split = {
+        "manifest_sha256": (
+            "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834"
+        ),
+        "heldout_plan_sha256": "7" * 64,
+        "collection_role": "collection",
+        "evaluation_role": "eval",
+        "collection_motion_count": 39,
+        "heldout_motion_count": 256,
+    }
+    return derive_data_lineage(
+        {
+            "contract_sha256": "8" * 64,
+            "invariant_profile_sha256": "9" * 64,
+            "live_capture": {
+                "attestation_sha256": "a" * 64,
+                "evidence_sha256": "b" * 64,
+                "scenario_sha256": "c" * 64,
+            },
+            "capture_provenance": {
+                "motion_split_manifest_sha256": motion_split[
+                    "manifest_sha256"
+                ],
+                "heldout_plan_sha256": motion_split[
+                    "heldout_plan_sha256"
+                ],
+            },
+        },
+        motion_split_contract=motion_split,
+        topology={
+            "cohort_count": 4,
+            "actor_ranks_per_cohort": 2,
+            "environments_per_actor_rank": 32,
+            "active_environments": 64,
+        },
+    )
 
 
 class _ResetAckServer:
@@ -244,6 +288,7 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
             "runtime_policy_sha256"
         ]
         self.cohort = self.root / "cohort"
+        self.data_lineage = _production_data_lineage()
         artifacts.create_cohort(
             self.cohort,
             campaign_id="pair-launcher-test",
@@ -272,6 +317,12 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
                 cohort_index=0,
                 expected_ranks=[0, 1],
                 expected_global_env_ids=list(range(64)),
+            ),
+            data_lineage=self.data_lineage,
+            motion_assignment=build_cohort_assignment(
+                self.data_lineage,
+                cohort_index=0,
+                expected_ranks=(0, 1),
             ),
         )
         endpoints = []
@@ -327,6 +378,17 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
             "TRAIN_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_ACTOR_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_WANDB_ENABLED": "0",
+            "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": str(
+                ROOT
+                / "GR00T-VisualSim2Real/gr00t/rl/data/motions/g1_wsdpt/"
+                "33demos_675_775_heldout_256_v1.json"
+            ),
+            "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": (
+                "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834"
+            ),
+            "ROUND_DAGGER_DATA_LINEAGE_SHA256": data_lineage_sha256(
+                self.data_lineage
+            ),
             # Prove the pair launcher removes accidental Torch topology.
             "RANK": "9",
             "WORLD_SIZE": "10",
@@ -346,6 +408,22 @@ class ActorPairLauncherDryRunTest(unittest.TestCase):
         self.assertIn("actor_rank=0 actor_world_size=2", result.stdout)
         self.assertIn("actor_rank=1 actor_world_size=2", result.stdout)
         self.assertIn("no_torch_distributed=1", result.stdout)
+        self.assertIn(
+            "env.config.reset_from_dataset.motion_split_role=collection",
+            result.stdout,
+        )
+        self.assertIn(
+            "env.config.reset_from_dataset.motion_split_verify_content=true",
+            result.stdout,
+        )
+        self.assertIn(
+            "env.config.reset_from_dataset.motion_assignment_offset=0",
+            result.stdout,
+        )
+        self.assertIn(
+            "env.config.reset_from_dataset.motion_assignment_offset=32",
+            result.stdout,
+        )
         self.assertNotIn("--multi_gpu", result.stdout)
         match = re.search(r"ACTOR_PAIR_STREAM_PLAN namespace=([^ ]+) ", result.stdout)
         self.assertIsNotNone(match)
@@ -622,6 +700,8 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
         self.netrc.write_text("machine api.wandb.ai\n")
         self.plan = self.root / "stream-plan.json"
         self.plan.write_text("{}\n")
+        self.motion_split = self.root / "motion-split.json"
+        self.motion_split.write_text("{}\n")
         self.argv_file = self.root / "docker.argv"
         self.fake_docker = self.root / "docker"
         self.fake_docker.write_text(
@@ -660,6 +740,9 @@ class ActorRankDockerIsolationTest(unittest.TestCase):
             "ROUND_DAGGER_CAMERA_ACCEPTANCE": str(self.camera),
             "ROUND_DAGGER_WANDB_NETRC": str(self.netrc),
             "ROUND_DAGGER_IMAGE3F_STREAM_PLAN": str(self.plan),
+            "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": str(
+                self.motion_split
+            ),
             "NETRC": str(self.netrc),
             "WANDB_API_KEY": "must-not-be-forwarded",
             "ROUND_DAGGER_RUNTIME_ADAPTER_MODE": "shadow",

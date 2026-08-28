@@ -1,5 +1,5 @@
 {
-  "schema": "fast_roborender.round_dagger.production_campaign_contract.v1",
+  "schema": "fast_roborender.round_dagger.production_campaign_contract.v2",
   "campaign_id": "roborender-dagger-256x512-v1",
   "topology": {
     "target_environments": 256,
@@ -7,9 +7,11 @@
     "cohort_count": 4,
     "environments_per_actor_rank": 32,
     "actor_ranks_per_cohort": 2,
+    "macro_round_count": 5,
     "steps_per_environment": 512,
     "transitions_per_cohort": 32768,
-    "transitions_per_macro_round": 131072
+    "transitions_per_macro_round": 131072,
+    "transitions_per_campaign": 655360
   },
   "observation_contract": {
     "primary_view": "head_color",
@@ -44,15 +46,28 @@
     "decay_rounds": 4,
     "rate": 1.0
   },
+  "motion_split": {
+    "manifest_relative_path": "GR00T-VisualSim2Real/gr00t/rl/data/motions/g1_wsdpt/33demos_675_775_heldout_256_v1.json",
+    "manifest_sha256": "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834",
+    "heldout_plan_relative_path": "configs/round_dagger/production_heldout_motion_plan_8x32.json",
+    "heldout_plan_sha256": "394ba77b2c8ecbdb4904ef24894cda0b88bb5b606ab75e578ee0a91756630f19",
+    "collection_role": "collection",
+    "evaluation_role": "eval",
+    "verify_content": true,
+    "collection_motion_count": 39,
+    "heldout_motion_count": 256,
+    "evaluation_seed_count": 8,
+    "motions_per_evaluation_seed": 32
+  },
   "artifacts": {
     "bootstrap_bundle": {
-      "checkpoint_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v5_20260825T0456Z/student-v0.pt",
-      "checkpoint_sha256": "3b3a9ac168eaf163a566772679a5bb4b8ec73c9947c9b51668ac08f9a014abae",
-      "runtime_policy_sha256": "fd1fd8f290fd603e05251f3798f40fd29b8028041e701e6240ac1ae4541f67b6",
-      "policy_spec_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v5_20260825T0456Z/student-v0.pt.policy_spec.json",
-      "policy_spec_sha256": "216cf3a2802ede98bf208ff7fb3925163973e2e32d823c1d6b1efa4dfeec24cb",
-      "manifest_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v5_20260825T0456Z/student-v0.pt.manifest.json",
-      "manifest_sha256": "ca103a67843c004dd2293a3b96927807e951ac477847023d646ffb091ff20379"
+      "checkpoint_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v6_complete_identity_20260827T061620Z/student-v0.pt",
+      "checkpoint_sha256": "720a975812f6083192234d650033511c821b6902da2ef7734d87943f6c0a359a",
+      "runtime_policy_sha256": "cd6f70aa9d589e810b7ab22999941930742a94621870457aadd068d2394deb9a",
+      "policy_spec_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v6_complete_identity_20260827T061620Z/student-v0.pt.policy_spec.json",
+      "policy_spec_sha256": "3e903c55218ca2aae4c970fab6aeb820de0a35d8965a34262b8206fd62f74dee",
+      "manifest_path": "/mnt/data2/ldu/roborender_round_dagger_validation/fresh_bootstrap_v6_complete_identity_20260827T061620Z/student-v0.pt.manifest.json",
+      "manifest_sha256": "33a1a07a4ffa09e02805bbb5ab70ba32ecf3d1d2d195d9f1bcb61021c20ad6ae"
     },
     "teacher": {
       "checkpoint_path": "/mnt/data2/ldu/fast_roborender_runtime_adapters/GR00T-VisualSim2Real/logs_rl/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q9_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--3500.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251105_004910/model_step_044500.pt",

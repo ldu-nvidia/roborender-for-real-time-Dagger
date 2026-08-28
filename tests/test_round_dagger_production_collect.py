@@ -118,15 +118,19 @@ class ProductionCollectHookStaticContractTest(unittest.TestCase):
         source = HOOK.read_text(encoding="utf-8")
         for expected in (
             "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38",
-            "a82f639a9038789db220793475dfce3eb5651ff3145287be748f387a20caeb9f",
-            "d075c02b3e8aace7c1a4b2ef1e0b694738052da66bea6300299a7c4fd6956be6",
             "ee358a97581512a5d03730d06efd5804e53844f517112dc0a845ed86b6dae46f",
             "sha256:65a0cbe64eb71ee2edb672bed3ec7bdaa8adfeb22298c0e99af8b91d74dc78f8",
-            "53234dfe2eab9b1ae02df21e143f996ecde831aadb8aacb2e5f2df632d3d8d27",
+            "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834",
             '"256:4:64:512:131072"',
             '"64:32768"',
             "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE",
             "simulator_rgb",
+            "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST",
+            "ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256",
+            "ROUND_DAGGER_DATA_LINEAGE_SHA256",
+            "ROUND_DAGGER_ENDPOINT_MANIFEST_SHA256",
+            "ROUND_DAGGER_CAMERA_ACCEPTANCE_SHA256",
+            "round_dagger.production_data_lineage verify",
         ):
             self.assertIn(expected, source)
         self.assertIn('exec "$PAIR_SCRIPT"', source)
@@ -291,6 +295,14 @@ class ProductionCollectHookRealDryRunTest(unittest.TestCase):
             "ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256": camera_acceptance[
                 "gr00t_source_tree_sha256"
             ],
+            "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": str(
+                ROOT
+                / "GR00T-VisualSim2Real/gr00t/rl/data/motions/g1_wsdpt/"
+                "33demos_675_775_heldout_256_v1.json"
+            ),
+            "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": (
+                "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834"
+            ),
             "ROUND_DAGGER_WANDB_NETRC": str(self.WANDB_NETRC),
             "ROUND_DAGGER_ACTOR_RUN_DIR": str(run_dir),
             "TRAIN_RUN_DIR": str(run_dir),

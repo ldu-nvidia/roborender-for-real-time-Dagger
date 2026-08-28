@@ -13,6 +13,10 @@ from pathlib import Path
 
 from round_dagger.artifacts import sha256_file
 from round_dagger.evaluation import DEFAULT_THRESHOLDS
+from round_dagger.production_data_lineage import (
+    data_lineage_sha256,
+    derive_data_lineage,
+)
 from round_dagger.state import load_campaign, load_state
 from scripts.round_dagger.production_launch import TEACHER_CHECKPOINT_RELATIVE
 
@@ -44,12 +48,6 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             )
         (self.tmp / "evaluation-seal.inventory.json").write_text("{}\n")
         (self.tmp / "evaluation-seal.snapshot_attestation.json").write_text("{}\n")
-        self.root = _campaign(self.tmp)
-        _to_ingested(self.root)
-        self.candidate = _stage_and_bind(self.root, self.tmp)
-        self.state = load_state(self.root)
-        self.campaign = load_campaign(self.root)
-
         self.teacher_checkpoint = self.tmp / "configured-teacher.pt"
         self.sealed_teacher = self.repository_root / TEACHER_CHECKPOINT_RELATIVE
         # _campaign pins sha256(b"teacher") as the expert identity.
@@ -76,6 +74,45 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.gr00t = self.repository_root / "GR00T-VisualSim2Real"
+        split_relative = Path(
+            "gr00t/rl/data/motions/g1_wsdpt/"
+            "33demos_675_775_heldout_256_v1.json"
+        )
+        split_source = (
+            self.live_repository_root / "GR00T-VisualSim2Real" / split_relative
+        )
+        split_target = self.gr00t / split_relative
+        split_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(split_source, split_target)
+        self.motion_split = split_target
+        self.motion_split_sha = sha256_file(split_target)
+        self.heldout_plan = (
+            self.repository_root
+            / "configs/round_dagger/production_heldout_motion_plan_8x32.json"
+        )
+        self.heldout_plan_sha = sha256_file(self.heldout_plan)
+        plan = json.loads(self.heldout_plan.read_text(encoding="utf-8"))
+        scenarios = [
+            {
+                "seed": case["seed"],
+                "env_index": case["env_index"],
+                "scenario_id": case["planned_case_id"],
+            }
+            for case in plan["capture"]["cases"]
+        ]
+        scenario_path = (
+            self.repository_root
+            / "configs/round_dagger/production_paired_scenarios_2x8.json"
+        )
+        scenario_path.write_text(
+            json.dumps(scenarios, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        self.root = _campaign(self.tmp)
+        _to_ingested(self.root)
+        self.candidate = _stage_and_bind(self.root, self.tmp)
+        self.state = load_state(self.root)
+        self.campaign = load_campaign(self.root)
         for relative in (
             "gr00t/rl/eval_agent_trl.py",
             "gr00t/rl/trl/trainer/anchor_io.py",
@@ -110,6 +147,91 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             (self.endpoints / f"renderer_{rank}.txt").write_text(
                 f"127.0.0.1 {19000 + rank}\n", encoding="utf-8"
             )
+        self.endpoint_manifest = self.tmp / "endpoint_manifest.txt"
+        self.endpoint_manifest.write_text(
+            "".join(
+                f"{self.endpoints / f'renderer_{rank}.txt'}\n"
+                for rank in range(2)
+            ),
+            encoding="utf-8",
+        )
+        self.capture_attestation = self.tmp / "capture_attestation.json"
+        self.capture_evidence = self.tmp / "capture_evidence.json"
+        self.capture_attestation.write_text("{}\n", encoding="utf-8")
+        self.capture_evidence.write_text("{}\n", encoding="utf-8")
+        camera_acceptance = self.tmp / "camera_acceptance.json"
+        camera_acceptance.write_text(
+            json.dumps({"reviewer": "fixture-reviewer"}) + "\n",
+            encoding="utf-8",
+        )
+        capture_passes = []
+        for seed in (17, 29, 43, 59, 71, 89, 101, 127):
+            for pass_index in (1, 2):
+                path = self.tmp / f"capture_pass_{seed}_{pass_index}.json"
+                path.write_text("{}\n", encoding="utf-8")
+                capture_passes.append(
+                    {
+                        "seed": seed,
+                        "pass_index": pass_index,
+                        "path": str(path),
+                        "sha256": sha256_file(path),
+                    }
+                )
+        runtime_contract_document = {
+            "schema": "fast_roborender.round_dagger.production_runtime_contract.v1",
+            "status": "release_eligible",
+            "invariant_profile_sha256": sha256_file(sealed_campaign_path),
+            "camera_acceptance": {
+                "path": str(camera_acceptance),
+                "sha256": sha256_file(camera_acceptance),
+            },
+            "renderer_fleet": {
+                "endpoint_manifest_path": str(self.endpoint_manifest),
+                "endpoint_manifest_sha256": sha256_file(self.endpoint_manifest),
+                "endpoint_directory": str(self.endpoints),
+                "renderer_count": 2,
+                "cohort_identity_sha256": _sha("renderer-cohort"),
+                "runtime_identity_sha256": _sha("renderer-runtime"),
+            },
+            "live_capture": {
+                "split_manifest_path": str(self.motion_split),
+                "split_manifest_sha256": self.motion_split_sha,
+                "heldout_plan_path": str(self.heldout_plan),
+                "heldout_plan_sha256": self.heldout_plan_sha,
+                "pass_artifacts": capture_passes,
+                "attestation_path": str(self.capture_attestation),
+                "attestation_sha256": sha256_file(self.capture_attestation),
+                "evidence_path": str(self.capture_evidence),
+                "evidence_sha256": sha256_file(self.capture_evidence),
+                "scenario_path": str(scenario_path),
+                "scenario_sha256": sha256_file(scenario_path),
+            },
+        }
+        self.runtime_contract = self.tmp / "production_runtime_contract.json"
+        self.runtime_contract.write_text(
+            json.dumps(
+                runtime_contract_document,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.runtime_contract_sha = sha256_file(self.runtime_contract)
+        normalized_runtime = {
+            **runtime_contract_document,
+            "contract_sha256": self.runtime_contract_sha,
+            "capture_provenance": {
+                "motion_split_manifest_sha256": self.motion_split_sha,
+                "heldout_plan_sha256": self.heldout_plan_sha,
+            },
+        }
+        self.data_lineage = derive_data_lineage(
+            normalized_runtime,
+            motion_split_contract=sealed_campaign["motion_split"],
+            topology=sealed_campaign["topology"],
+        )
+        self.data_lineage_sha = data_lineage_sha256(self.data_lineage)
 
         self.image_id_sha = _sha("actor-image-id")
         self.docker_log = self.tmp / "docker.log"
@@ -136,6 +258,12 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.control_python.write_text(
             "#!/usr/bin/env bash\n"
             "set -Eeuo pipefail\n"
+            "if [[ ${1:-} == -m && ${2:-} == "
+            "round_dagger.production_data_lineage && ${3:-} == verify ]]; then\n"
+            "  printf '{\"status\":\"PASS\",\"data_lineage_sha256\":\"%s\"}\\n' "
+            "\"$FIXTURE_DATA_LINEAGE_SHA\"\n"
+            "  exit 0\n"
+            "fi\n"
             "for value in \"$@\"; do\n"
             "  case \"$value\" in\n"
             "    *verify_sealed_source_snapshot.py|*verify_anchor_pool.py) exit 0 ;;\n"
@@ -172,6 +300,25 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                 self.repository_root
                 / "configs/round_dagger/production_paired_scenarios_2x8.json"
             ),
+            "ROUND_DAGGER_EVALUATION_MOTION_SPLIT_MANIFEST": str(
+                self.motion_split
+            ),
+            "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": self.motion_split_sha,
+            "ROUND_DAGGER_HELDOUT_EVALUATION_PLAN": str(self.heldout_plan),
+            "ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256": self.heldout_plan_sha,
+            "ROUND_DAGGER_CAMPAIGN_CONTRACT": str(self.runtime_contract),
+            "ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256": self.runtime_contract_sha,
+            "ROUND_DAGGER_DATA_LINEAGE_SHA256": self.data_lineage_sha,
+            "ROUND_DAGGER_CAPTURE_ATTESTATION": str(
+                self.capture_attestation
+            ),
+            "ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256": sha256_file(
+                self.capture_attestation
+            ),
+            "ROUND_DAGGER_CAPTURE_EVIDENCE": str(self.capture_evidence),
+            "ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256": sha256_file(
+                self.capture_evidence
+            ),
             "ROUND_DAGGER_EVALUATION_THRESHOLDS": str(
                 self.repository_root
                 / "configs/round_dagger/production_paired_thresholds.json"
@@ -203,6 +350,7 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
             "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256": self.anchor_inventory_sha,
             "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE": "simulator_rgb",
             "DOCKER_LOG": str(self.docker_log),
+            "FIXTURE_DATA_LINEAGE_SHA": self.data_lineage_sha,
         }
 
     def tearDown(self) -> None:
@@ -225,10 +373,14 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
                 / "configs/round_dagger/production_paired_scenarios_2x8.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(len(scenarios), 16)
+        self.assertEqual(len(scenarios), 256)
         self.assertEqual(
             [(row["seed"], row["env_index"]) for row in scenarios],
-            [(seed, env) for seed in (17, 29) for env in range(8)],
+            [
+                (seed, env)
+                for seed in (17, 29, 43, 59, 71, 89, 101, 127)
+                for env in range(32)
+            ],
         )
         self.assertEqual(
             json.loads(
@@ -273,6 +425,20 @@ class ProductionPairedEvaluationHookTest(unittest.TestCase):
         self.assertIn("--teacher-sha256", completed.stdout)
         self.assertIn("--sealed-teacher-checkpoint", completed.stdout)
         self.assertIn("--require-teacher-readonly-mount", completed.stdout)
+        self.assertIn("--motion-split-manifest", completed.stdout)
+        self.assertIn("--heldout-plan", completed.stdout)
+        runner_source = (
+            self.repository_root
+            / "scripts/round_dagger/run_paired_evaluation.sh"
+        ).read_text(encoding="utf-8")
+        for override in (
+            "motion_split_role=eval",
+            "motion_split_verify_content=true",
+            'motion_split_offset="$MOTION_OFFSET"',
+            'motion_split_limit="$MOTION_LIMIT"',
+            "motion_assignment_offset=0",
+        ):
+            self.assertIn(override, runner_source)
         self.assertIn("IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE", completed.stdout)
         teacher_mount = (
             f"type=bind,src={self.sealed_teacher},"

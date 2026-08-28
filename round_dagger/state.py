@@ -30,10 +30,26 @@ from round_dagger.artifacts import (
 )
 from round_dagger.gr00t_policy import REPLAY_ACTION_DIM
 from round_dagger.policy_bundle import validate_policy_bundle_identity
+from round_dagger.production_data_lineage import (
+    ProductionDataLineageError,
+    build_cohort_assignment,
+    data_lineage_sha256,
+    validate_cohort_assignment,
+    validate_data_lineage,
+)
 
+# V1 campaigns predate a durable execution horizon and remain readable for
+# smoke tests and non-production experiments.  A bounded campaign is V2: the
+# immutable campaign manifest carries the exact number of macro-rounds and the
+# coordinator refuses to open anything beyond that frontier.
 CAMPAIGN_SCHEMA = "fast_roborender.round_dagger.campaign.v1"
+BOUNDED_CAMPAIGN_SCHEMA = "fast_roborender.round_dagger.campaign.v2"
+PRODUCTION_CAMPAIGN_SCHEMA = "fast_roborender.round_dagger.campaign.v3"
 STATE_SCHEMA = "fast_roborender.round_dagger.coordinator_state.v2"
 ROUND_CONTRACT_SCHEMA = "fast_roborender.round_dagger.round_contract.v2"
+PRODUCTION_ROUND_CONTRACT_SCHEMA = (
+    "fast_roborender.round_dagger.round_contract.v3"
+)
 COLLECTION_SCHEMA = "fast_roborender.round_dagger.macro_round_collection.v1"
 BOOTSTRAP_SCHEMA = "fast_roborender.round_dagger.bootstrap_policy.v2"
 CANDIDATE_SCHEMA = "fast_roborender.round_dagger.policy_candidate.v2"
@@ -296,7 +312,7 @@ def _state_lock(root: Path) -> Iterator[None]:
 
 
 def _validate_campaign(document: Mapping[str, Any]) -> dict[str, Any]:
-    keys = {
+    base_keys = {
         "schema",
         "campaign_id",
         "target_environments",
@@ -316,9 +332,20 @@ def _validate_campaign(document: Mapping[str, Any]) -> dict[str, Any]:
         "beta_schedule",
         "beta_schedule_sha256",
     }
-    campaign = _require_exact(document, keys, "campaign manifest")
-    if campaign["schema"] != CAMPAIGN_SCHEMA:
+    schema = document.get("schema") if isinstance(document, Mapping) else None
+    if schema == CAMPAIGN_SCHEMA:
+        keys = base_keys
+    elif schema == BOUNDED_CAMPAIGN_SCHEMA:
+        keys = base_keys | {"macro_round_count"}
+    elif schema == PRODUCTION_CAMPAIGN_SCHEMA:
+        keys = base_keys | {
+            "macro_round_count",
+            "data_lineage",
+            "data_lineage_sha256",
+        }
+    else:
         raise StateError("campaign schema mismatch")
+    campaign = _require_exact(document, keys, "campaign manifest")
     _require_token(campaign["campaign_id"], "campaign_id")
     target = _require_int(
         campaign["target_environments"], "target_environments", minimum=1
@@ -333,6 +360,10 @@ def _validate_campaign(document: Mapping[str, Any]) -> dict[str, Any]:
         )
     _require_int(campaign["steps_per_environment"], "steps_per_environment", minimum=1)
     _require_int(campaign["action_dim"], "action_dim", minimum=1)
+    if schema in {BOUNDED_CAMPAIGN_SCHEMA, PRODUCTION_CAMPAIGN_SCHEMA}:
+        _require_int(
+            campaign["macro_round_count"], "macro_round_count", minimum=1
+        )
     views = campaign["view_names"]
     if not isinstance(views, list) or len(views) != 3 or len(set(views)) != 3:
         raise StateError("view_names must contain exactly three unique views")
@@ -361,6 +392,22 @@ def _validate_campaign(document: Mapping[str, Any]) -> dict[str, Any]:
     schedule = _validate_beta_schedule(campaign["beta_schedule"])
     if canonical_json_sha256(schedule) != campaign["beta_schedule_sha256"]:
         raise StateError("beta schedule digest mismatch")
+    if schema == PRODUCTION_CAMPAIGN_SCHEMA:
+        try:
+            lineage = validate_data_lineage(campaign["data_lineage"])
+            lineage_sha = data_lineage_sha256(lineage)
+        except ProductionDataLineageError as exc:
+            raise StateError(f"production data lineage is invalid: {exc}") from exc
+        if campaign["data_lineage_sha256"] != lineage_sha:
+            raise StateError("production data lineage digest mismatch")
+        if (
+            target != 256
+            or active != 64
+            or cohorts != 4
+            or campaign["steps_per_environment"] != 512
+            or campaign["macro_round_count"] != 5
+        ):
+            raise StateError("production data lineage requires exact 4x64x512x5")
     return campaign
 
 
@@ -464,6 +511,8 @@ def initialize_campaign(
     camera_mapping_sha256: str,
     training_config_sha256: str,
     beta_schedule: Mapping[str, Any] | None = None,
+    macro_round_count: int | None = None,
+    data_lineage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a campaign and its checksum-bound version-zero policy pointer."""
 
@@ -479,8 +528,30 @@ def initialize_campaign(
         beta_schedule
         or {"kind": "linear", "start": 1.0, "end": 0.0, "decay_rounds": 4}
     )
+    if macro_round_count is not None:
+        macro_round_count = _require_int(
+            macro_round_count, "macro_round_count", minimum=1
+        )
+    normalized_lineage: dict[str, Any] | None = None
+    if data_lineage is not None:
+        if macro_round_count is None:
+            raise StateError(
+                "production data lineage requires a bounded macro-round count"
+            )
+        try:
+            normalized_lineage = validate_data_lineage(data_lineage)
+        except ProductionDataLineageError as exc:
+            raise StateError(f"production data lineage is invalid: {exc}") from exc
     campaign = {
-        "schema": CAMPAIGN_SCHEMA,
+        "schema": (
+            PRODUCTION_CAMPAIGN_SCHEMA
+            if normalized_lineage is not None
+            else (
+                BOUNDED_CAMPAIGN_SCHEMA
+                if macro_round_count is not None
+                else CAMPAIGN_SCHEMA
+            )
+        ),
         "campaign_id": _require_token(campaign_id, "campaign_id"),
         "target_environments": target,
         "active_environments": active,
@@ -505,6 +576,13 @@ def initialize_campaign(
         "beta_schedule": schedule,
         "beta_schedule_sha256": canonical_json_sha256(schedule),
     }
+    if macro_round_count is not None:
+        campaign["macro_round_count"] = macro_round_count
+    if normalized_lineage is not None:
+        campaign["data_lineage"] = normalized_lineage
+        campaign["data_lineage_sha256"] = data_lineage_sha256(
+            normalized_lineage
+        )
     _validate_campaign(campaign)
     state = {
         "schema": STATE_SCHEMA,
@@ -536,7 +614,7 @@ def initialize_campaign(
         "evaluation_sha256": None,
         "last_promotion_sha256": None,
     }
-    _validate_state(state, state["campaign_sha256"])
+    _validate_state(state, campaign)
     with _state_lock(root):
         publish_immutable_json(root / "campaign.json", campaign)
         state_path = root / "coordinator_state.json"
@@ -606,8 +684,17 @@ def _validate_policy(
 
 
 def _validate_state(
-    document: Mapping[str, Any], campaign_sha256: str
+    document: Mapping[str, Any], campaign: Mapping[str, Any] | str
 ) -> dict[str, Any]:
+    if isinstance(campaign, Mapping):
+        campaign_sha256 = canonical_json_sha256(campaign)
+        macro_round_count = campaign.get("macro_round_count")
+    else:
+        # Compatibility for internal callers that validate a legacy V1 state
+        # against only its digest.  Bounded campaign loads always pass the
+        # complete immutable campaign document.
+        campaign_sha256 = campaign
+        macro_round_count = None
     keys = {
         "schema",
         "campaign_sha256",
@@ -636,6 +723,14 @@ def _validate_state(
     open_round = state["open_macro_round"]
     if open_round is not None:
         _require_int(open_round, "open_macro_round")
+    if macro_round_count is not None:
+        limit = _require_int(
+            macro_round_count, "campaign.macro_round_count", minimum=1
+        )
+        if next_round > limit:
+            raise StateError("next_macro_round exceeds the bounded campaign horizon")
+        if open_round is not None and open_round >= limit:
+            raise StateError("open_macro_round exceeds the bounded campaign horizon")
     for key in (
         "last_collected_macro_round",
         "last_ingested_macro_round",
@@ -699,7 +794,7 @@ def _load_state_unlocked(root: Path) -> dict[str, Any]:
     campaign = _validate_campaign(load_strict_json(root / "campaign.json"))
     return _validate_state(
         load_strict_json(root / "coordinator_state.json"),
-        canonical_json_sha256(campaign),
+        campaign,
     )
 
 
@@ -720,7 +815,7 @@ def _replace_state(
         updated = dict(state)
         updated["revision"] = expected_revision + 1
         campaign = _validate_campaign(load_strict_json(root / "campaign.json"))
-        _validate_state(updated, canonical_json_sha256(campaign))
+        _validate_state(updated, campaign)
         _atomic_replace_json(root / "coordinator_state.json", updated)
         return updated
 
@@ -752,13 +847,25 @@ _ROUND_KEYS = {
     "action_dim",
     "cohorts",
 }
+_PRODUCTION_ROUND_KEYS = _ROUND_KEYS | {
+    "data_lineage",
+    "data_lineage_sha256",
+}
 
 
 def _validate_round_contract(
     document: Any, campaign: Mapping[str, Any]
 ) -> dict[str, Any]:
-    contract = _require_exact(document, _ROUND_KEYS, "macro-round contract")
-    if contract["schema"] != ROUND_CONTRACT_SCHEMA:
+    production = campaign["schema"] == PRODUCTION_CAMPAIGN_SCHEMA
+    expected_schema = (
+        PRODUCTION_ROUND_CONTRACT_SCHEMA if production else ROUND_CONTRACT_SCHEMA
+    )
+    contract = _require_exact(
+        document,
+        _PRODUCTION_ROUND_KEYS if production else _ROUND_KEYS,
+        "macro-round contract",
+    )
+    if contract["schema"] != expected_schema:
         raise StateError("macro-round contract schema mismatch")
     if contract["campaign_id"] != campaign["campaign_id"] or contract[
         "campaign_sha256"
@@ -806,23 +913,51 @@ def _validate_round_contract(
         or contract["action_dim"] != campaign["action_dim"]
     ):
         raise StateError("macro-round observation/action contract mismatch")
+    if production:
+        try:
+            lineage = validate_data_lineage(contract["data_lineage"])
+            lineage_sha = data_lineage_sha256(lineage)
+        except ProductionDataLineageError as exc:
+            raise StateError(f"macro-round data lineage is invalid: {exc}") from exc
+        if (
+            lineage != campaign["data_lineage"]
+            or contract["data_lineage_sha256"] != lineage_sha
+            or lineage_sha != campaign["data_lineage_sha256"]
+        ):
+            raise StateError("macro-round data lineage differs from campaign")
     cohorts = contract["cohorts"]
     if not isinstance(cohorts, list) or len(cohorts) != campaign["cohort_count"]:
         raise StateError("macro-round cohort count mismatch")
     for index, raw in enumerate(cohorts):
-        cohort = _require_exact(
-            raw,
-            {"cohort_index", "environment_start", "environment_count"},
-            f"cohorts[{index}]",
-        )
-        if cohort != {
+        base_cohort = {
             "cohort_index": index,
             "environment_start": index * campaign["active_environments"],
             "environment_count": campaign["active_environments"],
-        }:
+        }
+        cohort_keys = set(base_cohort)
+        if production:
+            cohort_keys |= {"motion_assignment", "motion_assignment_sha256"}
+        cohort = _require_exact(raw, cohort_keys, f"cohorts[{index}]")
+        if {key: cohort[key] for key in base_cohort} != base_cohort:
             raise StateError(
                 "macro-round cohorts do not exactly partition environments"
             )
+        if production:
+            try:
+                assignment = validate_cohort_assignment(
+                    cohort["motion_assignment"],
+                    data_lineage=campaign["data_lineage"],
+                    cohort_index=index,
+                    expected_ranks=[0, 1],
+                )
+            except ProductionDataLineageError as exc:
+                raise StateError(
+                    f"macro-round cohort assignment is invalid: {exc}"
+                ) from exc
+            if cohort["motion_assignment_sha256"] != canonical_json_sha256(
+                assignment
+            ):
+                raise StateError("macro-round cohort assignment digest mismatch")
     if macro_round < 0:  # pragma: no cover - _require_int already rejects
         raise StateError("invalid macro-round")
     return contract
@@ -857,6 +992,11 @@ def open_macro_round(
     if state["phase"] != "READY" or state["open_macro_round"] is not None:
         raise StateError("a macro-round can only open from READY")
     macro_round = state["next_macro_round"]
+    macro_round_count = campaign.get("macro_round_count")
+    if macro_round_count is not None and macro_round >= macro_round_count:
+        raise StateError(
+            "bounded campaign is complete; no additional macro-round may open"
+        )
     active = dict(state["active_policy"])
     checkpoint, _ = _internal_path(root, active["checkpoint_path"], "active checkpoint")
     if sha256_file(checkpoint) != active["checkpoint_sha256"]:
@@ -877,8 +1017,13 @@ def open_macro_round(
         expected_runtime_policy_sha256=active["runtime_policy_sha256"],
     )
     beta = beta_for_macro_round(campaign["beta_schedule"], macro_round)
+    production = campaign["schema"] == PRODUCTION_CAMPAIGN_SCHEMA
     contract = {
-        "schema": ROUND_CONTRACT_SCHEMA,
+        "schema": (
+            PRODUCTION_ROUND_CONTRACT_SCHEMA
+            if production
+            else ROUND_CONTRACT_SCHEMA
+        ),
         "campaign_id": campaign["campaign_id"],
         "campaign_sha256": canonical_json_sha256(campaign),
         "macro_round": macro_round,
@@ -904,15 +1049,28 @@ def open_macro_round(
         "view_names": campaign["view_names"],
         "policy_image_shape": campaign["policy_image_shape"],
         "action_dim": campaign["action_dim"],
-        "cohorts": [
-            {
+        "cohorts": [],
+    }
+    if production:
+        contract["data_lineage"] = campaign["data_lineage"]
+        contract["data_lineage_sha256"] = campaign["data_lineage_sha256"]
+    for index in range(campaign["cohort_count"]):
+        cohort = {
                 "cohort_index": index,
                 "environment_start": index * campaign["active_environments"],
                 "environment_count": campaign["active_environments"],
-            }
-            for index in range(campaign["cohort_count"])
-        ],
-    }
+        }
+        if production:
+            assignment = build_cohort_assignment(
+                campaign["data_lineage"],
+                cohort_index=index,
+                expected_ranks=[0, 1],
+            )
+            cohort["motion_assignment"] = assignment
+            cohort["motion_assignment_sha256"] = canonical_json_sha256(
+                assignment
+            )
+        contract["cohorts"].append(cohort)
     _validate_round_contract(contract, campaign)
     publish_immutable_json(
         round_directory(root, macro_round) / "contract.json", contract
@@ -1507,9 +1665,12 @@ def complete_promotion(
 
 
 __all__ = [
+    "BOUNDED_CAMPAIGN_SCHEMA",
     "CAMPAIGN_SCHEMA",
+    "PRODUCTION_CAMPAIGN_SCHEMA",
     "COLLECTION_SCHEMA",
     "ROUND_CONTRACT_SCHEMA",
+    "PRODUCTION_ROUND_CONTRACT_SCHEMA",
     "STATE_SCHEMA",
     "StateError",
     "beta_for_macro_round",

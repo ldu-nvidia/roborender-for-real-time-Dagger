@@ -47,7 +47,10 @@ STEP_RE = re.compile(r"(?:^|[_-])step[_-]?(\d+)(?:[_-]|$)", re.IGNORECASE)
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 STATE_SCHEMA_VERSION = 2
 INITIALIZED_MARKER_SCHEMA = "fast_roborender.wandb_sidecar_initialized.v2"
-PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v1"
+PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v2"
+PRODUCTION_PUBLIC_CONFIG_SCHEMA = (
+    "fast_roborender.round_dagger.wandb_public_config.v3"
+)
 PUBLIC_CONFIG_KEYS = {
     "round_dagger/campaign_id",
     "round_dagger/macro_round",
@@ -58,6 +61,8 @@ PUBLIC_CONFIG_KEYS = {
     "round_dagger/steps_per_environment",
     "round_dagger/transitions_per_cohort",
     "round_dagger/transitions_per_macro_round",
+    "round_dagger/macro_round_count",
+    "round_dagger/transitions_per_campaign",
     "round_dagger/policy_version",
     "round_dagger/policy_checkpoint_sha256",
     "round_dagger/runtime_policy_sha256",
@@ -69,8 +74,12 @@ PUBLIC_CONFIG_KEYS = {
     "round_dagger/beta_sha256",
     "round_dagger/orchestration_config_sha256",
 }
+PRODUCTION_PUBLIC_CONFIG_KEYS = PUBLIC_CONFIG_KEYS | {
+    "round_dagger/campaign_contract_sha256",
+    "round_dagger/data_lineage_sha256",
+}
 PUBLIC_CONFIG_SHA_KEYS = {
-    key for key in PUBLIC_CONFIG_KEYS if key.endswith("_sha256")
+    key for key in PRODUCTION_PUBLIC_CONFIG_KEYS if key.endswith("_sha256")
 }
 PUBLIC_CONFIG_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -81,6 +90,8 @@ PUBLIC_CONFIG_EXACT_INTS = {
     "round_dagger/steps_per_environment": 512,
     "round_dagger/transitions_per_cohort": 64 * 512,
     "round_dagger/transitions_per_macro_round": 256 * 512,
+    "round_dagger/macro_round_count": 5,
+    "round_dagger/transitions_per_campaign": 5 * 256 * 512,
 }
 MEDIA_SUFFIXES = {
     "image": {".png", ".jpg", ".jpeg", ".webp"},
@@ -140,15 +151,21 @@ def load_public_config(path: Path) -> dict[str, str | int | float]:
         ) from None
     if not isinstance(document, dict) or set(document) != {"schema", "config"}:
         raise ArtifactError("public W&B config wrapper has unexpected fields")
-    if document["schema"] != PUBLIC_CONFIG_SCHEMA:
+    schema = document["schema"]
+    if schema not in {PUBLIC_CONFIG_SCHEMA, PRODUCTION_PUBLIC_CONFIG_SCHEMA}:
         raise ArtifactError("public W&B config schema mismatch")
+    expected_keys = (
+        PRODUCTION_PUBLIC_CONFIG_KEYS
+        if schema == PRODUCTION_PUBLIC_CONFIG_SCHEMA
+        else PUBLIC_CONFIG_KEYS
+    )
     values = document["config"]
-    if not isinstance(values, dict) or set(values) != PUBLIC_CONFIG_KEYS:
+    if not isinstance(values, dict) or set(values) != expected_keys:
         actual = set(values) if isinstance(values, dict) else set()
         raise ArtifactError(
             "public W&B config keys differ from the non-secret allowlist: "
-            f"missing={sorted(PUBLIC_CONFIG_KEYS - actual)} "
-            f"unknown={sorted(actual - PUBLIC_CONFIG_KEYS)}"
+            f"missing={sorted(expected_keys - actual)} "
+            f"unknown={sorted(actual - expected_keys)}"
         )
 
     clean: dict[str, str | int | float] = {}

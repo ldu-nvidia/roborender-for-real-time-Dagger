@@ -18,6 +18,7 @@ advances coordinator state.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -34,11 +35,28 @@ from round_dagger.artifacts import (
     sha256_file,
 )
 from round_dagger.promotion import load_candidate_manifest
-from round_dagger.state import _campaign_root, _internal_path, load_campaign, load_state
+from round_dagger.state import (
+    PRODUCTION_CAMPAIGN_SCHEMA,
+    _campaign_root,
+    _internal_path,
+    load_campaign,
+    load_state,
+)
+from round_dagger.production_data_lineage import (
+    ProductionDataLineageError,
+    data_lineage_sha256,
+    validate_data_lineage,
+)
 
 LEGACY_CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v1"
 CONTRACT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_contract.v2"
+PRODUCTION_CONTRACT_SCHEMA = (
+    "fast_roborender.round_dagger.paired_evaluation_contract.v3"
+)
 OUTCOME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_outcome.v4"
+PRODUCTION_OUTCOME_SCHEMA = (
+    "fast_roborender.round_dagger.paired_evaluation_outcome.v5"
+)
 REPORT_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_report.v2"
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_bundle.v2"
 RUNTIME_SCHEMA = "fast_roborender.round_dagger.paired_evaluation_runtime.v1"
@@ -331,6 +349,10 @@ _LEGACY_CONTRACT_KEYS = {
     "thresholds",
 }
 _CONTRACT_KEYS = _LEGACY_CONTRACT_KEYS | {"anchor_pool"}
+_PRODUCTION_CONTRACT_KEYS = _CONTRACT_KEYS | {
+    "data_lineage",
+    "data_lineage_sha256",
+}
 _ANCHOR_POOL_KEYS = {
     "path",
     "anchor_count",
@@ -435,8 +457,9 @@ def create_contract(
             "anchor_inventory_sha256",
         ),
     }
+    production = campaign.get("schema") == PRODUCTION_CAMPAIGN_SCHEMA
     contract = {
-        "schema": CONTRACT_SCHEMA,
+        "schema": PRODUCTION_CONTRACT_SCHEMA if production else CONTRACT_SCHEMA,
         "campaign_id": campaign["campaign_id"],
         "campaign_sha256": canonical_json_sha256(campaign),
         "macro_round": state["open_macro_round"],
@@ -462,6 +485,9 @@ def create_contract(
         "scenario_cases": cases,
         "thresholds": _validate_thresholds(thresholds),
     }
+    if production:
+        contract["data_lineage"] = campaign["data_lineage"]
+        contract["data_lineage_sha256"] = campaign["data_lineage_sha256"]
     _validate_contract_document(root, contract, bind_state=True)
     output_path, relative = _internal_path(root, output, "evaluation contract")
     _evaluation_root_for_contract(root, output_path, contract["macro_round"])
@@ -475,7 +501,15 @@ def _validate_contract_document(
     if not isinstance(document, Mapping):
         raise EvaluationError("paired evaluation contract must be a mapping")
     schema = document.get("schema")
-    if schema == CONTRACT_SCHEMA:
+    campaign = load_campaign(root)
+    production_campaign = campaign.get("schema") == PRODUCTION_CAMPAIGN_SCHEMA
+    if schema == PRODUCTION_CONTRACT_SCHEMA:
+        contract = _exact(
+            document,
+            _PRODUCTION_CONTRACT_KEYS,
+            "production paired evaluation contract",
+        )
+    elif schema == CONTRACT_SCHEMA:
         contract = _exact(document, _CONTRACT_KEYS, "paired evaluation contract")
     elif schema == LEGACY_CONTRACT_SCHEMA:
         contract = _exact(
@@ -485,7 +519,10 @@ def _validate_contract_document(
         )
     else:
         raise EvaluationError("paired evaluation contract schema mismatch")
-    campaign = load_campaign(root)
+    if production_campaign != (schema == PRODUCTION_CONTRACT_SCHEMA):
+        raise EvaluationError(
+            "production campaign requires capture-bound evaluation contract v3"
+        )
     if contract["campaign_id"] != campaign["campaign_id"] or contract[
         "campaign_sha256"
     ] != canonical_json_sha256(campaign):
@@ -567,7 +604,7 @@ def _validate_contract_document(
     if contract["num_envs_per_seed"] != envs:
         raise EvaluationError("num_envs_per_seed differs from scenario cases")
     _integer(contract["expected_renderer_count"], "expected_renderer_count", minimum=1)
-    if contract["schema"] == CONTRACT_SCHEMA:
+    if contract["schema"] in {CONTRACT_SCHEMA, PRODUCTION_CONTRACT_SCHEMA}:
         anchor = _exact(
             contract["anchor_pool"],
             _ANCHOR_POOL_KEYS,
@@ -587,6 +624,36 @@ def _validate_contract_document(
         if validated_anchor_index >= validated_anchor_count:
             raise EvaluationError("anchor_index must be smaller than anchor_count")
         _sha(anchor["inventory_sha256"], "anchor inventory SHA-256")
+    if production_campaign:
+        try:
+            lineage = validate_data_lineage(contract["data_lineage"])
+            lineage_sha = data_lineage_sha256(lineage)
+        except ProductionDataLineageError as exc:
+            raise EvaluationError(f"evaluation data lineage is invalid: {exc}") from exc
+        if (
+            lineage != campaign["data_lineage"]
+            or lineage_sha != campaign["data_lineage_sha256"]
+            or contract["data_lineage_sha256"] != lineage_sha
+        ):
+            raise EvaluationError("evaluation data lineage differs from campaign")
+        scenario_payload = (
+            json.dumps(
+                contract["scenario_cases"],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        if hashlib.sha256(scenario_payload).hexdigest() != lineage[
+            "heldout_evaluation"
+        ]["scenario_contract_sha256"]:
+            raise EvaluationError(
+                "evaluation scenarios differ from live capture attestation"
+            )
+        if len(contract["scenario_cases"]) != 256:
+            raise EvaluationError("production evaluation must contain 256 cases")
     contract["thresholds"] = _validate_thresholds(contract["thresholds"])
     return contract
 
@@ -740,6 +807,7 @@ _OUTCOME_KEYS = {
     "episodes",
     "source_artifacts",
 }
+_PRODUCTION_OUTCOME_KEYS = _OUTCOME_KEYS | {"data_lineage_sha256"}
 _SOURCE_KEYS = {
     "metrics_path",
     "metrics_sha256",
@@ -813,7 +881,7 @@ def attest_outcome(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
-    if contract["schema"] != CONTRACT_SCHEMA:
+    if contract["schema"] not in {CONTRACT_SCHEMA, PRODUCTION_CONTRACT_SCHEMA}:
         raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     seed = _integer(seed, "seed")
     if seed not in contract["seeds"]:
@@ -1048,8 +1116,9 @@ def attest_outcome(
         "renderer_after_path": after_relative,
         "renderer_after_sha256": sha256_file(after_file),
     }
+    production = contract["schema"] == PRODUCTION_CONTRACT_SCHEMA
     outcome = {
-        "schema": OUTCOME_SCHEMA,
+        "schema": PRODUCTION_OUTCOME_SCHEMA if production else OUTCOME_SCHEMA,
         "contract_sha256": contract["contract_sha256"],
         "campaign_id": contract["campaign_id"],
         "macro_round": contract["macro_round"],
@@ -1073,6 +1142,8 @@ def attest_outcome(
         "episodes": episodes,
         "source_artifacts": source_artifacts,
     }
+    if production:
+        outcome["data_lineage_sha256"] = contract["data_lineage_sha256"]
     output_path, relative = _internal_path(root, output, "paired outcome")
     digest = publish_immutable_json(output_path, outcome)
     return {**outcome, "outcome_path": relative, "outcome_sha256": digest}
@@ -1089,8 +1160,14 @@ def load_outcome(
 ) -> dict[str, Any]:
     root = _campaign_root(root)
     outcome_path, relative = _internal_path(root, path, "paired outcome")
-    outcome = _exact(load_strict_json(outcome_path), _OUTCOME_KEYS, "paired outcome")
-    if outcome["schema"] != OUTCOME_SCHEMA:
+    production = contract["schema"] == PRODUCTION_CONTRACT_SCHEMA
+    outcome = _exact(
+        load_strict_json(outcome_path),
+        _PRODUCTION_OUTCOME_KEYS if production else _OUTCOME_KEYS,
+        "paired outcome",
+    )
+    expected_schema = PRODUCTION_OUTCOME_SCHEMA if production else OUTCOME_SCHEMA
+    if outcome["schema"] != expected_schema:
         raise EvaluationError("paired outcome schema mismatch")
     policy = _policy_for_role(contract, expected_role)
     expected = {
@@ -1111,6 +1188,8 @@ def load_outcome(
         "renderer_errors": 0,
         "renderer_replays": 0,
     }
+    if production:
+        expected["data_lineage_sha256"] = contract["data_lineage_sha256"]
     if any(outcome.get(key) != value for key, value in expected.items()):
         raise EvaluationError("paired outcome identity/provenance mismatch")
     image3f_run_id = _validate_evaluation_run_id(
@@ -1189,7 +1268,7 @@ def publish_case_outcome(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
-    if contract["schema"] != CONTRACT_SCHEMA:
+    if contract["schema"] not in {CONTRACT_SCHEMA, PRODUCTION_CONTRACT_SCHEMA}:
         raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     seed = _integer(seed, "seed")
     source_path, _ = _internal_path(root, source, "attempt outcome")
@@ -1331,7 +1410,7 @@ def summarize_to_evaluator_result(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
-    if contract["schema"] != CONTRACT_SCHEMA:
+    if contract["schema"] not in {CONTRACT_SCHEMA, PRODUCTION_CONTRACT_SCHEMA}:
         raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     output_path, output_relative = _internal_path(
         root, output, "orchestrator evaluator result"
@@ -1450,7 +1529,7 @@ def verify_evaluator_result_evidence(
 
     root = _campaign_root(root)
     contract = load_contract(root, contract_path)
-    if contract["schema"] != CONTRACT_SCHEMA:
+    if contract["schema"] not in {CONTRACT_SCHEMA, PRODUCTION_CONTRACT_SCHEMA}:
         raise EvaluationError("legacy evaluation contracts are diagnostic-only")
     output_path, output_relative = _internal_path(
         root, result_path, "orchestrator evaluator result"

@@ -65,6 +65,21 @@ def _json_metrics(value: str) -> dict[str, float]:
     return {str(key): float(number) for key, number in document.items()}
 
 
+def _json_object_file(value: str) -> dict[str, Any]:
+    path = Path(value).expanduser()
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise argparse.ArgumentTypeError(
+            "data lineage must be an absolute non-symlink JSON file"
+        )
+    try:
+        document = load_strict_json(path)
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(f"invalid data-lineage JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise argparse.ArgumentTypeError("data lineage must be a JSON object")
+    return document
+
+
 def _print(document: Any) -> None:
     print(json.dumps(document, indent=2, sort_keys=True, allow_nan=False))
 
@@ -86,6 +101,22 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--target-environments", type=int, default=256)
     init.add_argument("--active-environments", type=int, default=64)
     init.add_argument("--steps-per-environment", type=int, default=512)
+    init.add_argument(
+        "--macro-round-count",
+        type=int,
+        help=(
+            "persist a finite campaign horizon; omitted preserves the legacy "
+            "unbounded non-production campaign contract"
+        ),
+    )
+    init.add_argument(
+        "--data-lineage",
+        type=_json_object_file,
+        help=(
+            "absolute immutable production_data_lineage.v1 JSON; required for "
+            "a production campaign and omitted for legacy experiments"
+        ),
+    )
     # Round replay stores the 11-D learned student/teacher action followed by
     # the fixed 15-D Homie action.  The 31-D value in the Isaac configuration
     # is the downstream whole-body command after HomieBase expands this input,
@@ -190,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
             renderer_sha256=args.renderer,
             camera_mapping_sha256=args.camera_mapping,
             training_config_sha256=args.training_config,
+            macro_round_count=args.macro_round_count,
+            data_lineage=args.data_lineage,
             beta_schedule={
                 "kind": args.beta_kind,
                 "start": args.beta_start,
@@ -200,7 +233,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         _print({"bootstrap": bootstrap, **result})
     elif args.command == "status":
-        _print({"campaign": load_campaign(root), "state": load_state(root)})
+        campaign = load_campaign(root)
+        coordinator = load_state(root)
+        result: dict[str, Any] = {
+            "campaign": campaign,
+            "state": coordinator,
+        }
+        macro_round_count = campaign.get("macro_round_count")
+        if macro_round_count is not None:
+            completed = coordinator["next_macro_round"]
+            result["execution"] = {
+                "macro_round_count": macro_round_count,
+                "completed_macro_rounds": completed,
+                "remaining_macro_rounds": macro_round_count - completed,
+                "complete": (
+                    coordinator["phase"] == "READY"
+                    and completed == macro_round_count
+                ),
+            }
+        _print(result)
     elif args.command == "open-round":
         _print(open_macro_round(root, expected_revision=args.expected_revision))
     elif args.command == "seal-collection":

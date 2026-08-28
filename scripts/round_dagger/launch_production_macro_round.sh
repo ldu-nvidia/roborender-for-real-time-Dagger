@@ -9,11 +9,13 @@ fatal() { echo "production macro-round launcher failed: $*" >&2; exit 2; }
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 VALIDATOR="$ROOT/scripts/round_dagger/production_launch.py"
 ORCHESTRATOR="$ROOT/scripts/round_dagger/orchestrate_macro_round.py"
-CAMPAIGN_CONTRACT="$ROOT/configs/round_dagger/production_campaign_256x512.json"
+INVARIANT_PROFILE="$ROOT/configs/round_dagger/production_campaign_256x512.json"
 LEARNER_CONTRACT="$ROOT/configs/round_dagger/production_learner_8xh100_1200.json"
 PYTHON=${ROUND_DAGGER_CONTROL_PYTHON:-/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python}
 DRY_RUN=${DRY_RUN:-0}
 ORCHESTRATION_CONFIG=
+CAMPAIGN_CONTRACT=
+CAMPAIGN_CONTRACT_SHA256=
 SEALED_SOURCE_ROOT=
 SEALED_SOURCE_INVENTORY_SHA256=
 EVALUATION_SEALED_SOURCE_ROOT=
@@ -23,6 +25,8 @@ usage() {
     cat >&2 <<'EOF'
 usage: launch_production_macro_round.sh \
   --orchestration-config ABSOLUTE_CONFIG_JSON \
+  --campaign-contract ABSOLUTE_POST_SEAL_RUNTIME_CONTRACT_JSON \
+  --campaign-contract-sha256 LOWERCASE_SHA256 \
   --sealed-source-root ABSOLUTE_OCI_SOURCE_ROOT \
   --evaluation-sealed-source-root ABSOLUTE_RTX_SOURCE_ROOT \
   --evaluation-sealed-source-inventory-sha256 LOWERCASE_SHA256 \
@@ -36,6 +40,16 @@ while (($#)); do
         --orchestration-config)
             (($# >= 2)) || usage
             ORCHESTRATION_CONFIG=$2
+            shift 2
+            ;;
+        --campaign-contract)
+            (($# >= 2)) || usage
+            CAMPAIGN_CONTRACT=$2
+            shift 2
+            ;;
+        --campaign-contract-sha256)
+            (($# >= 2)) || usage
+            CAMPAIGN_CONTRACT_SHA256=$2
             shift 2
             ;;
         --sealed-source-root)
@@ -69,6 +83,13 @@ done
 
 [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be exactly 0 or 1"
 [[ $ORCHESTRATION_CONFIG == /* ]] || fatal "--orchestration-config must be absolute"
+[[ $CAMPAIGN_CONTRACT == /* ]] || fatal "--campaign-contract must be absolute"
+[[ $CAMPAIGN_CONTRACT_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+    fatal "--campaign-contract-sha256 must be lowercase SHA-256"
+[[ -f $CAMPAIGN_CONTRACT && ! -L $CAMPAIGN_CONTRACT ]] || \
+    fatal "external campaign contract is missing or unsafe"
+[[ $(sha256sum -- "$CAMPAIGN_CONTRACT" | awk '{print $1}') == \
+   "$CAMPAIGN_CONTRACT_SHA256" ]] || fatal "external campaign contract SHA-256 mismatch"
 [[ $SEALED_SOURCE_ROOT == /* ]] || fatal "--sealed-source-root must be absolute"
 [[ $EVALUATION_SEALED_SOURCE_ROOT == /* ]] || \
     fatal "--evaluation-sealed-source-root must be absolute"
@@ -80,7 +101,7 @@ done
     fatal "--sealed-source-inventory-sha256 must be lowercase SHA-256"
 [[ -f $ORCHESTRATION_CONFIG && ! -L $ORCHESTRATION_CONFIG ]] || \
     fatal "strict orchestration config is missing or unsafe"
-for path in "$VALIDATOR" "$ORCHESTRATOR" "$CAMPAIGN_CONTRACT" "$LEARNER_CONTRACT"; do
+for path in "$VALIDATOR" "$ORCHESTRATOR" "$INVARIANT_PROFILE" "$LEARNER_CONTRACT"; do
     [[ -f $path && ! -L $path ]] || fatal "required production source artifact is missing or unsafe: $path"
 done
 PYTHON_REAL=$(realpath -e -- "$PYTHON") || fatal "cannot resolve validated control Python"
@@ -105,6 +126,7 @@ PLAN=$(
         "$PYTHON" "$VALIDATOR" \
         --orchestration-config "$ORCHESTRATION_CONFIG" \
         --campaign-contract "$CAMPAIGN_CONTRACT" \
+        --campaign-contract-sha256 "$CAMPAIGN_CONTRACT_SHA256" \
         --learner-contract "$LEARNER_CONTRACT" \
         --sealed-source-root "$SEALED_SOURCE_ROOT" \
         --evaluation-sealed-source-root "$EVALUATION_SEALED_SOURCE_ROOT" \

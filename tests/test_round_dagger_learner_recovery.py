@@ -72,6 +72,9 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
                 "hydra_config_sha256"
             ],
             beta_schedule=campaign_contract["beta_schedule"],
+            macro_round_count=campaign_contract["topology"][
+                "macro_round_count"
+            ],
         )
         state.open_macro_round(
             self.root, expected_revision=state.load_state(self.root)["revision"]

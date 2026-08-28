@@ -42,8 +42,17 @@ from scripts.round_dagger import verify_sealed_source_snapshot as source_seal
 
 
 ORCHESTRATION_CONFIG_SCHEMA = "fast_roborender.round_dagger.orchestration_config.v1"
+BOUNDED_ORCHESTRATION_CONFIG_SCHEMA = (
+    "fast_roborender.round_dagger.orchestration_config.v2"
+)
+PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA = (
+    "fast_roborender.round_dagger.orchestration_config.v3"
+)
 EVALUATOR_RESULT_SCHEMA = "fast_roborender.round_dagger.evaluator_result.v2"
-WANDB_PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v1"
+WANDB_PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v2"
+PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA = (
+    "fast_roborender.round_dagger.wandb_public_config.v3"
+)
 
 COHORT_COUNT = 4
 ENVIRONMENTS_PER_COHORT = 64
@@ -51,6 +60,10 @@ TARGET_ENVIRONMENTS = COHORT_COUNT * ENVIRONMENTS_PER_COHORT
 STEPS_PER_ENVIRONMENT = 512
 TRANSITIONS_PER_COHORT = ENVIRONMENTS_PER_COHORT * STEPS_PER_ENVIRONMENT
 TRANSITIONS_PER_MACRO_ROUND = TARGET_ENVIRONMENTS * STEPS_PER_ENVIRONMENT
+PRODUCTION_MACRO_ROUND_COUNT = 5
+TRANSITIONS_PER_CAMPAIGN = (
+    PRODUCTION_MACRO_ROUND_COUNT * TRANSITIONS_PER_MACRO_ROUND
+)
 EXPECTED_ACTOR_RANKS = (0, 1)
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -128,6 +141,8 @@ _PUBLIC_CONFIG_KEYS = {
     "round_dagger/steps_per_environment",
     "round_dagger/transitions_per_cohort",
     "round_dagger/transitions_per_macro_round",
+    "round_dagger/macro_round_count",
+    "round_dagger/transitions_per_campaign",
     "round_dagger/policy_version",
     "round_dagger/policy_checkpoint_sha256",
     "round_dagger/runtime_policy_sha256",
@@ -138,6 +153,10 @@ _PUBLIC_CONFIG_KEYS = {
     "round_dagger/beta",
     "round_dagger/beta_sha256",
     "round_dagger/orchestration_config_sha256",
+}
+_PRODUCTION_PUBLIC_CONFIG_KEYS = _PUBLIC_CONFIG_KEYS | {
+    "round_dagger/campaign_contract_sha256",
+    "round_dagger/data_lineage_sha256",
 }
 _PUBLIC_SHA_KEYS = {key for key in _PUBLIC_CONFIG_KEYS if key.endswith("_sha256")}
 _PHASE_CODES = {
@@ -256,6 +275,8 @@ class MacroRoundConfig:
     evaluator_config_sha256: str
     hooks: Mapping[str, HookSpec | None]
     sha256: str
+    macro_round_count: int | None = None
+    campaign_contract_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for path, label in (
@@ -265,6 +286,12 @@ class MacroRoundConfig:
             if not isinstance(path, Path) or not path.is_absolute():
                 raise OrchestrationError(f"{label} must be an absolute Path")
         _true_int(self.macro_round, "macro_round")
+        if self.macro_round_count is not None:
+            _true_int(self.macro_round_count, "macro_round_count", minimum=1)
+            if self.macro_round >= self.macro_round_count:
+                raise OrchestrationError(
+                    "macro_round must be below the bounded campaign horizon"
+                )
         for value, label in (
             (self.runtime_policy_sha256, "runtime_policy_sha256"),
             (self.learner_code_sha256, "learner_code_sha256"),
@@ -274,6 +301,11 @@ class MacroRoundConfig:
             (self.sha256, "orchestration config sha256"),
         ):
             _sha256(value, label)
+        if self.campaign_contract_sha256 is not None:
+            _sha256(
+                self.campaign_contract_sha256,
+                "production campaign contract sha256",
+            )
         if not isinstance(self.hooks, Mapping) or set(self.hooks) != set(_HOOK_NAMES):
             raise OrchestrationError("hooks must contain exactly the six orchestration hooks")
         frozen_hooks: dict[str, HookSpec | None] = {}
@@ -295,24 +327,33 @@ class MacroRoundConfig:
             raise OrchestrationError(
                 f"cannot load strict orchestration config ({type(exc).__name__})"
             ) from exc
-        document = _exact_mapping(
-            raw,
-            {
-                "schema",
-                "campaign_root",
-                "actor_root",
-                "macro_round",
-                "runtime_policy_sha256",
-                "learner_code_sha256",
-                "learner_config_sha256",
-                "learner_model_lineage_sha256",
-                "evaluator_config_sha256",
-                "hooks",
-            },
-            "orchestration config",
-        )
-        if document["schema"] != ORCHESTRATION_CONFIG_SCHEMA:
+        base_keys = {
+            "schema",
+            "campaign_root",
+            "actor_root",
+            "macro_round",
+            "runtime_policy_sha256",
+            "learner_code_sha256",
+            "learner_config_sha256",
+            "learner_model_lineage_sha256",
+            "evaluator_config_sha256",
+            "hooks",
+        }
+        if not isinstance(raw, Mapping):
+            raise OrchestrationError("orchestration config must be a mapping")
+        schema = raw.get("schema")
+        if schema == ORCHESTRATION_CONFIG_SCHEMA:
+            keys = base_keys
+        elif schema == BOUNDED_ORCHESTRATION_CONFIG_SCHEMA:
+            keys = base_keys | {"macro_round_count"}
+        elif schema == PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA:
+            keys = base_keys | {
+                "macro_round_count",
+                "campaign_contract_sha256",
+            }
+        else:
             raise OrchestrationError("orchestration config schema mismatch")
+        document = _exact_mapping(raw, keys, "orchestration config")
         raw_hooks = _exact_mapping(document["hooks"], set(_HOOK_NAMES), "hooks")
         hooks: dict[str, HookSpec | None] = {}
         for name in _HOOK_NAMES:
@@ -345,6 +386,23 @@ class MacroRoundConfig:
             ),
             hooks=hooks,
             sha256=artifacts.canonical_json_sha256(document),
+            macro_round_count=(
+                None
+                if schema == ORCHESTRATION_CONFIG_SCHEMA
+                else _true_int(
+                    document["macro_round_count"],
+                    "macro_round_count",
+                    minimum=1,
+                )
+            ),
+            campaign_contract_sha256=(
+                _sha256(
+                    document["campaign_contract_sha256"],
+                    "campaign_contract_sha256",
+                )
+                if schema == PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
+                else None
+            ),
         )
 
 
@@ -696,6 +754,7 @@ def validate_production_topology(
         "active_environments": ENVIRONMENTS_PER_COHORT,
         "cohort_count": COHORT_COUNT,
         "steps_per_environment": STEPS_PER_ENVIRONMENT,
+        "macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
     }
     for key, value in expected.items():
         if campaign.get(key) != value:
@@ -715,10 +774,17 @@ def validate_production_topology(
         }
         for index in range(COHORT_COUNT)
     ]
-    if cohorts != expected_cohorts:
+    if not isinstance(cohorts, list) or len(cohorts) != len(expected_cohorts):
         raise OrchestrationError(
             "macro-round cohorts do not exactly cover logical environments 0..255"
         )
+    for observed, expected_cohort in zip(cohorts, expected_cohorts, strict=True):
+        if not isinstance(observed, Mapping) or any(
+            observed.get(key) != value for key, value in expected_cohort.items()
+        ):
+            raise OrchestrationError(
+                "macro-round cohorts do not exactly cover logical environments 0..255"
+            )
 
 
 def _public_wandb_config(
@@ -744,6 +810,8 @@ def _public_wandb_config(
         "round_dagger/steps_per_environment": STEPS_PER_ENVIRONMENT,
         "round_dagger/transitions_per_cohort": TRANSITIONS_PER_COHORT,
         "round_dagger/transitions_per_macro_round": TRANSITIONS_PER_MACRO_ROUND,
+        "round_dagger/macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
+        "round_dagger/transitions_per_campaign": TRANSITIONS_PER_CAMPAIGN,
         "round_dagger/policy_version": contract["policy_version"],
         "round_dagger/policy_checkpoint_sha256": contract[
             "policy_checkpoint_sha256"
@@ -757,17 +825,40 @@ def _public_wandb_config(
         "round_dagger/beta_sha256": contract["beta_sha256"],
         "round_dagger/orchestration_config_sha256": config.sha256,
     }
-    return {"schema": WANDB_PUBLIC_CONFIG_SCHEMA, "config": public}
+    schema = WANDB_PUBLIC_CONFIG_SCHEMA
+    if config.campaign_contract_sha256 is not None:
+        if "data_lineage_sha256" not in contract:
+            raise OrchestrationError(
+                "production telemetry requires frozen data lineage"
+            )
+        public["round_dagger/campaign_contract_sha256"] = (
+            config.campaign_contract_sha256
+        )
+        public["round_dagger/data_lineage_sha256"] = contract[
+            "data_lineage_sha256"
+        ]
+        schema = PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA
+    return {"schema": schema, "config": public}
 
 
 def _validate_public_wandb_config(document: Mapping[str, Any]) -> None:
     wrapper = _exact_mapping(
         document, {"schema", "config"}, "public W&B config wrapper"
     )
-    if wrapper["schema"] != WANDB_PUBLIC_CONFIG_SCHEMA:
+    schema = wrapper["schema"]
+    if schema not in {
+        WANDB_PUBLIC_CONFIG_SCHEMA,
+        PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA,
+    }:
         raise OrchestrationError("public W&B config schema mismatch")
     values = _exact_mapping(
-        wrapper["config"], _PUBLIC_CONFIG_KEYS, "public W&B config"
+        wrapper["config"],
+        (
+            _PRODUCTION_PUBLIC_CONFIG_KEYS
+            if schema == PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA
+            else _PUBLIC_CONFIG_KEYS
+        ),
+        "public W&B config",
     )
     campaign_id = values["round_dagger/campaign_id"]
     if (
@@ -777,6 +868,12 @@ def _validate_public_wandb_config(document: Mapping[str, Any]) -> None:
         raise OrchestrationError("public W&B campaign_id is not a safe token")
     for key in _PUBLIC_SHA_KEYS:
         _sha256(values[key], key)
+    if schema == PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA:
+        for key in (
+            "round_dagger/campaign_contract_sha256",
+            "round_dagger/data_lineage_sha256",
+        ):
+            _sha256(values[key], key)
     exact_integers = {
         "round_dagger/cohort_count": COHORT_COUNT,
         "round_dagger/environments_per_cohort": ENVIRONMENTS_PER_COHORT,
@@ -784,6 +881,8 @@ def _validate_public_wandb_config(document: Mapping[str, Any]) -> None:
         "round_dagger/steps_per_environment": STEPS_PER_ENVIRONMENT,
         "round_dagger/transitions_per_cohort": TRANSITIONS_PER_COHORT,
         "round_dagger/transitions_per_macro_round": TRANSITIONS_PER_MACRO_ROUND,
+        "round_dagger/macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
+        "round_dagger/transitions_per_campaign": TRANSITIONS_PER_CAMPAIGN,
     }
     for key, expected in exact_integers.items():
         if _true_int(values[key], key, minimum=1) != expected:
@@ -897,6 +996,12 @@ class ProductionBackend:
             beta_sha256=contract["beta_sha256"],
             config_sha256=contract["training_config_sha256"],
             actor_seed_contract=actor_seed_contract,
+            data_lineage=contract.get("data_lineage"),
+            motion_assignment=(
+                contract["cohorts"][cohort_index].get("motion_assignment")
+                if contract.get("data_lineage") is not None
+                else None
+            ),
         )
 
     def _actor_run_dir(self, path: Path) -> Path | None:
@@ -1113,7 +1218,7 @@ class ProductionBackend:
                 raise OrchestrationError(f"learner {key} must be finite numeric")
             if not math.isfinite(float(value)):
                 raise OrchestrationError(f"learner {key} must be finite numeric")
-        return {
+        environment = {
             **document,
             "manifest_path": str(path),
             "manifest_sha256": artifacts.sha256_file(path),
@@ -1121,6 +1226,7 @@ class ProductionBackend:
             "absolute_policy_spec_path": str(policy_spec),
             "absolute_policy_bundle_manifest_path": str(policy_bundle_manifest),
         }
+        return environment
 
     def stage_candidate(
         self, learner_result: Mapping[str, Any], snapshot: Mapping[str, Any]
@@ -1477,7 +1583,31 @@ class MacroRoundOrchestrator:
             "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": str(
                 TRANSITIONS_PER_MACRO_ROUND
             ),
+            "ROUND_DAGGER_MACRO_ROUND_COUNT": str(
+                PRODUCTION_MACRO_ROUND_COUNT
+            ),
+            "ROUND_DAGGER_TRANSITIONS_PER_CAMPAIGN": str(
+                TRANSITIONS_PER_CAMPAIGN
+            ),
         }
+        if self.config.campaign_contract_sha256 is not None:
+            runtime_contract_path = os.environ.get(
+                "ROUND_DAGGER_CAMPAIGN_CONTRACT"
+            )
+            if not runtime_contract_path:
+                raise OrchestrationError(
+                    "external campaign-contract path is missing"
+                )
+            environment.update(
+                ROUND_DAGGER_CAMPAIGN_CONTRACT=runtime_contract_path,
+                ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256=(
+                    self.config.campaign_contract_sha256
+                ),
+                ROUND_DAGGER_DATA_LINEAGE_SHA256=contract[
+                    "data_lineage_sha256"
+                ],
+            )
+        return environment
 
     def _completed_retry(
         self, current: Mapping[str, Any]
@@ -1510,6 +1640,50 @@ class MacroRoundOrchestrator:
     def run(self) -> dict[str, Any]:
         campaign = self.backend.load_campaign()
         validate_production_topology(campaign)
+        if campaign.get("schema") == state.PRODUCTION_CAMPAIGN_SCHEMA:
+            if self.config.campaign_contract_sha256 is None:
+                raise OrchestrationError(
+                    "production orchestration requires an external campaign-contract SHA-256"
+                )
+            lineage = campaign.get("data_lineage")
+            if (
+                not isinstance(lineage, Mapping)
+                or lineage.get("runtime_contract_sha256")
+                != self.config.campaign_contract_sha256
+            ):
+                raise OrchestrationError(
+                    "external campaign contract differs from durable campaign lineage"
+                )
+            runtime_contract_path = os.environ.get(
+                "ROUND_DAGGER_CAMPAIGN_CONTRACT"
+            )
+            runtime_contract_sha = os.environ.get(
+                "ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256"
+            )
+            if (
+                not isinstance(runtime_contract_path, str)
+                or not Path(runtime_contract_path).is_absolute()
+                or runtime_contract_sha != self.config.campaign_contract_sha256
+            ):
+                raise OrchestrationError(
+                    "validated external campaign-contract handoff is missing"
+                )
+            try:
+                observed_runtime_contract_sha = artifacts.sha256_file(
+                    runtime_contract_path
+                )
+            except Exception as exc:
+                raise OrchestrationError(
+                    "external campaign contract is unavailable"
+                ) from exc
+            if observed_runtime_contract_sha != self.config.campaign_contract_sha256:
+                raise OrchestrationError(
+                    "external campaign contract changed after launch preflight"
+                )
+        if self.config.macro_round_count != PRODUCTION_MACRO_ROUND_COUNT:
+            raise OrchestrationError(
+                "production orchestration config must bind exactly five macro-rounds"
+            )
         current = self.backend.load_state()
         completed = self._completed_retry(current)
         if completed is not None:
@@ -1870,14 +2044,19 @@ class MacroRoundOrchestrator:
 
 __all__ = [
     "ORCHESTRATION_CONFIG_SCHEMA",
+    "BOUNDED_ORCHESTRATION_CONFIG_SCHEMA",
+    "PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA",
     "EVALUATOR_RESULT_SCHEMA",
     "WANDB_PUBLIC_CONFIG_SCHEMA",
+    "PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA",
     "COHORT_COUNT",
     "ENVIRONMENTS_PER_COHORT",
     "TARGET_ENVIRONMENTS",
     "STEPS_PER_ENVIRONMENT",
     "TRANSITIONS_PER_COHORT",
     "TRANSITIONS_PER_MACRO_ROUND",
+    "PRODUCTION_MACRO_ROUND_COUNT",
+    "TRANSITIONS_PER_CAMPAIGN",
     "EXPECTED_ACTOR_RANKS",
     "OrchestrationError",
     "HookSpec",

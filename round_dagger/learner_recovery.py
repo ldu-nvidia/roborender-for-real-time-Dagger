@@ -129,12 +129,14 @@ def _recovery_config(
     learner_code_sha256: str,
     learner_config_sha256: str,
     evaluator_config_sha256: str,
+    macro_round_count: int,
 ) -> dict[str, Any]:
     return {
-        "schema": "fast_roborender.round_dagger.orchestration_config.v1",
+        "schema": "fast_roborender.round_dagger.orchestration_config.v2",
         "campaign_root": str(campaign_root),
         "actor_root": str(campaign_root / "actors"),
         "macro_round": macro_round,
+        "macro_round_count": macro_round_count,
         "runtime_policy_sha256": active["runtime_policy_sha256"],
         "learner_code_sha256": learner_code_sha256,
         "learner_config_sha256": learner_config_sha256,
@@ -331,13 +333,17 @@ def recover_ingested_learner(
         if not path.is_file() or artifacts.sha256_file(path) != expected:
             raise LearnerRecoveryError(f"{label} identity mismatch")
 
-    campaign_contract = artifacts.load_strict_json(campaign_contract_path)
-    if (
-        campaign_contract.get("schema")
-        != "fast_roborender.round_dagger.production_campaign_contract.v1"
-        or not isinstance(campaign_contract.get("campaign_id"), str)
-    ):
-        raise LearnerRecoveryError("campaign contract schema/identity is invalid")
+    try:
+        # Recovery consumes the same exact production-v2 deployment contract
+        # as initial launch.  Reusing the strict loader prevents a v1 relabel
+        # from omitting the bounded horizon or held-out split identities.
+        campaign_contract = production_launch.load_campaign_contract(
+            campaign_contract_path
+        )
+    except production_launch.ProductionLaunchError as exc:
+        raise LearnerRecoveryError(
+            "campaign contract schema/identity is invalid"
+        ) from exc
     learner_contract = production_launch.load_learner_contract(learner_contract_path)
     campaign = state.load_campaign(root)
     current = state.load_state(root)
@@ -434,6 +440,7 @@ def recover_ingested_learner(
         learner_code_sha256=source_sha,
         learner_config_sha256=learner_config_sha,
         evaluator_config_sha256=campaign["training_config_sha256"],
+        macro_round_count=campaign["macro_round_count"],
     )
     config_sha = artifacts.canonical_json_sha256(config_document)
     environment = _bridge_environment(

@@ -58,6 +58,10 @@ SCENARIO_CASES=${ROUND_DAGGER_EVALUATION_SCENARIOS:?missing ROUND_DAGGER_EVALUAT
 SCENARIO_CASES_SHA=${ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256:?missing ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256}
 THRESHOLDS=${ROUND_DAGGER_EVALUATION_THRESHOLDS:?missing ROUND_DAGGER_EVALUATION_THRESHOLDS}
 THRESHOLDS_SHA=${ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256:?missing ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256}
+MOTION_SPLIT=${ROUND_DAGGER_EVALUATION_MOTION_SPLIT_MANIFEST:?missing ROUND_DAGGER_EVALUATION_MOTION_SPLIT_MANIFEST}
+MOTION_SPLIT_SHA=${ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256:?missing ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256}
+HELDOUT_PLAN=${ROUND_DAGGER_HELDOUT_EVALUATION_PLAN:?missing ROUND_DAGGER_HELDOUT_EVALUATION_PLAN}
+HELDOUT_PLAN_SHA=${ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256:?missing ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256}
 TEACHER_CHECKPOINT=${ROUND_DAGGER_TEACHER_CHECKPOINT:?missing ROUND_DAGGER_TEACHER_CHECKPOINT}
 TEACHER_SHA=${ROUND_DAGGER_TEACHER_SHA256:?missing ROUND_DAGGER_TEACHER_SHA256}
 SEALED_TEACHER=${ROUND_DAGGER_EVALUATION_SEALED_TEACHER:?missing ROUND_DAGGER_EVALUATION_SEALED_TEACHER}
@@ -77,6 +81,13 @@ ANCHOR_COUNT=${ROUND_DAGGER_MIN_ANCHORS:?missing ROUND_DAGGER_MIN_ANCHORS}
 ANCHOR_INDEX=${ROUND_DAGGER_ANCHOR_INDEX:?missing ROUND_DAGGER_ANCHOR_INDEX}
 ANCHOR_INVENTORY_SHA=${ROUND_DAGGER_ANCHOR_INVENTORY_SHA256:?missing ROUND_DAGGER_ANCHOR_INVENTORY_SHA256}
 ANCHOR_SOURCE=${IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE:?missing IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE}
+CAMPAIGN_CONTRACT=${ROUND_DAGGER_CAMPAIGN_CONTRACT:?missing ROUND_DAGGER_CAMPAIGN_CONTRACT}
+CAMPAIGN_CONTRACT_SHA=${ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256:?missing ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256}
+DATA_LINEAGE_SHA=${ROUND_DAGGER_DATA_LINEAGE_SHA256:?missing ROUND_DAGGER_DATA_LINEAGE_SHA256}
+CAPTURE_ATTESTATION=${ROUND_DAGGER_CAPTURE_ATTESTATION:?missing ROUND_DAGGER_CAPTURE_ATTESTATION}
+CAPTURE_ATTESTATION_SHA=${ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256:?missing ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256}
+CAPTURE_EVIDENCE=${ROUND_DAGGER_CAPTURE_EVIDENCE:?missing ROUND_DAGGER_CAPTURE_EVIDENCE}
+CAPTURE_EVIDENCE_SHA=${ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256:?missing ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256}
 
 [[ $CAMPAIGN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || \
     fatal "campaign ID is unsafe"
@@ -93,11 +104,17 @@ require_sha "$CANDIDATE_MANIFEST_SHA" ROUND_DAGGER_CANDIDATE_SHA256
 require_sha "$EVALUATOR_CONFIG_SHA" ROUND_DAGGER_EVALUATOR_CONFIG_SHA256
 require_sha "$SCENARIO_CASES_SHA" ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256
 require_sha "$THRESHOLDS_SHA" ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256
+require_sha "$MOTION_SPLIT_SHA" ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256
+require_sha "$HELDOUT_PLAN_SHA" ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256
 require_sha "$TEACHER_SHA" ROUND_DAGGER_TEACHER_SHA256
 require_sha "$EVALUATION_SOURCE_INVENTORY_SHA" ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256
 require_sha "$ANCHOR_INVENTORY_SHA" ROUND_DAGGER_ANCHOR_INVENTORY_SHA256
 require_sha "$RENDERER_RUNTIME_SHA" ROUND_DAGGER_RENDERER_RUNTIME_SHA256
 require_sha "$EXPECTED_IMAGE_ID_SHA" ROUND_DAGGER_RTX_IMAGE_ID_SHA256
+require_sha "$CAMPAIGN_CONTRACT_SHA" ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256
+require_sha "$DATA_LINEAGE_SHA" ROUND_DAGGER_DATA_LINEAGE_SHA256
+require_sha "$CAPTURE_ATTESTATION_SHA" ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256
+require_sha "$CAPTURE_EVIDENCE_SHA" ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256
 require_directory "$CAMPAIGN_ROOT" "campaign root"
 [[ $REPOSITORY_ROOT == "$EVALUATION_SOURCE_ROOT" ]] || \
     fatal "production evaluation hook is not executing from the sealed source root"
@@ -116,8 +133,13 @@ require_regular "$CANDIDATE_MANIFEST" "candidate manifest"
 require_regular "$EVALUATION_CONFIG" "evaluation config"
 require_regular "$SCENARIO_CASES" "scenario cases"
 require_regular "$THRESHOLDS" "evaluation thresholds"
+require_regular "$MOTION_SPLIT" "evaluation motion split manifest"
+require_regular "$HELDOUT_PLAN" "held-out evaluation plan"
 require_regular "$TEACHER_CHECKPOINT" "configured teacher checkpoint"
 require_regular "$SEALED_TEACHER" "sealed teacher checkpoint"
+require_regular "$CAMPAIGN_CONTRACT" "external campaign contract"
+require_regular "$CAPTURE_ATTESTATION" "live capture attestation"
+require_regular "$CAPTURE_EVIDENCE" "live capture evidence"
 [[ $TEACHER_CHECKPOINT != "$SEALED_TEACHER" ]] || \
     fatal "sealed teacher source must differ from the configured target"
 [[ $(stat -c %a "$SEALED_TEACHER") == 444 ]] || \
@@ -155,6 +177,22 @@ CONTROL_PYTHON_TARGET=$(readlink -f -- "$CONTROL_PYTHON") || \
     fatal "evaluation scenario cases SHA mismatch"
 [[ $(sha256sum "$THRESHOLDS" | awk '{print $1}') == "$THRESHOLDS_SHA" ]] || \
     fatal "evaluation thresholds SHA mismatch"
+[[ $(sha256sum "$MOTION_SPLIT" | awk '{print $1}') == "$MOTION_SPLIT_SHA" ]] || \
+    fatal "evaluation motion split manifest SHA mismatch"
+[[ $(sha256sum "$HELDOUT_PLAN" | awk '{print $1}') == "$HELDOUT_PLAN_SHA" ]] || \
+    fatal "held-out evaluation plan SHA mismatch"
+[[ $(sha256sum "$CAMPAIGN_CONTRACT" | awk '{print $1}') == "$CAMPAIGN_CONTRACT_SHA" ]] || \
+    fatal "external campaign contract SHA mismatch"
+[[ $(sha256sum "$CAPTURE_ATTESTATION" | awk '{print $1}') == "$CAPTURE_ATTESTATION_SHA" ]] || \
+    fatal "live capture attestation SHA mismatch"
+[[ $(sha256sum "$CAPTURE_EVIDENCE" | awk '{print $1}') == "$CAPTURE_EVIDENCE_SHA" ]] || \
+    fatal "live capture evidence SHA mismatch"
+[[ $MOTION_SPLIT == \
+   "$GR00T_SOURCE_ROOT/gr00t/rl/data/motions/g1_wsdpt/33demos_675_775_heldout_256_v1.json" ]] || \
+    fatal "evaluation motion split path is non-canonical"
+[[ $HELDOUT_PLAN == \
+   "$EVALUATION_SOURCE_ROOT/configs/round_dagger/production_heldout_motion_plan_8x32.json" ]] || \
+    fatal "held-out evaluation plan path is non-canonical"
 [[ $(sha256sum "$TEACHER_CHECKPOINT" | awk '{print $1}') == "$TEACHER_SHA" ]] || \
     fatal "configured teacher checkpoint SHA mismatch"
 [[ $(sha256sum "$SEALED_TEACHER" | awk '{print $1}') == "$TEACHER_SHA" ]] || \
@@ -183,6 +221,13 @@ verify_anchor_pool() {
 }
 verify_evaluation_source
 verify_anchor_pool
+MOTION_SPLIT_REPORT=$(
+    "$CONTROL_PYTHON" -m round_dagger.motion_split_contract verify \
+        --manifest "$MOTION_SPLIT" --manifest-sha256 "$MOTION_SPLIT_SHA" \
+        --plan "$HELDOUT_PLAN" --plan-sha256 "$HELDOUT_PLAN_SHA" \
+        --scenarios "$SCENARIO_CASES"
+) || fatal "motion split/held-out evaluation contract verification failed"
+printf '%s\n' "$MOTION_SPLIT_REPORT"
 
 # The pinned Hydra config must name the host path that will be shadowed by the
 # more-specific read-only file bind below.  Parsing the exact, digest-checked
@@ -226,6 +271,40 @@ CONFIGURED_ANCHOR_INDEX=${CONFIGURED_INPUTS[2]}
 
 SEALED_CAMPAIGN_CONTRACT="$EVALUATION_SOURCE_ROOT/configs/round_dagger/production_campaign_256x512.json"
 require_regular "$SEALED_CAMPAIGN_CONTRACT" "sealed production campaign contract"
+RUNTIME_CONTRACT_REPORT=$(
+    "$CONTROL_PYTHON" -m round_dagger.production_data_lineage verify \
+        --invariant-profile "$SEALED_CAMPAIGN_CONTRACT" \
+        --campaign-contract "$CAMPAIGN_CONTRACT" \
+        --campaign-contract-sha256 "$CAMPAIGN_CONTRACT_SHA"
+) || fatal "external campaign/live-capture contract verification failed"
+RUNTIME_LINEAGE_SHA=$(
+    "$CONTROL_PYTHON" -c \
+        'import json,sys; print(json.load(sys.stdin)["data_lineage_sha256"])' \
+        <<<"$RUNTIME_CONTRACT_REPORT"
+) || fatal "cannot parse runtime campaign lineage identity"
+[[ $RUNTIME_LINEAGE_SHA == "$DATA_LINEAGE_SHA" ]] || \
+    fatal "runtime campaign lineage differs from durable round"
+$CONTROL_PYTHON - "$CAMPAIGN_CONTRACT" "$SCENARIO_CASES" \
+    "$SCENARIO_CASES_SHA" "$CAPTURE_ATTESTATION" "$CAPTURE_ATTESTATION_SHA" \
+    "$CAPTURE_EVIDENCE" "$CAPTURE_EVIDENCE_SHA" <<'PY' || \
+    fatal "evaluator inputs differ from external campaign contract"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    capture = json.load(handle)["live_capture"]
+expected = {
+    "scenario_path": sys.argv[2],
+    "scenario_sha256": sys.argv[3],
+    "attestation_path": sys.argv[4],
+    "attestation_sha256": sys.argv[5],
+    "evidence_path": sys.argv[6],
+    "evidence_sha256": sys.argv[7],
+}
+if any(capture.get(key) != value for key, value in expected.items()):
+    raise SystemExit(1)
+PY
+printf '%s\n' "$RUNTIME_CONTRACT_REPORT"
 $CONTROL_PYTHON - "$SEALED_CAMPAIGN_CONTRACT" "$ANCHOR_POOL" \
     "$ANCHOR_COUNT" "$ANCHOR_INVENTORY_SHA" "$ANCHOR_SOURCE" <<'PY' || \
     fatal "sealed campaign anchor contract mismatch"
@@ -266,17 +345,17 @@ EXPECTED_RESULT="$EVALUATION_ROOT/result.json"
 # only the campaign root is writable for staged inputs and evaluation results.
 for path in "$REPOSITORY_ROOT" "$CAMPAIGN_ROOT" "$GR00T_SOURCE_ROOT" \
     "$EVALUATION_CONFIG" "$SCENARIO_CASES" "$THRESHOLDS" "$ENDPOINT_DIR" \
+    "$MOTION_SPLIT" "$HELDOUT_PLAN" \
     "$TEACHER_CHECKPOINT" "$SEALED_TEACHER" "$ANCHOR_POOL" \
-    "$SOURCE_INVENTORY" "$SOURCE_ATTESTATION"; do
+    "$SOURCE_INVENTORY" "$SOURCE_ATTESTATION" "$CAMPAIGN_CONTRACT" \
+    "$CAPTURE_ATTESTATION" "$CAPTURE_EVIDENCE"; do
     case "$path" in
         /mnt/data1|/mnt/data1/*|/mnt/data2|/mnt/data2/*) ;;
         *) fatal "container input is outside /mnt/data1 and /mnt/data2: $path" ;;
     esac
 done
-case "$SCENARIO_CASES:$THRESHOLDS" in
-    "$EVALUATION_SOURCE_ROOT"/*:"$EVALUATION_SOURCE_ROOT"/*) ;;
-    *) fatal "scenario and threshold contracts must come from the sealed source" ;;
-esac
+[[ $THRESHOLDS == "$EVALUATION_SOURCE_ROOT"/* ]] || \
+    fatal "threshold contract must come from the sealed source"
 
 mapfile -t ENDPOINT_FILES < <(find "$ENDPOINT_DIR" -maxdepth 1 -type f \
     -name 'renderer_*.txt' -print | LC_ALL=C sort)
@@ -405,6 +484,10 @@ DOCKER_RUN=("$DOCKER" run --rm
     --anchor-count "$ANCHOR_COUNT"
     --anchor-index "$ANCHOR_INDEX"
     --anchor-inventory-sha256 "$ANCHOR_INVENTORY_SHA"
+    --motion-split-manifest "$MOTION_SPLIT"
+    --motion-split-manifest-sha256 "$MOTION_SPLIT_SHA"
+    --heldout-plan "$HELDOUT_PLAN"
+    --heldout-plan-sha256 "$HELDOUT_PLAN_SHA"
     --scratch-root /run/round-dagger-eval
     --require-teacher-readonly-mount
     --orchestrator-result "$EVALUATOR_RESULT"

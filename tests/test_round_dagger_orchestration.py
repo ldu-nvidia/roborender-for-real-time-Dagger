@@ -8,6 +8,7 @@ from round_dagger import artifacts
 from round_dagger.artifacts import publish_immutable_json, sha256_file
 from round_dagger.orchestration import (
     COHORT_COUNT,
+    BOUNDED_ORCHESTRATION_CONFIG_SCHEMA,
     ENVIRONMENTS_PER_COHORT,
     EVALUATOR_RESULT_SCHEMA,
     HookSpec,
@@ -15,11 +16,13 @@ from round_dagger.orchestration import (
     MacroRoundOrchestrator,
     ProductionBackend,
     ORCHESTRATION_CONFIG_SCHEMA,
+    PRODUCTION_MACRO_ROUND_COUNT,
     OrchestrationError,
     STEPS_PER_ENVIRONMENT,
     TARGET_ENVIRONMENTS,
     TRANSITIONS_PER_COHORT,
     TRANSITIONS_PER_MACRO_ROUND,
+    TRANSITIONS_PER_CAMPAIGN,
     WANDB_PUBLIC_CONFIG_SCHEMA,
     _public_wandb_config,
     validate_production_topology,
@@ -55,6 +58,7 @@ def campaign():
         "active_environments": ENVIRONMENTS_PER_COHORT,
         "cohort_count": COHORT_COUNT,
         "steps_per_environment": STEPS_PER_ENVIRONMENT,
+        "macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
     }
 
 
@@ -112,6 +116,7 @@ def config(root: Path, *, transfer=True, ingest=True, promote=True):
         evaluator_config_sha256=SHA["evaluator_config"],
         hooks=hooks,
         sha256=SHA["orchestration"],
+        macro_round_count=PRODUCTION_MACRO_ROUND_COUNT,
     )
 
 
@@ -568,7 +573,25 @@ class ConfigAndTopologyTest(unittest.TestCase):
             path.write_text(json.dumps(document), encoding="utf-8")
             loaded = MacroRoundConfig.load(path)
             self.assertEqual(loaded.macro_round, 0)
+            self.assertIsNone(loaded.macro_round_count)
             self.assertIsNone(loaded.hooks["transfer"])
+
+            document["schema"] = BOUNDED_ORCHESTRATION_CONFIG_SCHEMA
+            document["macro_round_count"] = PRODUCTION_MACRO_ROUND_COUNT
+            path.write_text(json.dumps(document), encoding="utf-8")
+            bounded = MacroRoundConfig.load(path)
+            self.assertEqual(
+                bounded.macro_round_count, PRODUCTION_MACRO_ROUND_COUNT
+            )
+
+            document["macro_round"] = PRODUCTION_MACRO_ROUND_COUNT
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                OrchestrationError, "below the bounded campaign horizon"
+            ):
+                MacroRoundConfig.load(path)
+
+            document["macro_round"] = 0
 
             document["hooks"]["collect"] = {
                 "argv": [
@@ -594,6 +617,14 @@ class ConfigAndTopologyTest(unittest.TestCase):
             validate_production_topology(campaign(), wrong_contract)
 
     def test_public_wandb_projection_has_a_fixed_non_secret_allowlist(self):
+        self.assertEqual(
+            WANDB_PUBLIC_CONFIG_SCHEMA,
+            wandb_run_watcher.PUBLIC_CONFIG_SCHEMA,
+        )
+        self.assertEqual(
+            WANDB_PUBLIC_CONFIG_SCHEMA,
+            "fast_roborender.round_dagger.wandb_public_config.v2",
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             configuration = config(root)
@@ -612,10 +643,37 @@ class ConfigAndTopologyTest(unittest.TestCase):
             self.assertNotIn(str(root).lower(), serialized)
             self.assertNotIn("argv", serialized)
 
+            production_document = json.loads(json.dumps(document))
+            production_document["schema"] = (
+                wandb_run_watcher.PRODUCTION_PUBLIC_CONFIG_SCHEMA
+            )
+            production_document["config"].update(
+                {
+                    "round_dagger/campaign_contract_sha256": "d" * 64,
+                    "round_dagger/data_lineage_sha256": "e" * 64,
+                }
+            )
+            path.write_text(json.dumps(production_document), encoding="utf-8")
+            production_loaded = wandb_run_watcher.load_public_config(path)
+            self.assertEqual(
+                production_loaded["round_dagger/data_lineage_sha256"],
+                "e" * 64,
+            )
+
             document["config"]["wandb_api_key"] = "secret"
             path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(
                 wandb_run_watcher.ArtifactError, "unknown=.*wandb_api_key"
+            ):
+                wandb_run_watcher.load_public_config(path)
+
+            document["config"].pop("wandb_api_key")
+            document["schema"] = (
+                "fast_roborender.round_dagger.wandb_public_config.v1"
+            )
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                wandb_run_watcher.ArtifactError, "schema mismatch"
             ):
                 wandb_run_watcher.load_public_config(path)
 

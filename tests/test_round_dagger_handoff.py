@@ -17,6 +17,11 @@ from round_dagger.gr00t_policy import (
     build_portable_policy_spec,
 )
 from round_dagger.policy_identity import runtime_policy_identity_sha256
+from round_dagger.production_data_lineage import (
+    build_cohort_assignment,
+    data_lineage_sha256,
+    derive_data_lineage,
+)
 
 
 HOMIE_CONTROLLER_SHA256 = {"walk": "7" * 64, "stand": "8" * 64}
@@ -28,6 +33,45 @@ DIGESTS = {
     "beta_sha256": "5" * 64,
     "config_sha256": "6" * 64,
 }
+
+
+def _production_data_lineage() -> dict:
+    motion_split = {
+        "manifest_sha256": (
+            "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834"
+        ),
+        "heldout_plan_sha256": "7" * 64,
+        "collection_role": "collection",
+        "evaluation_role": "eval",
+        "collection_motion_count": 39,
+        "heldout_motion_count": 256,
+    }
+    return derive_data_lineage(
+        {
+            "contract_sha256": "8" * 64,
+            "invariant_profile_sha256": "9" * 64,
+            "live_capture": {
+                "attestation_sha256": "a" * 64,
+                "evidence_sha256": "b" * 64,
+                "scenario_sha256": "c" * 64,
+            },
+            "capture_provenance": {
+                "motion_split_manifest_sha256": motion_split[
+                    "manifest_sha256"
+                ],
+                "heldout_plan_sha256": motion_split[
+                    "heldout_plan_sha256"
+                ],
+            },
+        },
+        motion_split_contract=motion_split,
+        topology={
+            "cohort_count": 4,
+            "actor_ranks_per_cohort": 2,
+            "environments_per_actor_rank": 32,
+            "active_environments": 64,
+        },
+    )
 
 
 _FakePolicy = type("VisionActorObjPred", (), {})
@@ -289,6 +333,7 @@ class ActorLauncherContractTest(unittest.TestCase):
                 checkpoint, policy_state_sha
             )
             cohort = root / "cohort"
+            data_lineage = _production_data_lineage()
             artifacts.create_cohort(
                 cohort,
                 campaign_id="launcher-test",
@@ -317,6 +362,12 @@ class ActorLauncherContractTest(unittest.TestCase):
                     cohort_index=0,
                     expected_ranks=[0, 1],
                     expected_global_env_ids=list(range(64)),
+                ),
+                data_lineage=data_lineage,
+                motion_assignment=build_cohort_assignment(
+                    data_lineage,
+                    cohort_index=0,
+                    expected_ranks=(0, 1),
                 ),
             )
             endpoints = []
@@ -390,6 +441,17 @@ class ActorLauncherContractTest(unittest.TestCase):
                     policy_manifest
                 ),
                 "ROUND_DAGGER_MIN_ANCHORS": "1",
+                "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": str(
+                    Path(__file__).resolve().parents[1]
+                    / "GR00T-VisualSim2Real/gr00t/rl/data/motions/g1_wsdpt/"
+                    "33demos_675_775_heldout_256_v1.json"
+                ),
+                "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": (
+                    "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834"
+                ),
+                "ROUND_DAGGER_DATA_LINEAGE_SHA256": data_lineage_sha256(
+                    data_lineage
+                ),
                 "IMAGE3F_ENDPOINT_MANIFEST": str(endpoint_manifest),
                 "IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE": "simulator_rgb",
                 "ANCHORS": str(anchors),

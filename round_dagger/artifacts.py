@@ -28,11 +28,23 @@ from typing import Any, BinaryIO
 import numpy as np
 
 from round_dagger.seed_policy import ActorSeedError, validate_actor_seed_contract
+from round_dagger.production_data_lineage import (
+    ProductionDataLineageError,
+    data_lineage_sha256,
+    rank_assignment,
+    validate_cohort_assignment,
+    validate_data_lineage,
+)
 
 
 COHORT_CONTRACT_SCHEMA = "fast_roborender.round_dagger.cohort_contract.v1"
+PRODUCTION_COHORT_CONTRACT_SCHEMA = (
+    "fast_roborender.round_dagger.cohort_contract.v2"
+)
 SHARD_SCHEMA = "fast_roborender.round_dagger.rollout_shard.v1"
+PRODUCTION_SHARD_SCHEMA = "fast_roborender.round_dagger.rollout_shard.v2"
 COHORT_SCHEMA = "fast_roborender.round_dagger.cohort.v1"
+PRODUCTION_COHORT_SCHEMA = "fast_roborender.round_dagger.cohort.v2"
 
 CONTRACT_FILENAME = "contract.json"
 SEAL_FILENAME = "seal.json"
@@ -88,6 +100,11 @@ _ACTOR_SEED_FIELD = "actor_seed_contract"
 _TRAJECTORY_FINGERPRINT_FIELD = (
     "physical_teacher_trajectory_sha256_by_global_env"
 )
+_DATA_LINEAGE_FIELD = "data_lineage"
+_DATA_LINEAGE_SHA_FIELD = "data_lineage_sha256"
+_MOTION_ASSIGNMENT_FIELD = "motion_assignment"
+_MOTION_ASSIGNMENT_SHA_FIELD = "motion_assignment_sha256"
+_RANK_MOTION_ASSIGNMENT_FIELD = "rank_motion_assignment"
 
 _CONTRACT_KEYS = {
     "schema",
@@ -477,12 +494,20 @@ def _validate_action_contract(value: Any) -> dict[str, Any]:
 def _validate_contract(document: Any) -> dict[str, Any]:
     if not isinstance(document, Mapping):
         raise ArtifactError("cohort contract must be a mapping")
-    keys = _CONTRACT_KEYS | (
+    schema = document.get("schema")
+    production = schema == PRODUCTION_COHORT_CONTRACT_SCHEMA
+    if schema not in {COHORT_CONTRACT_SCHEMA, PRODUCTION_COHORT_CONTRACT_SCHEMA}:
+        raise ArtifactError("cohort contract schema mismatch")
+    production_keys = {
+        _DATA_LINEAGE_FIELD,
+        _DATA_LINEAGE_SHA_FIELD,
+        _MOTION_ASSIGNMENT_FIELD,
+        _MOTION_ASSIGNMENT_SHA_FIELD,
+    }
+    keys = _CONTRACT_KEYS | (production_keys if production else set()) | (
         {_ACTOR_SEED_FIELD} if _ACTOR_SEED_FIELD in document else set()
     )
     contract = _require_exact_keys(document, keys, "cohort contract")
-    if contract["schema"] != COHORT_CONTRACT_SCHEMA:
-        raise ArtifactError("cohort contract schema mismatch")
     _require_token(contract["campaign_id"], "campaign_id")
     _require_int(contract["macro_round"], "macro_round")
     _require_int(contract["cohort_index"], "cohort_index")
@@ -520,6 +545,25 @@ def _validate_contract(document: Any) -> dict[str, Any]:
             )
         except ActorSeedError as exc:
             raise ArtifactError(f"invalid actor seed contract: {exc}") from exc
+    if production:
+        try:
+            lineage = validate_data_lineage(contract[_DATA_LINEAGE_FIELD])
+            assignment = validate_cohort_assignment(
+                contract[_MOTION_ASSIGNMENT_FIELD],
+                data_lineage=lineage,
+                cohort_index=contract["cohort_index"],
+                expected_ranks=ranks,
+            )
+        except ProductionDataLineageError as exc:
+            raise ArtifactError(f"invalid production cohort lineage: {exc}") from exc
+        if contract[_DATA_LINEAGE_SHA_FIELD] != data_lineage_sha256(lineage):
+            raise ArtifactError("cohort data-lineage digest mismatch")
+        if contract[_MOTION_ASSIGNMENT_SHA_FIELD] != canonical_json_sha256(
+            assignment
+        ):
+            raise ArtifactError("cohort motion-assignment digest mismatch")
+        if _ACTOR_SEED_FIELD not in contract:
+            raise ArtifactError("production cohort requires actor seed contract")
     return contract
 
 
@@ -542,6 +586,8 @@ def create_cohort(
     beta_sha256: str,
     config_sha256: str,
     actor_seed_contract: Mapping[str, Any] | None = None,
+    data_lineage: Mapping[str, Any] | None = None,
+    motion_assignment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create an immutable cohort contract and its empty shard directory."""
 
@@ -560,8 +606,17 @@ def create_cohort(
     transitions = _require_int(expected_transitions, "expected_transitions", minimum=1)
     if not envs or transitions % len(envs):
         raise ArtifactError("expected_transitions must divide evenly across expected environments")
+    if (data_lineage is None) != (motion_assignment is None):
+        raise ArtifactError(
+            "production data lineage and motion assignment must be supplied together"
+        )
+    production = data_lineage is not None
     contract = {
-        "schema": COHORT_CONTRACT_SCHEMA,
+        "schema": (
+            PRODUCTION_COHORT_CONTRACT_SCHEMA
+            if production
+            else COHORT_CONTRACT_SCHEMA
+        ),
         "campaign_id": _require_token(campaign_id, "campaign_id"),
         "macro_round": _require_int(macro_round, "macro_round"),
         "cohort_index": _require_int(cohort_index, "cohort_index"),
@@ -581,6 +636,25 @@ def create_cohort(
     }
     if actor_seed_contract is not None:
         contract[_ACTOR_SEED_FIELD] = dict(actor_seed_contract)
+    if production:
+        try:
+            normalized_lineage = validate_data_lineage(data_lineage)
+            normalized_assignment = validate_cohort_assignment(
+                motion_assignment,
+                data_lineage=normalized_lineage,
+                cohort_index=cohort_index,
+                expected_ranks=ranks,
+            )
+        except ProductionDataLineageError as exc:
+            raise ArtifactError(f"invalid production cohort lineage: {exc}") from exc
+        contract[_DATA_LINEAGE_FIELD] = normalized_lineage
+        contract[_DATA_LINEAGE_SHA_FIELD] = data_lineage_sha256(
+            normalized_lineage
+        )
+        contract[_MOTION_ASSIGNMENT_FIELD] = normalized_assignment
+        contract[_MOTION_ASSIGNMENT_SHA_FIELD] = canonical_json_sha256(
+            normalized_assignment
+        )
     contract = _validate_contract(contract)
     publish_immutable_json(cohort_dir / CONTRACT_FILENAME, contract)
     _ensure_directory(cohort_dir / SHARD_DIRECTORY)
@@ -1046,7 +1120,11 @@ def publish_rollout_shard(
             pass
     payload_size = os.stat(payload_path, follow_symlinks=False).st_size
     manifest = {
-        "schema": SHARD_SCHEMA,
+        "schema": (
+            PRODUCTION_SHARD_SCHEMA
+            if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA
+            else SHARD_SCHEMA
+        ),
         "shard_id": shard_id,
         **supplied,
         "rank": rank,
@@ -1066,6 +1144,14 @@ def publish_rollout_shard(
             "size_bytes": payload_size,
         },
     }
+    if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA:
+        manifest[_DATA_LINEAGE_SHA_FIELD] = contract[_DATA_LINEAGE_SHA_FIELD]
+        manifest[_MOTION_ASSIGNMENT_SHA_FIELD] = contract[
+            _MOTION_ASSIGNMENT_SHA_FIELD
+        ]
+        manifest[_RANK_MOTION_ASSIGNMENT_FIELD] = rank_assignment(
+            contract[_MOTION_ASSIGNMENT_FIELD], rank
+        )
     _validate_shard_manifest(manifest)
     publish_immutable_json(sidecar_path, manifest)
     return verify_rollout_shard(sidecar_path)
@@ -1093,9 +1179,22 @@ def _validate_array_metadata(value: Any) -> dict[str, dict[str, Any]]:
 
 
 def _validate_shard_manifest(document: Any) -> dict[str, Any]:
-    manifest = _require_exact_keys(document, _SHARD_KEYS, "rollout shard manifest")
-    if manifest["schema"] != SHARD_SCHEMA:
+    if not isinstance(document, Mapping):
+        raise ArtifactError("rollout shard manifest must be a mapping")
+    schema = document.get("schema")
+    production = schema == PRODUCTION_SHARD_SCHEMA
+    if schema not in {SHARD_SCHEMA, PRODUCTION_SHARD_SCHEMA}:
         raise ArtifactError("rollout shard schema mismatch")
+    production_keys = {
+        _DATA_LINEAGE_SHA_FIELD,
+        _MOTION_ASSIGNMENT_SHA_FIELD,
+        _RANK_MOTION_ASSIGNMENT_FIELD,
+    }
+    manifest = _require_exact_keys(
+        document,
+        _SHARD_KEYS | (production_keys if production else set()),
+        "rollout shard manifest",
+    )
     shard_id = _require_token(manifest["shard_id"], "shard_id")
     _require_token(manifest["campaign_id"], "campaign_id")
     for field in ("macro_round", "cohort_index", "rank", "rollout_id", "part_index"):
@@ -1106,6 +1205,19 @@ def _validate_shard_manifest(document: Any) -> dict[str, Any]:
         raise ArtifactError("shard purpose must be exactly 'train' or 'eval'")
     for field in (*_DIGEST_FIELDS, "cohort_contract_sha256"):
         _require_sha256(manifest[field], field)
+    if production:
+        _require_sha256(
+            manifest[_DATA_LINEAGE_SHA_FIELD], _DATA_LINEAGE_SHA_FIELD
+        )
+        _require_sha256(
+            manifest[_MOTION_ASSIGNMENT_SHA_FIELD],
+            _MOTION_ASSIGNMENT_SHA_FIELD,
+        )
+        _require_exact_keys(
+            manifest[_RANK_MOTION_ASSIGNMENT_FIELD],
+            {"rank", "environment_count", "motion_assignment_offset"},
+            _RANK_MOTION_ASSIGNMENT_FIELD,
+        )
     _require_int(manifest["transition_count"], "transition_count", minimum=1)
     steps = _require_int(manifest["num_steps"], "num_steps", minimum=1)
     envs = _require_int(manifest["num_envs"], "num_envs", minimum=1)
@@ -1183,6 +1295,22 @@ def _verify_rollout_shard(sidecar_path: Path) -> dict[str, Any]:
     contract, contract_sha = _load_contract(cohort_dir)
     if manifest["cohort_contract_sha256"] != contract_sha:
         raise ArtifactError("shard cohort contract digest mismatch")
+    production = contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA
+    if production != (manifest["schema"] == PRODUCTION_SHARD_SCHEMA):
+        raise ArtifactError("shard/cohort production-lineage schema mismatch")
+    if production:
+        expected_rank_assignment = rank_assignment(
+            contract[_MOTION_ASSIGNMENT_FIELD], manifest["rank"]
+        )
+        if (
+            manifest[_DATA_LINEAGE_SHA_FIELD]
+            != contract[_DATA_LINEAGE_SHA_FIELD]
+            or manifest[_MOTION_ASSIGNMENT_SHA_FIELD]
+            != contract[_MOTION_ASSIGNMENT_SHA_FIELD]
+            or manifest[_RANK_MOTION_ASSIGNMENT_FIELD]
+            != expected_rank_assignment
+        ):
+            raise ArtifactError("shard production motion lineage mismatch")
     _require_exact_provenance(contract, _provenance_from_contract(manifest))
     if manifest["rank"] not in contract["expected_ranks"]:
         raise ArtifactError("shard rank is not expected by cohort")
@@ -1350,7 +1478,11 @@ def _build_seal(
     ranks = sorted({int(shard["rank"]) for shard in shards})
     envs = sorted({int(item) for shard in shards for item in shard["global_env_ids"]})
     seal = {
-        "schema": COHORT_SCHEMA,
+        "schema": (
+            PRODUCTION_COHORT_SCHEMA
+            if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA
+            else COHORT_SCHEMA
+        ),
         "campaign_id": contract["campaign_id"],
         "macro_round": contract["macro_round"],
         "cohort_index": contract["cohort_index"],
@@ -1372,6 +1504,13 @@ def _build_seal(
     if _ACTOR_SEED_FIELD in contract:
         seal[_ACTOR_SEED_FIELD] = dict(contract[_ACTOR_SEED_FIELD])
         seal[_TRAJECTORY_FINGERPRINT_FIELD] = dict(trajectory_fingerprints)
+    if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA:
+        seal[_DATA_LINEAGE_FIELD] = contract[_DATA_LINEAGE_FIELD]
+        seal[_DATA_LINEAGE_SHA_FIELD] = contract[_DATA_LINEAGE_SHA_FIELD]
+        seal[_MOTION_ASSIGNMENT_FIELD] = contract[_MOTION_ASSIGNMENT_FIELD]
+        seal[_MOTION_ASSIGNMENT_SHA_FIELD] = contract[
+            _MOTION_ASSIGNMENT_SHA_FIELD
+        ]
     return seal
 
 
@@ -1384,13 +1523,23 @@ def _validate_seal(document: Any) -> dict[str, Any]:
         raise ArtifactError(
             "cohort seed and physical/teacher fingerprint provenance must be complete"
         )
-    keys = _SEAL_KEYS | (
+    schema = document.get("schema")
+    production = schema == PRODUCTION_COHORT_SCHEMA
+    if schema not in {COHORT_SCHEMA, PRODUCTION_COHORT_SCHEMA}:
+        raise ArtifactError("cohort seal schema mismatch")
+    production_keys = {
+        _DATA_LINEAGE_FIELD,
+        _DATA_LINEAGE_SHA_FIELD,
+        _MOTION_ASSIGNMENT_FIELD,
+        _MOTION_ASSIGNMENT_SHA_FIELD,
+    }
+    keys = _SEAL_KEYS | (production_keys if production else set()) | (
         {_ACTOR_SEED_FIELD, _TRAJECTORY_FINGERPRINT_FIELD}
         if has_seed
         else set()
     )
     seal = _require_exact_keys(document, keys, "cohort seal")
-    if seal["schema"] != COHORT_SCHEMA or seal["sealed"] is not True:
+    if seal["sealed"] is not True:
         raise ArtifactError("cohort seal schema or sealed flag is invalid")
     _require_token(seal["campaign_id"], "campaign_id")
     _require_int(seal["macro_round"], "macro_round")
@@ -1437,6 +1586,25 @@ def _validate_seal(document: Any) -> dict[str, Any]:
             raise ArtifactError(
                 "sealed physical/teacher fingerprints must cover every environment"
             )
+    if production:
+        try:
+            lineage = validate_data_lineage(seal[_DATA_LINEAGE_FIELD])
+            assignment = validate_cohort_assignment(
+                seal[_MOTION_ASSIGNMENT_FIELD],
+                data_lineage=lineage,
+                cohort_index=seal["cohort_index"],
+                expected_ranks=seal["expected_ranks"],
+            )
+        except ProductionDataLineageError as exc:
+            raise ArtifactError(f"invalid sealed production lineage: {exc}") from exc
+        if (
+            seal[_DATA_LINEAGE_SHA_FIELD] != data_lineage_sha256(lineage)
+            or seal[_MOTION_ASSIGNMENT_SHA_FIELD]
+            != canonical_json_sha256(assignment)
+        ):
+            raise ArtifactError("sealed production lineage digest mismatch")
+        if not has_seed:
+            raise ArtifactError("production cohort seal requires actor seed provenance")
         for global_env_id, digest in fingerprints.items():
             _require_int(int(global_env_id), "trajectory fingerprint global_env_id")
             _require_sha256(digest, "physical/teacher trajectory SHA-256")
@@ -1526,8 +1694,11 @@ def verify_cohort(path: str | os.PathLike[str]) -> dict[str, Any]:
 __all__ = [
     "ArtifactError",
     "COHORT_CONTRACT_SCHEMA",
+    "PRODUCTION_COHORT_CONTRACT_SCHEMA",
     "SHARD_SCHEMA",
+    "PRODUCTION_SHARD_SCHEMA",
     "COHORT_SCHEMA",
+    "PRODUCTION_COHORT_SCHEMA",
     "canonical_json_sha256",
     "load_strict_json",
     "sha256_file",

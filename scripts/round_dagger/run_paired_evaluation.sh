@@ -10,7 +10,9 @@ Usage: run_paired_evaluation.sh --root DIR --contract FILE --results-dir DIR
        --sealed-teacher-checkpoint FILE
        --evaluation-source-inventory-sha256 SHA256
        --anchor-pool-dir DIR --anchor-count N --anchor-index N
-       --anchor-inventory-sha256 SHA256 --scratch-root DIR
+       --anchor-inventory-sha256 SHA256
+       --motion-split-manifest FILE --motion-split-manifest-sha256 SHA256
+       --heldout-plan FILE --heldout-plan-sha256 SHA256 --scratch-root DIR
        [--require-teacher-readonly-mount]
        [--orchestrator-result FILE] [--python PYTHON] [--dry-run]
 
@@ -37,6 +39,10 @@ ANCHOR_POOL=
 ANCHOR_COUNT=
 ANCHOR_INDEX=
 ANCHOR_INVENTORY_SHA=
+MOTION_SPLIT=
+MOTION_SPLIT_SHA=
+HELDOUT_PLAN=
+HELDOUT_PLAN_SHA=
 SCRATCH_ROOT=
 REQUIRE_TEACHER_READONLY_MOUNT=0
 ORCHESTRATOR_RESULT=${ROUND_DAGGER_EVALUATOR_RESULT:-}
@@ -59,6 +65,10 @@ while (($#)); do
         --anchor-count) ANCHOR_COUNT=${2:?}; shift 2 ;;
         --anchor-index) ANCHOR_INDEX=${2:?}; shift 2 ;;
         --anchor-inventory-sha256) ANCHOR_INVENTORY_SHA=${2:?}; shift 2 ;;
+        --motion-split-manifest) MOTION_SPLIT=${2:?}; shift 2 ;;
+        --motion-split-manifest-sha256) MOTION_SPLIT_SHA=${2:?}; shift 2 ;;
+        --heldout-plan) HELDOUT_PLAN=${2:?}; shift 2 ;;
+        --heldout-plan-sha256) HELDOUT_PLAN_SHA=${2:?}; shift 2 ;;
         --scratch-root) SCRATCH_ROOT=${2:?}; shift 2 ;;
         --require-teacher-readonly-mount)
             REQUIRE_TEACHER_READONLY_MOUNT=1
@@ -112,6 +122,26 @@ fi
     fatal "anchor index must be smaller than anchor count"
 [[ $ANCHOR_INVENTORY_SHA =~ ^[0-9a-f]{64}$ ]] || \
     fatal "anchor inventory SHA must be lowercase SHA-256"
+MOTION_SPLIT_INPUTS=0
+if [[ -n $MOTION_SPLIT || -n $MOTION_SPLIT_SHA || -n $HELDOUT_PLAN || \
+      -n $HELDOUT_PLAN_SHA || -n ${ROUND_DAGGER_EVALUATION_SOURCE_ROOT:-} ]]; then
+    MOTION_SPLIT_INPUTS=1
+    for value in MOTION_SPLIT MOTION_SPLIT_SHA HELDOUT_PLAN HELDOUT_PLAN_SHA; do
+        [[ -n ${!value} ]] || fatal "production motion split inputs are incomplete"
+    done
+    [[ $MOTION_SPLIT == /* && -f $MOTION_SPLIT && ! -L $MOTION_SPLIT ]] || \
+        fatal "motion split manifest must be an absolute, non-symlink regular file"
+    [[ $HELDOUT_PLAN == /* && -f $HELDOUT_PLAN && ! -L $HELDOUT_PLAN ]] || \
+        fatal "held-out plan must be an absolute, non-symlink regular file"
+    [[ $MOTION_SPLIT_SHA =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "motion split manifest SHA must be lowercase SHA-256"
+    [[ $HELDOUT_PLAN_SHA =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "held-out plan SHA must be lowercase SHA-256"
+    [[ $(sha256sum "$MOTION_SPLIT" | awk '{print $1}') == "$MOTION_SPLIT_SHA" ]] || \
+        fatal "motion split manifest SHA mismatch"
+    [[ $(sha256sum "$HELDOUT_PLAN" | awk '{print $1}') == "$HELDOUT_PLAN_SHA" ]] || \
+        fatal "held-out plan SHA mismatch"
+fi
 export PYTHONPATH="$REPOSITORY_ROOT:$GR00T_ROOT"
 [[ $SCRATCH_ROOT == /* && -d $SCRATCH_ROOT && ! -L $SCRATCH_ROOT ]] || \
     fatal "scratch root must be an absolute, non-symlink directory"
@@ -152,6 +182,27 @@ verify_anchor_pool
 
 "$PYTHON_BIN" -m round_dagger.evaluation verify-contract \
     --root "$ROOT" --contract "$CONTRACT" >/dev/null || fatal "contract verification failed"
+
+# The production hook already validates the immutable scenario artifact.  At
+# this inner layer, bind the plan to the scenario list embedded in the signed
+# evaluation contract without publishing any additional durable file.
+if ((MOTION_SPLIT_INPUTS)); then
+    "$PYTHON_BIN" - "$CONTRACT" "$MOTION_SPLIT" "$MOTION_SPLIT_SHA" \
+        "$HELDOUT_PLAN" "$HELDOUT_PLAN_SHA" <<'PY' || \
+        fatal "evaluation contract differs from the held-out seed-block plan"
+import sys
+from pathlib import Path
+from round_dagger.artifacts import load_strict_json
+from round_dagger.motion_split_contract import load_verified_contract, validate_scenarios
+
+contract = load_strict_json(Path(sys.argv[1]))
+plan = load_verified_contract(
+    manifest_path=Path(sys.argv[2]), manifest_sha256=sys.argv[3],
+    plan_path=Path(sys.argv[4]), plan_sha256=sys.argv[5],
+)
+validate_scenarios(plan, contract["scenario_cases"])
+PY
+fi
 
 readarray -t CONTRACT_FIELDS < <("$PYTHON_BIN" - "$CONTRACT" "$ROOT" <<'PY'
 import json, sys
@@ -365,6 +416,29 @@ trap cleanup_active_stage_on_exit EXIT
 while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_SHA; do
     [[ $ROLE == parent || $ROLE == candidate ]] || fatal "invalid role from contract"
     [[ $SEED =~ ^[0-9]+$ ]] || fatal "invalid seed from contract"
+    MOTION_OVERRIDES=()
+    if ((MOTION_SPLIT_INPUTS)); then
+        mapfile -t MOTION_BLOCK < <(
+            "$PYTHON_BIN" -m round_dagger.motion_split_contract block \
+                --manifest "$MOTION_SPLIT" --manifest-sha256 "$MOTION_SPLIT_SHA" \
+                --plan "$HELDOUT_PLAN" --plan-sha256 "$HELDOUT_PLAN_SHA" \
+                --seed "$SEED"
+        ) || fatal "cannot resolve immutable motion block for seed $SEED"
+        [[ ${#MOTION_BLOCK[@]} -eq 2 && ${MOTION_BLOCK[0]} =~ ^(0|[1-9][0-9]*)$ && \
+           ${MOTION_BLOCK[1]} == 32 ]] || \
+            fatal "held-out motion block for seed $SEED is malformed"
+        MOTION_OFFSET=${MOTION_BLOCK[0]}
+        MOTION_LIMIT=${MOTION_BLOCK[1]}
+        MOTION_OVERRIDES=(
+            ++env.config.reset_from_dataset.motion_split_manifest="$MOTION_SPLIT"
+            ++env.config.reset_from_dataset.motion_split_manifest_sha256="$MOTION_SPLIT_SHA"
+            ++env.config.reset_from_dataset.motion_split_role=eval
+            ++env.config.reset_from_dataset.motion_split_verify_content=true
+            ++env.config.reset_from_dataset.motion_split_offset="$MOTION_OFFSET"
+            ++env.config.reset_from_dataset.motion_split_limit="$MOTION_LIMIT"
+            ++env.config.reset_from_dataset.motion_assignment_offset=0
+        )
+    fi
     CHECKPOINT="$ROOT/$CHECKPOINT_REL"
     [[ -f $CHECKPOINT && ! -L $CHECKPOINT ]] || fatal "unsafe/missing $ROLE checkpoint"
     [[ $(sha256sum "$CHECKPOINT" | awk '{print $1}') == "$CHECKPOINT_SHA" ]] || \
@@ -515,6 +589,7 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         ++algo.config.videogen.reference_lag=256
         ++algo.config.videogen.primary_view=head_color
         ++algo.config.videogen.seed="$SEED"
+        "${MOTION_OVERRIDES[@]}"
         ++algo.config.videogen.anchor_pool_dir="$ANCHOR_POOL"
         ++algo.config.videogen.anchor_index="$ANCHOR_INDEX"
         ++algo.config.videogen.anchor_source="$ANCHOR_SOURCE"

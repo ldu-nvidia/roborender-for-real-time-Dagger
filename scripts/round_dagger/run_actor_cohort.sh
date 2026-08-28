@@ -24,6 +24,9 @@ required=(
     ROUND_DAGGER_TEACHER_SHA256 ROUND_DAGGER_RENDERER_SHA256
     ROUND_DAGGER_BETA ROUND_DAGGER_BETA_SHA256 ROUND_DAGGER_CONFIG_SHA256
     ROUND_DAGGER_IMAGE3F_ATTEMPT_NAMESPACE ROUND_DAGGER_IMAGE3F_STREAM_PLAN
+    ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST
+    ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256
+    ROUND_DAGGER_DATA_LINEAGE_SHA256
     IMAGE3F_ENDPOINT_MANIFEST IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE ANCHORS
     TRAIN_RUN_DIR
 )
@@ -35,14 +38,22 @@ done
     exit 2
 }
 
-case "$ROUND_DAGGER_COHORT_DIR:$ROUND_DAGGER_POLICY_CHECKPOINT:$ROUND_DAGGER_TEACHER_CHECKPOINT:$IMAGE3F_ENDPOINT_MANIFEST:$ROUND_DAGGER_IMAGE3F_STREAM_PLAN:$ANCHORS:$TRAIN_RUN_DIR" in
-    /*:/*:/*:/*:/*:/*:/*) ;;
+case "$ROUND_DAGGER_COHORT_DIR:$ROUND_DAGGER_POLICY_CHECKPOINT:$ROUND_DAGGER_TEACHER_CHECKPOINT:$IMAGE3F_ENDPOINT_MANIFEST:$ROUND_DAGGER_IMAGE3F_STREAM_PLAN:$ANCHORS:$TRAIN_RUN_DIR:$ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST" in
+    /*:/*:/*:/*:/*:/*:/*:/*) ;;
     *) echo "all actor artifact paths must be absolute" >&2; exit 2 ;;
 esac
 for file in "$ROUND_DAGGER_POLICY_CHECKPOINT" "$ROUND_DAGGER_TEACHER_CHECKPOINT" \
-    "$IMAGE3F_ENDPOINT_MANIFEST" "$ROUND_DAGGER_IMAGE3F_STREAM_PLAN"; do
+    "$IMAGE3F_ENDPOINT_MANIFEST" "$ROUND_DAGGER_IMAGE3F_STREAM_PLAN" \
+    "$ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST"; do
     [ -f "$file" ] && [ ! -L "$file" ] || { echo "unsafe or missing file: $file" >&2; exit 2; }
 done
+[[ $ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+    echo "motion split manifest SHA-256 is malformed" >&2; exit 2;
+}
+[[ $(sha256sum "$ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST" | awk '{print $1}') == \
+   "$ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256" ]] || {
+    echo "motion split manifest SHA-256 mismatch" >&2; exit 2;
+}
 [ -d "$ANCHORS" ] && [ ! -L "$ANCHORS" ] || { echo "unsafe anchor directory" >&2; exit 2; }
 [ -x "$GR00T_PYTHON" ] || { echo "GR00T_PYTHON is not executable" >&2; exit 2; }
 
@@ -93,14 +104,26 @@ export ROUND_DAGGER_ENVS_PER_SHARD=${ROUND_DAGGER_ENVS_PER_SHARD:-4}
 export ROUND_DAGGER_ROLLOUT_ID=${ROUND_DAGGER_ROLLOUT_ID:-0}
 export ROUND_DAGGER_PURPOSE=train
 
+mapfile -t MOTION_ASSIGNMENT < <(
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
 import os
 from pathlib import Path
-from round_dagger.artifacts import load_strict_json
+from round_dagger.artifacts import (
+    PRODUCTION_COHORT_CONTRACT_SCHEMA,
+    load_strict_json,
+)
 from round_dagger.gr00t_policy import REPLAY_ACTION_DIM
+from round_dagger.production_data_lineage import (
+    data_lineage_sha256,
+    rank_assignment,
+    validate_cohort_assignment,
+    validate_data_lineage,
+)
 
 root = Path(os.environ["ROUND_DAGGER_COHORT_DIR"])
 contract = load_strict_json(root / "contract.json")
+if contract.get("schema") != PRODUCTION_COHORT_CONTRACT_SCHEMA:
+    raise SystemExit("production actor refuses a legacy cohort contract")
 offset = int(os.environ["ROUND_DAGGER_GLOBAL_ENV_OFFSET"])
 expected = {
     "campaign_id": os.environ["ROUND_DAGGER_CAMPAIGN_ID"],
@@ -129,7 +152,32 @@ if contract.get("action_contract") != {
     "dtype": "float32", "shape": [REPLAY_ACTION_DIM]
 }:
     raise SystemExit("cohort action contract mismatch")
+lineage = validate_data_lineage(contract.get("data_lineage"))
+lineage_sha = data_lineage_sha256(lineage)
+if lineage_sha != os.environ["ROUND_DAGGER_DATA_LINEAGE_SHA256"]:
+    raise SystemExit("cohort data lineage differs from launch identity")
+if contract.get("data_lineage_sha256") != lineage_sha:
+    raise SystemExit("cohort contract data lineage digest mismatch")
+assignment = validate_cohort_assignment(
+    contract.get("motion_assignment"),
+    data_lineage=lineage,
+    cohort_index=contract["cohort_index"],
+    expected_ranks=contract["expected_ranks"],
+)
+row = rank_assignment(assignment, int(os.environ["ROUND_DAGGER_ACTOR_RANK"]))
+print(row["motion_assignment_offset"])
+print(row["environment_count"])
 PY
+)
+[[ ${#MOTION_ASSIGNMENT[@]} == 2 ]] || {
+    echo "cohort motion assignment did not resolve exact rank metadata" >&2
+    exit 2
+}
+MOTION_ASSIGNMENT_OFFSET=${MOTION_ASSIGNMENT[0]}
+[[ ${MOTION_ASSIGNMENT[1]} == 32 ]] || {
+    echo "cohort rank motion assignment must cover exactly 32 environments" >&2
+    exit 2
+}
 
 mapfile -t ACTOR_SEEDS < <(
     PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
@@ -261,6 +309,13 @@ COMMAND=(
     ++algo.config.videogen.beta_end="$ROUND_DAGGER_BETA"
     ++algo.config.videogen.beta_decay_iters=1
     ++algo.config.videogen.reference_lag=256
+    ++env.config.reset_from_dataset.motion_split_manifest="$ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST"
+    ++env.config.reset_from_dataset.motion_split_manifest_sha256="$ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"
+    ++env.config.reset_from_dataset.motion_split_role=collection
+    ++env.config.reset_from_dataset.motion_split_verify_content=true
+    ++env.config.reset_from_dataset.motion_split_offset=0
+    ++env.config.reset_from_dataset.motion_split_limit=null
+    ++env.config.reset_from_dataset.motion_assignment_offset="$MOTION_ASSIGNMENT_OFFSET"
     algo.config.videogen.seed="$ROUND_DAGGER_GENERATION_SEED"
     algo.trl.num_total_batches=1 algo.trl.total_episodes=null
     checkpoint="$ROUND_DAGGER_POLICY_CHECKPOINT" resume=false

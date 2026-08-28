@@ -87,6 +87,7 @@ READONLY_MOUNTS=(
     "${ROUND_DAGGER_CAMERA_ACCEPTANCE:?missing camera acceptance}"
     "${ROUND_DAGGER_WANDB_NETRC:?missing W&B netrc}"
     "${ROUND_DAGGER_IMAGE3F_STREAM_PLAN:?missing Image3F stream plan}"
+    "${ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST:?missing motion split manifest}"
 )
 while IFS= read -r endpoint; do
     [[ -z $endpoint ]] || READONLY_MOUNTS+=("$endpoint")

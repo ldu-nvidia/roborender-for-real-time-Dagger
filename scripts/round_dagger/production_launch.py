@@ -12,6 +12,7 @@ sealed OCI-NRT source snapshot all agree byte-for-byte.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import netrc
 import os
@@ -29,6 +30,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from round_dagger import artifacts, policy_bundle, state  # noqa: E402
+from round_dagger import motion_split_contract  # noqa: E402
+from round_dagger import production_data_lineage  # noqa: E402
 from round_dagger.gr00t_policy import (  # noqa: E402
     ENV_COMMAND_DIM,
     HOMIE_ACTION_DIM,
@@ -44,10 +47,12 @@ from round_dagger.orchestration import (  # noqa: E402
     COHORT_COUNT,
     ENVIRONMENTS_PER_COHORT,
     MacroRoundConfig,
+    PRODUCTION_MACRO_ROUND_COUNT,
     STEPS_PER_ENVIRONMENT,
     TARGET_ENVIRONMENTS,
     TRANSITIONS_PER_COHORT,
     TRANSITIONS_PER_MACRO_ROUND,
+    TRANSITIONS_PER_CAMPAIGN,
 )
 from scripts.round_dagger.verify_anchor_pool import verify_anchor_pool  # noqa: E402
 from scripts.round_dagger.verify_sealed_source_snapshot import (  # noqa: E402
@@ -57,19 +62,21 @@ from scripts.round_dagger.verify_sealed_source_snapshot import (  # noqa: E402
 
 
 CAMPAIGN_CONTRACT_SCHEMA = (
-    "fast_roborender.round_dagger.production_campaign_contract.v1"
+    "fast_roborender.round_dagger.production_campaign_contract.v2"
 )
 LEARNER_CONTRACT_SCHEMA = (
     "fast_roborender.round_dagger.production_learner_contract.v1"
 )
 LEARNER_BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
 SEALED_REPORT_SCHEMA = "fast_roborender.sealed_source_verification.v1"
-PLAN_SCHEMA = "fast_roborender.round_dagger.production_launch_plan.v1"
+PLAN_SCHEMA = "fast_roborender.round_dagger.production_launch_plan.v2"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SAFE_REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9_./-]+")
 VALIDATION_ROOT = Path("/mnt/data2/ldu/roborender_round_dagger_validation")
-BOOTSTRAP_ROOT = VALIDATION_ROOT / "fresh_bootstrap_v5_20260825T0456Z"
+BOOTSTRAP_ROOT = (
+    VALIDATION_ROOT / "fresh_bootstrap_v6_complete_identity_20260827T061620Z"
+)
 FLEET_ROOT = VALIDATION_ROOT / "fleet_two_gpu_provenance_v2"
 PRODUCTION_ASSET_ROOT = Path("/mnt/data2/ldu/roborender_round_dagger_assets")
 WANDB_NETRC = Path("/mnt/data2/ldu/roborender_round_dagger_credentials/.netrc")
@@ -88,6 +95,13 @@ TEACHER_CHECKPOINT = REPOSITORY_ROOT / TEACHER_CHECKPOINT_RELATIVE
 PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE = Path(
     "configs/round_dagger/production_campaign_256x512.json"
 )
+MOTION_SPLIT_MANIFEST_RELATIVE = Path(
+    "GR00T-VisualSim2Real/gr00t/rl/data/motions/g1_wsdpt/"
+    "33demos_675_775_heldout_256_v1.json"
+)
+HELDOUT_EVALUATION_PLAN_RELATIVE = Path(
+    "configs/round_dagger/production_heldout_motion_plan_8x32.json"
+)
 ANCHOR_POOL = PRODUCTION_ASSET_ROOT / "anchor_pool_2048"
 EVALUATION_CONFIG = (
     VALIDATION_ROOT
@@ -105,6 +119,7 @@ CAMPAIGN_CONTRACT_KEYS = {
     "observation_contract",
     "action_contract",
     "beta_schedule",
+    "motion_split",
     "artifacts",
     "actor_runtime",
     "telemetry",
@@ -245,9 +260,11 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
                 "cohort_count",
                 "environments_per_actor_rank",
                 "actor_ranks_per_cohort",
+                "macro_round_count",
                 "steps_per_environment",
                 "transitions_per_cohort",
                 "transitions_per_macro_round",
+                "transitions_per_campaign",
             },
             "campaign topology",
         ),
@@ -257,9 +274,11 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
             "cohort_count": COHORT_COUNT,
             "environments_per_actor_rank": 32,
             "actor_ranks_per_cohort": 2,
+            "macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
             "steps_per_environment": STEPS_PER_ENVIRONMENT,
             "transitions_per_cohort": TRANSITIONS_PER_COHORT,
             "transitions_per_macro_round": TRANSITIONS_PER_MACRO_ROUND,
+            "transitions_per_campaign": TRANSITIONS_PER_CAMPAIGN,
         },
         "campaign topology",
     )
@@ -317,6 +336,49 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
         "beta schedule",
     )
 
+    split = _exact(
+        contract["motion_split"],
+        {
+            "manifest_relative_path",
+            "manifest_sha256",
+            "heldout_plan_relative_path",
+            "heldout_plan_sha256",
+            "collection_role",
+            "evaluation_role",
+            "verify_content",
+            "collection_motion_count",
+            "heldout_motion_count",
+            "evaluation_seed_count",
+            "motions_per_evaluation_seed",
+        },
+        "motion split contract",
+    )
+    _require_equal(
+        split,
+        {
+            "manifest_relative_path": MOTION_SPLIT_MANIFEST_RELATIVE.as_posix(),
+            "manifest_sha256": (
+                "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834"
+            ),
+            "heldout_plan_relative_path": (
+                HELDOUT_EVALUATION_PLAN_RELATIVE.as_posix()
+            ),
+            "heldout_plan_sha256": (
+                "394ba77b2c8ecbdb4904ef24894cda0b88bb5b606ab75e578ee0a91756630f19"
+            ),
+            "collection_role": "collection",
+            "evaluation_role": "eval",
+            "verify_content": True,
+            "collection_motion_count": 39,
+            "heldout_motion_count": 256,
+            "evaluation_seed_count": 8,
+            "motions_per_evaluation_seed": 32,
+        },
+        "motion split contract",
+    )
+    _require_sha(split["manifest_sha256"], "motion split manifest SHA-256")
+    _require_sha(split["heldout_plan_sha256"], "held-out plan SHA-256")
+
     artifacts_doc = _exact(
         contract["artifacts"],
         {
@@ -345,22 +407,22 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
     )
     _require_equal(
         bootstrap["checkpoint_sha256"],
-        "3b3a9ac168eaf163a566772679a5bb4b8ec73c9947c9b51668ac08f9a014abae",
+        "720a975812f6083192234d650033511c821b6902da2ef7734d87943f6c0a359a",
         "bootstrap checkpoint identity",
     )
     _require_equal(
         bootstrap["runtime_policy_sha256"],
-        "fd1fd8f290fd603e05251f3798f40fd29b8028041e701e6240ac1ae4541f67b6",
+        "cd6f70aa9d589e810b7ab22999941930742a94621870457aadd068d2394deb9a",
         "bootstrap runtime identity",
     )
     _require_equal(
         bootstrap["policy_spec_sha256"],
-        "216cf3a2802ede98bf208ff7fb3925163973e2e32d823c1d6b1efa4dfeec24cb",
+        "3e903c55218ca2aae4c970fab6aeb820de0a35d8965a34262b8206fd62f74dee",
         "bootstrap policy spec identity",
     )
     _require_equal(
         bootstrap["manifest_sha256"],
-        "ca103a67843c004dd2293a3b96927807e951ac477847023d646ffb091ff20379",
+        "33a1a07a4ffa09e02805bbb5ab70ba32ecf3d1d2d195d9f1bcb61021c20ad6ae",
         "bootstrap manifest identity",
     )
     for key in ("checkpoint_path", "policy_spec_path", "manifest_path"):
@@ -599,6 +661,78 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
     return contract
 
 
+def materialize_campaign_contract(
+    invariant_profile_path: Path,
+    *,
+    runtime_contract_path: Path,
+    runtime_contract_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Merge a checked-in invariant profile with post-seal runtime evidence.
+
+    ``runtime_contract_sha256`` is the SHA-256 of the complete canonical JSON
+    file; the file intentionally contains no circular self-hash field.
+    """
+
+    invariant_sha = artifacts.sha256_file(invariant_profile_path)
+    profile = load_campaign_contract(invariant_profile_path)
+    try:
+        runtime_contract = production_data_lineage.load_verified_runtime_contract(
+            runtime_contract_path,
+            expected_sha256=runtime_contract_sha256,
+            expected_invariant_profile_sha256=invariant_sha,
+            motion_split_contract=profile["motion_split"],
+        )
+        lineage = production_data_lineage.derive_data_lineage(
+            runtime_contract,
+            motion_split_contract=profile["motion_split"],
+            topology=profile["topology"],
+        )
+    except production_data_lineage.ProductionDataLineageError as exc:
+        raise ProductionLaunchError(
+            f"production runtime contract is invalid: {exc}"
+        ) from exc
+
+    materialized = copy.deepcopy(profile)
+    camera_document = artifacts.load_strict_json(
+        runtime_contract["camera_acceptance"]["path"]
+    )
+    reviewer = camera_document.get("reviewer") if isinstance(camera_document, Mapping) else None
+    if not isinstance(reviewer, str) or not reviewer:
+        raise ProductionLaunchError("runtime camera acceptance has no reviewer")
+    materialized["artifacts"]["camera_acceptance"] = {
+        "path": runtime_contract["camera_acceptance"]["path"],
+        "sha256": runtime_contract["camera_acceptance"]["sha256"],
+        "reviewer": reviewer,
+    }
+    fleet = runtime_contract["renderer_fleet"]
+    materialized["artifacts"]["renderer"] = {
+        "cohort_identity_sha256": fleet["cohort_identity_sha256"],
+        "runtime_identity_sha256": fleet["runtime_identity_sha256"],
+    }
+    materialized["artifacts"]["endpoint_manifest"] = {
+        "path": fleet["endpoint_manifest_path"],
+        "sha256": fleet["endpoint_manifest_sha256"],
+        "endpoint_directory": fleet["endpoint_directory"],
+        "renderer_count": fleet["renderer_count"],
+    }
+    # Consume the field exactly where it lives in the external contract.  The
+    # verifier also returns a normalized convenience alias, but launch must
+    # not depend on a shape that is absent from the immutable JSON itself.
+    materialized["evaluation"]["scenario_contract"] = runtime_contract[
+        "live_capture"
+    ]["scenario_path"]
+    materialized["evaluation"]["scenario_contract_sha256"] = runtime_contract[
+        "live_capture"
+    ]["scenario_sha256"]
+    materialized["production_runtime_contract"] = runtime_contract
+    materialized["data_lineage"] = lineage
+    materialized["data_lineage_sha256"] = (
+        production_data_lineage.data_lineage_sha256(lineage)
+    )
+    materialized["invariant_profile_sha256"] = invariant_sha
+    return materialized, runtime_contract, lineage
+
+
 def load_learner_contract(path: Path) -> dict[str, Any]:
     contract = _load_contract(
         path, LEARNER_CONTRACT_SCHEMA, LEARNER_CONTRACT_KEYS, "learner contract"
@@ -749,20 +883,75 @@ def _verify_static_inputs(campaign_contract: Mapping[str, Any]) -> None:
         raise ProductionLaunchError(f"anchor pool verification failed: {exc}") from exc
     camera = campaign_artifacts["camera_acceptance"]
     _file_identity(Path(camera["path"]), camera["sha256"], "camera acceptance")
+    split = campaign_contract["motion_split"]
+    runtime_contract = campaign_contract.get("production_runtime_contract")
+    if isinstance(runtime_contract, Mapping):
+        split_manifest = Path(runtime_contract["live_capture"]["split_manifest_path"])
+        heldout_plan = Path(runtime_contract["live_capture"]["heldout_plan_path"])
+    else:
+        split_manifest = REPOSITORY_ROOT / split["manifest_relative_path"]
+        heldout_plan = REPOSITORY_ROOT / split["heldout_plan_relative_path"]
+    try:
+        verified_plan = motion_split_contract.load_verified_contract(
+            manifest_path=split_manifest,
+            manifest_sha256=split["manifest_sha256"],
+            plan_path=heldout_plan,
+            plan_sha256=split["heldout_plan_sha256"],
+        )
+    except motion_split_contract.MotionSplitContractError as exc:
+        raise ProductionLaunchError(f"motion split verification failed: {exc}") from exc
     evaluation = campaign_contract["evaluation"]
     _file_identity(Path(evaluation["hydra_config_path"]), evaluation["hydra_config_sha256"], "evaluation Hydra config")
-    for relative_key, sha_key, label in (
-        ("scenario_contract", "scenario_contract_sha256", "evaluation scenarios"),
-        ("threshold_contract", "threshold_contract_sha256", "evaluation thresholds"),
-    ):
-        relative = evaluation[relative_key]
-        if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
-            raise ProductionLaunchError(f"{label} path must be repository-relative")
-        _file_identity(REPOSITORY_ROOT / relative, evaluation[sha_key], label)
-    _require_evaluation_case_capacity(
-        REPOSITORY_ROOT / evaluation["scenario_contract"],
-        REPOSITORY_ROOT / evaluation["threshold_contract"],
+    scenario_path = Path(evaluation["scenario_contract"])
+    if isinstance(runtime_contract, Mapping):
+        if (
+            not scenario_path.is_absolute()
+            or str(scenario_path) != runtime_contract["scenario_path"]
+        ):
+            raise ProductionLaunchError(
+                "materialized evaluation scenario path differs from live capture"
+            )
+    elif scenario_path.is_absolute() or ".." in scenario_path.parts:
+        raise ProductionLaunchError(
+            "legacy evaluation scenario path must be repository-relative"
+        )
+    if not scenario_path.is_absolute():
+        scenario_path = REPOSITORY_ROOT / scenario_path
+    _file_identity(
+        scenario_path,
+        evaluation["scenario_contract_sha256"],
+        "evaluation scenarios",
     )
+    threshold_relative = evaluation["threshold_contract"]
+    if (
+        not isinstance(threshold_relative, str)
+        or Path(threshold_relative).is_absolute()
+        or ".." in Path(threshold_relative).parts
+    ):
+        raise ProductionLaunchError(
+            "evaluation threshold path must be repository-relative"
+        )
+    threshold_path = REPOSITORY_ROOT / threshold_relative
+    _file_identity(
+        threshold_path,
+        evaluation["threshold_contract_sha256"],
+        "evaluation thresholds",
+    )
+    _require_evaluation_case_capacity(
+        scenario_path,
+        threshold_path,
+    )
+    try:
+        motion_split_contract.validate_scenarios(
+            verified_plan,
+            artifacts.load_strict_json(
+                scenario_path
+            ),
+        )
+    except Exception as exc:
+        raise ProductionLaunchError(
+            f"evaluation scenarios differ from held-out motion plan: {exc}"
+        ) from exc
 
     runtime = campaign_contract["actor_runtime"]
     docker = _regular(Path(runtime["docker_bin"]), "Docker executable")
@@ -1050,15 +1239,33 @@ def _verify_local_evaluation_seal(
             "local sealed teacher and configured target must be distinct files"
         )
     evaluation = campaign_contract["evaluation"]
+    split = campaign_contract["motion_split"]
     for relative_key, sha_key, label in (
-        ("scenario_contract", "scenario_contract_sha256", "evaluation scenarios"),
-        ("threshold_contract", "threshold_contract_sha256", "evaluation thresholds"),
+        (
+            "manifest_relative_path",
+            "manifest_sha256",
+            "motion split manifest",
+        ),
+        (
+            "heldout_plan_relative_path",
+            "heldout_plan_sha256",
+            "held-out evaluation plan",
+        ),
     ):
         _file_identity(
-            local_root / evaluation[relative_key],
-            evaluation[sha_key],
+            local_root / split[relative_key],
+            split[sha_key],
             f"sealed {label}",
         )
+    # The finalized scenario contract is post-seal live-capture evidence and
+    # therefore must not require a Git update.  Thresholds remain a checked-in
+    # invariant; the scenario bytes were already verified from the external
+    # runtime contract and its two-pass attestation.
+    _file_identity(
+        local_root / evaluation["threshold_contract"],
+        evaluation["threshold_contract_sha256"],
+        "sealed evaluation thresholds",
+    )
     sealed_campaign_contract = artifacts.load_strict_json(
         _regular(
             local_root / PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE,
@@ -1068,9 +1275,11 @@ def _verify_local_evaluation_seal(
     if (
         sealed_campaign_contract.get("artifacts", {}).get("anchor_pool")
         != campaign_contract["artifacts"]["anchor_pool"]
+        or sealed_campaign_contract.get("motion_split")
+        != campaign_contract["motion_split"]
     ):
         raise ProductionLaunchError(
-            "sealed evaluation anchor contract differs from launch contract"
+            "sealed evaluation anchor/split contract differs from launch contract"
         )
     return {
         **local_report,
@@ -1365,7 +1574,11 @@ def _validate_orchestration_and_campaign(
         configuration = MacroRoundConfig.load(orchestration_path)
     except Exception as exc:
         raise ProductionLaunchError(f"strict orchestration config is invalid: {exc}") from exc
-    if not 0 <= configuration.macro_round < 5:
+    if configuration.macro_round_count != PRODUCTION_MACRO_ROUND_COUNT:
+        raise ProductionLaunchError(
+            "production orchestration config must bind exactly five macro-rounds"
+        )
+    if not 0 <= configuration.macro_round < PRODUCTION_MACRO_ROUND_COUNT:
         raise ProductionLaunchError(
             "production campaign contains exactly five macro-rounds (0 through 4)"
         )
@@ -1411,6 +1624,7 @@ def _validate_orchestration_and_campaign(
         "active_environments": 64,
         "cohort_count": 4,
         "steps_per_environment": 512,
+        "macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
         "view_names": ["head_color", "hand_left", "hand_right"],
         "policy_image_shape": [324, 192, 3],
         "action_dim": 26,
@@ -1424,10 +1638,17 @@ def _validate_orchestration_and_campaign(
         # consumed by the H100 learner.
         "policy_config_sha256": learner_deployment_contract_sha256,
         "beta_schedule": campaign_contract["beta_schedule"],
+        "data_lineage": campaign_contract["data_lineage"],
+        "data_lineage_sha256": campaign_contract["data_lineage_sha256"],
     }
     mismatches = [key for key, value in expected_campaign.items() if campaign.get(key) != value]
     if mismatches:
         raise ProductionLaunchError(f"campaign manifest differs from production contract: {mismatches}")
+    _require_equal(
+        configuration.campaign_contract_sha256,
+        campaign_contract["production_runtime_contract"]["contract_sha256"],
+        "orchestration/runtime campaign contract identity",
+    )
     active = coordinator["active_policy"]
     _require_equal(configuration.runtime_policy_sha256, active["runtime_policy_sha256"], "active runtime identity")
     _require_equal(configuration.learner_model_lineage_sha256, active["checkpoint_sha256"], "active model lineage")
@@ -1487,6 +1708,8 @@ def build_environment(
     telemetry = campaign_contract["telemetry"]
     wandb = campaign_contract["wandb"]
     evaluation = campaign_contract["evaluation"]
+    split = campaign_contract["motion_split"]
+    production_runtime = campaign_contract["production_runtime_contract"]
     cluster = learner_contract["cluster"]
     container = learner_contract["container"]
     handoff = learner_contract["handoff"]
@@ -1498,10 +1721,48 @@ def build_environment(
         "ROUND_DAGGER_EVALUATION_SEALED_TEACHER": sealed_teacher_checkpoint,
         "ROUND_DAGGER_EVALUATION_SOURCE_ROOT": evaluation_source_root,
         "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256": evaluation_source_inventory_sha256,
+        "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": str(
+            Path(evaluation_source_root) / split["manifest_relative_path"]
+        ),
+        "ROUND_DAGGER_EVALUATION_MOTION_SPLIT_MANIFEST": str(
+            Path(evaluation_source_root) / split["manifest_relative_path"]
+        ),
+        "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": split["manifest_sha256"],
+        "ROUND_DAGGER_CAMPAIGN_CONTRACT": production_runtime["contract_path"],
+        "ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256": production_runtime[
+            "contract_sha256"
+        ],
+        "ROUND_DAGGER_DATA_LINEAGE_SHA256": campaign_contract[
+            "data_lineage_sha256"
+        ],
+        "ROUND_DAGGER_INVARIANT_PROFILE_SHA256": campaign_contract[
+            "invariant_profile_sha256"
+        ],
+        "ROUND_DAGGER_CAPTURE_ATTESTATION": production_runtime["live_capture"][
+            "attestation_path"
+        ],
+        "ROUND_DAGGER_CAPTURE_ATTESTATION_SHA256": production_runtime[
+            "live_capture"
+        ]["attestation_sha256"],
+        "ROUND_DAGGER_CAPTURE_EVIDENCE": production_runtime["live_capture"][
+            "evidence_path"
+        ],
+        "ROUND_DAGGER_CAPTURE_EVIDENCE_SHA256": production_runtime[
+            "live_capture"
+        ]["evidence_sha256"],
+        "ROUND_DAGGER_HELDOUT_EVALUATION_PLAN": str(
+            Path(evaluation_source_root) / split["heldout_plan_relative_path"]
+        ),
+        "ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256": split[
+            "heldout_plan_sha256"
+        ],
         "ROUND_DAGGER_LEARNER_SOURCE_INVENTORY_SHA256": sealed_source_inventory_sha256,
         "ROUND_DAGGER_RENDERER_SHA256": artifact["renderer"]["cohort_identity_sha256"],
         "ROUND_DAGGER_RENDERER_RUNTIME_SHA256": artifact["renderer"]["runtime_identity_sha256"],
         "IMAGE3F_ENDPOINT_MANIFEST": artifact["endpoint_manifest"]["path"],
+        "ROUND_DAGGER_ENDPOINT_MANIFEST_SHA256": artifact[
+            "endpoint_manifest"
+        ]["sha256"],
         "ANCHORS": artifact["anchor_pool"]["path"],
         "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256": artifact["anchor_pool"]["inventory_sha256"],
         "ROUND_DAGGER_ANCHOR_INDEX": "0",
@@ -1526,6 +1787,8 @@ def build_environment(
         "ROUND_DAGGER_MIN_ANCHORS": str(artifact["anchor_pool"]["anchor_count"]),
         "ROUND_DAGGER_ENVS_PER_SHARD": str(runtime["environments_per_shard"]),
         "ROUND_DAGGER_ROLLOUT_ID": str(runtime["rollout_id"]),
+        "ROUND_DAGGER_MACRO_ROUND_COUNT": str(PRODUCTION_MACRO_ROUND_COUNT),
+        "ROUND_DAGGER_TRANSITIONS_PER_CAMPAIGN": str(TRANSITIONS_PER_CAMPAIGN),
         # Production remains pinned to the previously validated rollout.  The
         # runtime adapter shadow is a separate bounded-validation surface and
         # must never be selected through an ambient operator environment.
@@ -1545,7 +1808,11 @@ def build_environment(
         "ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE": wandb["authorization_scope"],
         "ROUND_DAGGER_WANDB_NETRC": wandb["netrc"],
         "ROUND_DAGGER_EVALUATION_CONFIG": evaluation["hydra_config_path"],
-        "ROUND_DAGGER_EVALUATION_SCENARIOS": str(Path(evaluation_source_root) / evaluation["scenario_contract"]),
+        "ROUND_DAGGER_EVALUATION_SCENARIOS": str(
+            Path(evaluation["scenario_contract"])
+            if Path(evaluation["scenario_contract"]).is_absolute()
+            else Path(evaluation_source_root) / evaluation["scenario_contract"]
+        ),
         "ROUND_DAGGER_EVALUATION_SCENARIOS_SHA256": evaluation["scenario_contract_sha256"],
         "ROUND_DAGGER_EVALUATION_THRESHOLDS": str(Path(evaluation_source_root) / evaluation["threshold_contract"]),
         "ROUND_DAGGER_EVALUATION_THRESHOLDS_SHA256": evaluation["threshold_contract_sha256"],
@@ -1583,16 +1850,24 @@ def validate_launch(
     *,
     orchestration_config: Path,
     campaign_contract_path: Path,
+    campaign_contract_sha256: str,
     learner_contract_path: Path,
     sealed_source_root: str,
     sealed_source_inventory_sha256: str,
     evaluation_sealed_source_root: str | Path,
     evaluation_sealed_source_inventory_sha256: str,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    campaign_contract_sha = artifacts.sha256_file(campaign_contract_path)
+    campaign_contract_sha = _require_sha(
+        campaign_contract_sha256, "caller campaign contract SHA-256"
+    )
+    invariant_profile_path = REPOSITORY_ROOT / PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE
+    campaign_contract, runtime_contract, _lineage = materialize_campaign_contract(
+        invariant_profile_path,
+        runtime_contract_path=campaign_contract_path,
+        runtime_contract_sha256=campaign_contract_sha,
+    )
     learner_deployment_contract_sha = artifacts.sha256_file(learner_contract_path)
     orchestration_sha = artifacts.sha256_file(orchestration_config)
-    campaign_contract = load_campaign_contract(campaign_contract_path)
     learner_contract = load_learner_contract(learner_contract_path)
     _verify_static_inputs(campaign_contract)
     source_report = _verify_remote_source(
@@ -1606,11 +1881,67 @@ def validate_launch(
         evaluation_sealed_source_inventory_sha256,
         campaign_contract=campaign_contract,
     )
+    capture = runtime_contract["live_capture"]
+    expected_capture_sources = {
+        "split_manifest_path": str(
+            Path(local_seal_report["root"])
+            / campaign_contract["motion_split"]["manifest_relative_path"]
+        ),
+        "heldout_plan_path": str(
+            Path(local_seal_report["root"])
+            / campaign_contract["motion_split"]["heldout_plan_relative_path"]
+        ),
+    }
+    if any(capture[key] != value for key, value in expected_capture_sources.items()):
+        raise ProductionLaunchError(
+            "live capture split/plan are not derived from the sealed evaluation source"
+        )
     _verify_camera_acceptance_source_bindings(
         campaign_contract,
         learner_source_report=source_report,
         evaluation_source_report=local_seal_report,
     )
+    capture_provenance = runtime_contract["capture_provenance"]
+    provenance_expected = {
+        "fast_roborender_revision": source_report.get(
+            "fast_roborender_revision"
+        ),
+        "gr00t_revision": source_report.get("gr00t_revision"),
+        "actor_source_inventory_sha256": (
+            evaluation_sealed_source_inventory_sha256
+        ),
+        "evaluation_source_inventory_sha256": (
+            evaluation_sealed_source_inventory_sha256
+        ),
+        "gr00t_source_tree_sha256": source_report.get(
+            "gr00t_source_tree_sha256"
+        ),
+        "camera_acceptance_sha256": campaign_contract["artifacts"][
+            "camera_acceptance"
+        ]["sha256"],
+        "renderer_runtime_sha256": campaign_contract["artifacts"]["renderer"][
+            "runtime_identity_sha256"
+        ],
+        "renderer_cohort_sha256": campaign_contract["artifacts"]["renderer"][
+            "cohort_identity_sha256"
+        ],
+        "anchor_inventory_sha256": campaign_contract["artifacts"]["anchor_pool"][
+            "inventory_sha256"
+        ],
+        "evaluation_config_sha256": campaign_contract["evaluation"][
+            "hydra_config_sha256"
+        ],
+    }
+    provenance_mismatches = [
+        key
+        for key, value in provenance_expected.items()
+        if capture_provenance.get(key) != value
+    ]
+    if provenance_mismatches:
+        raise ProductionLaunchError(
+            "live capture provenance differs from deployment: "
+            f"{provenance_mismatches}"
+        )
     (
         configuration,
         campaign,
@@ -1637,6 +1968,11 @@ def validate_launch(
         learner_contract_sha256=learner_deployment_contract_sha,
     )
     environment["ROUND_DAGGER_LAUNCH_ORCHESTRATION_SHA256"] = orchestration_sha
+    environment["ROUND_DAGGER_CAMPAIGN_CONTRACT"] = str(campaign_contract_path)
+    environment["ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256"] = campaign_contract_sha
+    environment["ROUND_DAGGER_DATA_LINEAGE_SHA256"] = campaign_contract[
+        "data_lineage_sha256"
+    ]
     if artifacts.sha256_file(campaign_contract_path) != campaign_contract_sha:
         raise ProductionLaunchError("campaign contract changed during preflight")
     if artifacts.sha256_file(learner_contract_path) != learner_deployment_contract_sha:
@@ -1670,6 +2006,12 @@ def validate_launch(
         "coordinator_phase": coordinator["phase"],
         "topology": "4 cohorts x 2 actors x 32 environments x 512 steps",
         "transitions_per_macro_round": TRANSITIONS_PER_MACRO_ROUND,
+        "macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
+        "transitions_per_campaign": TRANSITIONS_PER_CAMPAIGN,
+        "completed_macro_rounds": coordinator["next_macro_round"],
+        "remaining_macro_rounds": (
+            PRODUCTION_MACRO_ROUND_COUNT - coordinator["next_macro_round"]
+        ),
         "reference_lag_frames": 256,
         "bootstrap_anchor_source": campaign_contract["observation_contract"][
             "bootstrap_anchor_source"
@@ -1690,6 +2032,10 @@ def validate_launch(
         "learner_deployment_contract_sha256": learner_deployment_contract_sha,
         "derived_learner_bundle_sha256": derived_learner_bundle_sha,
         "campaign_contract_sha256": campaign_contract_sha,
+        "invariant_profile_sha256": campaign_contract[
+            "invariant_profile_sha256"
+        ],
+        "data_lineage_sha256": campaign_contract["data_lineage_sha256"],
         "orchestration_config_sha256": orchestration_sha,
         "learner": "1 OCI-NRT node / 8 H100 / batch 8 per rank / 1200 optimizer steps",
         "wandb": "ldu@nvidia.com -> nvidia/roborender-round-dagger",
@@ -1721,6 +2067,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orchestration-config", type=Path, required=True)
     parser.add_argument("--campaign-contract", type=Path, required=True)
+    parser.add_argument("--campaign-contract-sha256", required=True)
     parser.add_argument("--learner-contract", type=Path, required=True)
     parser.add_argument("--sealed-source-root", required=True)
     parser.add_argument("--sealed-source-inventory-sha256", required=True)
@@ -1738,6 +2085,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         environment, plan = validate_launch(
             orchestration_config=arguments.orchestration_config,
             campaign_contract_path=arguments.campaign_contract,
+            campaign_contract_sha256=arguments.campaign_contract_sha256,
             learner_contract_path=arguments.learner_contract,
             sealed_source_root=arguments.sealed_source_root,
             sealed_source_inventory_sha256=arguments.sealed_source_inventory_sha256,

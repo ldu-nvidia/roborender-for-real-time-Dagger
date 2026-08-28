@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from round_dagger import artifacts
+from round_dagger import production_data_lineage
 from round_dagger.orchestration import MacroRoundConfig
 from round_dagger.promotion import stage_bootstrap_policy
 from round_dagger.state import (
@@ -51,6 +52,110 @@ class ProductionLaunchTests(unittest.TestCase):
         self.addCleanup(local_temporary.cleanup)
         self.local_base = Path(local_temporary.name)
 
+    def _materialized_campaign_fixture(
+        self,
+        *,
+        evaluation_source_root: Path = ROOT,
+        evaluation_source_inventory_sha256: str = "d" * 64,
+    ) -> tuple[dict, dict, Path, str]:
+        """Return a schema-valid materialized profile for isolated launch tests.
+
+        Full live-capture byte verification is covered by the scenario-capture
+        and production-data-lineage suites.  These launch tests need the
+        normalized, already-verified shape at the boundary so they can test
+        durable orchestration binding without reviving the legacy contract.
+        """
+
+        runtime_path = self.base / "runtime-campaign-contract.json"
+        if not runtime_path.exists():
+            runtime_path.write_text(
+                json.dumps({"fixture": "external-runtime-contract"}, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime_path.chmod(0o444)
+        runtime_sha = artifacts.sha256_file(runtime_path)
+        profile = json.loads(CAMPAIGN_CONTRACT.read_text(encoding="utf-8"))
+        scenario_path = ROOT / profile["evaluation"]["scenario_contract"]
+        split_path = (
+            evaluation_source_root
+            / profile["motion_split"]["manifest_relative_path"]
+        )
+        heldout_plan_path = (
+            evaluation_source_root
+            / profile["motion_split"]["heldout_plan_relative_path"]
+        )
+        provenance = {
+            "fast_roborender_revision": "1" * 40,
+            "gr00t_revision": "2" * 40,
+            "actor_source_inventory_sha256": evaluation_source_inventory_sha256,
+            "evaluation_source_inventory_sha256": (
+                evaluation_source_inventory_sha256
+            ),
+            "gr00t_source_tree_sha256": "4" * 64,
+            "camera_acceptance_sha256": profile["artifacts"][
+                "camera_acceptance"
+            ]["sha256"],
+            "renderer_runtime_sha256": profile["artifacts"]["renderer"][
+                "runtime_identity_sha256"
+            ],
+            "renderer_cohort_sha256": profile["artifacts"]["renderer"][
+                "cohort_identity_sha256"
+            ],
+            "anchor_inventory_sha256": profile["artifacts"]["anchor_pool"][
+                "inventory_sha256"
+            ],
+            "evaluation_config_sha256": profile["evaluation"][
+                "hydra_config_sha256"
+            ],
+            "motion_split_manifest_sha256": profile["motion_split"][
+                "manifest_sha256"
+            ],
+            "heldout_plan_sha256": profile["motion_split"][
+                "heldout_plan_sha256"
+            ],
+        }
+        runtime = {
+            "schema": production_data_lineage.RUNTIME_CONTRACT_SCHEMA,
+            "status": "release_eligible",
+            "contract_path": str(runtime_path),
+            "contract_sha256": runtime_sha,
+            "invariant_profile_sha256": artifacts.sha256_file(CAMPAIGN_CONTRACT),
+            "live_capture": {
+                "split_manifest_path": str(split_path),
+                "split_manifest_sha256": profile["motion_split"][
+                    "manifest_sha256"
+                ],
+                "heldout_plan_path": str(heldout_plan_path),
+                "heldout_plan_sha256": profile["motion_split"][
+                    "heldout_plan_sha256"
+                ],
+                "attestation_path": str(self.base / "capture-attestation.json"),
+                "attestation_sha256": "5" * 64,
+                "evidence_path": str(self.base / "capture-evidence.json"),
+                "evidence_sha256": "6" * 64,
+                "scenario_path": str(scenario_path),
+                "scenario_sha256": profile["evaluation"][
+                    "scenario_contract_sha256"
+                ],
+            },
+            "capture_provenance": provenance,
+        }
+        lineage = production_data_lineage.derive_data_lineage(
+            runtime,
+            motion_split_contract=profile["motion_split"],
+            topology=profile["topology"],
+        )
+        profile["production_runtime_contract"] = runtime
+        profile["data_lineage"] = lineage
+        profile["data_lineage_sha256"] = (
+            production_data_lineage.data_lineage_sha256(lineage)
+        )
+        profile["invariant_profile_sha256"] = artifacts.sha256_file(
+            CAMPAIGN_CONTRACT
+        )
+        return profile, runtime, runtime_path, runtime_sha
+
     def _local_seal_fixture(
         self, name: str = "fast_roborender_deadbee_cafef00_sealed"
     ) -> tuple[Path, dict, dict, dict]:
@@ -69,6 +174,11 @@ class ProductionLaunchTests(unittest.TestCase):
         scenarios.parent.mkdir(parents=True, exist_ok=True)
         scenarios.write_bytes(b"sealed scenarios")
         thresholds.write_bytes(b"sealed thresholds")
+        split_manifest = root / "GR00T-VisualSim2Real/split.json"
+        heldout_plan = root / "configs/round_dagger/heldout-plan.json"
+        split_manifest.parent.mkdir(parents=True, exist_ok=True)
+        split_manifest.write_bytes(b"sealed split")
+        heldout_plan.write_bytes(b"sealed plan")
         campaign = {
             "artifacts": {
                 "teacher": {
@@ -90,6 +200,12 @@ class ProductionLaunchTests(unittest.TestCase):
                 "scenario_contract_sha256": artifacts.sha256_file(scenarios),
                 "threshold_contract": thresholds.relative_to(root).as_posix(),
                 "threshold_contract_sha256": artifacts.sha256_file(thresholds),
+            },
+            "motion_split": {
+                "manifest_relative_path": split_manifest.relative_to(root).as_posix(),
+                "manifest_sha256": artifacts.sha256_file(split_manifest),
+                "heldout_plan_relative_path": heldout_plan.relative_to(root).as_posix(),
+                "heldout_plan_sha256": artifacts.sha256_file(heldout_plan),
             },
         }
         sealed_campaign = root / production_launch.PRODUCTION_CAMPAIGN_CONTRACT_RELATIVE
@@ -125,6 +241,11 @@ class ProductionLaunchTests(unittest.TestCase):
         learner_config_sha: str | None = None,
         evaluation_source_root: Path = ROOT,
     ) -> tuple[Path, Path]:
+        campaign_contract, _, _, runtime_contract_sha = (
+            self._materialized_campaign_fixture(
+                evaluation_source_root=evaluation_source_root
+            )
+        )
         learner_deployment_sha = artifacts.sha256_file(LEARNER_CONTRACT)
         learner_contract = production_launch.load_learner_contract(LEARNER_CONTRACT)
         root = self.base / "campaign"
@@ -148,10 +269,12 @@ class ProductionLaunchTests(unittest.TestCase):
             view_names=("head_color", "hand_left", "hand_right"),
             policy_image_shape=(324, 192, 3),
             action_dim=26,
-            teacher_sha256="943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38",
-            renderer_sha256="a82f639a9038789db220793475dfce3eb5651ff3145287be748f387a20caeb9f",
-            camera_mapping_sha256="53234dfe2eab9b1ae02df21e143f996ecde831aadb8aacb2e5f2df632d3d8d27",
+            teacher_sha256=campaign_contract["artifacts"]["teacher"]["checkpoint_sha256"],
+            renderer_sha256=campaign_contract["artifacts"]["renderer"]["cohort_identity_sha256"],
+            camera_mapping_sha256=campaign_contract["artifacts"]["camera_acceptance"]["sha256"],
             training_config_sha256=EVALUATION_CONFIG_SHA,
+            macro_round_count=5,
+            data_lineage=campaign_contract["data_lineage"],
             beta_schedule={
                 "kind": "linear",
                 "start": 1.0,
@@ -190,10 +313,12 @@ class ProductionLaunchTests(unittest.TestCase):
             "promote": None,
         }
         orchestration = {
-            "schema": "fast_roborender.round_dagger.orchestration_config.v1",
+            "schema": "fast_roborender.round_dagger.orchestration_config.v3",
             "campaign_root": str(root),
             "actor_root": str(root / "actors"),
             "macro_round": 0,
+            "macro_round_count": 5,
+            "campaign_contract_sha256": runtime_contract_sha,
             "runtime_policy_sha256": active["runtime_policy_sha256"],
             "learner_code_sha256": learner_code_sha,
             "learner_config_sha256": learner_config_sha or derived_bundle_sha,
@@ -257,6 +382,22 @@ class ProductionLaunchTests(unittest.TestCase):
         campaign = production_launch.load_campaign_contract(CAMPAIGN_CONTRACT)
         learner = production_launch.load_learner_contract(LEARNER_CONTRACT)
         self.assertEqual(campaign["topology"]["transitions_per_macro_round"], 131072)
+        self.assertEqual(
+            campaign["schema"],
+            "fast_roborender.round_dagger.production_campaign_contract.v2",
+        )
+        self.assertEqual(campaign["motion_split"]["heldout_motion_count"], 256)
+        self.assertEqual(campaign["motion_split"]["collection_motion_count"], 39)
+        self.assertEqual(
+            campaign["artifacts"]["bootstrap_bundle"]["checkpoint_sha256"],
+            "720a975812f6083192234d650033511c821b6902da2ef7734d87943f6c0a359a",
+        )
+        self.assertEqual(
+            campaign["artifacts"]["bootstrap_bundle"]["runtime_policy_sha256"],
+            "cd6f70aa9d589e810b7ab22999941930742a94621870457aadd068d2394deb9a",
+        )
+        self.assertEqual(campaign["topology"]["macro_round_count"], 5)
+        self.assertEqual(campaign["topology"]["transitions_per_campaign"], 655360)
         self.assertEqual(campaign["topology"]["steps_per_environment"], 512)
         self.assertEqual(campaign["topology"]["transitions_per_cohort"], 32768)
         self.assertEqual(
@@ -381,7 +522,7 @@ class ProductionLaunchTests(unittest.TestCase):
         # Read the checked-in documents directly so this unit gate remains
         # runnable from a clean isolated worktree whose absolute path differs
         # from the canonical production checkout pinned by the full validator.
-        campaign = json.loads(CAMPAIGN_CONTRACT.read_text(encoding="utf-8"))
+        campaign, _, _, _ = self._materialized_campaign_fixture()
         learner = json.loads(LEARNER_CONTRACT.read_text(encoding="utf-8"))
         environment = production_launch.build_environment(
             campaign,
@@ -398,6 +539,14 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertEqual(
             environment["IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE"], "simulator_rgb"
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"],
+            campaign["motion_split"]["manifest_sha256"],
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256"],
+            campaign["motion_split"]["heldout_plan_sha256"],
         )
         self.assertNotIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK", environment)
         self.assertEqual(
@@ -417,6 +566,12 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         _, orchestration = self._campaign_and_orchestration(
             evaluation_source_root=local_sealed_root
+        )
+        materialized, runtime_contract, runtime_path, runtime_sha = (
+            self._materialized_campaign_fixture(
+                evaluation_source_root=local_sealed_root,
+                evaluation_source_inventory_sha256=evaluation_inventory_sha,
+            )
         )
         source_report = {
             "schema": production_launch.SEALED_REPORT_SCHEMA,
@@ -466,10 +621,20 @@ class ProductionLaunchTests(unittest.TestCase):
                 production_launch,
                 "_verify_camera_acceptance_source_bindings",
             ),
+            mock.patch.object(
+                production_launch,
+                "materialize_campaign_contract",
+                return_value=(
+                    materialized,
+                    runtime_contract,
+                    materialized["data_lineage"],
+                ),
+            ),
         ):
             environment, plan = production_launch.validate_launch(
                 orchestration_config=orchestration,
-                campaign_contract_path=CAMPAIGN_CONTRACT,
+                campaign_contract_path=runtime_path,
+                campaign_contract_sha256=runtime_sha,
                 learner_contract_path=LEARNER_CONTRACT,
                 sealed_source_root=source_report["root"],
                 sealed_source_inventory_sha256=SOURCE_SHA,
@@ -480,7 +645,14 @@ class ProductionLaunchTests(unittest.TestCase):
             )
         verify_local_seal.assert_called_once()
         self.assertEqual(plan["status"], "validated_no_submission")
+        self.assertEqual(
+            plan["schema"],
+            "fast_roborender.round_dagger.production_launch_plan.v2",
+        )
         self.assertEqual(plan["coordinator_phase"], "READY")
+        self.assertEqual(plan["macro_round_count"], 5)
+        self.assertEqual(plan["completed_macro_rounds"], 0)
+        self.assertEqual(plan["remaining_macro_rounds"], 5)
         self.assertFalse(plan["credentials_in_plan"])
         self.assertEqual(environment["ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256"], SOURCE_SHA)
         self.assertEqual(
@@ -500,6 +672,18 @@ class ProductionLaunchTests(unittest.TestCase):
             plan["evaluation_source_inventory_sha256"],
         )
         self.assertEqual(environment["ROUND_DAGGER_LEARNER_MAX_STEPS"], "1200")
+        self.assertEqual(environment["ROUND_DAGGER_MACRO_ROUND_COUNT"], "5")
+        self.assertEqual(
+            environment["ROUND_DAGGER_TRANSITIONS_PER_CAMPAIGN"], "655360"
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"],
+            "6a600b4dbdb7cb076d203d2440ad41d14acf4f1cad8a9417a76b51dc62ed4834",
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_HELDOUT_EVALUATION_PLAN_SHA256"],
+            "394ba77b2c8ecbdb4904ef24894cda0b88bb5b606ab75e578ee0a91756630f19",
+        )
         self.assertEqual(
             environment["IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE"], "simulator_rgb"
         )
@@ -565,18 +749,56 @@ class ProductionLaunchTests(unittest.TestCase):
         _, orchestration = self._campaign_and_orchestration(
             learner_config_sha=deployment_sha
         )
+        materialized, _, _, _ = self._materialized_campaign_fixture()
         with self.assertRaisesRegex(
             production_launch.ProductionLaunchError,
             "derived learner bundle identity",
         ):
             production_launch._validate_orchestration_and_campaign(
                 orchestration,
-                production_launch.load_campaign_contract(CAMPAIGN_CONTRACT),
+                materialized,
                 production_launch.load_learner_contract(LEARNER_CONTRACT),
                 deployment_sha,
                 SOURCE_SHA,
                 ROOT,
             )
+
+    def test_production_rejects_legacy_unbounded_orchestration_config(self) -> None:
+        _, orchestration = self._campaign_and_orchestration()
+        document = json.loads(orchestration.read_text(encoding="utf-8"))
+        document["schema"] = "fast_roborender.round_dagger.orchestration_config.v1"
+        document.pop("macro_round_count")
+        document.pop("campaign_contract_sha256")
+        legacy = self.base / "legacy-unbounded-orchestration.json"
+        legacy.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        legacy.chmod(0o444)
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "bind exactly five macro-rounds",
+        ):
+            production_launch._validate_orchestration_and_campaign(
+                legacy,
+                production_launch.load_campaign_contract(CAMPAIGN_CONTRACT),
+                production_launch.load_learner_contract(LEARNER_CONTRACT),
+                artifacts.sha256_file(LEARNER_CONTRACT),
+                SOURCE_SHA,
+                ROOT,
+            )
+
+    def test_v1_campaign_relabel_cannot_carry_v2_motion_split_shape(self) -> None:
+        document = json.loads(CAMPAIGN_CONTRACT.read_text(encoding="utf-8"))
+        document["schema"] = (
+            "fast_roborender.round_dagger.production_campaign_contract.v1"
+        )
+        path = self.base / "v1-relabeled-campaign.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError, "schema mismatch"
+        ):
+            production_launch.load_campaign_contract(path)
 
     def test_active_policy_spec_identity_cannot_be_rewritten_during_preflight(
         self,

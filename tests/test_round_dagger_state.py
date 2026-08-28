@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,7 @@ from round_dagger.artifacts import (
     publish_rollout_shard,
     seal_cohort,
 )
+from round_dagger import cli as round_cli
 from round_dagger.promotion import (
     PromotionError,
     load_active_policy,
@@ -32,6 +35,7 @@ from round_dagger.state import (
     _replace_state,
     beta_for_macro_round,
     initialize_campaign,
+    load_campaign,
     load_collection_manifest,
     load_state,
     open_macro_round,
@@ -48,7 +52,12 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
-def _campaign(tmp_path: Path) -> Path:
+def _campaign(
+    tmp_path: Path,
+    *,
+    macro_round_count: int | None = None,
+    data_lineage: dict | None = None,
+) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     root = tmp_path / "campaign"
     source = tmp_path / "bootstrap-source.pt"
@@ -82,6 +91,8 @@ def _campaign(tmp_path: Path) -> Path:
             "decay_rounds": 3,
             "rate": 0.99,
         },
+        macro_round_count=macro_round_count,
+        data_lineage=data_lineage,
     )
     return root
 
@@ -311,6 +322,59 @@ class StatePromotionLifecycleTest(unittest.TestCase):
             ),
             0.6,
         )
+
+    def test_bounded_campaign_persists_horizon_and_rejects_round_after_completion(
+        self,
+    ) -> None:
+        root = _campaign(self.tmp_path, macro_round_count=1)
+        campaign = load_campaign(root)
+        self.assertEqual(
+            campaign["schema"], "fast_roborender.round_dagger.campaign.v2"
+        )
+        self.assertEqual(campaign["macro_round_count"], 1)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(
+                round_cli.main(["status", "--root", str(root)]), 0
+            )
+        status = json.loads(buffer.getvalue())
+        self.assertEqual(
+            status["execution"],
+            {
+                "macro_round_count": 1,
+                "completed_macro_rounds": 0,
+                "remaining_macro_rounds": 1,
+                "complete": False,
+            },
+        )
+
+        _to_ingested(root)
+        candidate = _stage_and_bind(root, self.tmp_path)
+        evaluation = _evaluate_and_bind(root, candidate, passed=True)
+        promote_candidate(
+            root,
+            macro_round=0,
+            candidate_manifest=candidate["manifest_path"],
+            evaluation_manifest=evaluation["manifest_path"],
+        )
+        completed = load_state(root)
+        self.assertEqual(completed["next_macro_round"], 1)
+        with self.assertRaisesRegex(StateError, "campaign is complete"):
+            open_macro_round(root, expected_revision=completed["revision"])
+
+    def test_legacy_campaign_remains_unbounded_and_has_no_execution_status(self) -> None:
+        root = _campaign(self.tmp_path)
+        self.assertEqual(
+            load_campaign(root)["schema"],
+            "fast_roborender.round_dagger.campaign.v1",
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(
+                round_cli.main(["status", "--root", str(root)]), 0
+            )
+        self.assertNotIn("execution", json.loads(buffer.getvalue()))
 
     def test_transition_ordering_and_revision_cas_fail_closed(self) -> None:
         root = _campaign(self.tmp_path)
