@@ -203,6 +203,8 @@ RUNTIME_OUTPUT="$OUTPUT_DIR/scenario_capture_runtime.json"
 BEFORE="$OUTPUT_DIR/renderer_before.json"
 AFTER="$OUTPUT_DIR/renderer_after.json"
 PASS_OUTPUT="$OUTPUT_DIR/scenario_capture_pass.json"
+TENSOR_OUTPUT="$OUTPUT_DIR/heldout_expert_capture.npz"
+LINEAGE_OUTPUT="$OUTPUT_DIR/heldout_expert_lineage.json"
 if [[ $PASS_INDEX == 1 ]]; then
     FIRST_CONDITION_BUNDLE="$OUTPUT_DIR/first_condition_bundle.npz"
     [[ ! -e $FIRST_CONDITION_BUNDLE && ! -L $FIRST_CONDITION_BUNDLE ]] || \
@@ -314,6 +316,11 @@ export IMAGE_DAGGER_SCENARIO_CAPTURE_PASS_INDEX="$PASS_INDEX"
 export IMAGE_DAGGER_SCENARIO_CAPTURE_RUN_ID="$RUN_ID"
 export IMAGE_DAGGER_SCENARIO_CAPTURE_NONCE="$NONCE"
 export IMAGE_DAGGER_SCENARIO_CAPTURE_OUTPUT="$RUNTIME_OUTPUT"
+if [[ $PASS_INDEX == 2 && $PROFILE == production32 ]]; then
+    export IMAGE_DAGGER_SCENARIO_CAPTURE_TENSOR_OUTPUT="$TENSOR_OUTPUT"
+else
+    unset IMAGE_DAGGER_SCENARIO_CAPTURE_TENSOR_OUTPUT
+fi
 export IMAGE_DAGGER_EVAL_RELABEL=1
 export IMAGE_DAGGER_PAIRED_EVAL=0
 export IMAGE3F_RUN_ID="$RUN_ID"
@@ -380,6 +387,12 @@ fi
 
 [[ -f $RUNTIME_OUTPUT && ! -L $RUNTIME_OUTPUT ]] || \
     fatal "evaluator did not publish immutable scenario capture evidence"
+if [[ $PASS_INDEX == 2 && $PROFILE == production32 ]]; then
+    [[ -f $TENSOR_OUTPUT && ! -L $TENSOR_OUTPUT ]] || \
+        fatal "evaluator did not publish the held-out expert tensor capture"
+    [[ $(stat -c '%A' "$TENSOR_OUTPUT") != *w* ]] || \
+        fatal "held-out expert tensor capture is writable"
+fi
 [[ -f $FIRST_CONDITION_BUNDLE && ! -L $FIRST_CONDITION_BUNDLE ]] || \
     fatal "evaluator did not preserve the first-condition bundle"
 [[ $(stat -c '%A' "$FIRST_CONDITION_BUNDLE") != *w* ]] || \
@@ -401,4 +414,11 @@ verify=("$PYTHON_BIN" -m round_dagger.scenario_capture verify-pass
     --plan "$PLAN" --pass-artifact "$PASS_OUTPUT")
 ((SMOKE2)) && verify+=(--smoke2)
 "${verify[@]}" >/dev/null
-echo "HELDOUT_SCENARIO_CAPTURE_PASS seed=$SEED pass=$PASS_INDEX profile=$PROFILE envs=$NUM_ENVS artifact=$PASS_OUTPUT"
+if [[ $PASS_INDEX == 2 && $PROFILE == production32 ]]; then
+    "$PYTHON_BIN" -m round_dagger.heldout_capture bind \
+        --plan "$PLAN" --pass-artifact "$PASS_OUTPUT" \
+        --capture "$TENSOR_OUTPUT" --output "$LINEAGE_OUTPUT" >/dev/null
+    "$PYTHON_BIN" -m round_dagger.heldout_capture verify \
+        --lineage "$LINEAGE_OUTPUT" >/dev/null
+fi
+echo "HELDOUT_SCENARIO_CAPTURE_PASS seed=$SEED pass=$PASS_INDEX profile=$PROFILE envs=$NUM_ENVS artifact=$PASS_OUTPUT lineage=${LINEAGE_OUTPUT:-none}"
