@@ -84,6 +84,16 @@ class CountingSession:
         raise AssertionError("token mismatch reached inference")
 
 
+class SuccessfulSession:
+    def __init__(self):
+        self.generate_calls = 0
+
+    def generate(self, *_args, **_kwargs):
+        self.generate_calls += 1
+        stacked = np.zeros((3 * 240, 416, 3), dtype=np.uint8)
+        return [stacked], {"pipeline_ms": 1.0}
+
+
 class Image3FServerTransportTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -94,13 +104,14 @@ class Image3FServerTransportTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def _handler_pair(self, *, incarnation="c" * 32):
+    def _handler_pair(self, *, incarnation="c" * 32, session=None, references=None):
         module = self.module
         server_sock, client_sock = socket.socketpair()
         connections = module.ConnectionRegistry(
             max_connections=4, client_socket_timeout_s=2.0
         )
-        session = CountingSession()
+        session = session or CountingSession()
+        references = references or StubReferences()
         thread = threading.Thread(
             target=module.handle_conn,
             args=(
@@ -108,7 +119,7 @@ class Image3FServerTransportTest(unittest.TestCase):
                 ("local", 0),
                 session,
                 threading.Lock(),
-                StubReferences(),
+                references,
                 module.ServerMetrics(),
                 {"runtime": "test"},
                 {"renderer": "test"},
@@ -120,6 +131,66 @@ class Image3FServerTransportTest(unittest.TestCase):
         )
         connections.start_handler(server_sock, thread)
         return client_sock, thread, session
+
+    def test_successful_and_replayed_render_responses_carry_server_id(self):
+        module = self.module
+        incarnation = "c" * 32
+        session = SuccessfulSession()
+        references = module.LaggedReferenceStore(max_streams=1)
+        with mock.patch.dict(
+            os.environ, {"IMAGE3F_SERVER_ID": "transport-test:000"}, clear=False
+        ):
+            client_sock, thread, _ = self._handler_pair(
+                incarnation=incarnation,
+                session=session,
+                references=references,
+            )
+            depth = {
+                view: module.encode_array(np.zeros((240, 416), dtype=np.uint8))
+                for view in ("head_color", "hand_left", "hand_right")
+            }
+            rgb = {
+                view: module.encode_array(np.zeros((240, 416, 3), dtype=np.uint8))
+                for view in ("head_color", "hand_left", "hand_right")
+            }
+            request = {
+                "cmd": "render_frame",
+                "protocol_version": 3,
+                "expected_server_incarnation_id": incarnation,
+                "reference_lag": 256,
+                "stream_id": "stream-0",
+                "episode_id": "episode-0",
+                "step": 0,
+                "request_id": "stream-0|episode-0|0",
+                "depth": depth,
+                "mask": rgb,
+                "prev": rgb,
+                "prompt": "pick up the cube",
+                "seed": 17,
+            }
+            try:
+                protocol._send_msg(
+                    client_sock, {"cmd": "ping", "protocol_version": 3}
+                )
+                ping = protocol._recv_msg(client_sock)
+                self.assertEqual(ping["server_id"], "transport-test:000")
+
+                protocol._send_msg(client_sock, request)
+                rendered = protocol._recv_msg(client_sock)
+                self.assertIs(rendered["ok"], True)
+                self.assertIs(rendered.get("replayed"), None)
+                self.assertEqual(rendered["server_id"], "transport-test:000")
+
+                protocol._send_msg(client_sock, request)
+                replayed = protocol._recv_msg(client_sock)
+                self.assertIs(replayed["ok"], True)
+                self.assertIs(replayed["replayed"], True)
+                self.assertEqual(replayed["server_id"], "transport-test:000")
+                self.assertEqual(session.generate_calls, 1)
+            finally:
+                client_sock.close()
+                thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
 
     def test_v2_is_rejected_and_token_mismatch_never_reaches_inference(self):
         incarnation = "c" * 32

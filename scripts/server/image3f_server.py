@@ -374,6 +374,7 @@ def handle_conn(
     connections,
 ):
     print(f"tcp client {addr}", flush=True)
+    server_id = os.environ.get("IMAGE3F_SERVER_ID", "legacy")
     try:
         while True:
             req = _recv_msg(sock)
@@ -385,6 +386,7 @@ def handle_conn(
                     "ok": False,
                     "error": f"unsupported Image3F command {cmd!r}",
                     "retryable": False,
+                    "server_id": server_id,
                     "server_incarnation_id": server_incarnation_id,
                 })
                 continue
@@ -393,6 +395,7 @@ def handle_conn(
                     "ok": False,
                     "error": "Image3F protocol version mismatch",
                     "retryable": False,
+                    "server_id": server_id,
                     "server_incarnation_id": server_incarnation_id,
                 })
                 continue
@@ -408,6 +411,7 @@ def handle_conn(
                         "history is unavailable"
                     ),
                     "retryable": False,
+                    "server_id": server_id,
                     "server_incarnation_id": server_incarnation_id,
                 })
                 continue
@@ -423,6 +427,7 @@ def handle_conn(
                         "ok": False,
                         "error": "Image3F reference_lag must be a non-negative integer",
                         "retryable": False,
+                        "server_id": server_id,
                         "server_incarnation_id": server_incarnation_id,
                     })
                     continue
@@ -438,6 +443,7 @@ def handle_conn(
                             "server incarnation"
                         ),
                         "retryable": False,
+                        "server_id": server_id,
                         "server_incarnation_id": server_incarnation_id,
                     })
                     continue
@@ -445,7 +451,7 @@ def handle_conn(
                 _send_msg(sock, {
                     "ok": True,
                     "protocol_version": PROTOCOL_VERSION,
-                    "server_id": os.environ.get("IMAGE3F_SERVER_ID", "legacy"),
+                    "server_id": server_id,
                     "server_incarnation_id": server_incarnation_id,
                     "capabilities": {
                         "lagged_reference_history": True,
@@ -476,7 +482,7 @@ def handle_conn(
                         "ok": True,
                         "removed": removed,
                         "stream_id": reset_stream_id,
-                        "server_id": os.environ.get("IMAGE3F_SERVER_ID", "legacy"),
+                        "server_id": server_id,
                         "renderer_identity_sha256": renderer_identity_sha256,
                         "server_incarnation_id": server_incarnation_id,
                     })
@@ -485,6 +491,7 @@ def handle_conn(
                         "ok": False,
                         "error": f"{exc}",
                         "retryable": False,
+                        "server_id": server_id,
                         "server_incarnation_id": server_incarnation_id,
                     })
                 continue
@@ -553,6 +560,7 @@ def handle_conn(
                             "generated_sha256": references.image_mapping_sha256(
                                 replay_views
                             ),
+                            "server_id": server_id,
                             "renderer_identity_sha256": renderer_identity_sha256,
                             "server_incarnation_id": server_incarnation_id,
                             "stream_step": step,
@@ -627,6 +635,7 @@ def handle_conn(
                     "reference_source": reference_source,
                     "reference_provenance": provenance,
                     "generated_sha256": generated_sha256,
+                    "server_id": server_id,
                     "renderer_identity_sha256": renderer_identity_sha256,
                     "server_incarnation_id": server_incarnation_id,
                     "stream_step": step if reference_lag else None,
@@ -640,6 +649,7 @@ def handle_conn(
                     "ok": False,
                     "error": error,
                     "retryable": "in flight" in error,
+                    "server_id": server_id,
                     "server_incarnation_id": server_incarnation_id,
                 })
     except (
