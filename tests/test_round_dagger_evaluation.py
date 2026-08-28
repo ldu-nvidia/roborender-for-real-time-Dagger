@@ -1268,6 +1268,23 @@ class PairedEvaluationTest(unittest.TestCase):
             "[head_color,hand_left,hand_right]",
             rendered_command,
         )
+        for override in (
+            "contact_force_n=10.0",
+            "gravity_xy=0.5",
+            "min_base_height_m=0.3",
+            "dof_velocity_limit_fraction=0.98",
+            "torque_limit_fraction=0.98",
+            "min_object_height_m=0.6",
+            "right_arm_velocity_rad_s=3.14",
+        ):
+            self.assertEqual(
+                rendered_command.count(
+                    f"++env.config.safety_thresholds.{override}"
+                ),
+                4,
+                "physical-safety override must appear in every role/seed "
+                f"eval: {override}",
+            )
         self.assertIn("--output", completed.stdout)
         self.assertIn(str(orchestrator_result), completed.stdout)
         for view in POLICY_VIEWS:
@@ -1283,6 +1300,34 @@ class PairedEvaluationTest(unittest.TestCase):
             len({f"{run_id}:rank0:env0" for run_id in run_ids}), 4
         )
         self.assertFalse(results.exists())
+
+    def test_shell_launcher_preserves_existing_isaac_pythonpath(self) -> None:
+        wrapper = self.tmp / "python-with-path-log"
+        path_log = self.tmp / "pythonpath.log"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            "printf '%s\\n' \"${PYTHONPATH:-}\" >>\"$PYTHONPATH_LOG\"\n"
+            "exec \"$REAL_PYTHON\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        isaac_paths = "/isaac/exts:/isaac/kit/python/lib"
+        completed = self._run_launcher(
+            self.root / self.results_relative,
+            dry_run=True,
+            python_bin=wrapper,
+            extra_environment={
+                "PYTHONPATH": isaac_paths,
+                "PYTHONPATH_LOG": str(path_log),
+                "REAL_PYTHON": sys.executable,
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        observed = path_log.read_text(encoding="utf-8").splitlines()
+        self.assertGreater(len(observed), 0)
+        expected = f"{self.repository_root}:{self.gr00t}:{isaac_paths}"
+        self.assertEqual(observed, [expected] * len(observed))
 
     @unittest.skipUnless(
         importlib.util.find_spec("hydra") is not None,
@@ -1313,6 +1358,13 @@ class PairedEvaluationTest(unittest.TestCase):
             "++simulator.config.cameras.policy_views="
             "[head_color,hand_left,hand_right]",
             "++env.config.image_dagger_policy_view_count=3",
+            "++env.config.safety_thresholds.contact_force_n=10.0",
+            "++env.config.safety_thresholds.gravity_xy=0.5",
+            "++env.config.safety_thresholds.min_base_height_m=0.3",
+            "++env.config.safety_thresholds.dof_velocity_limit_fraction=0.98",
+            "++env.config.safety_thresholds.torque_limit_fraction=0.98",
+            "++env.config.safety_thresholds.min_object_height_m=0.6",
+            "++env.config.safety_thresholds.right_arm_velocity_rad_s=3.14",
             "++algo.config.eval.training_enabled=false",
             "++simulator.config.render_results=false",
             "++use_wandb=false",
@@ -1324,7 +1376,12 @@ class PairedEvaluationTest(unittest.TestCase):
             cwd=production_gr00t,
             env={
                 **os.environ,
-                "PYTHONPATH": f"{production_gr00t}:{self.repository_root}",
+                "PYTHONPATH": (
+                    f"{production_gr00t}:{self.repository_root}"
+                    f"{os.pathsep}{os.environ['PYTHONPATH']}"
+                    if os.environ.get("PYTHONPATH")
+                    else f"{production_gr00t}:{self.repository_root}"
+                ),
             },
             text=True,
             capture_output=True,
@@ -1336,6 +1393,16 @@ class PairedEvaluationTest(unittest.TestCase):
         self.assertIn("reference_lag: 256", completed.stdout)
         self.assertIn("policy_views:", completed.stdout)
         self.assertIn("image_dagger_policy_view_count: 3", completed.stdout)
+        for rendered_threshold in (
+            "contact_force_n: 10.0",
+            "gravity_xy: 0.5",
+            "min_base_height_m: 0.3",
+            "dof_velocity_limit_fraction: 0.98",
+            "torque_limit_fraction: 0.98",
+            "min_object_height_m: 0.6",
+            "right_arm_velocity_rad_s: 3.14",
+        ):
+            self.assertIn(rendered_threshold, completed.stdout)
 
     def test_sequential_sixteen_invocations_bound_and_clean_scratch(self) -> None:
         """One staged checkpoint namespace is retained at a time.

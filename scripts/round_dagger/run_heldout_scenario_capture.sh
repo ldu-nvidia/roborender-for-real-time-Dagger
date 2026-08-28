@@ -179,6 +179,82 @@ RUNTIME_OUTPUT="$OUTPUT_DIR/scenario_capture_runtime.json"
 BEFORE="$OUTPUT_DIR/renderer_before.json"
 AFTER="$OUTPUT_DIR/renderer_after.json"
 PASS_OUTPUT="$OUTPUT_DIR/scenario_capture_pass.json"
+
+# The pinned bootstrap bundle is mounted read-only in production, while the
+# upstream evaluator materializes loader-derived files beside its checkpoint.
+# Give this invocation a private writable namespace without ever evaluating
+# bytes other than the already-pinned inputs.  The source is hashed before and
+# after every copy and the staged file must match that same digest.
+INPUT_STAGE="$OUTPUT_DIR/evaluator_inputs"
+mkdir "$INPUT_STAGE" || fatal "cannot allocate fresh evaluator input stage"
+chmod 0700 "$INPUT_STAGE"
+
+stage_exact_file() {
+    local source=$1 destination=$2 expected_sha=$3 label=$4
+    local source_before source_after destination_sha
+    [[ -f $source && ! -L $source ]] || \
+        fatal "$label source is not a regular non-symlink file"
+    [[ ! -e $destination && ! -L $destination ]] || \
+        fatal "$label stage destination is not fresh"
+    source_before=$(sha256sum "$source" | awk '{print $1}')
+    [[ $source_before == "$expected_sha" ]] || \
+        fatal "$label source SHA mismatch before staging"
+    install -m 0600 -- "$source" "$destination" || \
+        fatal "cannot stage $label"
+    source_after=$(sha256sum "$source" | awk '{print $1}')
+    destination_sha=$(sha256sum "$destination" | awk '{print $1}')
+    [[ $source_before == "$source_after" ]] || \
+        fatal "$label source changed while staging"
+    [[ $destination_sha == "$expected_sha" ]] || \
+        fatal "$label staged SHA mismatch"
+}
+
+verify_staged_file() {
+    local path=$1 expected_sha=$2 label=$3
+    [[ -f $path && ! -L $path ]] || \
+        fatal "$label staged file is no longer a regular non-symlink file"
+    [[ $(sha256sum "$path" | awk '{print $1}') == "$expected_sha" ]] || \
+        fatal "$label staged bytes changed"
+}
+
+CHECKPOINT_BASENAME=$(basename -- "$CHECKPOINT")
+[[ $CHECKPOINT_BASENAME != config.yaml ]] || \
+    fatal "checkpoint basename conflicts with evaluator config"
+STAGED_CHECKPOINT="$INPUT_STAGE/$CHECKPOINT_BASENAME"
+STAGED_CONFIG="$INPUT_STAGE/config.yaml"
+stage_exact_file "$CHECKPOINT" "$STAGED_CHECKPOINT" "$CHECKPOINT_SHA" checkpoint
+stage_exact_file "$EVALUATION_CONFIG" "$STAGED_CONFIG" "$CONFIG_SHA" \
+    "evaluation config"
+
+SOURCE_POLICY_SPEC="${CHECKPOINT}.policy_spec.json"
+SOURCE_POLICY_MANIFEST="${CHECKPOINT}.manifest.json"
+STAGED_POLICY_SPEC="${STAGED_CHECKPOINT}.policy_spec.json"
+STAGED_POLICY_MANIFEST="${STAGED_CHECKPOINT}.manifest.json"
+POLICY_SPEC_SHA=
+POLICY_MANIFEST_SHA=
+if [[ -e $SOURCE_POLICY_SPEC || -L $SOURCE_POLICY_SPEC || \
+      -e $SOURCE_POLICY_MANIFEST || -L $SOURCE_POLICY_MANIFEST ]]; then
+    [[ -f $SOURCE_POLICY_SPEC && ! -L $SOURCE_POLICY_SPEC && \
+       -f $SOURCE_POLICY_MANIFEST && ! -L $SOURCE_POLICY_MANIFEST ]] || \
+        fatal "checkpoint policy sidecar bundle is incomplete or unsafe"
+    POLICY_SPEC_SHA=$(sha256sum "$SOURCE_POLICY_SPEC" | awk '{print $1}')
+    POLICY_MANIFEST_SHA=$(sha256sum "$SOURCE_POLICY_MANIFEST" | awk '{print $1}')
+    stage_exact_file "$SOURCE_POLICY_SPEC" "$STAGED_POLICY_SPEC" \
+        "$POLICY_SPEC_SHA" "policy spec"
+    stage_exact_file "$SOURCE_POLICY_MANIFEST" "$STAGED_POLICY_MANIFEST" \
+        "$POLICY_MANIFEST_SHA" "policy manifest"
+    PYTHONPATH="$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON_BIN" -m round_dagger.policy_bundle \
+        --checkpoint "$STAGED_CHECKPOINT" \
+        --policy-spec "$STAGED_POLICY_SPEC" \
+        --manifest "$STAGED_POLICY_MANIFEST" \
+        --expected-checkpoint-sha256 "$CHECKPOINT_SHA" \
+        --expected-runtime-policy-sha256 \
+            "$ROUND_DAGGER_RUNTIME_POLICY_SHA256" >/dev/null || \
+        fatal "staged checkpoint policy bundle failed identity validation"
+    export ROUND_DAGGER_POLICY_SPEC="$STAGED_POLICY_SPEC"
+    export ROUND_DAGGER_POLICY_MANIFEST="$STAGED_POLICY_MANIFEST"
+fi
 NONCE=$("$PYTHON_BIN" - <<'PY'
 import secrets
 print(secrets.token_hex(16))
@@ -200,7 +276,7 @@ probe=("$PYTHON_BIN" "$PROBE" --endpoint-dir "$ENDPOINT_DIR"
     --json)
 "${probe[@]}" --write-report "$BEFORE" >/dev/null
 
-export PYTHONPATH="$REPOSITORY_ROOT:$GR00T_ROOT"
+export PYTHONPATH="$REPOSITORY_ROOT:$GR00T_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export TRAIN_RUN_DIR="$OUTPUT_DIR"
 export IMAGE_DAGGER_SCENARIO_CAPTURE=1
 export IMAGE_DAGGER_SCENARIO_CAPTURE_PROFILE="$PROFILE"
@@ -216,35 +292,54 @@ export IMAGE3F_ENDPOINT_DIR="$ENDPOINT_DIR"
 export IMAGE3F_LOCAL_ENVS="$NUM_ENVS"
 export ROUND_DAGGER_SCENARIO_CAPTURE_PLAN_SHA256="$PLAN_SHA"
 
-"$PYTHON_BIN" "$EVALUATOR" \
-    ++checkpoint="$CHECKPOINT" ++num_envs="$NUM_ENVS" ++headless=true \
-    ++seed="$SEED" ++eval_output_dir="$OUTPUT_DIR" \
-    ++algo.config.eval.eval_num_envs_episodes=false \
-    ++algo.config.eval.num_eval_episodes=1 \
-    ++algo.config.eval.save_videos=false \
-    ++algo.config.eval.save_trajectories=false \
-    ++algo.config.eval.training_enabled=false \
-    ++algo.config.init_at_random_ep_len=false \
-    ++algo.config.videogen.enable=true \
-    ++algo.config.videogen.mode=image_dagger \
-    ++algo.config.videogen.raytraced_mix_prob=0.0 \
-    ++algo.config.videogen.image3f_endpoint_files="$ENDPOINT_LIST" \
-    '++algo.config.videogen.view_names=[head_color,hand_left,hand_right]' \
-    ++algo.config.videogen.reference_lag=256 \
-    ++algo.config.videogen.primary_view=head_color \
-    ++algo.config.videogen.seed="$SEED" \
-    ++algo.config.videogen.anchor_source=simulator_rgb \
-    '++simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]' \
-    ++simulator.config.cameras.policy_view_layout=vertical \
-    ++env.config.image_dagger_policy_view_count=3 \
-    ++env.config.reset_from_dataset.motion_split_manifest="$MOTION_SPLIT" \
-    ++env.config.reset_from_dataset.motion_split_manifest_sha256="$MOTION_SPLIT_SHA" \
-    ++env.config.reset_from_dataset.motion_split_role=eval \
-    ++env.config.reset_from_dataset.motion_split_offset="$OFFSET" \
-    ++env.config.reset_from_dataset.motion_split_limit="$NUM_ENVS" \
-    ++env.config.reset_from_dataset.motion_assignment_offset=0 \
-    ++env.config.reset_from_dataset.motion_split_verify_content=true \
-    ++simulator.config.render_results=false ++use_wandb=false
+(
+    cd "$GR00T_ROOT"
+    "$PYTHON_BIN" "$EVALUATOR" \
+        ++checkpoint="$STAGED_CHECKPOINT" ++num_envs="$NUM_ENVS" ++headless=true \
+        ++seed="$SEED" ++eval_output_dir="$OUTPUT_DIR" \
+        ++algo.config.eval.eval_num_envs_episodes=false \
+        ++algo.config.eval.num_eval_episodes=1 \
+        ++algo.config.eval.save_videos=false \
+        ++algo.config.eval.save_trajectories=false \
+        ++algo.config.eval.training_enabled=false \
+        ++algo.config.init_at_random_ep_len=false \
+        ++algo.config.videogen.enable=true \
+        ++algo.config.videogen.mode=image_dagger \
+        ++algo.config.videogen.raytraced_mix_prob=0.0 \
+        ++algo.config.videogen.image3f_endpoint_files="$ENDPOINT_LIST" \
+        '++algo.config.videogen.view_names=[head_color,hand_left,hand_right]' \
+        ++algo.config.videogen.reference_lag=256 \
+        ++algo.config.videogen.primary_view=head_color \
+        ++algo.config.videogen.seed="$SEED" \
+        ++algo.config.videogen.anchor_source=simulator_rgb \
+        '++simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]' \
+        ++simulator.config.cameras.policy_view_layout=vertical \
+        ++env.config.image_dagger_policy_view_count=3 \
+        ++env.config.safety_thresholds.contact_force_n=10.0 \
+        ++env.config.safety_thresholds.gravity_xy=0.5 \
+        ++env.config.safety_thresholds.min_base_height_m=0.3 \
+        ++env.config.safety_thresholds.dof_velocity_limit_fraction=0.98 \
+        ++env.config.safety_thresholds.torque_limit_fraction=0.98 \
+        ++env.config.safety_thresholds.min_object_height_m=0.6 \
+        ++env.config.safety_thresholds.right_arm_velocity_rad_s=3.14 \
+        ++env.config.reset_from_dataset.motion_split_manifest="$MOTION_SPLIT" \
+        ++env.config.reset_from_dataset.motion_split_manifest_sha256="$MOTION_SPLIT_SHA" \
+        ++env.config.reset_from_dataset.motion_split_role=eval \
+        ++env.config.reset_from_dataset.motion_split_offset="$OFFSET" \
+        ++env.config.reset_from_dataset.motion_split_limit="$NUM_ENVS" \
+        ++env.config.reset_from_dataset.motion_assignment_offset=0 \
+        ++env.config.reset_from_dataset.motion_split_verify_content=true \
+        ++simulator.config.render_results=false ++use_wandb=false \
+        hydra.run.dir="$OUTPUT_DIR/hydra" ++output_dir="$OUTPUT_DIR/output"
+)
+
+verify_staged_file "$STAGED_CHECKPOINT" "$CHECKPOINT_SHA" checkpoint
+verify_staged_file "$STAGED_CONFIG" "$CONFIG_SHA" "evaluation config"
+if [[ -n $POLICY_SPEC_SHA ]]; then
+    verify_staged_file "$STAGED_POLICY_SPEC" "$POLICY_SPEC_SHA" "policy spec"
+    verify_staged_file "$STAGED_POLICY_MANIFEST" "$POLICY_MANIFEST_SHA" \
+        "policy manifest"
+fi
 
 [[ -f $RUNTIME_OUTPUT && ! -L $RUNTIME_OUTPUT ]] || \
     fatal "evaluator did not publish immutable scenario capture evidence"

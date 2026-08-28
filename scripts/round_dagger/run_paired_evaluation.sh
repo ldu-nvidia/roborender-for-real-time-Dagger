@@ -142,7 +142,11 @@ if [[ -n $MOTION_SPLIT || -n $MOTION_SPLIT_SHA || -n $HELDOUT_PLAN || \
     [[ $(sha256sum "$HELDOUT_PLAN" | awk '{print $1}') == "$HELDOUT_PLAN_SHA" ]] || \
         fatal "held-out plan SHA mismatch"
 fi
-export PYTHONPATH="$REPOSITORY_ROOT:$GR00T_ROOT"
+# Isaac's container entrypoint contributes extension and Kit package roots to
+# PYTHONPATH.  Keep those paths after adding the sealed control/evaluator
+# sources; replacing them here makes an otherwise valid Isaac runtime fail at
+# import time.
+export PYTHONPATH="$REPOSITORY_ROOT:$GR00T_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 [[ $SCRATCH_ROOT == /* && -d $SCRATCH_ROOT && ! -L $SCRATCH_ROOT ]] || \
     fatal "scratch root must be an absolute, non-symlink directory"
 if [[ -n ${ROUND_DAGGER_EVALUATION_SOURCE_ROOT:-} ]]; then
@@ -413,6 +417,21 @@ cleanup_active_stage_on_exit() {
 }
 trap cleanup_active_stage_on_exit EXIT
 
+# The pinned production evaluation config predates the physical-safety signal.
+# Supply every required leaf explicitly so Hydra can compose that legacy config
+# while PhysicalSafetyThresholds.from_config remains strict and fail-closed.
+# These values are the approved production thresholds in the GR00T environment
+# contract; do not infer them from task-termination switches.
+PHYSICAL_SAFETY_OVERRIDES=(
+    ++env.config.safety_thresholds.contact_force_n=10.0
+    ++env.config.safety_thresholds.gravity_xy=0.5
+    ++env.config.safety_thresholds.min_base_height_m=0.3
+    ++env.config.safety_thresholds.dof_velocity_limit_fraction=0.98
+    ++env.config.safety_thresholds.torque_limit_fraction=0.98
+    ++env.config.safety_thresholds.min_object_height_m=0.6
+    ++env.config.safety_thresholds.right_arm_velocity_rad_s=3.14
+)
+
 while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_SHA; do
     [[ $ROLE == parent || $ROLE == candidate ]] || fatal "invalid role from contract"
     [[ $SEED =~ ^[0-9]+$ ]] || fatal "invalid seed from contract"
@@ -595,6 +614,7 @@ while IFS=$'\t' read -r ROLE SEED CHECKPOINT_REL CHECKPOINT_SHA RUNTIME_POLICY_S
         ++algo.config.videogen.anchor_source="$ANCHOR_SOURCE"
         '++simulator.config.cameras.policy_views=[head_color,hand_left,hand_right]'
         ++env.config.image_dagger_policy_view_count=3
+        "${PHYSICAL_SAFETY_OVERRIDES[@]}"
         ++algo.config.eval.training_enabled=false
         ++simulator.config.render_results=false ++use_wandb=false
         hydra.run.dir="$RESULT_DIR/hydra" ++output_dir="$RESULT_DIR/output")

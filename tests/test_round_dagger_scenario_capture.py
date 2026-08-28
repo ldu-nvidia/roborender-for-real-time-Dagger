@@ -6,6 +6,7 @@ import copy
 import ast
 import hashlib
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -675,6 +676,107 @@ class ScenarioCaptureTest(unittest.TestCase):
         )
         self.assertFalse(smoke_pass["runtime"]["release_eligible"])
         self.assertEqual(smoke_pass["served_requests"], 2)
+
+
+class ScenarioCaptureLauncherContractTest(unittest.TestCase):
+    """Keep the live capture CLI aligned with the evaluator's runtime needs."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repository = Path(__file__).resolve().parents[1]
+        cls.launcher = (
+            cls.repository / "scripts/round_dagger/run_heldout_scenario_capture.sh"
+        )
+        cls.source = cls.launcher.read_text(encoding="utf-8")
+
+    def test_cli_is_valid_and_documents_the_production_shape(self) -> None:
+        syntax = subprocess.run(
+            ["bash", "-n", str(self.launcher)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        help_result = subprocess.run(
+            [str(self.launcher), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        for option in (
+            "--plan",
+            "--checkpoint-sha256",
+            "--evaluation-config",
+            "--motion-split-sha256",
+            "--expected-renderers",
+            "--smoke2",
+        ):
+            self.assertIn(option, help_result.stdout)
+
+    def test_runtime_stages_exact_bundle_in_private_writable_namespace(self) -> None:
+        source = self.source
+        self.assertIn('INPUT_STAGE="$OUTPUT_DIR/evaluator_inputs"', source)
+        self.assertIn('mkdir "$INPUT_STAGE"', source)
+        self.assertIn('chmod 0700 "$INPUT_STAGE"', source)
+        self.assertIn("stage_exact_file()", source)
+        self.assertIn('install -m 0600 -- "$source" "$destination"', source)
+        self.assertIn('source_before == "$source_after"', source)
+        self.assertIn('destination_sha == "$expected_sha"', source)
+        self.assertIn(
+            'stage_exact_file "$CHECKPOINT" "$STAGED_CHECKPOINT" '
+            '"$CHECKPOINT_SHA" checkpoint',
+            source,
+        )
+        self.assertIn(
+            'stage_exact_file "$EVALUATION_CONFIG" "$STAGED_CONFIG" '
+            '"$CONFIG_SHA"',
+            source,
+        )
+        self.assertIn('SOURCE_POLICY_SPEC="${CHECKPOINT}.policy_spec.json"', source)
+        self.assertIn('SOURCE_POLICY_MANIFEST="${CHECKPOINT}.manifest.json"', source)
+        self.assertIn("-m round_dagger.policy_bundle", source)
+        self.assertIn("--expected-runtime-policy-sha256", source)
+        self.assertIn('"$ROUND_DAGGER_RUNTIME_POLICY_SHA256"', source)
+        self.assertIn('++checkpoint="$STAGED_CHECKPOINT"', source)
+        self.assertNotIn('++checkpoint="$CHECKPOINT"', source)
+        self.assertLess(
+            source.index('stage_exact_file "$CHECKPOINT"'),
+            source.index('++checkpoint="$STAGED_CHECKPOINT"'),
+        )
+        self.assertGreaterEqual(source.count("verify_staged_file"), 5)
+
+    def test_runtime_preserves_imports_and_supplies_fail_closed_overrides(self) -> None:
+        source = self.source
+        self.assertIn(
+            'export PYTHONPATH="$REPOSITORY_ROOT:$GR00T_ROOT'
+            '${PYTHONPATH:+:$PYTHONPATH}"',
+            source,
+        )
+        evaluator = source.index('"$PYTHON_BIN" "$EVALUATOR"')
+        self.assertLess(source.rindex('cd "$GR00T_ROOT"', 0, evaluator), evaluator)
+        self.assertIn('hydra.run.dir="$OUTPUT_DIR/hydra"', source)
+        self.assertIn('++output_dir="$OUTPUT_DIR/output"', source)
+        evaluator_source = (
+            self.repository / "GR00T-VisualSim2Real/gr00t/rl/eval_agent_trl.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'config_path = checkpoint.parent / "config.yaml"', evaluator_source
+        )
+        self.assertIn('STAGED_CONFIG="$INPUT_STAGE/config.yaml"', source)
+        approved_thresholds = {
+            "contact_force_n": "10.0",
+            "gravity_xy": "0.5",
+            "min_base_height_m": "0.3",
+            "dof_velocity_limit_fraction": "0.98",
+            "torque_limit_fraction": "0.98",
+            "min_object_height_m": "0.6",
+            "right_arm_velocity_rad_s": "3.14",
+        }
+        for name, value in approved_thresholds.items():
+            self.assertIn(
+                f"++env.config.safety_thresholds.{name}={value}", source
+            )
 
 
 if __name__ == "__main__":
