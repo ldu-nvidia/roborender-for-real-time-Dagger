@@ -16,6 +16,8 @@ from round_dagger.production_campaign_monitor import (
     _gpu_health_burst,
     _slurm_health,
     _tree_snapshot,
+    _wandb_remote_health,
+    _wandb_remote_progress,
     collect_report,
     run_monitor,
 )
@@ -370,6 +372,67 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
         self.assertEqual(report["progress_health"]["local_wandb_stale_polls"], 2)
         self.assertTrue(any("telemetry has not moved" in item for item in report["warnings"]))
         self.assertTrue(any("W&B artifacts have not moved" in item for item in report["warnings"]))
+
+    def test_remote_wandb_readback_is_campaign_bound_and_read_only(self) -> None:
+        netrc = self.base / ".netrc"
+        netrc.write_text(
+            "machine api.wandb.ai login user password hidden\n",
+            encoding="utf-8",
+        )
+        netrc.chmod(0o600)
+
+        class Run:
+            id = "run-1"
+            name = "round-0-actor"
+            state = "running"
+            updated_at = "2026-08-28T01:02:03Z"
+            lastHistoryStep = 17
+            config = {"round_dagger/campaign_id": "campaign"}
+
+        class Api:
+            viewer = {"email": "ldu@nvidia.com"}
+
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            def runs(self, _path, **_kwargs):
+                return [Run()]
+
+        fake_wandb = mock.Mock(Api=Api)
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            report = _wandb_remote_health(
+                entity="nvidia",
+                project="roborender-round-dagger",
+                expected_email="ldu@nvidia.com",
+                netrc_path=netrc,
+                campaign_id="campaign",
+            )
+        self.assertTrue(report["reachable"])
+        self.assertTrue(report["authorized"])
+        self.assertTrue(report["read_only"])
+        self.assertEqual(report["campaign_run_count"], 1)
+        self.assertEqual(report["runs"][0]["last_history_step"], 17)
+        self.assertNotIn("password", json.dumps(report).lower())
+
+    def test_remote_wandb_progress_detects_history_or_update_movement(self) -> None:
+        previous = {
+            "wandb_remote": {
+                "reachable": True,
+                "runs": [
+                    {"id": "run-1", "updated_at": "t1", "last_history_step": 4}
+                ],
+            }
+        }
+        unchanged = {
+            "reachable": True,
+            "runs": [{"id": "run-1", "updated_at": "t1", "last_history_step": 4}],
+        }
+        moved = {
+            "reachable": True,
+            "runs": [{"id": "run-1", "updated_at": "t2", "last_history_step": 5}],
+        }
+        self.assertFalse(_wandb_remote_progress(unchanged, previous))
+        self.assertTrue(_wandb_remote_progress(moved, previous))
 
 
 if __name__ == "__main__":
