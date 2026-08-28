@@ -1008,6 +1008,7 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
             7,
         )
         self.assertIn("$IMAGE3F_GENERATED_ROOT:/opt/roborender/assets/generated:ro", packed)
+
         self.assertGreaterEqual(
             packed.count("$GR00T_ROOT:/opt/GR00T-VisualSim2Real:ro"), 2
         )
@@ -1071,6 +1072,22 @@ class HsgGb200SmokeGateTests(unittest.TestCase):
         ).read_text()
         self.assertIn("export RUN_PROFILE=resume_minimal", wrapper)
         self.assertIn("DRY_RUN", submit)
+
+    def test_hsg_profiles_use_production_generated_rgb_reference_contract(self):
+        packed = (ROOT / "scripts/scaling/hsg_gb200_packed_smoke.sbatch").read_text()
+        self.assertIn("export REFERENCE_LAG=256", packed)
+        self.assertIn('--reference-lag "$REFERENCE_LAG"', packed)
+        self.assertIn(
+            '--require-reference-history --required-reference-lag "$REFERENCE_LAG"',
+            packed,
+        )
+        self.assertIn('export IMAGE3F_REFERENCE_LAG="$REFERENCE_LAG"', packed)
+        self.assertIn(
+            '++algo.config.videogen.reference_lag="$REFERENCE_LAG"', packed
+        )
+        self.assertNotIn("--reference-lag 0", packed)
+        self.assertNotIn("export IMAGE3F_REFERENCE_LAG=0", packed)
+        self.assertNotIn("++algo.config.videogen.reference_lag=0", packed)
 
     def test_resume_boundary_is_a_durable_checkpoint_stop_not_a_changed_target(self):
         callback_path = ROOT / (

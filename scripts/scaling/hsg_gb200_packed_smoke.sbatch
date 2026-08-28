@@ -67,6 +67,12 @@ export SLURM_EXPORT_ENV=ALL
 
 fatal() { echo "FATAL: $*" >&2; exit 2; }
 
+# The HSG path implements the production campaign's generated-RGB reference
+# policy: step 0 uses the state-aligned simulator bootstrap, steps 1..255 use
+# generated frame 0, and later steps use generated t-256.  Keep this immutable
+# here so smoke/calibration cannot silently exercise the legacy FT-FIXED path.
+export REFERENCE_LAG=256
+
 validate_calibration_run_directories() {
     local runtime_dir expected_run_root run_directory canonical
     [ "$RUN_PROFILE" = calibration_3view ] || return 0
@@ -1232,6 +1238,7 @@ done
 EP_LIST=$(python3 "$ROOT/scripts/scaling/image3f_probe.py" \
     --endpoint-dir "$FLEET_DIR/endpoints" --expected "$EXPECTED_RENDERERS" \
     --wait-timeout-s 60 --expected-release-id "$EXPECTED_IMAGE3F_RELEASE_ID" \
+    --require-reference-history --required-reference-lag "$REFERENCE_LAG" \
     --expected-adapter-sha256 "$EXPECTED_IMAGE3F_ADAPTER_SHA256" \
     --expected-engine-sha256 "$EXPECTED_IMAGE3F_ENGINE_SHA256" \
     --expected-inference-steps 5 --expected-teacache-threshold 0.3 \
@@ -1247,7 +1254,7 @@ EP_LIST=$(python3 "$ROOT/scripts/scaling/image3f_probe.py" \
 TRAIN_ABSOLUTE_TARGET=$NUM_ROLLOUT_ITERATIONS
 PLAN=(--global-envs "$GLOBAL_NUM_ENVS" --rollout-steps "$ROLLOUT_STEPS"
       --num-rollout-iterations "$TRAIN_ABSOLUTE_TARGET" --trainer-nodes "$TRAINER_RANKS"
-      --raytraced-mix 0.0 --envs-per-renderer 5 --reference-lag 0
+      --raytraced-mix 0.0 --envs-per-renderer 5 --reference-lag "$REFERENCE_LAG"
       --num-mini-batches 1 --per-device-train-batch-size 1
       --num-learning-epochs 1 --behavior-source annealed --teacher-rollout-ratio 0.0
       --beta-schedule linear --beta-start 1.0 --beta-end 0.0 --beta-decay-iters 500
@@ -1276,7 +1283,7 @@ export ROBORENDER_TELEMETRY_DIR="$TRAIN_RUN_DIR/telemetry"
 export IMAGE3F_ENDPOINT_DIR="$FLEET_DIR/endpoints"
 export IMAGE3F_ENDPOINT_MANIFEST="$FLEET_DIR/selected_endpoints.txt"
 export IMAGE3F_LOCAL_ENVS="$LOCAL_NUM_ENVS"
-export IMAGE3F_REFERENCE_LAG=0
+export IMAGE3F_REFERENCE_LAG="$REFERENCE_LAG"
 export IMAGE3F_EXPECT_OUTPUT_VIEWS=head_color,hand_left,hand_right
 export IMAGE3F_EXPECT_OUTPUT_SHAPE=240,416,3
 export IMAGE3F_REQUEST_TIMEOUT_S=120
@@ -1451,7 +1458,7 @@ run_train_phase() {
                 teacher_actor_path="$TEACHER_CKPT" \
                 "${SMOKE_DATASET_ARGS[@]}" \
                 algo.config.videogen.raytraced_mix_prob=0.0 ++algo.config.videogen.seed="$RANK_RENDER_SEED" \
-                ++algo.config.videogen.reference_lag=0 ++algo.config.videogen.primary_view=head_color \
+                ++algo.config.videogen.reference_lag="$REFERENCE_LAG" ++algo.config.videogen.primary_view=head_color \
                 simulator.config.cameras.policy_views="[head_color,hand_left,hand_right]" \
                 policy_view_count=3 ++env.config.image_dagger_policy_view_count=3 \
                 algo.config.videogen.image3f_endpoint_files="$EP_LIST" \
