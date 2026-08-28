@@ -274,7 +274,9 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             artifacts.sha256_file(self.contract),
         )
 
-    def test_validate_consumes_real_runtime_evidence_schema_via_materializer(self) -> None:
+    def test_validate_consumes_real_runtime_evidence_from_distinct_evaluation_seal(
+        self,
+    ) -> None:
         runtime_evidence = {
             "schema": "fast_roborender.round_dagger.production_runtime_contract.v1",
             "status": "release_eligible",
@@ -318,7 +320,7 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             learner_contract_sha256="a" * 64,
             sealed_source_root=Path("/remote/sealed/source"),
             sealed_source_inventory_sha256=SHA,
-            evaluation_sealed_source_root=ROOT,
+            evaluation_sealed_source_root=self.evaluation_source,
             evaluation_sealed_source_inventory_sha256="e" * 64,
             launcher=ROOT / "scripts/round_dagger/launch_production_macro_round.sh",
             launcher_sha256="b" * 64,
@@ -342,6 +344,27 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             runtime_contract_path=self.contract,
             runtime_contract_sha256=artifacts.sha256_file(self.contract),
         )
+
+    def test_validate_rejects_relative_evaluation_seal(self) -> None:
+        relative = DriverInputs(
+            campaign_root=self.campaign_root,
+            campaign_contract=self.contract,
+            campaign_contract_sha256=artifacts.sha256_file(self.contract),
+            learner_contract=ROOT
+            / "configs/round_dagger/production_learner_8xh100_1200.json",
+            learner_contract_sha256="a" * 64,
+            sealed_source_root=Path("/remote/sealed/source"),
+            sealed_source_inventory_sha256=SHA,
+            evaluation_sealed_source_root=Path("relative-evaluation-seal"),
+            evaluation_sealed_source_inventory_sha256="e" * 64,
+            launcher=ROOT / "scripts/round_dagger/launch_production_macro_round.sh",
+            launcher_sha256="b" * 64,
+            control_root=self.control_root,
+        )
+        with self.assertRaisesRegex(
+            ProductionDriverError, "evaluation sealed source root must be absolute"
+        ):
+            relative.validate()
 
     def test_campaign_global_lock_is_exclusive(self) -> None:
         with ExclusiveCampaignLock(self.campaign_root):

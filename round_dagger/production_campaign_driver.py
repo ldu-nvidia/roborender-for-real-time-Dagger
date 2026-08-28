@@ -170,6 +170,10 @@ class DriverInputs:
         if self.heartbeat_seconds <= 0:
             raise ProductionDriverError("heartbeat_seconds must be positive")
         _lstat_directory(self.campaign_root, "campaign root")
+        if not self.evaluation_sealed_source_root.is_absolute():
+            raise ProductionDriverError(
+                "evaluation sealed source root must be absolute"
+            )
         _lstat_directory(self.evaluation_sealed_source_root, "evaluation sealed source")
         if not self.sealed_source_root.is_absolute():
             raise ProductionDriverError("sealed source root must be absolute")
@@ -195,14 +199,19 @@ class DriverInputs:
         expected_learner = (
             repository_root / "configs/round_dagger/production_learner_8xh100_1200.json"
         )
-        if self.evaluation_sealed_source_root.resolve(strict=True) != repository_root:
-            raise ProductionDriverError(
-                "driver must execute from the exact evaluation sealed source root"
-            )
+        # The driver and actor hooks deliberately execute from the live RTX
+        # checkout whose revisions are matched to the remote learner seal by
+        # production_launch.  Evaluation consumes a separate immutable local
+        # seal, which production_launch verifies by inventory before any
+        # orchestration begins.  Requiring these roots to be identical makes
+        # that intended three-root deployment impossible: a source tree cannot
+        # be both the live Git checkout and the read-only evaluation seal.
         if self.launcher != expected_launcher:
-            raise ProductionDriverError("launcher must belong to the driver sealed source")
+            raise ProductionDriverError("launcher must belong to the driver source root")
         if self.learner_contract != expected_learner:
-            raise ProductionDriverError("learner contract must belong to the driver sealed source")
+            raise ProductionDriverError(
+                "learner contract must belong to the driver source root"
+            )
         try:
             learner_contract = artifacts.load_strict_json(self.learner_contract)
             campaign = state.load_campaign(self.campaign_root)

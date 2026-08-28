@@ -420,6 +420,22 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(campaign["telemetry"]["clip_every_steps"], 300)
         self.assertEqual(campaign["wandb"]["expected_email"], "ldu@nvidia.com")
         self.assertEqual(campaign["wandb"]["entity"], "nvidia")
+        self.assertEqual(
+            campaign["artifacts"]["teacher"]["checkpoint_path"],
+            str(ROOT / production_launch.TEACHER_CHECKPOINT_RELATIVE),
+        )
+        self.assertEqual(
+            campaign["actor_runtime"]["gr00t_root"],
+            str(ROOT / "GR00T-VisualSim2Real"),
+        )
+        self.assertEqual(
+            campaign["actor_runtime"]["pair_executor"],
+            str(ROOT / "scripts/round_dagger/run_actor_rank_docker.sh"),
+        )
+        self.assertEqual(
+            campaign["actor_runtime"]["pair_rank_script"],
+            str(ROOT / "scripts/round_dagger/run_actor_cohort_with_wandb.sh"),
+        )
         thresholds = artifacts.load_strict_json(
             ROOT / campaign["evaluation"]["threshold_contract"]
         )
@@ -1034,6 +1050,35 @@ class ProductionLaunchTests(unittest.TestCase):
             )
 
     def test_contract_mutation_and_unsafe_source_path_fail_closed(self) -> None:
+        for label, mutate, expected_error in (
+            (
+                "teacher",
+                lambda document: document["artifacts"]["teacher"].__setitem__(
+                    "checkpoint_path", "/tmp/substituted-teacher.pt"
+                ),
+                "teacher checkpoint path mismatch",
+            ),
+            (
+                "actor",
+                lambda document: document["actor_runtime"].__setitem__(
+                    "pair_executor", "/tmp/substituted-actor.sh"
+                ),
+                "actor runtime mismatch",
+            ),
+        ):
+            with self.subTest(source_owned_path=label):
+                campaign = artifacts.load_strict_json(CAMPAIGN_CONTRACT)
+                mutate(campaign)
+                path = self.base / f"campaign-{label}.json"
+                path.write_text(
+                    json.dumps(campaign, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    production_launch.ProductionLaunchError, expected_error
+                ):
+                    production_launch.load_campaign_contract(path)
+
         learner = artifacts.load_strict_json(LEARNER_CONTRACT)
         learner["optimization"]["optimizer_steps"] = 499
         mutated = self.base / "learner.json"
