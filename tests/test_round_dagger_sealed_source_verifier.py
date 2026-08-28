@@ -150,6 +150,20 @@ class SealedSourceVerifierTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["schema"], verifier.REPORT_SCHEMA)
 
+    def test_filesystem_forced_directory_setgid_is_non_writable_and_allowed(self) -> None:
+        fixture = SealedSourceFixture(self)
+        for path in (fixture.gr00t, fixture.root):
+            path.chmod(stat.S_ISGID | 0o555)
+        report = verifier.verify(fixture.root, fixture.inventory_sha)
+        self.assertEqual(report["status"], "PASS")
+
+        fixture.root.chmod(0o555)
+        fixture.gr00t.chmod(stat.S_ISVTX | 0o555)
+        with self.assertRaisesRegex(
+            verifier.VerificationError, "optional filesystem-forced setgid"
+        ):
+            verifier.verify(fixture.root, fixture.inventory_sha)
+
     def test_inventory_sha_must_be_well_formed_and_exactly_pinned(self) -> None:
         fixture = SealedSourceFixture(self)
         with self.assertRaisesRegex(verifier.VerificationError, "malformed"):
@@ -193,7 +207,7 @@ class SealedSourceVerifierTests(unittest.TestCase):
                 else:
                     (fixture.root / "module.py").chmod(0o444 | stat.S_ISUID)
                 with self.assertRaisesRegex(
-                    verifier.VerificationError, "writable|mode must be exactly|mode is invalid"
+                    verifier.VerificationError, "writable|mode must be|mode is invalid"
                 ):
                     verifier.verify(fixture.root, fixture.inventory_sha)
 

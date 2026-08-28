@@ -32,6 +32,20 @@ class VerificationError(RuntimeError):
     """The source snapshot does not satisfy the sealed-source contract."""
 
 
+def _sealed_directory_mode(mode: int) -> bool:
+    """Accept read/execute-only directories plus filesystem-forced setgid.
+
+    Some managed parallel filesystems (including the production OCI Lustre
+    mount) force the setgid bit on every directory so children inherit the
+    allocation group.  Setgid does not grant write access.  Continue to reject
+    every write bit, setuid, sticky bit, and any ordinary permission other than
+    ``0555``.
+    """
+
+    permissions = stat.S_IMODE(mode)
+    return permissions in {0o555, stat.S_ISGID | 0o555}
+
+
 def _exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
     missing = sorted(expected - value.keys())
     unexpected = sorted(value.keys() - expected)
@@ -190,8 +204,11 @@ def _tree_records(root: Path) -> tuple[list[dict[str, Any]], str, str]:
         raise VerificationError(f"sealed source root is unavailable: {root}") from exc
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         raise VerificationError(f"sealed source root must be a real directory: {root}")
-    if root_stat.st_mode & 0o222 or stat.S_IMODE(root_stat.st_mode) != 0o555:
-        raise VerificationError(f"sealed source root mode must be exactly 0o555: {root}")
+    if not _sealed_directory_mode(root_stat.st_mode):
+        raise VerificationError(
+            "sealed source root mode must be 0o555 with only optional "
+            f"filesystem-forced setgid: {root}"
+        )
 
     files: list[tuple[str, Path, int]] = []
     directories = [root]
@@ -220,9 +237,10 @@ def _tree_records(root: Path) -> tuple[list[dict[str, Any]], str, str]:
                     raise VerificationError(
                         f"sealed source contains executable bytecode directory: {relative}"
                     )
-                if mode & 0o222 or stat.S_IMODE(mode) != 0o555:
+                if not _sealed_directory_mode(mode):
                     raise VerificationError(
-                        f"sealed source directory mode must be exactly 0o555: {relative}"
+                        "sealed source directory mode must be 0o555 with only "
+                        f"optional filesystem-forced setgid: {relative}"
                     )
                 directories.append(path)
                 continue
