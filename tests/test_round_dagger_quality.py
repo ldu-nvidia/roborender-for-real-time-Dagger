@@ -264,9 +264,14 @@ class StudentQualityTest(unittest.TestCase):
             function.index("publish_student_quality"),
         )
         owner_wait = script.index('OWNER_ACTOR_STATUS=$(tr -d')
-        watcher_finish = script.index(': >"$WANDB_PAIR_FINISH"', owner_wait)
         pre_drain = script.index("if finalize_completed_cohort; then", owner_wait)
-        self.assertLess(pre_drain, watcher_finish)
+        terminal_and_finish = script.index(
+            "if ! publish_attempt_terminal; then", pre_drain
+        )
+        watcher_reaped = script.index('wait "$OWNER_PID"', terminal_and_finish)
+        self.assertLess(pre_drain, terminal_and_finish)
+        self.assertLess(terminal_and_finish, watcher_reaped)
+        self.assertIn('command+=(--finish-marker "$WANDB_PAIR_FINISH")', script)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,9 @@ import contextlib
 import io
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,12 +15,14 @@ from scripts.scaling import wandb_run_watcher as watcher
 
 
 class FakeRun:
-    def __init__(self, failures_remaining=0):
+    def __init__(self, failures_remaining=0, finish_failure=False):
         self.logs = []
         self.metrics = []
         self.finished = False
+        self.summary = {}
         self.failures_remaining = failures_remaining
         self.log_attempts = 0
+        self.finish_failure = finish_failure
 
     def log(self, payload):
         self.log_attempts += 1
@@ -30,6 +35,8 @@ class FakeRun:
         self.metrics.append((args, kwargs))
 
     def finish(self, exit_code=None):
+        if self.finish_failure:
+            raise RuntimeError("sender did not drain")
         self.finished = True
         self.exit_code = exit_code
 
@@ -195,6 +202,9 @@ class WandbRunWatcherTest(unittest.TestCase):
             self.assertTrue(any("loss/dagger_bc_loss" in entry for entry in fake_run.logs))
             self.assertTrue(any("media/image/triplet" in entry for entry in fake_run.logs))
             self.assertTrue(any("media/video/rollout" in entry for entry in fake_run.logs))
+            self.assertEqual(watcher.load_state(state_file), {})
+            fake_run.finish(exit_code=0)
+            upload.commit_state()
             self.assertEqual(len(watcher.load_state(state_file)), 3)
 
             scalar.write_text(
@@ -236,9 +246,53 @@ class WandbRunWatcherTest(unittest.TestCase):
 
             self.assertEqual(fake_run.log_attempts, 3)
             self.assertEqual([entry["trainer_step"] for entry in fake_run.logs], [2, 1])
+            fake_run.finish(exit_code=0)
+            upload.commit_state()
             self.assertEqual(len(watcher.load_state(state_file)), 2)
             self.assertIn("upload deferred", stderr.getvalue())
             self.assertNotIn("transient upload failure", stderr.getvalue())
+
+    def test_unfinished_session_is_replayed_and_only_finish_is_acknowledged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scalar_dir = root / "telemetry" / "scalars"
+            scalar_dir.mkdir(parents=True)
+            scalar = scalar_dir / "step_000003.json"
+            scalar.write_text(
+                json.dumps({"step": 3, "metrics": {"quality/error": 0.25}}),
+                encoding="utf-8",
+            )
+            state_file = root / "telemetry" / ".state.json"
+            first_run = FakeRun()
+            first = watcher.WandbArtifactWatcher(
+                run_dir=root,
+                wandb_module=FakeWandb(),
+                wandb_run=first_run,
+                state_file=state_file,
+                run_id="stable_run",
+                min_age_s=0,
+            )
+            self.assertEqual(first.scan_once(now=10**12), 1)
+            self.assertEqual(
+                watcher.load_state(state_file, expected_run_id="stable_run"), {}
+            )
+
+            # Simulate a process crash before finish: a new watcher must replay.
+            second_run = FakeRun()
+            second = watcher.WandbArtifactWatcher(
+                run_dir=root,
+                wandb_module=FakeWandb(),
+                wandb_run=second_run,
+                state_file=state_file,
+                run_id="stable_run",
+                min_age_s=0,
+            )
+            self.assertEqual(second.scan_once(now=10**12), 1)
+            second_run.finish(exit_code=0)
+            second.commit_state()
+            self.assertEqual(
+                len(watcher.load_state(state_file, expected_run_id="stable_run")), 1
+            )
 
     def test_bad_artifact_is_quarantined_while_valid_scalar_uploads(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -269,6 +323,37 @@ class WandbRunWatcherTest(unittest.TestCase):
             self.assertEqual(upload.last_scan_error_count, 1)
             self.assertIn("invalid image artifact", stderr.getvalue())
             self.assertNotIn(str(root), stderr.getvalue())
+
+    def test_once_fails_when_discovery_quarantines_an_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            images = root / "telemetry" / "images"
+            images.mkdir(parents=True)
+            (images / "missing_step_name.png").write_bytes(b"invalid")
+            fake_wandb = FakeWandb()
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
+            arguments = [
+                "--run-dir", str(root), "--project", "dagger",
+                "--expected-email", "ldu@nvidia.com", "--entity", "nvidia",
+                "--authorization-scope", "team", "--min-age-s", "0", "--once",
+            ]
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), \
+                 mock.patch.object(watcher, "_load_wandb", return_value=fake_wandb), \
+                 mock.patch.object(watcher, "query_identity", return_value=identity):
+                self.assertEqual(watcher.main(arguments), 2)
+
+            self.assertTrue(fake_wandb.runs[0].finished)
+            self.assertEqual(fake_wandb.runs[0].exit_code, 2)
+            self.assertFalse(
+                (root / "telemetry" / "WANDB_DELIVERY_RECEIPT.json").exists()
+            )
 
     def test_ready_marker_is_atomic_and_contains_no_credentials(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -321,6 +406,57 @@ class WandbRunWatcherTest(unittest.TestCase):
             watcher.save_state(state_file, {"x": "y"}, run_id="other_run")
             with self.assertRaisesRegex(watcher.ArtifactError, "different sidecar run"):
                 watcher.bind_state_to_run(state_file, first)
+
+    def test_sigkill_during_run_id_stage_never_exposes_partial_final(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "telemetry" / "WANDB_SIDECAR_RUN_ID"
+            code = """
+import os
+import signal
+import sys
+from pathlib import Path
+from scripts.scaling import wandb_run_watcher as watcher
+
+real_fsync = watcher.os.fsync
+def crash_after_staging_fsync(descriptor):
+    real_fsync(descriptor)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+watcher.os.fsync = crash_after_staging_fsync
+watcher.load_or_create_run_id(Path(sys.argv[1]))
+"""
+            killed = subprocess.run(
+                [sys.executable, "-c", code, str(path)],
+                check=False,
+            )
+            self.assertEqual(killed.returncode, -signal.SIGKILL)
+            staging = path.parent / f".{path.name}.staging"
+            self.assertFalse(path.exists())
+            self.assertTrue(staging.is_file())
+
+            recovered = watcher.load_or_create_run_id(path)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), recovered)
+            self.assertIsNotNone(watcher.RUN_ID_RE.fullmatch(recovered))
+            self.assertFalse(staging.exists())
+
+    def test_run_id_recovery_rejects_unsafe_staging_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "telemetry" / "WANDB_SIDECAR_RUN_ID"
+            path.parent.mkdir(parents=True)
+            victim = path.parent / "victim"
+            victim.write_text("do not remove\n", encoding="utf-8")
+            staging = path.parent / f".{path.name}.staging"
+            try:
+                staging.symlink_to(victim)
+            except OSError:
+                self.skipTest("symlinks are not available")
+            with self.assertRaisesRegex(
+                watcher.ArtifactError, "staging artifact is unsafe"
+            ):
+                watcher.load_or_create_run_id(path)
+            self.assertTrue(staging.is_symlink())
+            self.assertEqual(victim.read_text(encoding="utf-8"), "do not remove\n")
+            self.assertFalse(path.exists())
 
     def test_malformed_or_symlinked_run_id_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -403,6 +539,86 @@ class WandbRunWatcherTest(unittest.TestCase):
                 self.assertTrue(call["config"]["team_member"])
                 self.assertTrue(call["config"]["entity_is_team"])
                 self.assertFalse(call["config"]["personal"])
+
+    def test_remote_finish_failure_does_not_advance_upload_cursor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scalar_dir = root / "telemetry" / "scalars"
+            scalar_dir.mkdir(parents=True)
+            (scalar_dir / "step_000004.json").write_text(
+                json.dumps({"step": 4, "metrics": {"quality/mse": 0.5}}),
+                encoding="utf-8",
+            )
+            fake_wandb = FakeWandb()
+            failed_run = FakeRun(finish_failure=True)
+            fake_wandb.init = mock.Mock(return_value=failed_run)
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
+            arguments = [
+                "--run-dir", str(root), "--project", "dagger",
+                "--expected-email", "ldu@nvidia.com", "--entity", "nvidia",
+                "--authorization-scope", "team", "--min-age-s", "0", "--once",
+            ]
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), \
+                 mock.patch.object(watcher, "_load_wandb", return_value=fake_wandb), \
+                 mock.patch.object(watcher, "query_identity", return_value=identity), \
+                 contextlib.redirect_stderr(stderr):
+                self.assertEqual(watcher.main(arguments), 2)
+
+            state_file = root / "telemetry" / ".wandb_upload_state.json"
+            run_id = (
+                root / "telemetry" / "WANDB_SIDECAR_RUN_ID"
+            ).read_text(encoding="utf-8").strip()
+            self.assertEqual(
+                watcher.load_state(state_file, expected_run_id=run_id), {}
+            )
+            self.assertIn("remote finish failed", stderr.getvalue())
+
+    def test_successful_terminal_drain_writes_final_summary_and_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scalars = root / "telemetry" / "scalars"
+            scalars.mkdir(parents=True)
+            (scalars / "step_000000_actor_pair_terminal_attempt.json").write_text(
+                json.dumps(
+                    {
+                        "step": 0,
+                        "metrics": {
+                            "collection/terminal_pending": 1,
+                            "collection/succeeded": 0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_wandb = FakeWandb()
+            identity = SimpleNamespace(
+                entity="nvidia", email="ldu@nvidia.com",
+                authorization_scope="team", team_member=True,
+                entity_is_team=True, personal=False,
+            )
+            arguments = [
+                "--run-dir", str(root), "--project", "dagger",
+                "--expected-email", "ldu@nvidia.com", "--entity", "nvidia",
+                "--authorization-scope", "team", "--min-age-s", "0", "--once",
+            ]
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), \
+                 mock.patch.object(watcher, "_load_wandb", return_value=fake_wandb), \
+                 mock.patch.object(watcher, "query_identity", return_value=identity):
+                self.assertEqual(watcher.main(arguments), 0)
+            self.assertEqual(fake_wandb.runs[0].summary["collection/succeeded"], 1)
+            self.assertEqual(fake_wandb.runs[0].summary["collection/terminal_pending"], 0)
+            receipt = json.loads(
+                (root / "telemetry" / "WANDB_DELIVERY_RECEIPT.json").read_text()
+            )
+            self.assertEqual(receipt["outcome"], "SUCCEEDED")
 
     def test_precreated_id_without_initialized_marker_recovers_with_allow(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -615,6 +831,104 @@ class WandbRunWatcherTest(unittest.TestCase):
             min_age_s=5.0,
         )
         self.assertTrue(complete)
+
+    def test_finish_marker_propagates_actor_failure_to_wandb_finish(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            finish = root / "actor_pair_finish"
+            finish.write_text("2\n", encoding="ascii")
+            fake_wandb = FakeWandb()
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
+            arguments = [
+                "--run-dir",
+                str(root),
+                "--project",
+                "dagger",
+                "--expected-email",
+                "ldu@nvidia.com",
+                "--entity",
+                "nvidia",
+                "--authorization-scope",
+                "team",
+                "--poll-interval-s",
+                "0.01",
+                "--min-age-s",
+                "0",
+                "--finish-marker",
+                finish.name,
+            ]
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), mock.patch.object(
+                watcher, "_load_wandb", return_value=fake_wandb
+            ), mock.patch.object(watcher, "query_identity", return_value=identity):
+                self.assertEqual(watcher.main(arguments), 2)
+
+            self.assertEqual(fake_wandb.runs[0].exit_code, 2)
+            self.assertTrue(fake_wandb.runs[0].finished)
+
+    def test_runtime_expiry_without_terminal_marker_finishes_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_wandb = FakeWandb()
+            identity = SimpleNamespace(
+                entity="nvidia",
+                email="ldu@nvidia.com",
+                authorization_scope="team",
+                team_member=True,
+                entity_is_team=True,
+                personal=False,
+            )
+            arguments = [
+                "--run-dir",
+                str(root),
+                "--project",
+                "dagger",
+                "--expected-email",
+                "ldu@nvidia.com",
+                "--entity",
+                "nvidia",
+                "--authorization-scope",
+                "team",
+                "--poll-interval-s",
+                "0.001",
+                "--min-age-s",
+                "0",
+                "--max-runtime-s",
+                "0.001",
+            ]
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"RANK": "0"}, clear=False), mock.patch.object(
+                watcher, "_load_wandb", return_value=fake_wandb
+            ), mock.patch.object(
+                watcher, "query_identity", return_value=identity
+            ), contextlib.redirect_stderr(stderr):
+                self.assertEqual(watcher.main(arguments), 2)
+
+            self.assertEqual(fake_wandb.runs[0].exit_code, 2)
+            self.assertIn("expired before terminal marker", stderr.getvalue())
+
+    def test_finish_marker_rejects_symlinks_and_unknown_exit_codes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            invalid = root / "invalid"
+            invalid.write_text("17\n", encoding="ascii")
+            with self.assertRaisesRegex(watcher.ArtifactError, "invalid"):
+                watcher.load_finish_exit_code(invalid)
+            target = root / "target"
+            target.write_text("2\n", encoding="ascii")
+            link = root / "link"
+            try:
+                link.symlink_to(target)
+            except OSError:
+                self.skipTest("symlinks are not available")
+            with self.assertRaisesRegex(watcher.ArtifactError, "non-symlink"):
+                watcher.load_finish_exit_code(link)
 
     def test_nonzero_rank_main_is_a_noop_before_loading_wandb(self):
         with mock.patch.dict(os.environ, {"RANK": "1"}, clear=False), mock.patch.object(

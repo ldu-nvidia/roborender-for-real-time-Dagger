@@ -184,6 +184,7 @@ class PairedEvaluationTest(unittest.TestCase):
                 "success": index % 2 == 0,
                 "safety_violation": False,
                 "action_imitation_mse": 1.0,
+                "episode_return": float(index),
                 "episode_length": 300,
             }
             for index in range(256)
@@ -206,6 +207,7 @@ class PairedEvaluationTest(unittest.TestCase):
                 "success": index % 2 == 0,
                 "safety_violation": False,
                 "action_imitation_mse": 1.0,
+                "episode_return": float(index),
                 "episode_length": 300,
                 "live_reset_state_sha256": _sha(f"reset:{index}"),
             }
@@ -1177,6 +1179,15 @@ class PairedEvaluationTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             report["metrics"]["paired_action_imitation_mse_relative_change"], -0.2
+        )
+        self.assertAlmostEqual(
+            report["metrics"]["parent_episode_return_mean"], 1.5
+        )
+        self.assertAlmostEqual(
+            report["metrics"]["candidate_episode_return_mean"], 1.5
+        )
+        self.assertAlmostEqual(
+            report["metrics"]["paired_episode_return_mean_delta"], 0.0
         )
         evaluator_result = result["evaluator_result"]
         self.assertEqual(evaluator_result["schema"], EVALUATOR_RESULT_SCHEMA)

@@ -63,16 +63,16 @@ PRODUCTION_CONTRACT_RELATIVE_PATH = Path(
     "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json"
 )
 HELDOUT_SOURCE_ROOT = Path(
-    "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1"
+    "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829"
 )
 HELDOUT_SNAPSHOT_FILE_SHA256 = (
-    "cea0ee36b228c611635af8dd23b83db3bdaa0fcea493acd57379f080273fdbc8"
+    "42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9"
 )
 HELDOUT_SNAPSHOT_SHA256 = (
-    "c72e5b1329ad62f2286021efa757cae7a1d748d0bfb66b6c63642be25b72162f"
+    "c80ee79dae99bb048f9f75bb38aae75fb3e305e665eedfc83d43470babd08bde"
 )
 PRODUCTION_CONTRACT_SHA256 = (
-    "b25900118e34f514ecaa2b08bf423cd3ecad3e1c5ca081a95431867357e2f442"
+    "e4a1d23a3426d879aac93f934eb9e213a657b0451b54f4f4918e425a357d73e5"
 )
 TRAIN_STEPS = 100
 STOP_STEP = 50

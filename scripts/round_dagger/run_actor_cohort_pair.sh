@@ -35,6 +35,7 @@ else
 fi
 STAGGER_SECONDS=${ROUND_DAGGER_ACTOR_PAIR_STAGGER_SECONDS:-10}
 WANDB_ENABLED=${ROUND_DAGGER_WANDB_ENABLED:-0}
+WANDB_RECOVERY_EXECUTOR_DEFAULT=$ROOT/scripts/round_dagger/run_wandb_recovery_docker.sh
 case "${WANDB_ENABLED,,}" in
     0|false|no) WANDB_REQUESTED=0; WANDB_PAIR=0 ;;
     1|true|yes)
@@ -50,6 +51,19 @@ case "${WANDB_ENABLED,,}" in
         ;;
     *) echo "ROUND_DAGGER_WANDB_ENABLED must be boolean" >&2; exit 2 ;;
 esac
+
+WANDB_RECOVERY_EXECUTOR=${ROUND_DAGGER_WANDB_RECOVERY_EXECUTOR:-$WANDB_RECOVERY_EXECUTOR_DEFAULT}
+if [ "$WANDB_PAIR" = 1 ]; then
+    case "$WANDB_RECOVERY_EXECUTOR" in /*) ;; *) echo "W&B recovery executor must be absolute" >&2; exit 2 ;; esac
+    [ -f "$WANDB_RECOVERY_EXECUTOR" ] && [ ! -L "$WANDB_RECOVERY_EXECUTOR" ] || {
+        echo "unsafe or missing W&B recovery executor" >&2; exit 2;
+    }
+    if [[ ${ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH:-0} == 1 &&
+          $WANDB_RECOVERY_EXECUTOR != "$WANDB_RECOVERY_EXECUTOR_DEFAULT" ]]; then
+        echo "production W&B recovery executor must come from the sealed actor source" >&2
+        exit 2
+    fi
+fi
 
 case "$COHORT_DIR:$TRAIN_DIR:$ACTOR_RUN_DIR:$RANK_SCRIPT:$ENDPOINT_MANIFEST" in
     /*:/*:/*:/*:/*) ;;
@@ -136,6 +150,36 @@ publish_student_quality() {
                 "${ROUND_DAGGER_CONFIG_SHA256:?missing ROUND_DAGGER_CONFIG_SHA256}"
 }
 
+verify_wandb_delivery() {
+    [ "$WANDB_PAIR" = 1 ] || return 0
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m round_dagger.wandb_delivery verify --run-dir "$TRAIN_DIR"
+}
+
+recover_wandb_delivery() {
+    [ "$WANDB_PAIR" = 1 ] || return 0
+    ROUND_DAGGER_WANDB_RECOVERY_IN_CONTAINER=0 \
+        /usr/bin/env bash "$WANDB_RECOVERY_EXECUTOR" && \
+        verify_wandb_delivery
+}
+
+publish_recovery_terminal() {
+    local recovery_attempt terminal
+    recovery_attempt=$(mktemp -d \
+        "$TRAIN_DIR/actor_pair_attempts/wandb_recovery_$(date -u +%Y%m%dT%H%M%SZ)_$$_XXXXXXXX")
+    terminal=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m round_dagger.actor_pair_terminal \
+            --attempt-dir "$recovery_attempt" --run-dir "$TRAIN_DIR" \
+            --cohort-dir "$COHORT_DIR" \
+            --campaign-id "${ROUND_DAGGER_CAMPAIGN_ID:?missing ROUND_DAGGER_CAMPAIGN_ID}" \
+            --macro-round "${ROUND_DAGGER_MACRO_ROUND:?missing ROUND_DAGGER_MACRO_ROUND}" \
+            --cohort-index "${ROUND_DAGGER_COHORT_INDEX:?missing ROUND_DAGGER_COHORT_INDEX}" \
+            --rank0-exit-code 0 --rank1-exit-code 0 \
+            --lifecycle-exit-code 0 --quality-exit-code 0 \
+            --wandb-wrapper-exit-code 0 --delivery-pending) || return $?
+    printf '%s\n' "$terminal"
+}
+
 # Serialize lifecycle ownership for this cohort.  If the outer launcher dies,
 # a surviving rank retains the descriptor until it exits; a retry therefore
 # cannot overlap and claim the same immutable shard or stream ownership.
@@ -146,6 +190,13 @@ flock -n "$PAIR_LOCK_FD" || {
     echo "another actor-pair attempt is still active for this cohort" >&2; exit 2;
 }
 
+# A SIGKILL can strand only the hidden same-directory NPZ temporary that the
+# immutable publisher had not linked into the canonical namespace.  With the
+# pair lock held, no exporter can still be writing it.  Delete only that exact
+# implementation-owned name; unknown hidden entries remain fail-closed.
+TEMP_CLEANUP_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m round_dagger.actor_pair prune-temps --cohort-dir "$COHORT_DIR")
+
 STATUS_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -m round_dagger.actor_pair status --cohort-dir "$COHORT_DIR")
 read -r SEALED STATE0 STATE1 < <(python3 -c \
@@ -153,8 +204,9 @@ read -r SEALED STATE0 STATE1 < <(python3 -c \
     <<<"$STATUS_JSON")
 
 for rank_state in "$STATE0" "$STATE1"; do
-    [[ "$rank_state" == empty || "$rank_state" == complete ]] || {
-        echo "actor pair contains a partial rank; refusing to overwrite immutable evidence" >&2
+    [[ "$rank_state" == empty || "$rank_state" == resumable || \
+       "$rank_state" == complete ]] || {
+        echo "actor pair contains a non-resumable rank state" >&2
         exit 2
     }
 done
@@ -197,6 +249,10 @@ if [ "$SEALED" = 1 ]; then
     fi
     if [ "$DRY_RUN" != 1 ]; then
         publish_student_quality
+        if [ "$WANDB_PAIR" = 1 ] && ! verify_wandb_delivery; then
+            publish_recovery_terminal
+            recover_wandb_delivery
+        fi
     fi
     printf '%s\n' "$STATUS_JSON"
     echo "ACTOR_PAIR_ALREADY_SEALED_STREAMS_CLEAN"
@@ -205,9 +261,9 @@ fi
 
 LAUNCH_RANKS=()
 for rank in 0 1; do
-    if [ "${rank}" = 0 ] && [ "$STATE0" = empty ]; then
+    if [ "${rank}" = 0 ] && [ "$STATE0" != complete ]; then
         LAUNCH_RANKS+=(0)
-    elif [ "${rank}" = 1 ] && [ "$STATE1" = empty ]; then
+    elif [ "${rank}" = 1 ] && [ "$STATE1" != complete ]; then
         LAUNCH_RANKS+=(1)
     fi
 done
@@ -217,10 +273,10 @@ if [ "${#LAUNCH_RANKS[@]}" -eq 0 ]; then
         echo "DRY_RUN_ACTOR_PAIR_ALREADY_COMPLETE no_cleanup=1 no_seal=1"
         exit 0
     fi
-    if [ "$WANDB_REQUESTED" = 1 ]; then
-        echo "unsealed W&B cohort has no incomplete actor available to own telemetry recovery" >&2
-        exit 2
-    fi
+    # Both immutable ranks can survive loss of their former supervisor after
+    # export but before sealing.  No actor (and therefore no pair-local W&B
+    # owner) needs to be relaunched: finalize the exact cohort and publish the
+    # shared quality projection for the campaign telemetry bridge.
     CLEANUP_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m "$LIFECYCLE_MODULE" cleanup \
             --train-dir "$TRAIN_DIR" --cohort-dir "$COHORT_DIR" \
@@ -231,6 +287,24 @@ if [ "${#LAUNCH_RANKS[@]}" -eq 0 ]; then
         python3 -m round_dagger.actor_pair seal --cohort-dir "$COHORT_DIR")
     printf '%s\n' "$SEALED_JSON"
     publish_student_quality
+    RECOVERY_ATTEMPT_DIR=$(mktemp -d \
+        "$TRAIN_DIR/actor_pair_attempts/recovered_complete_$(date -u +%Y%m%dT%H%M%SZ)_$$_XXXXXXXX")
+    RECOVERY_TERMINAL_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m round_dagger.actor_pair_terminal \
+            --attempt-dir "$RECOVERY_ATTEMPT_DIR" --run-dir "$TRAIN_DIR" \
+            --cohort-dir "$COHORT_DIR" \
+            --campaign-id "${ROUND_DAGGER_CAMPAIGN_ID:?missing ROUND_DAGGER_CAMPAIGN_ID}" \
+            --macro-round "${ROUND_DAGGER_MACRO_ROUND:?missing ROUND_DAGGER_MACRO_ROUND}" \
+            --cohort-index "${ROUND_DAGGER_COHORT_INDEX:?missing ROUND_DAGGER_COHORT_INDEX}" \
+            --rank0-exit-code 0 --rank1-exit-code 0 \
+            --lifecycle-exit-code 0 --quality-exit-code 0 \
+            --wandb-wrapper-exit-code 0 \
+            $([ "$WANDB_PAIR" = 1 ] && printf '%s' '--delivery-pending'))
+    printf '%s\n' "$RECOVERY_TERMINAL_JSON"
+    if [ "$WANDB_PAIR" = 1 ]; then
+        recover_wandb_delivery
+    fi
+    printf '%s\n' "$TEMP_CLEANUP_JSON"
     echo "ACTOR_PAIR_RECOVERED_COMPLETE_STREAMS_CLEAN"
     exit 0
 fi
@@ -300,9 +374,9 @@ WANDB_ACTOR_DONE=
 WANDB_PAIR_FINISH_RELATIVE=
 WANDB_PAIR_FINISH=
 if [ "$WANDB_PAIR" = 1 ]; then
-    if [ "$STATE0" = empty ]; then
+    if [ "$STATE0" != complete ]; then
         WANDB_OWNER=0
-    elif [ "$STATE1" = empty ]; then
+    elif [ "$STATE1" != complete ]; then
         WANDB_OWNER=1
     else
         echo "unsealed W&B cohort has no incomplete actor available to own telemetry recovery" >&2
@@ -359,7 +433,7 @@ for rank in 0 1; do
     # Private IPC is the hard isolation boundary.  A small stagger additionally
     # avoids making both Isaac/Carb plugin loaders and GPU contexts peak at the
     # exact same instant.  Dry-run validation is intentionally immediate.
-    if [ "$rank" = 0 ] && [ "$DRY_RUN" != 1 ] && [ "$STATE1" = empty ] && \
+    if [ "$rank" = 0 ] && [ "$DRY_RUN" != 1 ] && [ "$STATE1" != complete ] && \
        [ "$STAGGER_SECONDS" -gt 0 ]; then
         sleep "$STAGGER_SECONDS"
     fi
@@ -374,6 +448,53 @@ PRE_DRAIN_FINALIZATION_STATUS=0
 CLEANUP_JSON=
 SEALED_JSON=
 QUALITY_JSON=
+TERMINAL_JSON=
+TERMINAL_PUBLISHED=0
+TERMINAL_DELIVERY_PENDING=0
+WANDB_WRAPPER_STATUS=0
+DRAIN_EXIT_CODE=2
+
+# Publish one immutable, per-attempt terminal record and a numeric scalar for
+# the W&B sidecar.  In pair-W&B mode the helper publishes the finish marker
+# last and embeds exit code 2 for any actor/lifecycle/quality failure, so the
+# remote W&B run cannot appear successful after a failed collection.
+publish_attempt_terminal() {
+    local command=(
+        python3 -m round_dagger.actor_pair_terminal
+        --attempt-dir "$ATTEMPT_DIR" --run-dir "$TRAIN_DIR"
+        --cohort-dir "$COHORT_DIR"
+        --campaign-id "${ROUND_DAGGER_CAMPAIGN_ID:?missing ROUND_DAGGER_CAMPAIGN_ID}"
+        --macro-round "${ROUND_DAGGER_MACRO_ROUND:?missing ROUND_DAGGER_MACRO_ROUND}"
+        --cohort-index "${ROUND_DAGGER_COHORT_INDEX:?missing ROUND_DAGGER_COHORT_INDEX}"
+        --rank0-exit-code "${STATUSES[0]}"
+        --rank1-exit-code "${STATUSES[1]}"
+        --lifecycle-exit-code "$LIFECYCLE_STATUS"
+        --quality-exit-code "$PRE_DRAIN_FINALIZATION_STATUS"
+        --wandb-wrapper-exit-code "$WANDB_WRAPPER_STATUS"
+    )
+    if [ "$TERMINAL_DELIVERY_PENDING" = 1 ]; then
+        command+=(--delivery-pending)
+    fi
+    if [ "$WANDB_PAIR" = 1 ]; then
+        command+=(--finish-marker "$WANDB_PAIR_FINISH")
+    fi
+    TERMINAL_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "${command[@]}") || return $?
+    TERMINAL_PUBLISHED=1
+}
+
+publish_failure_finish_fallback() {
+    # Terminal publication is itself fail-closed, but its failure must not
+    # strand an otherwise healthy W&B owner forever.  This bounded fallback
+    # conveys only failure; it can never convert a failure to success.
+    [ "$WANDB_PAIR" = 1 ] || return 0
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$WANDB_PAIR_FINISH" <<'PY'
+import sys
+from pathlib import Path
+from round_dagger.actor_pair_terminal import _atomic_finish_marker
+
+_atomic_finish_marker(Path(sys.argv[1]), 2)
+PY
+}
 
 # The rank-local primitive normally publishes this receipt immediately after
 # its exact immutable shard gate.  Repeating publication here closes the
@@ -447,12 +568,42 @@ if [ "$WANDB_PAIR" = 1 ]; then
                 fi
             fi
         fi
-        : >"$WANDB_PAIR_FINISH"
+        DRAIN_EXIT_CODE=0
+        if [ "${STATUSES[0]}" -ne 0 ] || [ "${STATUSES[1]}" -ne 0 ] || \
+           [ "$LIFECYCLE_STATUS" -ne 0 ] || \
+           [ "$PRE_DRAIN_FINALIZATION_STATUS" -ne 0 ]; then
+            DRAIN_EXIT_CODE=2
+        fi
+        if [ "$DRAIN_EXIT_CODE" -eq 0 ]; then
+            TERMINAL_DELIVERY_PENDING=1
+        fi
+        # actor_pair_terminal publishes the immutable terminal document and
+        # scalar first, then atomically exposes the finish marker last.  The
+        # watcher therefore cannot finish before terminal telemetry is visible.
+        if ! publish_attempt_terminal; then
+            PRE_DRAIN_FINALIZATION_STATUS=1
+            echo "actor-pair terminal/finish publication failed" >&2
+            publish_failure_finish_fallback
+        fi
     fi
     wait "$OWNER_PID"
-    OWNER_WRAPPER_STATUS=$?
-    if [ "$OWNER_WRAPPER_STATUS" -ne 0 ]; then
-        STATUSES[$WANDB_OWNER]=$OWNER_WRAPPER_STATUS
+    WANDB_WRAPPER_STATUS=$?
+    if [ "$WANDB_WRAPPER_STATUS" -eq 0 ] && [ "$DRAIN_EXIT_CODE" -eq 0 ]; then
+        if ! verify_wandb_delivery; then
+            WANDB_WRAPPER_STATUS=2
+            echo "actor-pair W&B sender exited without durable artifact coverage" >&2
+        fi
+    fi
+    if [ "$WANDB_WRAPPER_STATUS" -ne 0 ] && \
+       [ -f "$COHORT_DIR/seal.json" ] && [ ! -L "$COHORT_DIR/seal.json" ]; then
+        if ! PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m round_dagger.wandb_delivery failure \
+                --attempt-dir "$ATTEMPT_DIR" --run-dir "$TRAIN_DIR" \
+                --macro-round "${ROUND_DAGGER_MACRO_ROUND:?missing ROUND_DAGGER_MACRO_ROUND}" \
+                --cohort-index "${ROUND_DAGGER_COHORT_INDEX:?missing ROUND_DAGGER_COHORT_INDEX}" \
+                --wrapper-exit-code "$WANDB_WRAPPER_STATUS" >/dev/null; then
+            echo "sealed actor pair also lacked W&B delivery-failure telemetry" >&2
+        fi
     fi
 else
     for rank in 0 1; do
@@ -479,7 +630,9 @@ if [ "$FINALIZED_BEFORE_WANDB_DRAIN" != 1 ] && \
 fi
 
 if [ "${STATUSES[0]}" -ne 0 ] || [ "${STATUSES[1]}" -ne 0 ] || \
-   [ "$LIFECYCLE_STATUS" -ne 0 ] || [ "$PRE_DRAIN_FINALIZATION_STATUS" -ne 0 ]; then
+   [ "$LIFECYCLE_STATUS" -ne 0 ] || \
+   [ "$PRE_DRAIN_FINALIZATION_STATUS" -ne 0 ] || \
+   [ "$WANDB_WRAPPER_STATUS" -ne 0 ]; then
     if [ "$DRY_RUN" != 1 ] && [ ! -e "$COHORT_DIR/seal.json" ] && \
        ! PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m "$LIFECYCLE_MODULE" cleanup-attempt \
@@ -493,7 +646,12 @@ if [ "${STATUSES[0]}" -ne 0 ] || [ "${STATUSES[1]}" -ne 0 ] || \
     else
         SEAL_FAILURE_DETAIL="cohort was not sealed"
     fi
-    echo "actor pair failed: rank0=${STATUSES[0]} rank1=${STATUSES[1]} lifecycle=$LIFECYCLE_STATUS quality_finalization=$PRE_DRAIN_FINALIZATION_STATUS; $SEAL_FAILURE_DETAIL" >&2
+    if [ "$TERMINAL_PUBLISHED" != 1 ] && ! publish_attempt_terminal; then
+        echo "failed actor attempt also lacked terminal telemetry publication" >&2
+        publish_failure_finish_fallback
+    fi
+    [ -z "$TERMINAL_JSON" ] || printf '%s\n' "$TERMINAL_JSON"
+    echo "actor pair failed: rank0=${STATUSES[0]} rank1=${STATUSES[1]} lifecycle=$LIFECYCLE_STATUS quality_finalization=$PRE_DRAIN_FINALIZATION_STATUS wandb_wrapper=$WANDB_WRAPPER_STATUS; $SEAL_FAILURE_DETAIL" >&2
     echo "actor pair logs: ${LOGS[0]} ${LOGS[1]}" >&2
     exit 2
 fi
@@ -505,7 +663,11 @@ fi
 if [ "$FINALIZED_BEFORE_WANDB_DRAIN" != 1 ]; then
     finalize_completed_cohort
 fi
+if [ "$TERMINAL_PUBLISHED" != 1 ]; then
+    publish_attempt_terminal
+fi
 printf '%s\n' "$CLEANUP_JSON"
 printf '%s\n' "$SEALED_JSON"
 printf '%s\n' "$QUALITY_JSON"
+printf '%s\n' "$TERMINAL_JSON"
 echo "ACTOR_PAIR_SEALED_STREAMS_CLEAN logs=${LOGS[0]},${LOGS[1]}"

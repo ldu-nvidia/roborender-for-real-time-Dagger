@@ -43,6 +43,32 @@ class NumpyPolicy:
         return {"weight": self.weight, "bias": self.bias}
 
 
+class TransferProbe:
+    """Tensor-like spy proving that slicing precedes every host transfer."""
+
+    def __init__(self, array, *, key, transfers):
+        self.array = array
+        self.key = key
+        self.transfers = transfers
+
+    @property
+    def shape(self):
+        return self.array.shape
+
+    def __getitem__(self, item):
+        return type(self)(self.array[item], key=self.key, transfers=self.transfers)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        self.transfers.append((self.key, tuple(self.array.shape)))
+        return self
+
+    def numpy(self):
+        return self.array
+
+
 def fake_trainer(*, steps=3, envs=4):
     mean = np.asarray([0.2, 0.3, 0.4], dtype=np.float32)
     std = np.asarray([0.5, 0.4, 0.3], dtype=np.float32)
@@ -270,6 +296,66 @@ class ActorConversionTest(unittest.TestCase):
 
 
 class ActorPublicationIntegrationTest(unittest.TestCase):
+    def _cohort_environment(
+        self,
+        root,
+        *,
+        trainer,
+        policy,
+        environments_per_shard=2,
+        campaign_id="actor-test",
+    ):
+        envs = int(trainer.storage.values["vision_obs"].shape[1])
+        steps = int(trainer.num_steps_per_env)
+        runtime_sha = runtime_policy_sha256(
+            policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
+        )
+        digests = {
+            "policy_sha256": "1" * 64,
+            "runtime_policy_sha256": runtime_sha,
+            "teacher_sha256": "3" * 64,
+            "renderer_sha256": "4" * 64,
+            "beta_sha256": "5" * 64,
+            "config_sha256": "6" * 64,
+        }
+        identity = {
+            "campaign_id": campaign_id,
+            "macro_round": 0,
+            "cohort_index": 0,
+            "purpose": "train",
+        }
+        cohort = Path(root) / "cohort"
+        artifacts.create_cohort(
+            cohort,
+            expected_ranks=[0],
+            expected_global_env_ids=list(range(10, 10 + envs)),
+            expected_transitions=steps * envs,
+            view_contract={
+                "dtype": "uint8",
+                "layout": "vertical",
+                "shape": [6, 4, 3],
+                "views": ["head_color", "hand_left", "hand_right"],
+            },
+            action_contract={"dtype": "float32", "shape": [2]},
+            **identity,
+            **digests,
+        )
+        environment = {
+            "ROUND_DAGGER_COHORT_DIR": str(cohort),
+            "ROUND_DAGGER_CAMPAIGN_ID": identity["campaign_id"],
+            "ROUND_DAGGER_MACRO_ROUND": "0",
+            "ROUND_DAGGER_COHORT_INDEX": "0",
+            "ROUND_DAGGER_POLICY_SHA256": digests["policy_sha256"],
+            "ROUND_DAGGER_RUNTIME_POLICY_SHA256": runtime_sha,
+            "ROUND_DAGGER_TEACHER_SHA256": digests["teacher_sha256"],
+            "ROUND_DAGGER_RENDERER_SHA256": digests["renderer_sha256"],
+            "ROUND_DAGGER_BETA_SHA256": digests["beta_sha256"],
+            "ROUND_DAGGER_CONFIG_SHA256": digests["config_sha256"],
+            "ROUND_DAGGER_ENVS_PER_SHARD": str(environments_per_shard),
+            "ROUND_DAGGER_ROLLOUT_ID": "0",
+        }
+        return cohort, environment, runtime_sha, identity, digests
+
     def test_one_rank_exports_parts_and_seals_exactly(self):
         trainer, _ = fake_trainer()
         policy = NumpyPolicy()
@@ -331,6 +417,214 @@ class ActorPublicationIntegrationTest(unittest.TestCase):
             sealed = artifacts.seal_cohort(cohort)
             self.assertEqual(sealed["transition_count"], 12)
             self.assertEqual(sealed["global_env_ids"], [10, 11, 12, 13])
+
+    def test_export_slices_each_environment_part_before_host_transfer(self):
+        trainer, _ = fake_trainer(steps=3, envs=5)
+        transfers = []
+        for key, value in trainer.storage.values.items():
+            trainer.storage.values[key] = TransferProbe(
+                value, key=key, transfers=transfers
+            )
+        policy = NumpyPolicy()
+        with tempfile.TemporaryDirectory() as temporary:
+            cohort, environment, runtime_sha, _, _ = self._cohort_environment(
+                temporary,
+                trainer=trainer,
+                policy=policy,
+                environments_per_shard=2,
+                campaign_id="bounded-export",
+            )
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch(
+                "round_dagger.actor.trainer_rollout_arrays",
+                side_effect=AssertionError("full rollout conversion is forbidden"),
+            ):
+                reports = export_trainer_rollout(
+                    trainer,
+                    policy_module=policy,
+                    initial_runtime_policy_sha256=runtime_sha,
+                )
+
+            self.assertEqual(len(reports), 3)
+            self.assertTrue(transfers)
+            self.assertTrue(all(shape[1] <= 2 for _, shape in transfers))
+            self.assertEqual(
+                [shape[1] for key, shape in transfers if key == "vision_obs"],
+                [2, 2, 1],
+            )
+            self.assertEqual(artifacts.seal_cohort(cohort)["transition_count"], 15)
+
+    def test_streamed_export_is_byte_exact_with_full_rollout_split(self):
+        trainer, _ = fake_trainer(steps=3, envs=5)
+        policy = NumpyPolicy()
+        complete = trainer_rollout_arrays(trainer)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference_cohort, _, runtime_sha, identity, digests = (
+                self._cohort_environment(
+                    root / "reference",
+                    trainer=trainer,
+                    policy=policy,
+                    environments_per_shard=2,
+                    campaign_id="exact-export",
+                )
+            )
+            reference_reports = []
+            for part_index, start in enumerate(range(0, 5, 2)):
+                stop = min(5, start + 2)
+                reference_reports.append(
+                    artifacts.publish_rollout_shard(
+                        reference_cohort,
+                        rank=0,
+                        rollout_id=0,
+                        part_index=part_index,
+                        arrays={
+                            key: np.ascontiguousarray(value[:, start:stop])
+                            for key, value in complete.items()
+                        },
+                        **identity,
+                        **digests,
+                    )
+                )
+
+            _, environment, _, _, _ = self._cohort_environment(
+                root / "streamed",
+                trainer=trainer,
+                policy=policy,
+                environments_per_shard=2,
+                campaign_id="exact-export",
+            )
+            with mock.patch.dict(os.environ, environment, clear=False):
+                streamed_reports = export_trainer_rollout(
+                    trainer,
+                    policy_module=policy,
+                    initial_runtime_policy_sha256=runtime_sha,
+                )
+
+            self.assertEqual(
+                [report["payload_sha256"] for report in streamed_reports],
+                [report["payload_sha256"] for report in reference_reports],
+            )
+
+    def test_storage_layout_failure_is_rejected_before_first_publish(self):
+        trainer, _ = fake_trainer()
+        trainer.storage.values["student_actions"] = trainer.storage.values[
+            "student_actions"
+        ][:, :-1]
+        policy = NumpyPolicy()
+        with tempfile.TemporaryDirectory() as temporary:
+            _, environment, runtime_sha, _, _ = self._cohort_environment(
+                temporary,
+                trainer=trainer,
+                policy=policy,
+                campaign_id="layout-failure",
+            )
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch(
+                "round_dagger.actor.publish_rollout_shard"
+            ) as publish:
+                with self.assertRaisesRegex(
+                    ActorExportError, "disagree on environment dimension"
+                ):
+                    export_trainer_rollout(
+                        trainer,
+                        policy_module=policy,
+                        initial_runtime_policy_sha256=runtime_sha,
+                    )
+            publish.assert_not_called()
+
+    def test_eight_part_export_retry_skips_verified_prefix_and_completes(self):
+        trainer, _ = fake_trainer(envs=32)
+        policy = NumpyPolicy()
+        with tempfile.TemporaryDirectory() as temporary:
+            cohort, environment, runtime_sha, _, _ = self._cohort_environment(
+                temporary,
+                trainer=trainer,
+                policy=policy,
+                environments_per_shard=4,
+                campaign_id="retry-export",
+            )
+            actual_publish = artifacts.publish_rollout_shard
+            calls = 0
+
+            def fail_after_five_parts(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 6:
+                    raise OSError("injected export interruption")
+                return actual_publish(*args, **kwargs)
+
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch(
+                "round_dagger.actor.publish_rollout_shard",
+                side_effect=fail_after_five_parts,
+            ):
+                with self.assertRaisesRegex(OSError, "injected export interruption"):
+                    export_trainer_rollout(
+                        trainer,
+                        policy_module=policy,
+                        initial_runtime_policy_sha256=runtime_sha,
+                    )
+
+            sidecars = sorted((cohort / "shards").glob("*.json"))
+            self.assertEqual(len(sidecars), 5)
+            first_sidecar = cohort / "shards/rank-0000_rollout-00000000_part-0000.json"
+            first_sha = artifacts.sha256_file(first_sidecar)
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch(
+                "round_dagger.actor.publish_rollout_shard",
+                wraps=actual_publish,
+            ) as retry_publish:
+                reports = export_trainer_rollout(
+                    trainer,
+                    policy_module=policy,
+                    initial_runtime_policy_sha256=runtime_sha,
+                )
+            self.assertEqual(len(reports), 8)
+            self.assertEqual(retry_publish.call_count, 3)
+            self.assertEqual(artifacts.sha256_file(first_sidecar), first_sha)
+            self.assertEqual(artifacts.seal_cohort(cohort)["transition_count"], 96)
+
+    def test_payload_only_crash_window_recovers_create_only_on_retry(self):
+        trainer, _ = fake_trainer(envs=8)
+        policy = NumpyPolicy()
+        with tempfile.TemporaryDirectory() as temporary:
+            cohort, environment, runtime_sha, _, _ = self._cohort_environment(
+                temporary,
+                trainer=trainer,
+                policy=policy,
+                environments_per_shard=4,
+                campaign_id="payload-only-retry",
+            )
+            actual_sidecar_publish = artifacts.publish_immutable_json
+            target = "rank-0000_rollout-00000000_part-0001.json"
+
+            def fail_before_second_sidecar(path, document):
+                if Path(path).name == target:
+                    raise OSError("injected sidecar crash")
+                return actual_sidecar_publish(path, document)
+
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch(
+                "round_dagger.artifacts.publish_immutable_json",
+                side_effect=fail_before_second_sidecar,
+            ):
+                with self.assertRaisesRegex(OSError, "injected sidecar crash"):
+                    export_trainer_rollout(
+                        trainer,
+                        policy_module=policy,
+                        initial_runtime_policy_sha256=runtime_sha,
+                    )
+
+            orphan = cohort / "shards/rank-0000_rollout-00000000_part-0001.npz"
+            self.assertTrue(orphan.is_file())
+            self.assertFalse((cohort / "shards" / target).exists())
+            orphan_sha = artifacts.sha256_file(orphan)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                reports = export_trainer_rollout(
+                    trainer,
+                    policy_module=policy,
+                    initial_runtime_policy_sha256=runtime_sha,
+                )
+            self.assertEqual(len(reports), 2)
+            self.assertEqual(artifacts.sha256_file(orphan), orphan_sha)
+            self.assertTrue((cohort / "shards" / target).is_file())
+            self.assertEqual(artifacts.seal_cohort(cohort)["transition_count"], 24)
 
     def test_changed_policy_is_rejected_before_publish(self):
         trainer, _ = fake_trainer()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import re
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -20,6 +22,9 @@ from round_dagger import artifacts
 from round_dagger.actor_pair import (
     ActorPairError,
     inspect_actor_pair,
+    inspect_actor_pair_for_recovery,
+    inspect_actor_rank,
+    prune_stale_shard_temporaries,
     require_actor_rank_completion,
     seal_actor_pair,
 )
@@ -36,6 +41,9 @@ from tests.test_round_dagger_handoff import publish_policy_bundle
 ROOT = Path(__file__).resolve().parents[1]
 PAIR_SCRIPT = ROOT / "scripts/round_dagger/run_actor_cohort_pair.sh"
 DOCKER_EXECUTOR = ROOT / "scripts/round_dagger/run_actor_rank_docker.sh"
+WANDB_RECOVERY_DOCKER = (
+    ROOT / "scripts/round_dagger/run_wandb_recovery_docker.sh"
+)
 WANDB_RANK_SCRIPT = ROOT / "scripts/round_dagger/run_actor_cohort_with_wandb.sh"
 DIGESTS = {
     "policy_sha256": "1" * 64,
@@ -173,6 +181,18 @@ def _arrays(rank: int) -> dict[str, np.ndarray]:
     }
 
 
+def _part_arrays(rank: int, part_index: int) -> dict[str, np.ndarray]:
+    arrays = _arrays(rank)
+    start = part_index * 4
+    stop = start + 4
+    return {
+        name: np.ascontiguousarray(
+            value[start:stop] if name == "global_env_ids" else value[:, start:stop]
+        )
+        for name, value in arrays.items()
+    }
+
+
 def _cohort(path: Path, *, image_shape: list[int] | None = None) -> None:
     artifacts.create_cohort(
         path,
@@ -218,6 +238,20 @@ class ActorPairArtifactGateTest(unittest.TestCase):
             **DIGESTS,
         )
 
+    def _publish_part(self, rank: int, part_index: int) -> None:
+        artifacts.publish_rollout_shard(
+            self.cohort,
+            rank=rank,
+            rollout_id=0,
+            part_index=part_index,
+            arrays=_part_arrays(rank, part_index),
+            campaign_id="actor-pair-test",
+            macro_round=0,
+            cohort_index=0,
+            purpose="train",
+            **DIGESTS,
+        )
+
     def test_only_exact_joint_rank_coverage_can_publish_seal(self) -> None:
         self.assertEqual(
             inspect_actor_pair(self.cohort)["rank_states"],
@@ -242,33 +276,53 @@ class ActorPairArtifactGateTest(unittest.TestCase):
             sealed["cohort_sha256"],
         )
 
-    def test_partial_and_unreferenced_output_fail_closed(self) -> None:
-        arrays = _arrays(0)
-        partial = {
-            name: value[:4] if name == "global_env_ids" else value[:, :4]
-            for name, value in arrays.items()
-        }
-        artifacts.publish_rollout_shard(
-            self.cohort,
-            rank=0,
-            rollout_id=0,
-            part_index=0,
-            arrays=partial,
-            campaign_id="actor-pair-test",
-            macro_round=0,
-            cohort_index=0,
-            purpose="train",
-            **DIGESTS,
+    def test_exact_chunk_prefix_is_resumable_but_cannot_be_sealed(self) -> None:
+        for part_index in range(3):
+            self._publish_part(0, part_index)
+        rank = inspect_actor_rank(self.cohort, 0)
+        self.assertEqual(rank["state"], "resumable")
+        self.assertEqual(rank["shard_count"], 3)
+        self.assertEqual(rank["transition_count"], 3 * 4 * 512)
+        self.assertEqual(
+            inspect_actor_pair(self.cohort)["rank_states"]["0"], "resumable"
         )
-        self.assertEqual(inspect_actor_pair(self.cohort)["rank_states"]["0"], "partial")
         with self.assertRaisesRegex(ActorPairError, "both independent"):
             seal_actor_pair(self.cohort)
+
+    def test_gapped_prefix_and_unreferenced_output_fail_closed(self) -> None:
+        self._publish_part(0, 1)
+        with self.assertRaisesRegex(ActorPairError, "contiguous part prefix"):
+            inspect_actor_pair(self.cohort)
 
         other = self.root / "stray"
         _cohort(other)
         (other / "shards" / "orphan.npz").write_bytes(b"not committed")
-        with self.assertRaisesRegex(ActorPairError, "uncommitted or unreferenced"):
+        with self.assertRaisesRegex(ActorPairError, "unexpected actor shard rank"):
             inspect_actor_pair(other)
+
+    def test_payload_without_sidecar_is_a_single_recoverable_next_part(self) -> None:
+        self._publish_part(0, 0)
+        target = "rank-0000_rollout-00000000_part-0001.json"
+        actual_publish = artifacts.publish_immutable_json
+
+        def fail_before_sidecar(path, document):
+            if Path(path).name == target:
+                raise OSError("injected sidecar publication crash")
+            return actual_publish(path, document)
+
+        with mock.patch(
+            "round_dagger.artifacts.publish_immutable_json",
+            side_effect=fail_before_sidecar,
+        ):
+            with self.assertRaisesRegex(OSError, "sidecar publication crash"):
+                self._publish_part(0, 1)
+
+        report = inspect_actor_rank(self.cohort, 0)
+        self.assertEqual(report["state"], "resumable")
+        self.assertEqual(
+            report["recoverable_payload"],
+            "rank-0000_rollout-00000000_part-0001.npz",
+        )
 
     def test_rank_gate_does_not_read_a_peers_in_progress_payload(self) -> None:
         self._publish(0)
@@ -284,6 +338,44 @@ class ActorPairArtifactGateTest(unittest.TestCase):
         report = require_actor_rank_completion(self.cohort, 0)
         self.assertEqual(report["state"], "complete")
         self.assertEqual(report["transition_count"], 32 * 512)
+
+    def test_sigkill_npz_temporary_is_pruned_but_never_accepted(self) -> None:
+        temporary = (
+            self.cohort
+            / "shards"
+            / ".rank-0001_rollout-00000000_part-0000.npz.abc123__"
+        )
+        temporary.write_bytes(b"interrupted zip bytes")
+        with self.assertRaisesRegex(ActorPairError, "stale uncommitted"):
+            inspect_actor_rank(self.cohort, 1)
+        with self.assertRaisesRegex(ActorPairError, "unexpected actor shard entry"):
+            inspect_actor_pair(self.cohort)
+        recovery = inspect_actor_pair_for_recovery(self.cohort)
+        self.assertTrue(recovery["requires_temp_cleanup"])
+        self.assertEqual(recovery["stale_temporaries"], [temporary.name])
+        self.assertEqual(recovery["rank_states"]["1"], "empty")
+
+        cleanup = prune_stale_shard_temporaries(self.cohort)
+        self.assertEqual(cleanup["removed"], [temporary.name])
+        self.assertFalse(temporary.exists())
+        self.assertEqual(inspect_actor_rank(self.cohort, 1)["state"], "empty")
+
+        unknown = self.cohort / "shards" / ".rank-0001_unknown.tmp"
+        unknown.write_bytes(b"ambiguous")
+        self.assertEqual(prune_stale_shard_temporaries(self.cohort)["removed"], [])
+        self.assertTrue(unknown.exists())
+        with self.assertRaisesRegex(ActorPairError, "unexpected actor shard entry"):
+            inspect_actor_pair(self.cohort)
+
+    def test_symlink_in_cohort_ancestor_is_rejected(self) -> None:
+        real_parent = self.root / "real-parent"
+        real_parent.mkdir()
+        real_cohort = real_parent / "cohort"
+        _cohort(real_cohort)
+        linked_parent = self.root / "linked-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        with self.assertRaisesRegex(ActorPairError, "symbolic link"):
+            inspect_actor_pair(linked_parent / "cohort")
 
 
 class ActorPairLauncherDryRunTest(unittest.TestCase):
@@ -560,6 +652,37 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "    purpose='train', **DIGESTS)\n",
             encoding="utf-8",
         )
+        self.ack_delivery = self.root / "ack_delivery.py"
+        self.ack_delivery.write_text(
+            "import hashlib,json,sys,time\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "from pathlib import Path\n"
+            "from scripts.scaling import wandb_run_watcher as w\n"
+            "root=Path(sys.argv[1]); telemetry=root/'telemetry'; telemetry.mkdir(exist_ok=True)\n"
+            "run_id='fixture_run'; (telemetry/'WANDB_SIDECAR_RUN_ID').write_text(run_id+'\\n')\n"
+            "errors=[]; items=w.discover_scalars(root,min_age_s=0,now=time.time()+1,errors=errors)+w.discover_artifacts(root,min_age_s=0,now=time.time()+1,errors=errors)\n"
+            "assert not errors\n"
+            "state=telemetry/'.wandb_upload_state.json'; w.save_state(state,{x.relative_path:x.fingerprint for x in items},run_id=run_id)\n"
+            "receipt={'schema':w.DELIVERY_RECEIPT_SCHEMA,'wandb_run_id':run_id,'upload_state_sha256':hashlib.sha256(state.read_bytes()).hexdigest(),'outcome':'SUCCEEDED'}\n"
+            "(telemetry/'WANDB_DELIVERY_RECEIPT.json').write_text(json.dumps(receipt,sort_keys=True)+'\\n')\n",
+            encoding="utf-8",
+        )
+        self.fake_modules = self.root / "fake_modules"
+        fake_wandb = self.fake_modules / "wandb"
+        fake_wandb.mkdir(parents=True)
+        (fake_wandb / "__init__.py").write_text(
+            "class Api:\n"
+            "  def __init__(self,timeout=15): self.viewer={'email':'ldu@nvidia.com','username':'leo','teams':['nvidia']}\n"
+            "class Run:\n"
+            "  def __init__(self): self.summary={}\n"
+            "  def define_metric(self,*a,**k): pass\n"
+            "  def log(self,p): pass\n"
+            "  def finish(self,exit_code=None): pass\n"
+            "def init(**kwargs): return Run()\n"
+            "def Image(path): return path\n"
+            "def Video(path,format=None): return path\n",
+            encoding="utf-8",
+        )
         self.executor = self.root / "executor"
         self.executor.write_text(
             "#!/usr/bin/env bash\n"
@@ -581,10 +704,30 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "[ -f \"$finish\" ] && [ ! -L \"$finish\" ]\n"
             "[ -f \"$ROUND_DAGGER_COHORT_DIR/seal.json\" ]\n"
             "compgen -G \"$TRAIN_RUN_DIR/telemetry/scalars/*student_quality*.json\" >/dev/null\n"
-            f"printf 'drained\\n' > {self.drained!s}\n",
+            f"{sys.executable} {self.ack_delivery!s} \"$TRAIN_RUN_DIR\"\n"
+            f"printf 'drained\\n' > {self.drained!s}\n"
+            "[ \"${TEST_LATE_WANDB_WRAPPER_FAILURE:-0}\" = 0 ] || exit 7\n",
             encoding="utf-8",
         )
         self.executor.chmod(0o755)
+        self.recovery_executor = self.root / "test-wandb-recovery"
+        self.recovery_executor.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            "command=(\n"
+            f"  {sys.executable!s} {ROOT / 'scripts/scaling/wandb_run_watcher.py'!s}\n"
+            "  --run-dir \"$TRAIN_RUN_DIR\"\n"
+            "  --project \"$ROUND_DAGGER_WANDB_PROJECT\"\n"
+            "  --entity \"$ROUND_DAGGER_WANDB_ENTITY\"\n"
+            "  --expected-email \"$ROUND_DAGGER_WANDB_EXPECTED_EMAIL\"\n"
+            "  --authorization-scope team --min-age-s 0 --once\n"
+            ")\n"
+            "env -u RANK -u SLURM_PROCID -u LOCAL_RANK \"${command[@]}\"\n"
+            f"PYTHONPATH={ROOT!s}:\"${{PYTHONPATH:-}}\" {sys.executable!s} "
+            "-m round_dagger.wandb_delivery verify --run-dir \"$TRAIN_RUN_DIR\"\n",
+            encoding="utf-8",
+        )
+        self.recovery_executor.chmod(0o755)
 
     def tearDown(self) -> None:
         for server in self.reset_servers:
@@ -605,7 +748,14 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "TRAIN_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_ACTOR_RUN_DIR": str(self.run_dir),
             "ROUND_DAGGER_ACTOR_PAIR_EXECUTOR": str(self.executor),
+            "ROUND_DAGGER_WANDB_RECOVERY_EXECUTOR": str(
+                self.recovery_executor
+            ),
             "ROUND_DAGGER_WANDB_ENABLED": "1",
+            "ROUND_DAGGER_WANDB_PYTHON": sys.executable,
+            "ROUND_DAGGER_WANDB_PROJECT": "dagger",
+            "ROUND_DAGGER_WANDB_ENTITY": "nvidia",
+            "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": "ldu@nvidia.com",
             "ROUND_DAGGER_POLICY_SHA256": DIGESTS["policy_sha256"],
             "ROUND_DAGGER_RUNTIME_POLICY_SHA256": DIGESTS[
                 "runtime_policy_sha256"
@@ -619,6 +769,7 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             "ROUND_DAGGER_EXPECTED_RENDERERS": "2",
             "ROUND_DAGGER_IMAGE3F_RESET_TIMEOUT_S": "1",
             "ROUND_DAGGER_IMAGE3F_RESET_RETRIES": "0",
+            "PYTHONPATH": f"{self.fake_modules}:{ROOT}",
         }
 
     def test_rank_one_owns_and_drains_sidecar_before_retry_seals(self) -> None:
@@ -640,7 +791,7 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
         self.assertLessEqual(seal.stat().st_mtime_ns, self.drained.stat().st_mtime_ns)
         self.assertTrue(artifacts.verify_cohort(self.cohort)["sealed"])
 
-    def test_both_complete_but_unsealed_fails_without_telemetry_owner(self) -> None:
+    def test_both_complete_but_unsealed_is_safely_finalized_without_owner(self) -> None:
         artifacts.publish_rollout_shard(
             self.cohort,
             rank=1,
@@ -653,17 +804,94 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
             purpose="train",
             **DIGESTS,
         )
+        environment = self._environment()
+        environment["ROUND_DAGGER_WANDB_ENABLED"] = "0"
         result = subprocess.run(
             ["bash", str(PAIR_SCRIPT)],
-            env=self._environment(),
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ACTOR_PAIR_RECOVERED_COMPLETE_STREAMS_CLEAN", result.stdout)
+        self.assertTrue((self.cohort / "seal.json").is_file())
+        self.assertTrue(artifacts.verify_cohort(self.cohort)["sealed"])
+        self.assertFalse(self.owner_log.exists())
+        terminals = list(
+            (self.run_dir / "actor_pair_attempts").glob(
+                "recovered_complete_*/actor_pair_terminal.json"
+            )
+        )
+        self.assertEqual(len(terminals), 1)
+        terminal = json.loads(terminals[0].read_text(encoding="utf-8"))
+        self.assertEqual(terminal["outcome"], "SUCCEEDED")
+        self.assertTrue(terminal["cohort_sealed"])
+
+    def test_late_wandb_wrapper_failure_cannot_leave_success_terminal(self) -> None:
+        environment = self._environment()
+        environment["TEST_LATE_WANDB_WRAPPER_FAILURE"] = "1"
+        result = subprocess.run(
+            ["bash", str(PAIR_SCRIPT)],
+            env=environment,
             text=True,
             capture_output=True,
             check=False,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("no incomplete actor", result.stderr)
-        self.assertFalse((self.cohort / "seal.json").exists())
-        self.assertFalse(self.owner_log.exists())
+        terminals = list(
+            (self.run_dir / "actor_pair_attempts").glob(
+                "attempt_*/actor_pair_terminal.json"
+            )
+        )
+        self.assertEqual(len(terminals), 1)
+        terminal = json.loads(terminals[0].read_text(encoding="utf-8"))
+        self.assertEqual(terminal["outcome"], "PENDING_WANDB_DELIVERY")
+        self.assertEqual(terminal["failure_code"], "none")
+        self.assertEqual(terminal["wandb_wrapper_exit_code"], 0)
+        self.assertEqual(terminal["rank_exit_codes"], {"0": 0, "1": 0})
+        self.assertTrue(terminal["cohort_sealed"])
+        failures = list(
+            (self.run_dir / "telemetry/scalars").glob(
+                "*_wandb_delivery_failure_*.json"
+            )
+        )
+        self.assertEqual(len(failures), 1)
+
+        # A retry sees the immutable cohort, reopens the same sidecar run,
+        # replays the late failure plus pending terminal, and publishes a new
+        # sender-drain receipt before accepting the seal.
+        retry_environment = self._environment()
+        retry = subprocess.run(
+            ["bash", str(PAIR_SCRIPT)],
+            env=retry_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIn("ACTOR_PAIR_ALREADY_SEALED_STREAMS_CLEAN", retry.stdout)
+        from round_dagger.wandb_delivery import verify_delivery
+
+        delivery = verify_delivery(self.run_dir)
+        self.assertIsNotNone(delivery)
+        self.assertGreaterEqual(delivery["recovered_delivery_failure_count"], 1)
+
+    def test_trusted_dispatch_rejects_non_source_recovery_executor(self) -> None:
+        environment = self._environment()
+        environment["ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH"] = "1"
+        result = subprocess.run(
+            ["bash", str(PAIR_SCRIPT)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "production W&B recovery executor must come from the sealed actor source",
+            result.stderr,
+        )
 
 
 class ActorWandbExplicitOwnerFlagTest(unittest.TestCase):
@@ -701,6 +929,166 @@ class ActorWandbExplicitOwnerFlagTest(unittest.TestCase):
             result = self._run(Path(temporary).resolve(), rank="1", owner="rank1")
         self.assertEqual(result.returncode, 2)
         self.assertIn("owner flag must be exactly 0 or 1", result.stderr)
+
+
+class WandbRecoveryDockerIsolationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.run_dir = self.root / "run"
+        self.run_dir.mkdir()
+        self.netrc = self.root / ".netrc"
+        self.netrc.write_text(
+            "machine api.wandb.ai\n  login user\n  password fixture\n",
+            encoding="utf-8",
+        )
+        self.netrc.chmod(0o600)
+        self.docker_argv = self.root / "docker.argv"
+        self.fake_docker = self.root / "docker"
+        self.fake_docker.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            "if [[ ${1:-} == image && ${2:-} == inspect ]]; then\n"
+            "  printf 'sha256:%s\\n' \"$ROUND_DAGGER_RTX_IMAGE_ID_SHA256\"\n"
+            "  exit 0\n"
+            "fi\n"
+            f"printf '%s\\n' \"$@\" > {self.docker_argv!s}\n",
+            encoding="utf-8",
+        )
+        self.fake_docker.chmod(0o755)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _environment(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "ROUND_DAGGER_TRUSTED_COLLECT_DISPATCH": "1",
+            "ROUND_DAGGER_ACTOR_SOURCE_ROOT": str(ROOT),
+            "ROUND_DAGGER_ACTOR_SOURCE_INVENTORY_SHA256": "a" * 64,
+            "TRAIN_RUN_DIR": str(self.run_dir),
+            "ROUND_DAGGER_WANDB_NETRC": str(self.netrc),
+            "ROUND_DAGGER_WANDB_PYTHON": "/opt/round-dagger-rtx/bin/python",
+            "ROUND_DAGGER_WANDB_PROJECT": "roborender-dagger",
+            "ROUND_DAGGER_WANDB_ENTITY": "nvidia",
+            "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": "ldu@nvidia.com",
+            "ROUND_DAGGER_WANDB_NAME": "cohort-recovery",
+            "ROUND_DAGGER_WANDB_GROUP": "production",
+            "ROUND_DAGGER_DOCKER_BIN": str(self.fake_docker),
+            "ROUND_DAGGER_RTX_IMAGE": "actor:pinned",
+            "ROUND_DAGGER_RTX_IMAGE_ID_SHA256": "b" * 64,
+            "ROUND_DAGGER_CAMPAIGN_ID": "dagger_prod_run1",
+            "ROUND_DAGGER_MACRO_ROUND": "2",
+            "ROUND_DAGGER_COHORT_INDEX": "3",
+            "WANDB_API_KEY": "must-never-appear-on-docker-argv",
+        }
+
+    def test_host_launches_pinned_cpu_only_recovery_context(self) -> None:
+        result = subprocess.run(
+            ["bash", str(WANDB_RECOVERY_DOCKER)],
+            env=self._environment(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.docker_argv.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(argv[0], "run")
+        self.assertIn("--read-only", argv)
+        self.assertIn("--cap-drop=ALL", argv)
+        self.assertIn("--security-opt=no-new-privileges", argv)
+        self.assertIn("--ipc=private", argv)
+        self.assertIn("--network=host", argv)
+        self.assertNotIn("--gpus", argv)
+        self.assertFalse(any("device=" in value for value in argv))
+        self.assertIn(
+            f"type=bind,src={ROOT},dst={ROOT},readonly", argv
+        )
+        self.assertIn(
+            f"type=bind,src={self.run_dir},dst={self.run_dir}", argv
+        )
+        self.assertNotIn(
+            f"type=bind,src={self.run_dir},dst={self.run_dir},readonly", argv
+        )
+        self.assertIn(
+            f"type=bind,src={self.netrc},dst={self.netrc},readonly", argv
+        )
+        self.assertIn("ROUND_DAGGER_WANDB_RECOVERY_IN_CONTAINER=1", argv)
+        self.assertIn("ROUND_DAGGER_WANDB_NETRC", argv)
+        self.assertIn("ROUND_DAGGER_WANDB_PYTHON", argv)
+        self.assertNotIn("WANDB_API_KEY", argv)
+        self.assertNotIn("must-never-appear-on-docker-argv", argv)
+        self.assertIn(f"sha256:{'b' * 64}", argv)
+        self.assertNotIn("actor:pinned", argv)
+        self.assertEqual(
+            argv[-3:],
+            [
+                "/usr/bin/env",
+                "bash",
+                str(WANDB_RECOVERY_DOCKER),
+            ],
+        )
+
+    def test_image_identity_mismatch_fails_before_docker_run(self) -> None:
+        environment = self._environment()
+        environment["ROUND_DAGGER_RTX_IMAGE_ID_SHA256"] = "c" * 64
+        # The inspect fixture deliberately reports the independently pinned ID.
+        environment["TEST_INSPECT_IMAGE_ID"] = "b" * 64
+        self.fake_docker.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            "if [[ ${1:-} == image && ${2:-} == inspect ]]; then\n"
+            "  printf 'sha256:%s\\n' \"$TEST_INSPECT_IMAGE_ID\"\n"
+            "  exit 0\n"
+            "fi\n"
+            f"printf '%s\\n' \"$@\" > {self.docker_argv!s}\n",
+            encoding="utf-8",
+        )
+        self.fake_docker.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(WANDB_RECOVERY_DOCKER)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("actor image ID differs", result.stderr)
+        self.assertFalse(self.docker_argv.exists())
+
+    def test_container_watcher_success_still_fails_closed_on_delivery_verify(self) -> None:
+        invocation_log = self.root / "python.argv"
+        fake_python = self.root / "container-python"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {invocation_log!s}\n"
+            "if [[ ${1:-} == -m && ${2:-} == round_dagger.wandb_delivery ]]; then\n"
+            "  exit 23\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        environment = self._environment()
+        environment["ROUND_DAGGER_WANDB_RECOVERY_IN_CONTAINER"] = "1"
+        environment["ROUND_DAGGER_WANDB_PYTHON"] = str(fake_python)
+        result = subprocess.run(
+            ["bash", str(WANDB_RECOVERY_DOCKER)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 23)
+        invocations = invocation_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(invocations), 2)
+        self.assertIn("wandb_run_watcher.py", invocations[0])
+        self.assertIn("--once", invocations[0])
+        self.assertEqual(
+            invocations[1],
+            f"-m round_dagger.wandb_delivery verify --run-dir {self.run_dir}",
+        )
 
 
 class ActorRankDockerIsolationTest(unittest.TestCase):

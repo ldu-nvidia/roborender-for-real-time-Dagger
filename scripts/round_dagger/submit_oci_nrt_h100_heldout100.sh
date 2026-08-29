@@ -47,7 +47,7 @@ PROJECT=${ROUND_DAGGER_HELDOUT100_WANDB_PROJECT:-roborender-round-dagger-validat
 DRY_RUN=${DRY_RUN:-0}
 
 [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be 0 or 1"
-[[ $LOCAL_CAMPAIGN == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1 ]] || \
+[[ $LOCAL_CAMPAIGN == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829 ]] || \
     fatal "campaign mount must preserve the exact fixed-256 artifact paths"
 [[ $CAMPAIGN_ID == dagger_prod_run1 ]] || fatal "heldout100 campaign must be dagger_prod_run1"
 [[ $MACRO_ROUND == 0 ]] || fatal "heldout100 macro round must be exactly zero"
@@ -126,7 +126,7 @@ done
 [[ -f $REMOTE_CAMPAIGN/heldout_snapshot.json && ! -L $REMOTE_CAMPAIGN/heldout_snapshot.json ]] || \
     fatal "staged fixed-256 held-out snapshot is absent"
 [[ $(sha256sum "$REMOTE_CAMPAIGN/heldout_snapshot.json" | awk '{print $1}') == \
-   cea0ee36b228c611635af8dd23b83db3bdaa0fcea493acd57379f080273fdbc8 ]] || \
+   42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9 ]] || \
     fatal "staged held-out snapshot file identity mismatch"
 
 mapfile -t IDENTITY < <(

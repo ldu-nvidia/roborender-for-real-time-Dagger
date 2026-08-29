@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -31,11 +32,32 @@ from round_dagger.orchestration import MacroRoundConfig
 
 DRIVER_STATUS_SCHEMA = "fast_roborender.round_dagger.production_driver_status.v1"
 DRIVER_BINDING_SCHEMA = "fast_roborender.round_dagger.production_driver_binding.v1"
+COLLECTION_FAILURE_SCHEMA = (
+    "fast_roborender.round_dagger.collection_attempt_failure.v1"
+)
+COLLECTION_ATTEMPT_SCHEMA = (
+    "fast_roborender.round_dagger.collection_launcher_attempt.v1"
+)
 ORCHESTRATION_SCHEMA = "fast_roborender.round_dagger.orchestration_config.v3"
 PRODUCTION_MACRO_ROUNDS = 5
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
-_SENSITIVE_RE = re.compile(r"(?i)(api[_-]?key|password|secret|access[_-]?token|identity[_-]?token)")
+_SENSITIVE_RE = re.compile(
+    r"(?i)(api[_-]?key|password|secret|access[_-]?token|identity[_-]?token)"
+)
 _PHASES = {"READY", "COLLECTING", "COLLECTED", "INGESTED", "TRAINED", "EVALUATED"}
+_ATTEMPT_STAGING_RE = re.compile(
+    r"^\.macro_round_[0-9]{6}_policy_[0-9]{6}_[0-9a-f]{12}_"
+    r"attempt_[0-9]{6}\.json\.staging$"
+)
+_FAILURE_STAGING_RE = re.compile(
+    r"^\.macro_round_[0-9]{6}_policy_[0-9]{6}_[0-9a-f]{12}_"
+    r"failure_[0-9]{6}\.json\.staging$"
+)
+_OPERATOR_SIGNAL_RETURN_CODES = {
+    128 + signal.SIGHUP,
+    128 + signal.SIGINT,
+    128 + signal.SIGTERM,
+}
 
 
 class ProductionDriverError(RuntimeError):
@@ -55,7 +77,28 @@ def _absolute(value: str | os.PathLike[str], label: str) -> Path:
     return path
 
 
+def _check_path_chain(path: Path, label: str) -> None:
+    """Reject every existing symlink or non-directory ancestor."""
+
+    path = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    current = Path(path.anchor)
+    parts = path.parts[1:] if path.anchor else path.parts
+    for index, component in enumerate(parts):
+        current /= component
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise ProductionDriverError(f"{label} contains a symbolic link: {current}")
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise ProductionDriverError(
+                f"{label} contains a non-directory ancestor: {current}"
+            )
+
+
 def _lstat_regular(path: Path, label: str, *, immutable: bool = False) -> None:
+    _check_path_chain(path, label)
     try:
         info = os.lstat(path)
     except FileNotFoundError as exc:
@@ -67,6 +110,7 @@ def _lstat_regular(path: Path, label: str, *, immutable: bool = False) -> None:
 
 
 def _lstat_directory(path: Path, label: str) -> None:
+    _check_path_chain(path, label)
     try:
         info = os.lstat(path)
     except FileNotFoundError as exc:
@@ -98,7 +142,9 @@ def _reject_secrets(value: Any, label: str = "input") -> None:
 
 
 def _atomic_json(path: Path, document: Mapping[str, Any], *, mode: int = 0o600) -> None:
+    _check_path_chain(path.parent, "atomic JSON parent")
     path.parent.mkdir(parents=True, exist_ok=True)
+    _check_path_chain(path, "atomic JSON path")
     payload = (
         json.dumps(document, sort_keys=True, indent=2, allow_nan=False) + "\n"
     ).encode("utf-8")
@@ -124,30 +170,132 @@ def _atomic_json(path: Path, document: Mapping[str, Any], *, mode: int = 0o600) 
 
 
 def _publish_immutable(path: Path, document: Mapping[str, Any]) -> str:
+    """Publish complete JSON create-only without exposing a partial final name.
+
+    The deterministic hidden staging name is protected by an advisory lock on
+    the parent directory.  A SIGKILL can therefore strand only that staging
+    inode; the next publisher removes it without interpreting its bytes.  The
+    final path is installed with ``link(2)``, which never overwrites an
+    existing artifact.
+    """
+
+    _check_path_chain(path.parent, "immutable publication parent")
     path.parent.mkdir(parents=True, exist_ok=True)
+    _check_path_chain(path, "immutable publication path")
     payload = (
         json.dumps(document, sort_keys=True, indent=2, allow_nan=False) + "\n"
     ).encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(path, flags, 0o400)
-    try:
-        with os.fdopen(descriptor, "wb", closefd=True) as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        os.chmod(path, 0o444)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(path.parent, directory_flags)
+    staging_name = f".{path.name}.staging"
+    staging_created = False
+
+    def existing_bytes() -> bytes:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except BaseException:
-        try:
-            path.unlink()
+            descriptor = os.open(path.name, flags, dir_fd=directory_fd)
         except FileNotFoundError:
-            pass
-        raise
-    return artifacts.sha256_file(path)
+            raise
+        except OSError as exc:
+            raise ProductionDriverError(
+                f"existing immutable artifact is unsafe: {path}"
+            ) from exc
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o222:
+                raise ProductionDriverError(
+                    f"existing immutable artifact is unsafe: {path}"
+                )
+            if info.st_size != len(payload):
+                raise ProductionDriverError(
+                    f"existing immutable artifact conflicts: {path}"
+                )
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        finally:
+            os.close(descriptor)
+
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        try:
+            staging_info = os.stat(
+                staging_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            staging_info = None
+        if staging_info is not None:
+            if not stat.S_ISREG(staging_info.st_mode):
+                raise ProductionDriverError(
+                    f"immutable publication staging artifact is unsafe: {path}"
+                )
+            os.unlink(staging_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+
+        try:
+            current = existing_bytes()
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            if current != payload:
+                raise ProductionDriverError(
+                    f"existing immutable artifact conflicts: {path}"
+                )
+            return expected_sha256
+
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(staging_name, flags, 0o400, dir_fd=directory_fd)
+        staging_created = True
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as output:
+                output.write(payload)
+                output.flush()
+                os.fchmod(output.fileno(), 0o444)
+                os.fsync(output.fileno())
+            try:
+                os.link(
+                    staging_name,
+                    path.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                if existing_bytes() != payload:
+                    raise ProductionDriverError(
+                        f"existing immutable artifact conflicts: {path}"
+                    ) from None
+            os.fsync(directory_fd)
+            return expected_sha256
+        finally:
+            if staging_created:
+                try:
+                    os.unlink(staging_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                except FileNotFoundError:
+                    pass
+    finally:
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
 
 
 @dataclass(frozen=True)
@@ -165,10 +313,21 @@ class DriverInputs:
     launcher_sha256: str
     control_root: Path
     heartbeat_seconds: float = 60.0
+    collection_retry_limit: int = 2
+    collection_retry_backoff_seconds: float = 30.0
 
     def validate(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         if self.heartbeat_seconds <= 0:
             raise ProductionDriverError("heartbeat_seconds must be positive")
+        if (
+            type(self.collection_retry_limit) is not int
+            or self.collection_retry_limit < 0
+        ):
+            raise ProductionDriverError("collection_retry_limit must be a non-negative integer")
+        if self.collection_retry_backoff_seconds < 0:
+            raise ProductionDriverError(
+                "collection_retry_backoff_seconds must be non-negative"
+            )
         _lstat_directory(self.campaign_root, "campaign root")
         if not self.evaluation_sealed_source_root.is_absolute():
             raise ProductionDriverError(
@@ -273,6 +432,7 @@ class ExclusiveCampaignLock:
         self._descriptor: int | None = None
 
     def __enter__(self) -> "ExclusiveCampaignLock":
+        _check_path_chain(self.path, "driver lock path")
         try:
             info = os.lstat(self.path)
         except FileNotFoundError:
@@ -284,7 +444,9 @@ class ExclusiveCampaignLock:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             os.close(descriptor)
-            raise ProductionDriverError("another production driver holds the campaign lock") from exc
+            raise ProductionDriverError(
+                "another production driver holds the campaign lock"
+            ) from exc
         os.ftruncate(descriptor, 0)
         os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
         os.fsync(descriptor)
@@ -294,6 +456,58 @@ class ExclusiveCampaignLock:
     def __exit__(self, *_: object) -> None:
         if self._descriptor is not None:
             fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+
+class ExclusiveLauncherExecutionLock:
+    """Lock inherited by the launcher so it survives a driver SIGKILL.
+
+    The campaign lock protects one live driver, but the launcher is a separate
+    process and intentionally continues if its supervising driver disappears.
+    Passing this locked descriptor through ``exec`` lets a replacement driver
+    distinguish an actually live, not-yet-heartbeated orchestrator from an
+    abandoned immutable attempt without relying on a mutable PID record.
+    """
+
+    def __init__(self, campaign_root: Path):
+        self.path = campaign_root / ".production_five_round_launcher.lock"
+        self._descriptor: int | None = None
+
+    def __enter__(self) -> "ExclusiveLauncherExecutionLock":
+        _check_path_chain(self.path, "launcher execution lock path")
+        try:
+            info = os.lstat(self.path)
+        except FileNotFoundError:
+            info = None
+        if info is not None and not stat.S_ISREG(info.st_mode):
+            raise ProductionDriverError(
+                f"unsafe launcher execution lock path: {self.path}"
+            )
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise ProductionDriverError(
+                "a prior launcher/orchestrator is still alive; refusing duplicate "
+                "orchestration"
+            ) from exc
+        self._descriptor = descriptor
+        return self
+
+    @property
+    def descriptor(self) -> int:
+        if self._descriptor is None:
+            raise ProductionDriverError("launcher execution lock is not held")
+        return self._descriptor
+
+    def __exit__(self, *_: object) -> None:
+        if self._descriptor is not None:
+            # Do not issue LOCK_UN: the launcher inherits this same open-file
+            # description. Closing the driver's copy releases the lock only
+            # after the launcher has also exited; an explicit unlock would
+            # incorrectly drop protection while an orphan child is still live.
             os.close(self._descriptor)
             self._descriptor = None
 
@@ -410,7 +624,10 @@ def _orchestration_document(
         "hooks": {
             "collect": {
                 "argv": [
-                    str(repository_root / "scripts/round_dagger/run_production_actor_cohort_hook.sh")
+                    str(
+                        repository_root
+                        / "scripts/round_dagger/run_production_actor_cohort_hook.sh"
+                    )
                 ],
                 "timeout_seconds": 14400,
             },
@@ -517,7 +734,9 @@ def _launcher_argv(inputs: DriverInputs, config_path: Path, *, dry_run: bool) ->
     if dry_run:
         argv.append("--dry-run")
     if any(_SENSITIVE_RE.search(item) for item in argv):
-        raise ProductionDriverError("launcher argv unexpectedly contains a credential-shaped value")
+        raise ProductionDriverError(
+            "launcher argv unexpectedly contains a credential-shaped value"
+        )
     return argv
 
 
@@ -532,6 +751,9 @@ def _status_document(
     launcher_pid: int | None = None,
     launcher_start_ticks: int | None = None,
     detail: str | None = None,
+    collection_retry_count: int = 0,
+    collection_recovery: Mapping[str, Any] | None = None,
+    collection_retry_ledger_path: Path | None = None,
 ) -> dict[str, Any]:
     document: dict[str, Any] = {
         "schema": DRIVER_STATUS_SCHEMA,
@@ -555,10 +777,651 @@ def _status_document(
         "binding_path": None if binding_path is None else str(binding_path),
         "launcher_pid": launcher_pid,
         "launcher_start_ticks": launcher_start_ticks,
+        "collection_retry_count": collection_retry_count,
+        "collection_retry_limit": inputs.collection_retry_limit,
+        "collection_recovery": collection_recovery,
+        "collection_retry_ledger_path": (
+            None
+            if collection_retry_ledger_path is None
+            else str(collection_retry_ledger_path)
+        ),
         "detail": detail,
     }
     _reject_secrets(document, "driver status")
     return document
+
+
+def _retry_frontier(
+    campaign: Mapping[str, Any], coordinator: Mapping[str, Any]
+) -> dict[str, Any]:
+    active = coordinator.get("active_policy")
+    if not isinstance(active, Mapping):
+        raise ProductionDriverError("retry frontier has no active policy")
+    frontier = {
+        "campaign_id": campaign.get("campaign_id"),
+        "macro_round": coordinator.get("next_macro_round"),
+        "policy_version": active.get("version"),
+        "policy_checkpoint_sha256": active.get("checkpoint_sha256"),
+    }
+    if not isinstance(frontier["campaign_id"], str):
+        raise ProductionDriverError("retry frontier campaign ID is invalid")
+    if type(frontier["macro_round"]) is not int or type(frontier["policy_version"]) is not int:
+        raise ProductionDriverError("retry frontier indices are invalid")
+    _sha(frontier["policy_checkpoint_sha256"], "retry frontier policy checkpoint")
+    return frontier
+
+
+def _retry_ledger_directory(inputs: DriverInputs, *, create: bool) -> Path:
+    directory = inputs.control_root / "collection_attempt_failures"
+    _check_path_chain(directory, "collection retry ledger")
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+        _check_path_chain(directory, "collection retry ledger")
+    if directory.exists():
+        _lstat_directory(directory, "collection retry ledger")
+    return directory
+
+
+def _attempt_ledger_directory(inputs: DriverInputs, *, create: bool) -> Path:
+    directory = inputs.control_root / "collection_launcher_attempts"
+    _check_path_chain(directory, "collection attempt ledger")
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+        _check_path_chain(directory, "collection attempt ledger")
+    if directory.exists():
+        _lstat_directory(directory, "collection attempt ledger")
+    return directory
+
+
+def _prune_ledger_staging(
+    directory: Path,
+    *,
+    pattern: re.Pattern[str],
+    label: str,
+) -> list[str]:
+    """Remove only exact regular staging inodes left by our publisher.
+
+    The immutable publisher and this recovery path take the same advisory lock
+    on the ledger directory. Hidden names that do not match the complete
+    canonical final-record grammar are not removed and remain visible to the
+    strict loader. A matching symlink or non-regular inode is ambiguous and
+    therefore rejected rather than followed or deleted.
+    """
+
+    _check_path_chain(directory, label)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(directory, directory_flags)
+    removed: list[str] = []
+    locked = False
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        locked = True
+        for name in sorted(os.listdir(directory_fd)):
+            if pattern.fullmatch(name) is None:
+                continue
+            try:
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ProductionDriverError(
+                    f"cannot inspect {label} staging artifact"
+                ) from exc
+            if not stat.S_ISREG(info.st_mode):
+                raise ProductionDriverError(f"{label} staging artifact is unsafe")
+            os.unlink(name, dir_fd=directory_fd)
+            removed.append(name)
+        if removed:
+            os.fsync(directory_fd)
+    finally:
+        if locked:
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
+    return removed
+
+
+def _load_collection_attempts(
+    *,
+    inputs: DriverInputs,
+    campaign: Mapping[str, Any],
+    coordinator: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    directory = _attempt_ledger_directory(inputs, create=False)
+    if not directory.exists():
+        return []
+    _prune_ledger_staging(
+        directory,
+        pattern=_ATTEMPT_STAGING_RE,
+        label="collection attempt ledger",
+    )
+    frontier = _retry_frontier(campaign, coordinator)
+    matching: list[dict[str, Any]] = []
+    for path in sorted(directory.iterdir()):
+        _lstat_regular(path, "collection launcher attempt", immutable=True)
+        try:
+            document = artifacts.load_strict_json(path)
+        except Exception as exc:
+            raise ProductionDriverError(
+                "cannot load immutable collection launcher attempt"
+            ) from exc
+        expected_keys = {
+            "schema",
+            "campaign_id",
+            "campaign_contract_sha256",
+            "macro_round",
+            "policy_version",
+            "policy_checkpoint_sha256",
+            "attempt_index",
+            "orchestration_config_path",
+            "orchestration_config_sha256",
+        }
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != expected_keys
+            or document.get("schema") != COLLECTION_ATTEMPT_SCHEMA
+        ):
+            raise ProductionDriverError("collection launcher attempt schema is invalid")
+        _reject_secrets(document, "collection launcher attempt")
+        for field in (
+            "campaign_contract_sha256",
+            "policy_checkpoint_sha256",
+            "orchestration_config_sha256",
+        ):
+            _sha(document.get(field), f"collection launcher attempt {field}")
+        if document["campaign_contract_sha256"] != inputs.campaign_contract_sha256:
+            raise ProductionDriverError(
+                "collection launcher attempt belongs to another campaign contract"
+            )
+        attempt_index = document.get("attempt_index")
+        if type(attempt_index) is not int or attempt_index < 0:
+            raise ProductionDriverError("collection launcher attempt index is invalid")
+        if (
+            not isinstance(document.get("campaign_id"), str)
+            or type(document.get("macro_round")) is not int
+            or document["macro_round"] < 0
+            or type(document.get("policy_version")) is not int
+            or document["policy_version"] < 0
+        ):
+            raise ProductionDriverError("collection launcher attempt frontier is invalid")
+        config_path = document.get("orchestration_config_path")
+        if not isinstance(config_path, str) or not Path(config_path).is_absolute():
+            raise ProductionDriverError("collection launcher config path is invalid")
+        expected_name = (
+            f"macro_round_{document['macro_round']:06d}"
+            f"_policy_{document['policy_version']:06d}"
+            f"_{document['policy_checkpoint_sha256'][:12]}"
+            f"_attempt_{attempt_index:06d}.json"
+        )
+        if path.name != expected_name:
+            raise ProductionDriverError("collection launcher attempt filename is not canonical")
+        if all(document.get(key) == value for key, value in frontier.items()):
+            matching.append(dict(document))
+    indices = [document["attempt_index"] for document in matching]
+    if indices != list(range(len(indices))):
+        raise ProductionDriverError(
+            "collection launcher attempts are not a contiguous immutable ledger"
+        )
+    return matching
+
+
+def _publish_collection_attempt(
+    *,
+    inputs: DriverInputs,
+    campaign: Mapping[str, Any],
+    coordinator: Mapping[str, Any],
+    attempt_index: int,
+    config_path: Path,
+    config_sha256: str,
+) -> Path:
+    if type(attempt_index) is not int or attempt_index < 0:
+        raise ProductionDriverError("collection launcher attempt index is invalid")
+    frontier = _retry_frontier(campaign, coordinator)
+    directory = _attempt_ledger_directory(inputs, create=True)
+    path = directory / (
+        f"macro_round_{frontier['macro_round']:06d}"
+        f"_policy_{frontier['policy_version']:06d}"
+        f"_{frontier['policy_checkpoint_sha256'][:12]}"
+        f"_attempt_{attempt_index:06d}.json"
+    )
+    document = {
+        "schema": COLLECTION_ATTEMPT_SCHEMA,
+        **frontier,
+        "campaign_contract_sha256": inputs.campaign_contract_sha256,
+        "attempt_index": attempt_index,
+        "orchestration_config_path": str(config_path),
+        "orchestration_config_sha256": config_sha256,
+    }
+    _reject_secrets(document, "collection launcher attempt")
+    _publish_immutable(path, document)
+    return path
+
+
+def _load_collection_failures(
+    *,
+    inputs: DriverInputs,
+    campaign: Mapping[str, Any],
+    coordinator: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Load immutable failed launcher attempts at this exact frontier."""
+
+    directory = _retry_ledger_directory(inputs, create=False)
+    if not directory.exists():
+        return []
+    _prune_ledger_staging(
+        directory,
+        pattern=_FAILURE_STAGING_RE,
+        label="collection failure ledger",
+    )
+    frontier = _retry_frontier(campaign, coordinator)
+    matching: list[dict[str, Any]] = []
+    for path in sorted(directory.iterdir()):
+        _lstat_regular(path, "collection attempt failure", immutable=True)
+        try:
+            document = artifacts.load_strict_json(path)
+        except Exception as exc:
+            raise ProductionDriverError(
+                "cannot load immutable collection attempt failure"
+            ) from exc
+        if not isinstance(document, Mapping):
+            raise ProductionDriverError("collection attempt failure is not an object")
+        expected_keys = {
+            "schema",
+            "campaign_id",
+            "campaign_contract_sha256",
+            "macro_round",
+            "policy_version",
+            "policy_checkpoint_sha256",
+            "failure_index",
+            "retry_attempt_number",
+            "failed_orchestration_config_path",
+            "failed_orchestration_config_sha256",
+            "launcher_return_code",
+            "operator_cancelled",
+            "recovery",
+        }
+        if (
+            set(document) != expected_keys
+            or document.get("schema") != COLLECTION_FAILURE_SCHEMA
+        ):
+            raise ProductionDriverError("collection attempt failure schema is invalid")
+        _reject_secrets(document, "collection attempt failure")
+        _sha(
+            document.get("campaign_contract_sha256"),
+            "retry authorization campaign contract",
+        )
+        _sha(
+            document.get("policy_checkpoint_sha256"),
+            "retry authorization policy checkpoint",
+        )
+        _sha(
+            document.get("failed_orchestration_config_sha256"),
+            "retry authorization orchestration config",
+        )
+        if document.get("campaign_contract_sha256") != inputs.campaign_contract_sha256:
+            raise ProductionDriverError(
+                "collection failure belongs to another campaign contract"
+            )
+        failure_index = document.get("failure_index")
+        retry_attempt_number = document.get("retry_attempt_number")
+        return_code = document.get("launcher_return_code")
+        if (
+            not isinstance(document.get("campaign_id"), str)
+            or type(document.get("macro_round")) is not int
+            or document["macro_round"] < 0
+            or type(document.get("policy_version")) is not int
+            or document["policy_version"] < 0
+        ):
+            raise ProductionDriverError("collection failure frontier is invalid")
+        if type(failure_index) is not int or failure_index < 1:
+            raise ProductionDriverError("collection failure index is invalid")
+        if (
+            type(retry_attempt_number) is not int
+            or retry_attempt_number != failure_index - 1
+        ):
+            raise ProductionDriverError("collection retry attempt number is invalid")
+        if type(return_code) is not int or return_code == 0:
+            raise ProductionDriverError("collection failure return code is invalid")
+        operator_cancelled = document.get("operator_cancelled")
+        recovery = document.get("recovery")
+        if type(operator_cancelled) is not bool:
+            raise ProductionDriverError("collection cancellation flag is invalid")
+        if recovery is not None and (
+            not isinstance(recovery, Mapping)
+            or recovery.get("safe_to_retry") is not True
+        ):
+            raise ProductionDriverError("collection recovery proof is invalid")
+        if operator_cancelled and recovery is not None:
+            raise ProductionDriverError("operator cancellation cannot carry retry proof")
+        expected_name = (
+            f"macro_round_{document['macro_round']:06d}"
+            f"_policy_{document['policy_version']:06d}"
+            f"_{document['policy_checkpoint_sha256'][:12]}"
+            f"_failure_{failure_index:06d}.json"
+        )
+        if path.name != expected_name:
+            raise ProductionDriverError("collection failure filename is not canonical")
+        config_path = document.get("failed_orchestration_config_path")
+        if not isinstance(config_path, str) or not Path(config_path).is_absolute():
+            raise ProductionDriverError("collection failure config path is invalid")
+        if all(document.get(key) == value for key, value in frontier.items()):
+            matching.append(dict(document))
+    indices = [document["failure_index"] for document in matching]
+    if indices != list(range(1, len(indices) + 1)):
+        raise ProductionDriverError(
+            "collection attempt failures are not a contiguous immutable ledger"
+        )
+    return matching
+
+
+def _publish_collection_failure(
+    *,
+    inputs: DriverInputs,
+    campaign: Mapping[str, Any],
+    coordinator: Mapping[str, Any],
+    failure_index: int,
+    config_path: Path,
+    config_sha256: str,
+    launcher_return_code: int,
+    operator_cancelled: bool,
+    recovery: Mapping[str, Any] | None,
+) -> Path:
+    if type(failure_index) is not int or failure_index < 1:
+        raise ProductionDriverError("collection failure index must be positive")
+    if type(launcher_return_code) is not int or launcher_return_code == 0:
+        raise ProductionDriverError("collection failure return code must be nonzero")
+    if operator_cancelled and recovery is not None:
+        raise ProductionDriverError("operator cancellation cannot be retryable")
+    if recovery is not None and recovery.get("safe_to_retry") is not True:
+        raise ProductionDriverError("collection failure lacks a safe recovery proof")
+    frontier = _retry_frontier(campaign, coordinator)
+    directory = _retry_ledger_directory(inputs, create=True)
+    stem = (
+        f"macro_round_{frontier['macro_round']:06d}"
+        f"_policy_{frontier['policy_version']:06d}"
+        f"_{frontier['policy_checkpoint_sha256'][:12]}"
+        f"_failure_{failure_index:06d}.json"
+    )
+    path = directory / stem
+    document = {
+        "schema": COLLECTION_FAILURE_SCHEMA,
+        **frontier,
+        "campaign_contract_sha256": inputs.campaign_contract_sha256,
+        "failure_index": failure_index,
+        "retry_attempt_number": failure_index - 1,
+        "failed_orchestration_config_path": str(config_path),
+        "failed_orchestration_config_sha256": config_sha256,
+        "launcher_return_code": launcher_return_code,
+        "operator_cancelled": operator_cancelled,
+        "recovery": None if recovery is None else dict(recovery),
+    }
+    _reject_secrets(document, "collection attempt failure")
+    _publish_immutable(path, document)
+    return path
+
+
+def _is_operator_cancellation(return_code: int) -> bool:
+    """Conservatively identify outcomes that must never be auto-retried."""
+
+    return (
+        return_code < 0
+        or return_code in _OPERATOR_SIGNAL_RETURN_CODES
+        or 129 <= return_code <= 192
+    )
+
+
+def _recoverable_collection_evidence(
+    *,
+    inputs: DriverInputs,
+    campaign: Mapping[str, Any],
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Prove that rerunning the idempotent orchestrator is phase-safe.
+
+    READY at the same frontier means the round was never opened.  COLLECTING
+    additionally requires a strict actor-filesystem proof because collection
+    may contain unsealed work.  COLLECTED through EVALUATED are durable state
+    machine checkpoints whose loaders revalidate immutable evidence before the
+    orchestrator continues.  Forward progress within the same round is safe;
+    policy/frontier changes and phase regression fail closed.
+    """
+
+    before_phase = before.get("phase")
+    after_phase = after.get("phase")
+    phase_order = {
+        "READY": 0,
+        "COLLECTING": 1,
+        "COLLECTED": 2,
+        "INGESTED": 3,
+        "TRAINED": 4,
+        "EVALUATED": 5,
+    }
+    if (
+        before_phase not in phase_order
+        or after_phase not in phase_order
+        or after.get("next_macro_round") != before.get("next_macro_round")
+        or after.get("active_policy") != before.get("active_policy")
+        or phase_order[after_phase] < phase_order[before_phase]
+        or (before_phase != "READY" and after_phase == "READY")
+    ):
+        return None
+
+    macro_round = before.get("next_macro_round")
+    if type(macro_round) is not int:
+        return None
+    expected_before_open = None if before_phase == "READY" else macro_round
+    expected_after_open = None if after_phase == "READY" else macro_round
+    if (
+        before.get("open_macro_round") != expected_before_open
+        or after.get("open_macro_round") != expected_after_open
+    ):
+        return None
+
+    base = {
+        "schema": "fast_roborender.round_dagger.launcher_recovery.v1",
+        "macro_round": macro_round,
+        "from_phase": before_phase,
+        "resume_phase": after_phase,
+        "safe_to_retry": True,
+    }
+    if after_phase == "READY":
+        return {**base, "resume_mode": "round_not_opened", "cohorts": []}
+    if after_phase in {"COLLECTED", "INGESTED", "TRAINED", "EVALUATED"}:
+        return {**base, "resume_mode": "durable_phase", "cohorts": []}
+
+    # Imported lazily so the driver remains lightweight for status-only paths.
+    from round_dagger.actor_pair import (
+        ActorPairError,
+        inspect_actor_pair_for_recovery,
+    )
+
+    campaign_id = campaign.get("campaign_id")
+    if not isinstance(campaign_id, str) or not campaign_id:
+        return None
+    actor_round = (
+        inputs.campaign_root
+        / "actors"
+        / campaign_id
+        / f"macro_round_{macro_round:06d}"
+    )
+    cohorts: list[dict[str, Any]] = []
+    encountered_gap = False
+    unsealed_count = 0
+    for cohort_index in range(4):
+        cohort = actor_round / f"cohort_{cohort_index:02d}"
+        if not os.path.lexists(cohort):
+            encountered_gap = True
+            cohorts.append({"cohort_index": cohort_index, "state": "absent"})
+            continue
+        try:
+            report = inspect_actor_pair_for_recovery(cohort)
+        except (ActorPairError, OSError, ValueError):
+            return None
+        if report["sealed"]:
+            # Collection is strictly sequential.  A seal after an absent or
+            # unfinished cohort means the filesystem frontier is ambiguous.
+            if encountered_gap or unsealed_count:
+                return None
+            cohorts.append({"cohort_index": cohort_index, "state": "sealed"})
+            continue
+        states = report.get("rank_states")
+        if not isinstance(states, Mapping) or set(states.values()) - {
+            "empty",
+            "complete",
+            "resumable",
+        }:
+            return None
+        if encountered_gap or unsealed_count:
+            return None
+        unsealed_count += 1
+        encountered_gap = True
+        cohorts.append(
+            {
+                "cohort_index": cohort_index,
+                "state": "unsealed",
+                "rank_states": dict(states),
+                "requires_temp_cleanup": bool(
+                    report.get("requires_temp_cleanup", False)
+                ),
+            }
+        )
+
+    return {
+        **base,
+        "resume_mode": "collection_frontier",
+        "cohorts": cohorts,
+    }
+
+
+def _reconcile_unmatched_attempt(
+    *,
+    inputs: DriverInputs,
+    runtime_contract: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    coordinator: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+) -> tuple[Path, str, Path, dict[str, Any]]:
+    """Validate and resume one attempt whose launcher result was not recorded."""
+
+    frontier = _retry_frontier(campaign, coordinator)
+    if any(attempt.get(key) != value for key, value in frontier.items()):
+        raise ProductionDriverError(
+            "unmatched launcher attempt is not bound to the active frontier"
+        )
+    recovery = _recoverable_collection_evidence(
+        inputs=inputs,
+        campaign=campaign,
+        before=coordinator,
+        after=coordinator,
+    )
+    if recovery is None:
+        raise ProductionDriverError(
+            "unmatched launcher attempt has no phase-safe resume proof"
+        )
+
+    raw_config_path = attempt.get("orchestration_config_path")
+    if not isinstance(raw_config_path, str) or not Path(raw_config_path).is_absolute():
+        raise ProductionDriverError("unmatched launcher config path is invalid")
+    config_path = Path(os.path.abspath(raw_config_path))
+    if str(config_path) != raw_config_path:
+        raise ProductionDriverError("unmatched launcher config path is not canonical")
+    expected_directory = Path(
+        os.path.abspath(inputs.control_root / "orchestration_configs")
+    )
+    if config_path.parent != expected_directory:
+        raise ProductionDriverError(
+            "unmatched launcher config lies outside the immutable config namespace"
+        )
+    expected_stem = (
+        f"macro_round_{frontier['macro_round']:06d}"
+        f"_policy_{frontier['policy_version']:06d}"
+        f"_{frontier['policy_checkpoint_sha256'][:12]}"
+    )
+    match = re.fullmatch(
+        rf"{re.escape(expected_stem)}_attempt_([0-9]{{6}})\.json",
+        config_path.name,
+    )
+    if match is None or int(match.group(1)) < 1:
+        raise ProductionDriverError(
+            "unmatched launcher config filename is not canonical"
+        )
+
+    config_sha = attempt.get("orchestration_config_sha256")
+    _sha(config_sha, "unmatched launcher orchestration config")
+    _verify_file(config_path, config_sha, "unmatched launcher orchestration config")
+    try:
+        observed_document = artifacts.load_strict_json(config_path)
+        MacroRoundConfig.load(config_path)
+    except Exception as exc:
+        raise ProductionDriverError(
+            "unmatched launcher orchestration config is invalid"
+        ) from exc
+    expected_document = _orchestration_document(
+        inputs, runtime_contract, campaign, coordinator
+    )
+    if observed_document != expected_document:
+        raise ProductionDriverError(
+            "unmatched launcher config no longer matches the exact active frontier"
+        )
+
+    binding_path = config_path.with_suffix(".binding.json")
+    _lstat_regular(binding_path, "unmatched launcher binding", immutable=True)
+    try:
+        binding = artifacts.load_strict_json(binding_path)
+    except Exception as exc:
+        raise ProductionDriverError("unmatched launcher binding is invalid") from exc
+    expected_binding = {
+        "schema": DRIVER_BINDING_SCHEMA,
+        "campaign_id": campaign["campaign_id"],
+        "campaign_contract_path": str(inputs.campaign_contract),
+        "campaign_contract_sha256": inputs.campaign_contract_sha256,
+        "learner_contract_path": str(inputs.learner_contract),
+        "learner_contract_sha256": inputs.learner_contract_sha256,
+        "launcher_path": str(inputs.launcher),
+        "launcher_sha256": inputs.launcher_sha256,
+        "macro_round": frontier["macro_round"],
+        "active_policy_version": frontier["policy_version"],
+        "active_policy_checkpoint_sha256": frontier[
+            "policy_checkpoint_sha256"
+        ],
+        "orchestration_config_path": str(config_path),
+        "orchestration_config_sha256": config_sha,
+    }
+    if binding != expected_binding:
+        raise ProductionDriverError(
+            "unmatched launcher binding no longer matches the exact active frontier"
+        )
+    return config_path, config_sha, binding_path, recovery
+
+
+def _round_was_promoted(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> bool:
+    before_policy = before.get("active_policy")
+    after_policy = after.get("active_policy")
+    before_round = before.get("next_macro_round")
+    after_round = after.get("next_macro_round")
+    before_version = (
+        before_policy.get("version") if isinstance(before_policy, Mapping) else None
+    )
+    after_version = (
+        after_policy.get("version") if isinstance(after_policy, Mapping) else None
+    )
+    return bool(
+        isinstance(before_policy, Mapping)
+        and isinstance(after_policy, Mapping)
+        and type(before_round) is int
+        and type(after_round) is int
+        and type(before_version) is int
+        and type(after_version) is int
+        and after.get("phase") == "READY"
+        and after.get("open_macro_round") is None
+        and after_round == before_round + 1
+        and after_version == before_version + 1
+    )
 
 
 def _invoke_launcher(
@@ -567,44 +1430,76 @@ def _invoke_launcher(
     log_path: Path,
     heartbeat_seconds: float,
     on_heartbeat: Callable[[int, int | None], None],
+    execution_lock_fd: int | None = None,
 ) -> int:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab", buffering=0) as log:
-        child = subprocess.Popen(
-            list(argv),
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
-        start_ticks = _proc_start_ticks(child.pid)
-        on_heartbeat(child.pid, start_ticks)
-        stop_signal: list[int] = []
+    forwarded_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, forwarded_signals)
+    previous_handlers: dict[int, Any] = {}
+    stop_signal: list[int] = []
+    child: subprocess.Popen[bytes] | None = None
+    signals_unblocked = False
 
-        def forward(signum: int, _frame: object) -> None:
-            stop_signal.append(signum)
-            try:
-                os.killpg(child.pid, signum)
-            except ProcessLookupError:
-                pass
-
-        previous_handlers: dict[int, Any] = {}
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            previous_handlers[signum] = signal.signal(signum, forward)
+    def forward(signum: int, _frame: object) -> None:
+        stop_signal.append(signum)
+        if child is None:
+            return
         try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            pass
+
+    def restore_child_signal_mask() -> None:
+        # The pre-fork block closes the parent race, but a forked child inherits
+        # that mask. Restore the caller's original mask before exec so forwarded
+        # termination signals are actionable in the launcher process group.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for signum in forwarded_signals:
+            previous_handlers[signum] = signal.signal(signum, forward)
+        with log_path.open("ab", buffering=0) as log:
+            child = subprocess.Popen(
+                list(argv),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+                preexec_fn=restore_child_signal_mask,
+                pass_fds=(
+                    () if execution_lock_fd is None else (execution_lock_fd,)
+                ),
+            )
+            start_ticks = _proc_start_ticks(child.pid)
+            # Handlers are active and the child process group exists before any
+            # pending operator signal is unblocked. This closes the Popen ->
+            # first-heartbeat window in which a driver-only SIGTERM could
+            # otherwise orphan a still-running orchestrator.
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            signals_unblocked = True
+            on_heartbeat(child.pid, start_ticks)
             while True:
                 try:
                     return_code = child.wait(timeout=heartbeat_seconds)
                     break
                 except subprocess.TimeoutExpired:
                     on_heartbeat(child.pid, start_ticks)
-            if stop_signal and return_code == 0:
+            if stop_signal:
                 return 128 + stop_signal[-1]
             return return_code
-        finally:
+    finally:
+        if signals_unblocked:
+            cleanup_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, forwarded_signals
+            )
+        else:
+            cleanup_mask = previous_mask
+        try:
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
 
 
 def run_driver(
@@ -617,7 +1512,10 @@ def run_driver(
 
     runtime_contract, _learner_contract, _campaign = inputs.validate()
     status_path = inputs.control_root / "driver_status.json"
-    with ExclusiveCampaignLock(inputs.campaign_root):
+    with (
+        ExclusiveCampaignLock(inputs.campaign_root),
+        ExclusiveLauncherExecutionLock(inputs.campaign_root) as execution_lock,
+    ):
         _refuse_live_orphan(status_path)
         while True:
             campaign, coordinator = _snapshot(inputs.campaign_root)
@@ -631,10 +1529,128 @@ def run_driver(
                 _atomic_json(status_path, result)
                 return result
 
-            config_path, config_sha, binding_path = materialize_orchestration_config(
-                inputs, runtime_contract, campaign, coordinator
+            collection_failures = _load_collection_failures(
+                inputs=inputs,
+                campaign=campaign,
+                coordinator=coordinator,
             )
-            initial_round = coordinator["next_macro_round"]
+            collection_attempts = _load_collection_attempts(
+                inputs=inputs,
+                campaign=campaign,
+                coordinator=coordinator,
+            )
+            if len(collection_attempts) < len(collection_failures) or len(
+                collection_attempts
+            ) > len(collection_failures) + 1:
+                raise ProductionDriverError(
+                    "collection attempt/failure ledgers have an impossible frontier"
+                )
+            for index, failure in enumerate(collection_failures):
+                attempt = collection_attempts[index]
+                if (
+                    failure["retry_attempt_number"] != attempt["attempt_index"]
+                    or failure["failed_orchestration_config_path"]
+                    != attempt["orchestration_config_path"]
+                    or failure["failed_orchestration_config_sha256"]
+                    != attempt["orchestration_config_sha256"]
+                ):
+                    raise ProductionDriverError(
+                        "collection attempt/failure ledgers disagree"
+                    )
+            unmatched_attempt = (
+                collection_attempts[-1]
+                if len(collection_attempts) == len(collection_failures) + 1
+                else None
+            )
+            failure_count = len(collection_failures)
+            retry_count = min(failure_count, inputs.collection_retry_limit)
+            latest_failure_path = None
+            if collection_failures:
+                frontier = _retry_frontier(campaign, coordinator)
+                latest_failure_path = _retry_ledger_directory(
+                    inputs, create=False
+                ) / (
+                    f"macro_round_{frontier['macro_round']:06d}"
+                    f"_policy_{frontier['policy_version']:06d}"
+                    f"_{frontier['policy_checkpoint_sha256'][:12]}"
+                    f"_failure_{failure_count:06d}.json"
+                )
+                last_failure = collection_failures[-1]
+                fresh_recovery = None
+                if (
+                    not last_failure["operator_cancelled"]
+                    and last_failure["recovery"] is not None
+                ):
+                    fresh_recovery = _recoverable_collection_evidence(
+                        inputs=inputs,
+                        campaign=campaign,
+                        before=coordinator,
+                        after=coordinator,
+                    )
+                # An unmatched later attempt is already a durable record that
+                # this bounded retry was authorized before the driver died.
+                # Reconcile that exact attempt instead of re-authorizing it
+                # from an older failure at a now-more-advanced phase.
+                if unmatched_attempt is None and (
+                    last_failure["operator_cancelled"]
+                    or last_failure["recovery"] is None
+                    or fresh_recovery is None
+                    or failure_count > inputs.collection_retry_limit
+                ):
+                    failed = _status_document(
+                        inputs=inputs,
+                        coordinator=coordinator,
+                        driver_state="FAILED",
+                        collection_retry_count=retry_count,
+                        collection_recovery=last_failure["recovery"],
+                        collection_retry_ledger_path=latest_failure_path,
+                        detail=(
+                            "previous launcher attempt was operator-cancelled; "
+                            "automatic restart is forbidden"
+                            if last_failure["operator_cancelled"]
+                            else "previous launcher failure had no safe recovery proof"
+                            if last_failure["recovery"] is None
+                            else "current collection frontier no longer satisfies the "
+                            "recorded safe-recovery contract"
+                            if fresh_recovery is None
+                            else f"bounded collection retry limit "
+                            f"{inputs.collection_retry_limit} was already exhausted"
+                        ),
+                    )
+                    _atomic_json(status_path, failed)
+                    raise ProductionDriverError(
+                        "immutable collection failure ledger forbids another launch"
+                    )
+
+            resume_recovery = None
+            if unmatched_attempt is not None:
+                (
+                    config_path,
+                    config_sha,
+                    binding_path,
+                    resume_recovery,
+                ) = _reconcile_unmatched_attempt(
+                    inputs=inputs,
+                    runtime_contract=runtime_contract,
+                    campaign=campaign,
+                    coordinator=coordinator,
+                    attempt=unmatched_attempt,
+                )
+            else:
+                config_path, config_sha, binding_path = (
+                    materialize_orchestration_config(
+                        inputs, runtime_contract, campaign, coordinator
+                    )
+                )
+            if not dry_run and unmatched_attempt is None:
+                _publish_collection_attempt(
+                    inputs=inputs,
+                    campaign=campaign,
+                    coordinator=coordinator,
+                    attempt_index=failure_count,
+                    config_path=config_path,
+                    config_sha256=config_sha,
+                )
             log_path = config_path.with_suffix(".launcher.log")
 
             def heartbeat(pid: int, ticks: int | None) -> None:
@@ -652,7 +1668,17 @@ def run_driver(
                         binding_path=binding_path,
                         launcher_pid=pid,
                         launcher_start_ticks=ticks,
-                        detail="production launcher is running",
+                        collection_retry_count=retry_count,
+                        collection_retry_ledger_path=latest_failure_path,
+                        collection_recovery=resume_recovery,
+                        detail=(
+                            f"resuming unmatched launcher attempt from durable "
+                            f"{current['phase']} phase"
+                            if unmatched_attempt is not None
+                            else "production launcher is running"
+                            if retry_count == 0
+                            else f"production launcher retry {retry_count} is running"
+                        ),
                     ),
                 )
 
@@ -662,9 +1688,65 @@ def run_driver(
                 log_path=log_path,
                 heartbeat_seconds=inputs.heartbeat_seconds,
                 on_heartbeat=heartbeat,
+                execution_lock_fd=execution_lock.descriptor,
             )
             _, after = _snapshot(inputs.campaign_root)
+            operator_cancelled = return_code != 0 and _is_operator_cancellation(
+                return_code
+            )
             if return_code != 0:
+                recovery = (
+                    None
+                    if dry_run or operator_cancelled
+                    else _recoverable_collection_evidence(
+                        inputs=inputs,
+                        campaign=campaign,
+                        before=coordinator,
+                        after=after,
+                    )
+                )
+                failure_ledger_path = None
+                next_failure_count = failure_count
+                if not dry_run:
+                    next_failure_count = failure_count + 1
+                    failure_ledger_path = _publish_collection_failure(
+                        inputs=inputs,
+                        campaign=campaign,
+                        coordinator=coordinator,
+                        failure_index=next_failure_count,
+                        config_path=config_path,
+                        config_sha256=config_sha,
+                        launcher_return_code=return_code,
+                        operator_cancelled=operator_cancelled,
+                        recovery=recovery,
+                    )
+                if (
+                    recovery is not None
+                    and next_failure_count <= inputs.collection_retry_limit
+                ):
+                    next_retry = next_failure_count
+                    retrying = _status_document(
+                        inputs=inputs,
+                        coordinator=after,
+                        driver_state="RETRYING",
+                        config_path=config_path,
+                        config_sha256=config_sha,
+                        binding_path=binding_path,
+                        collection_retry_count=next_retry,
+                        collection_recovery=recovery,
+                        collection_retry_ledger_path=failure_ledger_path,
+                        detail=(
+                            f"launcher exited nonzero ({return_code}); verified immutable "
+                            f"durable phase frontier permits bounded retry {next_retry}/"
+                            f"{inputs.collection_retry_limit}"
+                        ),
+                    )
+                    _atomic_json(status_path, retrying)
+                    if inputs.collection_retry_backoff_seconds:
+                        time.sleep(inputs.collection_retry_backoff_seconds)
+                    # Re-snapshot and publish a fresh immutable launcher config.
+                    # Completed actor ranks are skipped by the actor-pair gate.
+                    continue
                 failed = _status_document(
                     inputs=inputs,
                     coordinator=after,
@@ -672,7 +1754,20 @@ def run_driver(
                     config_path=config_path,
                     config_sha256=config_sha,
                     binding_path=binding_path,
-                    detail=f"launcher exited nonzero ({return_code}); fail-closed stop",
+                    collection_retry_count=retry_count,
+                    collection_recovery=recovery,
+                    collection_retry_ledger_path=(
+                        failure_ledger_path or latest_failure_path
+                    ),
+                    detail=(
+                        f"launcher was cancelled by an operator signal ({return_code}); "
+                        "automatic retry is forbidden"
+                        if operator_cancelled
+                        else f"launcher exited nonzero ({return_code}); fail-closed stop"
+                        if recovery is None
+                        else f"launcher exited nonzero ({return_code}); bounded collection "
+                        f"retry limit {inputs.collection_retry_limit} exhausted"
+                    ),
                 )
                 _atomic_json(status_path, failed)
                 raise ProductionDriverError(f"production launcher exited {return_code}")
@@ -690,10 +1785,7 @@ def run_driver(
                 )
                 _atomic_json(status_path, validated)
                 return validated
-            if not (
-                after["phase"] == "READY"
-                and after["next_macro_round"] == initial_round + 1
-            ):
+            if not _round_was_promoted(coordinator, after):
                 failed = _status_document(
                     inputs=inputs,
                     coordinator=after,
@@ -726,6 +1818,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--launcher-sha256", required=True)
     parser.add_argument("--control-root", type=Path, required=True)
     parser.add_argument("--heartbeat-seconds", type=float, default=60.0)
+    parser.add_argument("--collection-retry-limit", type=int, default=2)
+    parser.add_argument(
+        "--collection-retry-backoff-seconds", type=float, default=30.0
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -752,6 +1848,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             launcher_sha256=arguments.launcher_sha256,
             control_root=_absolute(arguments.control_root, "control root"),
             heartbeat_seconds=arguments.heartbeat_seconds,
+            collection_retry_limit=arguments.collection_retry_limit,
+            collection_retry_backoff_seconds=(
+                arguments.collection_retry_backoff_seconds
+            ),
         )
         result = run_driver(inputs, dry_run=arguments.dry_run)
     except ProductionDriverError as exc:

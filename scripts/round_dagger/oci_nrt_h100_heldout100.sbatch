@@ -61,7 +61,7 @@ HELDOUT_SNAPSHOT="$LOCAL_CAMPAIGN/heldout_snapshot.json"
 
 [[ ${SLURM_JOB_NUM_NODES:-} == 1 ]] || fatal "heldout100 requires one node"
 [[ ${SLURM_GPUS_ON_NODE:-8} =~ (^|[^0-9])8([^0-9]|$)|^8$ ]] || fatal "heldout100 requires eight H100 GPUs"
-[[ $LOCAL_CAMPAIGN == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1 ]] || \
+[[ $LOCAL_CAMPAIGN == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829 ]] || \
     fatal "campaign mount does not preserve fixed-256 artifact paths"
 for path in "$REMOTE_SOURCE" "$CONTAINER" "$REMOTE_CAMPAIGN" "$LOCAL_CAMPAIGN" \
             "$REMOTE_OUTPUT" "$LOCAL_OUTPUT" \

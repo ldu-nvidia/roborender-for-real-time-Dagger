@@ -71,6 +71,12 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
                 "candidate_action_imitation_mse": 0.10,
                 "paired_action_imitation_mse_delta": -0.10,
                 "paired_action_imitation_mse_relative_change": -0.50,
+                "parent_episode_return_mean": 10.0,
+                "candidate_episode_return_mean": 12.5,
+                "paired_episode_return_mean_delta": 2.5,
+                "parent_episode_length_mean": 300.0,
+                "candidate_episode_length_mean": 280.0,
+                "paired_episode_length_mean_delta": -20.0,
                 "parent_lag_boundary_cases": 256.0,
                 "candidate_lag_boundary_cases": 256.0,
                 "paired_initial_condition_matches": 256.0,
@@ -131,6 +137,12 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
         self.assertEqual(payload["eval/parent/action_imitation_mse"], 0.20)
         self.assertEqual(payload["eval/candidate/action_imitation_mse"], 0.10)
         self.assertEqual(payload["eval/delta/action_imitation_mse"], -0.10)
+        self.assertEqual(payload["eval/parent/episode_return_mean"], 10.0)
+        self.assertEqual(payload["eval/candidate/episode_return_mean"], 12.5)
+        self.assertEqual(payload["eval/delta/episode_return_mean"], 2.5)
+        self.assertEqual(payload["eval/parent/episode_length_mean"], 300.0)
+        self.assertEqual(payload["eval/candidate/episode_length_mean"], 280.0)
+        self.assertEqual(payload["eval/delta/episode_length_mean"], -20.0)
         self.assertEqual(payload["eval/candidate/optimizer_steps"], 1200)
         self.assertEqual(_inventory(self.root), before)
         self.assertTrue(observer.state_path.is_file())

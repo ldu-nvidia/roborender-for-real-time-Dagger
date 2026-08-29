@@ -16,6 +16,7 @@ from round_dagger.production_campaign_monitor import (
     _gpu_health_burst,
     _slurm_health,
     _tree_snapshot,
+    _bound_process_matches,
     _wandb_remote_health,
     _wandb_remote_progress,
     collect_report,
@@ -38,6 +39,67 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
 
     def test_monitor_interval_is_exactly_thirty_minutes(self) -> None:
         self.assertEqual(MONITOR_INTERVAL_SECONDS, 1800.0)
+
+    def test_bound_quality_process_rejects_another_campaign(self) -> None:
+        pidfile = self.base / "quality.pid.json"
+        pidfile.write_text(
+            json.dumps(
+                {
+                    "schema": "fast_roborender.round_dagger.student_quality_bridge_process.v1",
+                    "pid": 123,
+                    "start_ticks": 456,
+                    "entrypoint": "/sealed/scripts/round_dagger/student_quality_wandb_bridge.py",
+                    "campaign_root": "/another/campaign",
+                    "state_dir": "/state/other",
+                    "driver_status": "/control/other.json",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        report = _bound_process_matches((pidfile,), campaign_root=self.campaign)
+        self.assertFalse(report[str(pidfile)]["healthy"])
+        self.assertEqual(report[str(pidfile)]["error"], "campaign_mismatch")
+
+    def test_bound_quality_process_requires_exact_pid_ticks_and_arguments(self) -> None:
+        pidfile = self.base / "quality.pid.json"
+        entrypoint = "/sealed/scripts/round_dagger/student_quality_wandb_bridge.py"
+        state_dir = "/state/current"
+        driver_status = "/control/current.json"
+        pidfile.write_text(
+            json.dumps(
+                {
+                    "schema": "fast_roborender.round_dagger.student_quality_bridge_process.v1",
+                    "pid": 123,
+                    "start_ticks": 456,
+                    "entrypoint": entrypoint,
+                    "campaign_root": str(self.campaign),
+                    "state_dir": state_dir,
+                    "driver_status": driver_status,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        argv = (
+            "/python", entrypoint,
+            "--campaign-root", str(self.campaign),
+            "--state-dir", state_dir,
+            "--driver-status", driver_status,
+        )
+        with (
+            mock.patch(
+                "round_dagger.production_campaign_monitor._process_start_ticks",
+                return_value=456,
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._process_argv",
+                return_value=argv,
+            ),
+        ):
+            report = _bound_process_matches((pidfile,), campaign_root=self.campaign)
+        self.assertTrue(report[str(pidfile)]["healthy"])
+        self.assertEqual(report[str(pidfile)]["pid"], 123)
 
     def test_bounded_test_poll_writes_atomic_latest_and_history(self) -> None:
         counter = 0
@@ -372,6 +434,64 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
         self.assertEqual(report["progress_health"]["local_wandb_stale_polls"], 2)
         self.assertTrue(any("telemetry has not moved" in item for item in report["warnings"]))
         self.assertTrue(any("W&B artifacts have not moved" in item for item in report["warnings"]))
+
+    def test_renderer_alive_does_not_mask_missing_required_quality_bridge(self) -> None:
+        coordinator = {
+            "campaign_id": "campaign", "phase": "COLLECTING",
+            "next_macro_round": 0, "open_macro_round": 0,
+            "macro_round_count": 5, "completed": False, "revision": 1,
+            "active_policy_version": 0,
+            "active_policy_checkpoint_sha256": "a" * 64,
+        }
+
+        def processes(patterns):
+            return {
+                pattern: {
+                    "count": 1 if pattern == "renderer" else 0,
+                    "pids": [10] if pattern == "renderer" else [],
+                }
+                for pattern in patterns
+            }
+
+        with (
+            mock.patch(
+                "round_dagger.production_campaign_monitor._coordinator",
+                return_value=coordinator,
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._process_matches",
+                side_effect=processes,
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._slurm_health",
+                return_value={"reachable": True, "active_jobs": [], "recent_jobs": []},
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._gpu_health_burst",
+                return_value={"available": True, "gpus": [], "alerts": [], "compute_processes": []},
+            ),
+        ):
+            report = collect_report(
+                campaign_root=self.campaign,
+                campaign_contract=self.contract,
+                campaign_contract_sha256=self.contract_sha,
+                actor_patterns=(),
+                fleet_patterns=("renderer",),
+                required_process_patterns=("student_quality_wandb_bridge.py",),
+                telemetry_roots=(), wandb_roots=(), disk_paths=(self.base,),
+                oci_nrt_host="oci-nrt", slurm_user="ldu", slurm_job_prefix="rrd-",
+            )
+        self.assertFalse(report["progress_health"]["required_processes_healthy"])
+        self.assertIn(
+            "student_quality_wandb_bridge.py",
+            report["local_process_health"]["missing_required_processes"],
+        )
+        self.assertTrue(
+            any("required production process" in item for item in report["warnings"])
+        )
+        self.assertFalse(
+            any("renderer-fleet" in item for item in report["warnings"])
+        )
 
     def test_remote_wandb_readback_is_campaign_bound_and_read_only(self) -> None:
         netrc = self.base / ".netrc"

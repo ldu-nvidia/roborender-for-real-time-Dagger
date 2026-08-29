@@ -200,6 +200,114 @@ def _process_matches(patterns: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _process_start_ticks(pid: int) -> int | None:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        if fields[2] == "Z":
+            return None
+        return int(fields[21])
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
+
+
+def _process_argv(pid: int) -> tuple[str, ...] | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    if not raw:
+        return None
+    return tuple(
+        item.decode("utf-8", errors="replace")
+        for item in raw.split(b"\0")
+        if item
+    )
+
+
+def _has_argument_pair(argv: Sequence[str], name: str, value: str) -> bool:
+    return any(
+        argv[index] == name and argv[index + 1] == value
+        for index in range(len(argv) - 1)
+    )
+
+
+def _bound_process_matches(
+    pidfiles: Sequence[Path], *, campaign_root: Path
+) -> dict[str, dict[str, Any]]:
+    """Check exact campaign process identities, never a cross-campaign substring."""
+
+    reports: dict[str, dict[str, Any]] = {}
+    expected_keys = {
+        "schema",
+        "pid",
+        "start_ticks",
+        "entrypoint",
+        "campaign_root",
+        "state_dir",
+        "driver_status",
+    }
+    expected_schema = "fast_roborender.round_dagger.student_quality_bridge_process.v1"
+    for pidfile in pidfiles:
+        key = str(pidfile)
+        report: dict[str, Any] = {"healthy": False, "pid": None}
+        reports[key] = report
+        try:
+            info = os.lstat(pidfile)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("unsafe_pidfile")
+            document = artifacts.load_strict_json(pidfile)
+            if not isinstance(document, Mapping) or set(document) != expected_keys:
+                raise ValueError("invalid_pidfile_contract")
+            if document.get("schema") != expected_schema:
+                raise ValueError("invalid_pidfile_schema")
+            pid = document.get("pid")
+            start_ticks = document.get("start_ticks")
+            entrypoint = document.get("entrypoint")
+            bound_campaign = document.get("campaign_root")
+            state_dir = document.get("state_dir")
+            driver_status = document.get("driver_status")
+            if type(pid) is not int or type(start_ticks) is not int:
+                raise ValueError("invalid_process_identity")
+            if not all(
+                isinstance(value, str) and Path(value).is_absolute()
+                for value in (entrypoint, bound_campaign, state_dir, driver_status)
+            ):
+                raise ValueError("invalid_process_binding")
+            report["pid"] = pid
+            if bound_campaign != str(campaign_root):
+                raise ValueError("campaign_mismatch")
+            if _process_start_ticks(pid) != start_ticks:
+                raise ValueError("process_identity_not_live")
+            argv = _process_argv(pid)
+            if argv is None or entrypoint not in argv:
+                raise ValueError("entrypoint_mismatch")
+            for name, value in (
+                ("--campaign-root", bound_campaign),
+                ("--state-dir", state_dir),
+                ("--driver-status", driver_status),
+            ):
+                if not _has_argument_pair(argv, name, value):
+                    raise ValueError("argument_binding_mismatch")
+            report.update(
+                {
+                    "healthy": True,
+                    "start_ticks": start_ticks,
+                    "campaign_bound": True,
+                }
+            )
+        except FileNotFoundError:
+            report["error"] = "pidfile_missing"
+        except artifacts.ArtifactError:
+            report["error"] = "invalid_pidfile_json"
+        except OSError:
+            report["error"] = "pidfile_io_error"
+        except (TypeError, ValueError) as exc:
+            # Only stable reason codes are exposed; process argv is never copied
+            # into telemetry because unrelated arguments could contain secrets.
+            report["error"] = str(exc) or type(exc).__name__
+    return reports
+
+
 def _tree_snapshot(root: Path, *, maximum_files: int = 200_000) -> dict[str, Any]:
     result: dict[str, Any] = {
         "root": str(root),
@@ -745,6 +853,8 @@ def collect_report(
     wandb_project: str | None = None,
     wandb_expected_email: str | None = None,
     wandb_netrc: Path | None = None,
+    required_process_patterns: Sequence[str] = (),
+    required_process_pidfiles: Sequence[Path] = (),
     previous: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     _regular_immutable(campaign_contract, campaign_contract_sha256, "runtime campaign contract")
@@ -765,6 +875,10 @@ def collect_report(
 
     warnings: list[str] = []
     fleet = _process_matches(fleet_patterns)
+    required_processes = _process_matches(required_process_patterns)
+    required_bound_processes = _bound_process_matches(
+        required_process_pidfiles, campaign_root=campaign_root
+    )
     actors = _process_matches(actor_patterns)
     actor_visible = any(item["count"] for item in actors.values())
     fleet_visible = any(item["count"] for item in fleet.values())
@@ -776,6 +890,26 @@ def collect_report(
         warnings.append("COLLECTING phase has no configured local actor process visible")
     if fleet_patterns and not fleet_visible and not coordinator["completed"]:
         warnings.append("no configured local renderer-fleet process is visible")
+    missing_required_processes = [
+        pattern
+        for pattern, report in required_processes.items()
+        if not report["count"]
+    ]
+    missing_required_bound_processes = [
+        path
+        for path, report in required_bound_processes.items()
+        if not report["healthy"]
+    ]
+    if missing_required_processes and not coordinator["completed"]:
+        warnings.extend(
+            f"required production process is not visible: {pattern}"
+            for pattern in missing_required_processes
+        )
+    if missing_required_bound_processes and not coordinator["completed"]:
+        warnings.extend(
+            f"required campaign-bound process is not healthy: {path}"
+            for path in missing_required_bound_processes
+        )
     slurm = _slurm_health(oci_nrt_host, slurm_user, slurm_job_prefix)
     if not slurm["reachable"]:
         warnings.append("OCI-NRT Slurm status is unreachable")
@@ -883,6 +1017,9 @@ def collect_report(
         "remote_wandb_progressed": remote_wandb_progressed,
         "remote_wandb_stale_polls": remote_wandb_stale_polls,
         "stale_warning_after_polls": 2,
+        "required_processes_healthy": not (
+            missing_required_processes or missing_required_bound_processes
+        ),
     }
 
     return {
@@ -893,7 +1030,14 @@ def collect_report(
         "campaign_contract_path": str(campaign_contract),
         "campaign_contract_sha256": campaign_contract_sha256,
         "campaign": coordinator,
-        "local_process_health": {"actors": actors, "renderer_fleet": fleet},
+        "local_process_health": {
+            "actors": actors,
+            "renderer_fleet": fleet,
+            "required_processes": required_processes,
+            "missing_required_processes": missing_required_processes,
+            "required_bound_processes": required_bound_processes,
+            "missing_required_bound_processes": missing_required_bound_processes,
+        },
         "oci_nrt_slurm": slurm,
         "file_movement": file_movement,
         "wandb_remote": wandb_remote,
@@ -922,6 +1066,8 @@ def run_monitor(
     wandb_project: str | None = None,
     wandb_expected_email: str | None = None,
     wandb_netrc: Path | None = None,
+    required_process_patterns: Sequence[str] = (),
+    required_process_pidfiles: Sequence[Path] = (),
     max_polls: int | None = None,
     test_poll_interval_seconds: float | None = None,
 ) -> dict[str, Any]:
@@ -955,6 +1101,8 @@ def run_monitor(
                 wandb_project=wandb_project,
                 wandb_expected_email=wandb_expected_email,
                 wandb_netrc=wandb_netrc,
+                required_process_patterns=required_process_patterns,
+                required_process_pidfiles=required_process_pidfiles,
                 previous=previous,
             )
             poll += 1
@@ -977,6 +1125,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--actor-pattern", action="append", default=[])
     parser.add_argument("--fleet-pattern", action="append", default=[])
+    parser.add_argument("--required-process-pattern", action="append", default=[])
+    parser.add_argument(
+        "--required-process-pidfile", type=Path, action="append", default=[]
+    )
     parser.add_argument("--telemetry-root", type=Path, action="append", default=[])
     parser.add_argument("--wandb-root", type=Path, action="append", default=[])
     parser.add_argument("--disk-path", type=Path, action="append", default=[])
@@ -1018,6 +1170,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_root=_absolute(arguments.output_root, "monitor output root"),
             actor_patterns=tuple(arguments.actor_pattern),
             fleet_patterns=tuple(arguments.fleet_pattern),
+            required_process_patterns=tuple(arguments.required_process_pattern),
+            required_process_pidfiles=tuple(
+                _absolute(item, "required process pidfile")
+                for item in arguments.required_process_pidfile
+            ),
             telemetry_roots=tuple(telemetry_roots),
             wandb_roots=tuple(wandb_roots),
             disk_paths=tuple(_absolute(item, "disk path") for item in arguments.disk_path)

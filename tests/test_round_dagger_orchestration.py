@@ -2,7 +2,9 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from round_dagger import artifacts
 from round_dagger.artifacts import publish_immutable_json, sha256_file
@@ -391,6 +393,34 @@ class ConfigAndTopologyTest(unittest.TestCase):
                 OrchestrationError, "without verified Image3F cleanup"
             ):
                 backend.seal_cohort(source)
+
+    def test_production_seal_reenters_collect_until_wandb_delivery_is_durable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = replace(
+                config(root), campaign_contract_sha256="f" * 64
+            )
+            backend = ProductionBackend(configuration)
+            source = (
+                configuration.actor_root
+                / "production-campaign"
+                / "macro_round_000000"
+                / "cohort_00"
+            )
+            source.mkdir(parents=True)
+            (source / artifacts.SEAL_FILENAME).write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    backend, "_require_actor_cleanup", return_value={"status": "clean"}
+                ),
+                mock.patch(
+                    "round_dagger.orchestration.wandb_delivery.verify_delivery",
+                    return_value=None,
+                ) as verify,
+            ):
+                self.assertIsNone(backend.complete_cohort(source))
+            verify.assert_called_once_with(source.with_name("cohort_00_run"))
+
 
     def test_learner_result_requires_exact_colocated_policy_sidecars(self):
         with tempfile.TemporaryDirectory() as temporary:

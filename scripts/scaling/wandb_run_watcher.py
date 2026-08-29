@@ -14,12 +14,16 @@ files, and records fingerprints so a restart does not upload unchanged media.
 
 The sidecar uses ``trainer_step`` as a custom W&B x-axis rather than the W&B
 internal step.  Late-arriving media can therefore be uploaded safely without
-colliding with the trainer's scalar-history step.
+colliding with the trainer's scalar-history step.  Artifact fingerprints are
+committed only after the W&B sender finishes successfully, so a crash cannot
+turn a merely queued upload into a permanently skipped artifact.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import math
 import os
@@ -47,6 +51,7 @@ STEP_RE = re.compile(r"(?:^|[_-])step[_-]?(\d+)(?:[_-]|$)", re.IGNORECASE)
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 STATE_SCHEMA_VERSION = 2
 INITIALIZED_MARKER_SCHEMA = "fast_roborender.wandb_sidecar_initialized.v2"
+DELIVERY_RECEIPT_SCHEMA = "fast_roborender.wandb_sidecar_delivery_receipt.v1"
 PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v2"
 PRODUCTION_PUBLIC_CONFIG_SCHEMA = (
     "fast_roborender.round_dagger.wandb_public_config.v3"
@@ -420,6 +425,34 @@ def update_final_drain(
     return deadline, now >= deadline
 
 
+def load_finish_exit_code(path: Path) -> int:
+    """Read the supervisor's terminal result from a safe finish marker.
+
+    Legacy/standalone callers create an empty marker, which remains a success.
+    Production actor pairs publish ``0`` or ``2`` atomically after writing
+    their immutable terminal evidence and final scalar.  Propagating ``2`` to
+    ``run.finish`` makes a failed collection visually terminal in W&B instead
+    of leaving a green or apparently live run behind.
+    """
+
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise ArtifactError("W&B finish marker must be a regular non-symlink file")
+        if info.st_size > 8:
+            raise ArtifactError("W&B finish marker is oversized")
+        payload = path.read_text(encoding="ascii").strip()
+    except ArtifactError:
+        raise
+    except (OSError, UnicodeError):
+        raise ArtifactError("W&B finish marker is unreadable") from None
+    if payload == "":
+        return 0
+    if payload not in {"0", "2"}:
+        raise ArtifactError("W&B finish marker exit code is invalid")
+    return int(payload)
+
+
 def _validate_run_id(value: str) -> str:
     value = value.strip()
     if not RUN_ID_RE.fullmatch(value):
@@ -428,47 +461,134 @@ def _validate_run_id(value: str) -> str:
 
 
 def load_or_create_run_id(path: Path) -> str:
-    """Return one durable W&B run ID, creating it atomically if necessary."""
+    """Return one crash-safe, create-only durable W&B run ID.
+
+    The final pathname is never opened for writing.  A deterministic hidden
+    staging inode is fsynced and hard-linked into the final name while the
+    parent directory lock is held.  SIGKILL can therefore strand only the
+    staging name, which a later caller removes without interpreting its bytes.
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        if path.is_symlink():
-            raise ArtifactError("W&B sidecar run ID file must not be a symlink")
-        return _validate_run_id(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        pass
+        directory_fd = os.open(path.parent, directory_flags)
     except OSError as exc:
         raise ArtifactError(
-            f"cannot read W&B sidecar run ID file ({type(exc).__name__})"
+            f"cannot open W&B sidecar run ID directory ({type(exc).__name__})"
         ) from None
+    staging_name = f".{path.name}.staging"
+    staging_created = False
+    locked = False
 
-    candidate = secrets.token_urlsafe(18)
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        if path.is_symlink():
-            raise ArtifactError("W&B sidecar run ID file must not be a symlink")
+    def read_existing() -> str | None:
         try:
-            return _validate_run_id(path.read_text(encoding="utf-8"))
+            info = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
         except OSError as exc:
+            raise ArtifactError(
+                f"cannot inspect W&B sidecar run ID file ({type(exc).__name__})"
+            ) from None
+        if stat.S_ISLNK(info.st_mode):
+            raise ArtifactError("W&B sidecar run ID file must not be a symlink")
+        if not stat.S_ISREG(info.st_mode):
+            raise ArtifactError("W&B sidecar run ID must be a regular file")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+            with os.fdopen(descriptor, "rb", closefd=True) as handle:
+                opened = os.fstat(handle.fileno())
+                if not stat.S_ISREG(opened.st_mode) or opened.st_size > 256:
+                    raise ArtifactError("W&B sidecar run ID file is unsafe")
+                payload = handle.read(257)
+            return _validate_run_id(payload.decode("utf-8"))
+        except ArtifactError:
+            raise
+        except (OSError, UnicodeError) as exc:
             raise ArtifactError(
                 f"cannot read W&B sidecar run ID file ({type(exc).__name__})"
             ) from None
-    except OSError as exc:
-        raise ArtifactError(
-            f"cannot create W&B sidecar run ID file ({type(exc).__name__})"
-        ) from None
+
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(candidate + "\n")
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        locked = True
+        try:
+            staging_info = os.stat(
+                staging_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            staging_info = None
+        except OSError as exc:
+            raise ArtifactError(
+                f"cannot inspect W&B run ID staging file ({type(exc).__name__})"
+            ) from None
+        if staging_info is not None:
+            if not stat.S_ISREG(staging_info.st_mode):
+                raise ArtifactError("W&B run ID staging artifact is unsafe")
+            os.unlink(staging_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+
+        existing = read_existing()
+        if existing is not None:
+            return existing
+
+        candidate = _validate_run_id(secrets.token_urlsafe(18))
+        payload = (candidate + "\n").encode("utf-8")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(
+                staging_name, flags, 0o600, dir_fd=directory_fd
+            )
+        except OSError as exc:
+            raise ArtifactError(
+                f"cannot create W&B run ID staging file ({type(exc).__name__})"
+            ) from None
+        staging_created = True
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-    except Exception:
-        # An interrupted exclusive create must never leave an empty/partial ID
-        # that a restart could mistake for a different W&B run.
-        path.unlink(missing_ok=True)
-        raise
-    return candidate
+        try:
+            os.link(
+                staging_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            winner = read_existing()
+            if winner is None:
+                raise ArtifactError("W&B run ID publication race is ambiguous")
+            return winner
+        os.fsync(directory_fd)
+        return candidate
+    finally:
+        if staging_created:
+            try:
+                os.unlink(staging_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except FileNotFoundError:
+                pass
+        if locked:
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
 
 
 def _decode_state(path: Path) -> tuple[str | None, dict[str, str], bool]:
@@ -527,6 +647,11 @@ def save_state(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -640,7 +765,12 @@ class WandbArtifactWatcher:
         self.min_age_s = min_age_s
         self.max_image_bytes = max_image_bytes
         self.max_video_bytes = max_video_bytes
-        self.state = load_state(state_file, expected_run_id=run_id)
+        # ``durable_state`` is a delivery acknowledgement: every fingerprint
+        # in it followed a successful ``run.finish``.  ``state`` additionally
+        # includes artifacts queued during this process, preventing duplicate
+        # log calls while deliberately remaining replayable after a crash.
+        self.durable_state = load_state(state_file, expected_run_id=run_id)
+        self.state = dict(self.durable_state)
         self.last_scan_error_count = 0
         self.last_scan_pending_count = 0
 
@@ -684,10 +814,7 @@ class WandbArtifactWatcher:
                 else:  # Defensive: discovery only emits the three known kinds.
                     raise ArtifactError(f"unknown artifact kind {artifact.kind!r}")
                 self.run.log(payload)
-                next_state = dict(self.state)
-                next_state[artifact.relative_path] = artifact.fingerprint
-                save_state(self.state_file, next_state, run_id=self.run_id)
-                self.state = next_state
+                self.state[artifact.relative_path] = artifact.fingerprint
                 uploaded += 1
             except Exception as exc:
                 # A malformed media file or transient W&B failure must not stop
@@ -701,6 +828,76 @@ class WandbArtifactWatcher:
         self.last_scan_error_count = len(discovery_errors) + upload_errors
         self.last_scan_pending_count = pending - uploaded
         return uploaded
+
+    def commit_state(self) -> None:
+        """Persist queued fingerprints after the remote sender is drained.
+
+        Callers must invoke this only after ``run.finish`` succeeds.  If the
+        process dies or finish fails first, the previous durable cursor stays
+        intact and a restarted watcher replays the unacknowledged artifacts.
+        """
+
+        save_state(self.state_file, self.state, run_id=self.run_id)
+        self.durable_state = dict(self.state)
+
+    def terminal_projection(self, *, exit_code: int) -> dict[str, int] | None:
+        """Return the final dashboard projection for actor terminal telemetry."""
+
+        found = False
+        for relative_path in self.state:
+            if "actor_pair_terminal_" not in relative_path or not relative_path.endswith(".json"):
+                continue
+            path = self.run_dir / relative_path
+            try:
+                _, metrics = load_scalar_file(path)
+            except ArtifactError:
+                continue
+            found = found or metrics.get("collection/terminal_pending") == 1
+        if not found:
+            return None
+        succeeded = int(exit_code == 0)
+        return {
+            "collection/delivery_confirmed": succeeded,
+            "collection/terminal_pending": 0,
+            "collection/succeeded": succeeded,
+            "collection/failed": 1 - succeeded,
+        }
+
+    def write_delivery_receipt(self, *, exit_code: int) -> None:
+        """Bind a successful sender drain to the exact durable cursor bytes."""
+
+        projection = self.terminal_projection(exit_code=exit_code)
+        if projection is None or exit_code != 0:
+            return
+        state_sha256 = hashlib.sha256(self.state_file.read_bytes()).hexdigest()
+        path = self.run_dir / "telemetry" / "WANDB_DELIVERY_RECEIPT.json"
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(
+                    {
+                        "schema": DELIVERY_RECEIPT_SCHEMA,
+                        "wandb_run_id": self.run_id,
+                        "upload_state_sha256": state_sha256,
+                        "outcome": "SUCCEEDED",
+                    },
+                    output,
+                    sort_keys=True,
+                )
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def write_ready_marker(
@@ -983,7 +1180,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             now = time.monotonic()
             if args.once:
-                if watcher.last_scan_pending_count:
+                if (
+                    watcher.last_scan_pending_count
+                    or watcher.last_scan_error_count
+                ):
                     exit_code = 2
                 break
             final_drain_deadline, drain_complete = update_final_drain(
@@ -997,12 +1197,21 @@ def main(argv: list[str] | None = None) -> int:
                     raise ArtifactError(
                         "final telemetry drain left pending or invalid artifacts"
                     )
+                exit_code = load_finish_exit_code(run_dir / args.finish_marker)
                 break
             if (
                 final_drain_deadline is None
                 and args.max_runtime_s
                 and now - started >= args.max_runtime_s
             ):
+                # A bounded watcher that expires without its supervisor's
+                # terminal marker has lost lifecycle ownership.  Marking that
+                # run successful would hide an orphaned actor/supervisor.
+                print(
+                    "W&B artifact watcher: runtime expired before terminal marker",
+                    file=sys.stderr,
+                )
+                exit_code = 2
                 break
             sleep_s = min(args.poll_interval_s, 60.0)
             if final_drain_deadline is not None:
@@ -1013,13 +1222,39 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 2
     finally:
         try:
+            projection = watcher.terminal_projection(exit_code=exit_code)
+            if projection is not None:
+                # The immutable history scalar intentionally says pending.  A
+                # successful sender drain makes this W&B summary the final
+                # operator-facing projection; a failed drain never commits the
+                # local cursor/receipt below.
+                run.summary.update(projection)
             run.finish(exit_code=exit_code)
         except Exception as exc:
+            try:
+                run.finish(exit_code=2)
+            except Exception:
+                pass
             print(
                 f"W&B artifact watcher: remote finish failed ({type(exc).__name__})",
                 file=sys.stderr,
             )
             exit_code = 2
+        else:
+            try:
+                watcher.commit_state()
+                watcher.write_delivery_receipt(exit_code=exit_code)
+            except (ArtifactError, OSError) as exc:
+                # Remote delivery succeeded but the acknowledgement was not
+                # durable.  Fail closed; restart will replay rather than lose
+                # telemetry.  Do not expose exception text because paths may
+                # contain operator-specific information.
+                print(
+                    "W&B artifact watcher: upload acknowledgement failed "
+                    f"({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+                exit_code = 2
     return exit_code
 
 

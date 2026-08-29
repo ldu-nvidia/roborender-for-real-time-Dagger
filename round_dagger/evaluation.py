@@ -1063,6 +1063,11 @@ _RAW_PAIRED_EPISODE_KEYS = {
 _EPISODE_KEYS = _RAW_PAIRED_EPISODE_KEYS | {
     "first_condition_sha256",
     "first_generated_sha256",
+    # ``_roborender_fixed_seed_episodes.reward`` is the simulator's
+    # cumulative reward for the completed first episode.  Keep it on the
+    # canonical paired record as episodic return instead of silently dropping
+    # the only closed-loop reward signal before aggregation.
+    "episode_return",
 }
 _PRODUCTION_EPISODE_KEYS = _EPISODE_KEYS | {
     "live_condition_sha256",
@@ -1541,6 +1546,9 @@ def attest_outcome(
             raise EvaluationError(
                 "paired episode differs from fixed-seed reset/outcome evidence"
             )
+        episode["episode_return"] = _number(
+            fixed["reward"], "fixed episode.reward"
+        )
         episode["first_condition_sha256"] = condition_hashes[str(env_index)]
         episode["first_generated_sha256"] = generated_hashes[str(env_index)]
         if production:
@@ -1708,11 +1716,19 @@ def load_outcome(
     if not isinstance(episodes, list) or len(episodes) != len(expected_cases):
         raise EvaluationError("outcome episode coverage is incomplete")
     for expected_case, raw in zip(expected_cases, episodes, strict=True):
-        episode = _exact(
-            raw,
-            _PRODUCTION_EPISODE_KEYS if production else _EPISODE_KEYS,
-            "outcome episode",
+        expected_episode_keys = (
+            _PRODUCTION_EPISODE_KEYS if production else _EPISODE_KEYS
         )
+        # Outcomes published before episodic return was retained used the
+        # same outcome schema but lack exactly this additive field.  Accept
+        # those immutable artifacts without inventing a reward value; scoring
+        # emits return aggregates only when both paired sides carry the real
+        # simulator evidence.
+        legacy_episode_keys = expected_episode_keys - {"episode_return"}
+        if isinstance(raw, Mapping) and set(raw) == legacy_episode_keys:
+            episode = dict(raw)
+        else:
+            episode = _exact(raw, expected_episode_keys, "outcome episode")
         if (
             episode["env_index"] != expected_case["env_index"]
             or episode["seed"] != expected_seed
@@ -1725,6 +1741,8 @@ def load_outcome(
         ):
             raise EvaluationError("outcome success/safety fields are malformed")
         _number(episode["action_imitation_mse"], "action_imitation_mse", minimum=0.0)
+        if "episode_return" in episode:
+            _number(episode["episode_return"], "episode_return")
         _integer(episode["episode_length"], "episode_length", minimum=1)
         views = _exact(
             episode["generated_view_sha256"], set(POLICY_VIEWS), "generated views"
@@ -1840,9 +1858,16 @@ def _score(
     candidate_action = _mean(
         [float(item["action_imitation_mse"]) for item in candidate]
     )
+    parent_episode_length = _mean(
+        [float(item["episode_length"]) for item in parent]
+    )
+    candidate_episode_length = _mean(
+        [float(item["episode_length"]) for item in candidate]
+    )
     success_delta = candidate_success - parent_success
     safety_delta = candidate_safety - parent_safety
     action_delta = candidate_action - parent_action
+    episode_length_delta = candidate_episode_length - parent_episode_length
     action_relative_change = action_delta / max(
         parent_action, thresholds["action_mse_floor"]
     )
@@ -1874,6 +1899,9 @@ def _score(
         "candidate_action_imitation_mse": candidate_action,
         "paired_action_imitation_mse_delta": action_delta,
         "paired_action_imitation_mse_relative_change": action_relative_change,
+        "parent_episode_length_mean": parent_episode_length,
+        "candidate_episode_length_mean": candidate_episode_length,
+        "paired_episode_length_mean_delta": episode_length_delta,
         "parent_lag_boundary_cases": float(
             sum(item["episode_length"] > REFERENCE_LAG for item in parent)
         ),
@@ -1884,6 +1912,21 @@ def _score(
         "paired_initial_generated_matches": float(len(parent)),
         "renderer_errors": 0.0,
     }
+    return_evidence_complete = all(
+        "episode_return" in item for item in (*parent, *candidate)
+    )
+    if return_evidence_complete:
+        parent_return = _mean(
+            [float(item["episode_return"]) for item in parent]
+        )
+        candidate_return = _mean(
+            [float(item["episode_return"]) for item in candidate]
+        )
+        metrics.update(
+            parent_episode_return_mean=parent_return,
+            candidate_episode_return_mean=candidate_return,
+            paired_episode_return_mean_delta=candidate_return - parent_return,
+        )
     if parent and "live_reset_state_sha256" in parent[0]:
         metrics["paired_live_reset_state_matches"] = float(len(parent))
         metrics["paired_live_condition_matches"] = float(

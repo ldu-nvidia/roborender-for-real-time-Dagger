@@ -27,10 +27,10 @@
     "required_optimizer_steps": [0, 100],
     "case_count": 256,
     "cohort_count": 8,
-    "source_root": "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1",
+    "source_root": "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829",
     "snapshot_relative_path": "heldout_snapshot.json",
-    "snapshot_file_sha256": "cea0ee36b228c611635af8dd23b83db3bdaa0fcea493acd57379f080273fdbc8",
-    "snapshot_sha256": "c72e5b1329ad62f2286021efa757cae7a1d748d0bfb66b6c63642be25b72162f"
+    "snapshot_file_sha256": "42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9",
+    "snapshot_sha256": "c80ee79dae99bb048f9f75bb38aae75fb3e305e665eedfc83d43470babd08bde"
   },
   "quality_gate": {
     "minimum_relative_action_mse_reduction": 0.001,
@@ -65,6 +65,6 @@
   "production_target": {
     "run_name": "dagger_prod_run1",
     "learner_contract_path": "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json",
-    "learner_contract_sha256": "b25900118e34f514ecaa2b08bf423cd3ecad3e1c5ca081a95431867357e2f442"
+    "learner_contract_sha256": "e4a1d23a3426d879aac93f934eb9e213a657b0451b54f4f4918e425a357d73e5"
   }
 }

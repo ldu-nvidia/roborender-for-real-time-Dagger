@@ -33,6 +33,7 @@ REPOSITORY_ROOT = Path(__file__).absolute().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.append(str(REPOSITORY_ROOT))
 
+from round_dagger import state as campaign_state  # noqa: E402
 from round_dagger.artifacts import (  # noqa: E402
     canonical_json_sha256,
     load_strict_json,
@@ -48,11 +49,31 @@ from scripts.scaling.wandb_preflight import (  # noqa: E402
 
 STATE_SCHEMA = "fast_roborender.round_dagger.student_quality_wandb_state.v1"
 RUN_SCHEMA = "fast_roborender.round_dagger.student_quality_wandb_run.v1"
+INITIALIZED_SCHEMA = (
+    "fast_roborender.round_dagger.student_quality_wandb_initialized.v1"
+)
+READY_SCHEMA = "fast_roborender.round_dagger.student_quality_wandb_ready.v1"
 LEARNED_ACTION_DIMENSIONS = 11
 MACRO_RE = re.compile(r"macro_round_([0-9]{6})\Z")
 COHORT_RE = re.compile(r"cohort_([0-9]{2})\Z")
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+PHASE_CODES = {
+    "READY": 0,
+    "COLLECTING": 1,
+    "COLLECTED": 2,
+    "INGESTED": 3,
+    "TRAINED": 4,
+    "EVALUATED": 5,
+}
+DRIVER_STATE_CODES = {
+    "UNKNOWN": -1,
+    "LAUNCHING": 0,
+    "DRY_RUN_VALIDATED": 1,
+    "COMPLETE": 2,
+    "FAILED": 3,
+    "RETRYING": 4,
+}
 
 
 class QualityBridgeError(RuntimeError):
@@ -103,6 +124,28 @@ def _state_dir(campaign_root: Path, value: str | os.PathLike[str]) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
         raise QualityBridgeError("observer state directory is unsafe")
+    return path
+
+
+def _ready_marker_path(state_dir: Path, value: Path | None) -> Path | None:
+    if value is None:
+        return None
+    path = _absolute(value)
+    # Keep the process-owned readiness signal in the already validated external
+    # state directory.  Requiring a direct child also prevents a caller from
+    # routing the atomic replace through an unchecked nested directory.
+    if path.parent != state_dir:
+        raise QualityBridgeError(
+            "ready marker must be a direct child of observer state directory"
+        )
+    if path in {
+        state_dir / "student_quality_wandb.lock",
+        state_dir / "student_quality_wandb_state.json",
+        state_dir / "student_quality_wandb_initialized.json",
+    }:
+        raise QualityBridgeError("ready marker collides with observer state")
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise QualityBridgeError("ready marker is unsafe")
     return path
 
 
@@ -167,6 +210,41 @@ def _initial_state(
     }
 
 
+def _initialization_document(expected: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": INITIALIZED_SCHEMA,
+        "campaign_id": expected["campaign_id"],
+        "campaign_sha256": expected["campaign_sha256"],
+        "wandb_entity": expected["wandb_entity"],
+        "wandb_project": expected["wandb_project"],
+        "wandb_run_id": expected["wandb_run_id"],
+    }
+
+
+def _load_initialized_marker(
+    path: Path, expected: Mapping[str, Any]
+) -> bool:
+    if not os.path.lexists(path):
+        return False
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise QualityBridgeError("W&B initialization marker is unreadable") from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024:
+        raise QualityBridgeError("W&B initialization marker is unsafe")
+    try:
+        document = load_strict_json(path)
+    except Exception as exc:
+        raise QualityBridgeError("W&B initialization marker is unreadable") from exc
+    if document != _initialization_document(expected):
+        raise QualityBridgeError("W&B initialization marker differs")
+    return True
+
+
+def _write_initialized_marker(path: Path, expected: Mapping[str, Any]) -> None:
+    _atomic_json(path, _initialization_document(expected))
+
+
 def _load_state(path: Path, expected: Mapping[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return dict(expected)
@@ -215,6 +293,159 @@ def _cohort_seals(root: Path, campaign_id: str) -> list[tuple[int, int, Path]]:
             if seal.exists():
                 result.append((int(match.group(1)), int(cohort_match.group(1)), _regular(seal, "cohort seal")))
     return sorted(result)
+
+
+def _driver_status(
+    path: Path | None, *, campaign_root: Path
+) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    document = load_strict_json(_regular(path, "production driver status"))
+    if not isinstance(document, Mapping):
+        raise QualityBridgeError("production driver status root is malformed")
+    if document.get("schema") != "fast_roborender.round_dagger.production_driver_status.v1":
+        raise QualityBridgeError("production driver status schema differs")
+    if document.get("campaign_root") != str(campaign_root):
+        raise QualityBridgeError("production driver status belongs to another campaign")
+    driver_state = document.get("state")
+    if driver_state not in set(DRIVER_STATE_CODES) - {"UNKNOWN"}:
+        raise QualityBridgeError("production driver state is malformed")
+    return dict(document)
+
+
+def campaign_status_projection(
+    *,
+    root: Path,
+    campaign: Mapping[str, Any],
+    seals: Sequence[tuple[int, int, Path]],
+    driver_status_path: Path | None,
+) -> tuple[dict[str, int | float], dict[str, str | int]]:
+    """Return an eager, non-secret operator status projection.
+
+    Only immutable cohort seals count as accepted transitions.  Partial ranks
+    remain visible through the actor-pair terminal scalar, but are deliberately
+    excluded here so the campaign dashboard cannot mistake salvageable output
+    for learner-ready data.
+    """
+
+    try:
+        coordinator = campaign_state.load_state(root)
+    except Exception as exc:
+        raise QualityBridgeError("durable coordinator state is invalid") from exc
+    phase = coordinator.get("phase")
+    macro_round = coordinator.get("next_macro_round")
+    policy = coordinator.get("active_policy")
+    if (
+        phase not in PHASE_CODES
+        or type(macro_round) is not int
+        or not isinstance(policy, Mapping)
+        or type(policy.get("version")) is not int
+    ):
+        raise QualityBridgeError("durable coordinator status is malformed")
+    cohort_count = campaign.get("cohort_count")
+    active_environments = campaign.get("active_environments")
+    steps = campaign.get("steps_per_environment")
+    if any(
+        type(value) is not int or value < 1
+        for value in (cohort_count, active_environments, steps)
+    ):
+        raise QualityBridgeError("campaign collection topology is malformed")
+    driver = _driver_status(driver_status_path, campaign_root=root)
+    driver_state = "UNKNOWN" if driver is None else str(driver["state"])
+    failed = driver_state == "FAILED"
+    retrying = driver_state == "RETRYING"
+    complete = driver_state == "COMPLETE"
+    # ``next_macro_round`` is literally the coordinator's next round.  While a
+    # campaign is active that is also the round whose collection readiness we
+    # display.  On COMPLETE, however, the coordinator has already advanced it;
+    # quality/readiness must remain attached to the last completed round rather
+    # than an unstarted phantom round.
+    quality_round = macro_round - 1 if complete and macro_round > 0 else macro_round
+    transitions_per_cohort = active_environments * steps
+    current_seals = [row for row in seals if row[0] == quality_round]
+    sealed_transitions_total = len(seals) * transitions_per_cohort
+    current_transitions = len(current_seals) * transitions_per_cohort
+    round_target = cohort_count * transitions_per_cohort
+    retry_count = 0 if driver is None else driver.get("collection_retry_count", 0)
+    retry_limit = 0 if driver is None else driver.get("collection_retry_limit", 0)
+    recovery = None if driver is None else driver.get("collection_recovery")
+    if (
+        type(retry_count) is not int
+        or retry_count < 0
+        or type(retry_limit) is not int
+        or retry_limit < 0
+    ):
+        raise QualityBridgeError("production driver retry counters are malformed")
+    recovery_safe = int(
+        isinstance(recovery, Mapping) and recovery.get("safe_to_retry") is True
+    )
+    if retrying:
+        failure_reason = "bounded_collection_retry"
+        safe_detail = "verified immutable actor progress; retrying missing collection work"
+    elif failed and recovery_safe and retry_count >= retry_limit:
+        failure_reason = "collection_retry_exhausted"
+        safe_detail = "bounded collection retries exhausted; campaign stopped fail-closed"
+    elif failed:
+        failure_reason = "launcher_nonzero"
+        safe_detail = "production launcher failed; campaign stopped fail-closed"
+    elif complete:
+        failure_reason = "none"
+        safe_detail = "production campaign completed"
+    else:
+        failure_reason = "none"
+        safe_detail = "production campaign is active"
+    # Readiness is a property of the logical quality round only.  Historical
+    # seals are still uploaded, but cannot make another round look ready.
+    # Historical seals remain useful as an explicitly indexed W&B history, but
+    # must never make a newly opened round look as though it already has data or
+    # quality available.
+    data_ready = bool(current_seals)
+    # This is an observer heartbeat, not the driver's update timestamp.  A live
+    # bridge therefore advances its custom W&B x-axis even while the durable
+    # driver state is unchanged.
+    status_event = time.time_ns()
+    metrics: dict[str, int | float] = {
+        "campaign/status_event": status_event,
+        "campaign/data_ready": int(data_ready),
+        "campaign/quality_available": int(data_ready),
+        "campaign/failed": int(failed),
+        "campaign/complete": int(complete),
+        "campaign/retrying": int(retrying),
+        "campaign/collection_retry_count": retry_count,
+        "campaign/collection_retry_limit": retry_limit,
+        "campaign/collection_recovery_safe": recovery_safe,
+        "campaign/phase_code": PHASE_CODES[phase],
+        "campaign/driver_state_code": DRIVER_STATE_CODES[driver_state],
+        "campaign/macro_round": quality_round,
+        "campaign/coordinator_next_macro_round": macro_round,
+        "campaign/policy_version": int(policy["version"]),
+        "campaign/cohorts_sealed_total": len(seals),
+        "campaign/current_round_cohorts_sealed": len(current_seals),
+        "campaign/current_round_cohort_target": cohort_count,
+        "campaign/sealed_transitions_total": sealed_transitions_total,
+        "campaign/current_round_sealed_transitions": current_transitions,
+        "campaign/current_round_transition_target": round_target,
+        "campaign/current_round_collection_fraction": current_transitions / round_target,
+    }
+    summary: dict[str, str | int] = {
+        "campaign/status": driver_state if failed or retrying or complete else phase,
+        "campaign/failure_reason": failure_reason,
+        "campaign/status_detail": safe_detail,
+        "campaign/data_status": (
+            "sealed_rollout_quality_available"
+            if data_ready
+            else "waiting_for_sealed_rollout"
+        ),
+        "campaign/data_ready": int(data_ready),
+        "campaign/failed": int(failed),
+        "campaign/complete": int(complete),
+        "campaign/retrying": int(retrying),
+        "campaign/collection_retry_count": retry_count,
+        "campaign/collection_retry_limit": retry_limit,
+        "campaign/coordinator_phase": phase,
+        "campaign/driver_state": driver_state,
+    }
+    return metrics, summary
 
 
 def _cosine(student: np.ndarray, expert: np.ndarray) -> np.ndarray:
@@ -349,6 +580,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--entity", required=True)
     parser.add_argument("--expected-email", required=True)
     parser.add_argument("--authorization-scope", choices=("team",), required=True)
+    parser.add_argument(
+        "--driver-status",
+        type=Path,
+        required=True,
+        help="production driver_status.json used for lifecycle/failure visibility",
+    )
+    parser.add_argument(
+        "--ready-marker",
+        type=Path,
+        help=(
+            "optional direct child of --state-dir written atomically after "
+            "W&B initialization and the first successful telemetry poll"
+        ),
+    )
     parser.add_argument("--poll-seconds", type=float, default=0.0)
     return parser
 
@@ -358,12 +603,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not math.isfinite(arguments.poll_seconds) or arguments.poll_seconds < 0:
         print("student quality bridge failed: invalid poll interval", file=sys.stderr)
         return 2
+    run: Any | None = None
+    exit_code = 2
     try:
         root, campaign = _campaign(arguments.campaign_root)
         campaign_sha = canonical_json_sha256(campaign)
         run_id = _run_id(campaign["campaign_id"], campaign_sha)
         state_dir = _state_dir(root, arguments.state_dir)
         state_path = state_dir / "student_quality_wandb_state.json"
+        initialized_path = state_dir / "student_quality_wandb_initialized.json"
+        ready_path = _ready_marker_path(state_dir, arguments.ready_marker)
         expected = _initial_state(
             campaign_id=campaign["campaign_id"],
             campaign_sha256=campaign_sha,
@@ -372,6 +621,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_id=run_id,
         )
         with _lock(state_dir):
+            if ready_path is not None:
+                # A prior process's marker must not make this launch appear
+                # ready before its own W&B initialization and first poll.
+                ready_path.unlink(missing_ok=True)
             wandb = _load_wandb()
             query_identity(
                 wandb,
@@ -380,16 +633,76 @@ def main(argv: Sequence[str] | None = None) -> int:
                 authorization_scope=arguments.authorization_scope,
                 timeout_s=15.0,
             )
+            remote_initialized = _load_initialized_marker(
+                initialized_path, expected
+            )
+            state = _load_state(state_path, expected)
+            if not remote_initialized:
+                # A cursor without an initialization acknowledgement cannot
+                # prove that the deterministic remote run ever existed.  It
+                # must not suppress history if ``resume=allow`` creates that
+                # run after a crash or remote deletion.
+                state = dict(expected)
+            # One bridge process owns one persistent W&B run.  Re-opening and
+            # finishing it green on every poll hides a later campaign failure
+            # and makes an active campaign look terminal between heartbeats.
+            wandb_dir = state_dir / "wandb"
+            wandb_dir.mkdir(exist_ok=True)
+            run = wandb.init(
+                project=arguments.project,
+                entity=arguments.entity,
+                id=run_id,
+                name=f"{campaign['campaign_id']}-student-quality",
+                resume="must" if remote_initialized else "allow",
+                dir=str(wandb_dir),
+                config={
+                    "round_dagger/campaign_id": campaign["campaign_id"],
+                    "round_dagger/campaign_sha256": campaign_sha,
+                    "round_dagger/quality_scope": "sealed-rollout-action-agreement",
+                    "round_dagger/telemetry_read_only": True,
+                },
+                tags=("round-dagger", "student-quality", "read-only-bridge"),
+            )
+            run.define_metric("campaign/status_event")
+            run.define_metric("campaign/*", step_metric="campaign/status_event")
+            run.define_metric("rollout_quality/event_index")
+            run.define_metric(
+                "rollout_quality/*",
+                step_metric="rollout_quality/event_index",
+            )
+            if not remote_initialized:
+                # Commit the empty, run-bound cursor before acknowledging the
+                # first remote initialization.  Every crash boundary is safe:
+                # before the marker we retry with allow and replay everything;
+                # after it we use must with an empty cursor and still replay.
+                _atomic_json(state_path, state)
+                _write_initialized_marker(initialized_path, expected)
+            durable_uploaded = dict(state["uploaded_seal_sha256_by_event"])
+            # A successfully queued log is not a durable delivery
+            # acknowledgement.  Keep this process's progress only in memory
+            # until ``run.finish`` has drained the W&B sender successfully.
+            # A crash or outage therefore replays events on restart (possible
+            # duplicates, never silent loss).
+            session_uploaded: dict[str, str] = {}
+            ready_written = False
             while True:
-                state = _load_state(state_path, expected)
-                uploaded = dict(state["uploaded_seal_sha256_by_event"])
                 pending: list[dict[str, Any]] = []
-                for macro_round, cohort_index, seal_path in _cohort_seals(root, campaign["campaign_id"]):
+                seals = _cohort_seals(root, campaign["campaign_id"])
+                status_metrics, status_summary = campaign_status_projection(
+                    root=root,
+                    campaign=campaign,
+                    seals=seals,
+                    driver_status_path=_absolute(arguments.driver_status),
+                )
+                for macro_round, cohort_index, seal_path in seals:
                     event = macro_round * 100 + cohort_index
                     key = str(event)
                     seal_sha = sha256_file(seal_path)
-                    if key in uploaded:
-                        if uploaded[key] != seal_sha:
+                    delivered_sha = session_uploaded.get(
+                        key, durable_uploaded.get(key)
+                    )
+                    if delivered_sha is not None:
+                        if delivered_sha != seal_sha:
                             raise QualityBridgeError("uploaded cohort seal changed")
                         continue
                     pending.append(
@@ -399,58 +712,69 @@ def main(argv: Sequence[str] | None = None) -> int:
                             cohort_index=cohort_index,
                         )
                     )
-                if pending:
-                    wandb_dir = state_dir / "wandb"
-                    wandb_dir.mkdir(exist_ok=True)
-                    run = wandb.init(
-                        project=arguments.project,
-                        entity=arguments.entity,
-                        id=run_id,
-                        name=f"{campaign['campaign_id']}-student-quality",
-                        resume="allow",
-                        dir=str(wandb_dir),
-                        config={
-                            "round_dagger/campaign_id": campaign["campaign_id"],
-                            "round_dagger/campaign_sha256": campaign_sha,
-                            "round_dagger/quality_scope": "sealed-rollout-action-agreement",
-                            "round_dagger/telemetry_read_only": True,
+                run.log(status_metrics)
+                run.summary.update(status_summary)
+                for record in pending:
+                    # The event index inside the payload is the custom x-axis.
+                    # Never set W&B's global ``step``: a late media/quality event
+                    # from an earlier round would otherwise be dropped as
+                    # out-of-order history.
+                    run.log(record["metrics"])
+                    session_uploaded[str(record["event"])] = record[
+                        "seal_sha256"
+                    ]
+                if ready_path is not None and not ready_written:
+                    _atomic_json(
+                        ready_path,
+                        {
+                            "schema": READY_SCHEMA,
+                            "campaign_id": campaign["campaign_id"],
+                            "wandb_run_id": run_id,
+                            "process_id": os.getpid(),
+                            "ready_unix_ns": time.time_ns(),
                         },
-                        tags=("round-dagger", "student-quality", "read-only-bridge"),
                     )
-                    exit_code = 1
-                    try:
-                        run.define_metric("rollout_quality/event_index")
-                        run.define_metric(
-                            "rollout_quality/*",
-                            step_metric="rollout_quality/event_index",
-                        )
-                        for record in pending:
-                            run.log(record["metrics"], step=record["event"])
-                        exit_code = 0
-                    finally:
-                        # Cursor publication happens only after this synchronous
-                        # sender drain returns successfully.
-                        run.finish(exit_code=exit_code)
-                    if exit_code != 0:
-                        raise QualityBridgeError("W&B sender did not finish cleanly")
-                    for record in pending:
-                        uploaded[str(record["event"])] = record["seal_sha256"]
-                    state = {
-                        **state,
-                        "uploaded_seal_sha256_by_event": dict(
-                            sorted(uploaded.items(), key=lambda item: int(item[0]))
-                        ),
-                    }
-                    _atomic_json(state_path, state)
+                    ready_written = True
                 print(
                     f"STUDENT_QUALITY_WANDB_POLL_OK uploaded={len(pending)} run_id={run_id}",
                     flush=True,
                 )
+                driver_state = status_summary["campaign/driver_state"]
+                if driver_state == "FAILED":
+                    exit_code = 2
+                    break
+                if driver_state == "COMPLETE":
+                    exit_code = 0
+                    break
                 if arguments.poll_seconds == 0:
+                    # One-shot mode is a bounded diagnostic.  Production uses a
+                    # positive polling interval so active status remains live.
+                    exit_code = 0
                     break
                 time.sleep(arguments.poll_seconds)
+            try:
+                run.finish(exit_code=exit_code)
+            except Exception as exc:
+                run = None
+                raise QualityBridgeError("W&B sender did not finish cleanly") from exc
+            run = None
+            # The sender drain above is the delivery acknowledgement.  Persist
+            # the combined cursor only after it succeeds.  If this local fsync
+            # fails, a restart safely replays already-delivered events.
+            if session_uploaded:
+                combined = {**durable_uploaded, **session_uploaded}
+                state = {
+                    **state,
+                    "uploaded_seal_sha256_by_event": dict(
+                        sorted(combined.items(), key=lambda item: int(item[0]))
+                    ),
+                }
+                _atomic_json(state_path, state)
     except WandbPreflightError:
         print("student quality bridge failed: W&B identity/preflight rejected", file=sys.stderr)
+        if run is not None:
+            with contextlib.suppress(Exception):
+                run.finish(exit_code=2)
         return 2
     except Exception as error:
         if isinstance(error, QualityBridgeError):
@@ -458,8 +782,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             detail = f"unexpected {type(error).__name__}"
         print(f"student quality bridge failed: {detail}", file=sys.stderr)
+        if run is not None:
+            with contextlib.suppress(Exception):
+                run.finish(exit_code=2)
         return 2
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

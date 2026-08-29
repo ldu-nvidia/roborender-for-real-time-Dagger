@@ -37,6 +37,7 @@ from round_dagger import (
     replay,
     seed_policy,
     state,
+    wandb_delivery,
 )
 from scripts.round_dagger import verify_sealed_source_snapshot as source_seal
 
@@ -1036,6 +1037,19 @@ class ProductionBackend:
                 f"actor cohort has invalid Image3F cleanup evidence: {exc}"
             ) from exc
 
+    def _require_actor_wandb_delivery(self, path: Path) -> dict[str, Any] | None:
+        """Require sender-drained actor telemetry for production cohorts."""
+
+        run_dir = self._actor_run_dir(path)
+        if run_dir is None or self.config.campaign_contract_sha256 is None:
+            return None
+        try:
+            return wandb_delivery.verify_delivery(run_dir)
+        except wandb_delivery.WandbDeliveryError as exc:
+            raise OrchestrationError(
+                f"actor cohort has invalid W&B delivery evidence: {exc}"
+            ) from exc
+
     def complete_cohort(self, path: Path) -> dict[str, Any] | None:
         if not (path / artifacts.SEAL_FILENAME).exists():
             return None
@@ -1044,12 +1058,28 @@ class ProductionBackend:
             # Returning None makes the orchestrator invoke the idempotent
             # collection hook, whose sealed recovery path performs cleanup.
             return None
+        if (
+            self._actor_run_dir(path) is not None
+            and self.config.campaign_contract_sha256 is not None
+            and self._require_actor_wandb_delivery(path) is None
+        ):
+            # A sealed cohort with an interrupted sidecar remains replayable.
+            # Returning None invokes the collect hook's sealed recovery branch.
+            return None
         return artifacts.verify_cohort(path)
 
     def seal_cohort(self, path: Path) -> dict[str, Any]:
         if self._actor_run_dir(path) is not None and self._require_actor_cleanup(path) is None:
             raise OrchestrationError(
                 "actor cohort cannot be sealed without verified Image3F cleanup"
+            )
+        if (
+            self._actor_run_dir(path) is not None
+            and self.config.campaign_contract_sha256 is not None
+            and self._require_actor_wandb_delivery(path) is None
+        ):
+            raise OrchestrationError(
+                "production actor cohort cannot be accepted without durable W&B delivery"
             )
         return artifacts.seal_cohort(path)
 

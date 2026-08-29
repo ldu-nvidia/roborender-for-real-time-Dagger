@@ -176,10 +176,78 @@ done <"$ENV_HANDOFF"
    "$ROUND_DAGGER_LAUNCH_ORCHESTRATION_SHA256" ]] || \
     fatal "orchestration config changed after preflight"
 
+# Policy-v0 quality must be visible before the long first collection phase.
+# This is the same fixed256 held-out action evaluation used by the learner
+# (MSE/MAE/RMSE/cosine and per-action metrics), executed once against the
+# frozen active bundle.  Closed-loop Isaac evaluation remains the separate
+# round-boundary paired promotion gate.
+readarray -t BASELINE_BINDING < <(
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" - "$ORCHESTRATION_CONFIG" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+print(document["campaign_root"])
+print(document["macro_round"])
+PY
+)
+[[ ${#BASELINE_BINDING[@]} == 2 ]] || fatal "cannot derive policy-v0 baseline binding"
+ROUND_DAGGER_CAMPAIGN_ROOT=${BASELINE_BINDING[0]}
+ROUND_DAGGER_MACRO_ROUND=${BASELINE_BINDING[1]}
+[[ $ROUND_DAGGER_CAMPAIGN_ROOT == /* && -d $ROUND_DAGGER_CAMPAIGN_ROOT && \
+   ! -L $ROUND_DAGGER_CAMPAIGN_ROOT ]] || fatal "baseline campaign root is unsafe"
+[[ $ROUND_DAGGER_MACRO_ROUND =~ ^(0|[1-9][0-9]*)$ ]] || \
+    fatal "baseline macro-round is malformed"
+ROUND_DAGGER_CAMPAIGN_ID=$(
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" - "$ROUND_DAGGER_CAMPAIGN_ROOT" <<'PY'
+import sys
+from round_dagger.state import load_campaign
+
+print(load_campaign(sys.argv[1])["campaign_id"])
+PY
+) || fatal "cannot load baseline campaign identity"
+export ROUND_DAGGER_CAMPAIGN_ROOT ROUND_DAGGER_MACRO_ROUND ROUND_DAGGER_CAMPAIGN_ID
+BASELINE_SCRIPT="$EVALUATION_SEALED_SOURCE_ROOT/scripts/round_dagger/run_policy_v0_baseline_docker.sh"
+[[ -f $BASELINE_SCRIPT && ! -L $BASELINE_SCRIPT ]] || \
+    fatal "sealed policy-v0 baseline primitive is missing or unsafe"
+
+run_or_verify_policy_v0_baseline() {
+    if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$EVALUATION_SEALED_SOURCE_ROOT" \
+        "$PYTHON" - "$ROUND_DAGGER_CAMPAIGN_ROOT" <<'PY' >/dev/null 2>&1
+import sys
+from round_dagger.heldout_baseline import verify_active_policy_v0_result
+
+verify_active_policy_v0_result(sys.argv[1], require_wandb_receipt=True)
+PY
+    then
+        return 0
+    fi
+    export ROUND_DAGGER_TRUSTED_BASELINE_DISPATCH=1
+    /usr/bin/env bash "$BASELINE_SCRIPT" || \
+        fatal "policy-v0 fixed256 baseline execution failed"
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$EVALUATION_SEALED_SOURCE_ROOT" \
+        "$PYTHON" - "$ROUND_DAGGER_CAMPAIGN_ROOT" <<'PY' >/dev/null || \
+        fatal "policy-v0 fixed256 baseline artifact did not verify"
+import sys
+from round_dagger.heldout_baseline import verify_active_policy_v0_result
+
+verify_active_policy_v0_result(sys.argv[1], require_wandb_receipt=True)
+PY
+}
+
 if [[ $DRY_RUN == 1 ]]; then
     printf '%s\n' "$PLAN"
+    if [[ $ROUND_DAGGER_MACRO_ROUND == 0 ]]; then
+        echo "POLICY_V0_FIXED256_BASELINE_DRY_RUN required_before_collection=1"
+    fi
     echo "PRODUCTION_MACRO_ROUND_DRY_RUN_OK no_campaign_mutation=1 no_submission=1"
     exit 0
+fi
+
+if [[ $ROUND_DAGGER_MACRO_ROUND == 0 ]]; then
+    run_or_verify_policy_v0_baseline
 fi
 
 # The validator has already bound this exact config to the durable campaign,

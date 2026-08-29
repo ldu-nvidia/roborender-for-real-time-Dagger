@@ -104,11 +104,22 @@ _METRIC_MAP = {
     "paired_action_imitation_mse_relative_change": (
         "eval/delta/action_imitation_mse_relative_change"
     ),
+    "parent_episode_length_mean": "eval/parent/episode_length_mean",
+    "candidate_episode_length_mean": "eval/candidate/episode_length_mean",
+    "paired_episode_length_mean_delta": "eval/delta/episode_length_mean",
     "parent_lag_boundary_cases": "eval/parent/lag_boundary_cases",
     "candidate_lag_boundary_cases": "eval/candidate/lag_boundary_cases",
     "paired_initial_condition_matches": "eval/pair/initial_condition_matches",
     "paired_initial_generated_matches": "eval/pair/initial_generated_matches",
     "renderer_errors": "eval/renderer/errors",
+}
+_OPTIONAL_METRIC_MAP = {
+    # Historical immutable paired outcomes predate retention of simulator
+    # reward.  Continue uploading their established metrics while exposing
+    # return only for evidence that actually contains it.
+    "parent_episode_return_mean": "eval/parent/episode_return_mean",
+    "candidate_episode_return_mean": "eval/candidate/episode_return_mean",
+    "paired_episode_return_mean_delta": "eval/delta/episode_return_mean",
 }
 
 
@@ -429,6 +440,9 @@ def wandb_metrics(record: EvaluationRecord) -> dict[str, int | float]:
         if source == "paired_cases":
             continue
         payload[destination] = float(record.metrics[source])
+    for source, destination in _OPTIONAL_METRIC_MAP.items():
+        if source in record.metrics:
+            payload[destination] = float(record.metrics[source])
     return payload
 
 

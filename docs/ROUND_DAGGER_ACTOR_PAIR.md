@@ -42,18 +42,42 @@ coverage, frozen policy identity, and common `TRAIN_RUN_DIR`. The operator must
 also supply the machine-specific inputs already required by the rank-local
 launcher: the teacher checkpoint path, endpoint manifest, anchor directory,
 validated GR00T Python/root, RTX image tag, and optional W&B account variables.
-W&B is launched only by logical rank 0; rank 1 contributes files to the same
-telemetry directory without creating a second remote run.
+W&B is launched by exactly one rank that is actually relaunched (rank 0 on a
+fresh pair, or the missing rank on a prefix retry); the peer contributes files
+to the same telemetry directory without creating a second remote run.
 
 Production pins `bootstrap_anchor_source=simulator_rgb`: reset frame zero uses
 the current three-view Isaac RGB observation. The legacy anchor pool remains a
 verified compatibility asset, but is not the production bootstrap source.
 
 The pair hook waits for both processes even if either fails. It never signals
-an actor, renderer, or unrelated job. A partial rank remains unsealed for
-forensics and is not overwritten. An exactly complete rank may be skipped on a
-retry; a cohort seal is published and reverified only after both exact
+an actor, renderer, or unrelated job. An interrupted rank is relaunched only
+when its committed shards form a fully verified, contiguous prefix of exact
+4-environment parts. The exporter reuses that immutable prefix and resumes at
+the first missing part. A single payload without its sidecar is also safe at
+that boundary: the retry must regenerate byte-identical content create-only
+before committing the missing sidecar. Gaps, overlaps, malformed chunks, or
+any conflicting payload remain fail-closed. An exactly complete rank is
+skipped; a cohort seal is published and reverified only after both exact
 32-environment partitions contain all 512 steps.
+
+A SIGKILL may strand the hidden same-directory NPZ temporary created before
+immutable payload publication. While holding the exclusive pair lock, the
+supervisor removes only the exact exporter-owned temporary name; it never
+counts that inode as rollout evidence. Unknown hidden files, gaps, and
+conflicts are retained and rejected. If both ranks are already complete but a
+former supervisor died before sealing, the retry performs stream cleanup,
+seals and reverifies the cohort, and republishes the deterministic quality
+projection without relaunching an actor.
+
+The pair's immutable terminal record is published only after the W&B owner
+wrapper completes its final drain. It binds the campaign, macro-round, and
+cohort to `contract.json`, records the wrapper exit code separately from actor
+exit codes, and cannot report success when a late telemetry drain fails. The
+five-round driver records every failed collection attempt in a read-only,
+frontier-bound ledger. That ledger survives driver restarts, enforces the same
+bounded retry budget across processes, and permanently forbids automatic
+retry after an operator-delivered signal.
 
 Run the control-plane gates without Docker, Isaac, or a GPU:
 
@@ -67,3 +91,6 @@ available. A Slurm deployment can replace the Docker executor with an absolute
 executor implementing the same `EXECUTOR RANK RANK_SCRIPT` interface, but it
 must preserve private IPC, one-GPU isolation, inherited artifact paths, exit
 status, and the absence of Torch distributed environment variables.
+
+Actor sidecar and campaign-quality terminal semantics are documented in
+[`ROUND_DAGGER_WANDB_LIFECYCLE.md`](ROUND_DAGGER_WANDB_LIFECYCLE.md).

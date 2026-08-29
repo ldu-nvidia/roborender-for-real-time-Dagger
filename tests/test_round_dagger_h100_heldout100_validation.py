@@ -23,7 +23,7 @@ OLD_CONTRACT = (
 )
 HELDOUT = Path(
     "/mnt/data2/ldu/roborender_round_dagger_production/"
-    "dagger_prod_run1/heldout_snapshot.json"
+    "dagger_prod_run1_resilient_20260829/heldout_snapshot.json"
 )
 
 from scripts.round_dagger import h100_heldout100_validation as validation  # noqa: E402

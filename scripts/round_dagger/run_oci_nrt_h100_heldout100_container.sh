@@ -39,7 +39,7 @@ AUTH_SCOPE=${ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE:?missing W&B authorization s
 [[ $CAMPAIGN == /* && -d $CAMPAIGN && ! -L $CAMPAIGN ]] || fatal "campaign mount is unsafe"
 [[ $OUTPUT == "$CAMPAIGN"/* && -d $OUTPUT && ! -L $OUTPUT ]] || fatal "output mount is not nested"
 [[ $JOB == /round_dagger_heldout100_job && -d $JOB && ! -L $JOB ]] || fatal "job scratch mount is non-canonical"
-[[ $HELDOUT == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1/heldout_snapshot.json ]] || \
+[[ $HELDOUT == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829/heldout_snapshot.json ]] || \
     fatal "fixed-256 held-out snapshot path changed"
 [[ $CONTRACT == "$ROOT/configs/round_dagger/validation_learner_1x8h100_heldout100.json" ]] || fatal "heldout100 contract path changed"
 [[ $CAMPAIGN_ID == dagger_prod_run1 && $MACRO_ROUND == 0 ]] || fatal "campaign/round identity is invalid"
@@ -255,8 +255,8 @@ report = {
     "learner_identity_sha256": identity, "learner_config_sha256": config,
     "learner_code_sha256": code, "replay_snapshot_file_sha256": replay_file,
     "replay_snapshot_sha256": replay,
-    "heldout_snapshot_file_sha256": "cea0ee36b228c611635af8dd23b83db3bdaa0fcea493acd57379f080273fdbc8",
-    "heldout_snapshot_sha256": "c72e5b1329ad62f2286021efa757cae7a1d748d0bfb66b6c63642be25b72162f",
+    "heldout_snapshot_file_sha256": "42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9",
+    "heldout_snapshot_sha256": "c80ee79dae99bb048f9f75bb38aae75fb3e305e665eedfc83d43470babd08bde",
     "runtime_container_sha256": container, "learner_contract_sha256": contract,
     "stopped_checkpoint_sha256": sha256_file(stopped_path),
     "resumed_checkpoint_sha256": sha256_file(resumed_path),

@@ -103,6 +103,104 @@ if [ "$PAIR_LIFECYCLE" = 1 ]; then
 fi
 DONE="$RUN_DIR/$FINISH_MARKER"
 LOG="$RUN_DIR/logs/wandb_sidecar.log"
+
+# Publish a numeric terminal result create-only and durably.  In particular, an
+# expired pair-supervisor lease is a failure (2), never the legacy empty marker
+# that the generic watcher interprets as success.  Create-only publication also
+# prevents a late healthy supervisor from silently overwriting an orphan result.
+publish_finish_marker() {
+    local code=$1
+    "$WANDB_PYTHON" - "$DONE" "$code" <<'PY'
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+code = sys.argv[2]
+if code not in {"0", "2"}:
+    raise SystemExit("finish code must be 0 or 2")
+payload = (code + "\n").encode("ascii")
+path.parent.mkdir(parents=True, exist_ok=True)
+descriptor, temporary_name = tempfile.mkstemp(
+    prefix=f".{path.name}.", dir=path.parent
+)
+temporary = Path(temporary_name)
+try:
+    with os.fdopen(descriptor, "wb", closefd=True) as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    os.chmod(temporary, 0o444)
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or path.read_bytes() != payload:
+            raise SystemExit("existing finish marker conflicts")
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+}
+
+# The outer pair treats existence of ACTOR_DONE as ownership transfer.  Publish
+# it with the same create-only, fsynced discipline as the finish marker so a
+# crash can never expose an empty/truncated status that is mistaken for an actor
+# failure.
+publish_actor_done_marker() {
+    local code=$1
+    "$WANDB_PYTHON" - "$ACTOR_DONE" "$code" <<'PY'
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    code = int(sys.argv[2])
+except ValueError:
+    raise SystemExit("actor status must be an integer") from None
+if not 0 <= code <= 255:
+    raise SystemExit("actor status must be in [0,255]")
+payload = f"{code}\n".encode("ascii")
+path.parent.mkdir(parents=True, exist_ok=True)
+descriptor, temporary_name = tempfile.mkstemp(
+    prefix=f".{path.name}.", dir=path.parent
+)
+temporary = Path(temporary_name)
+try:
+    with os.fdopen(descriptor, "wb", closefd=True) as output:
+        output.write(payload)
+        output.flush()
+        os.fchmod(output.fileno(), 0o444)
+        os.fsync(output.fileno())
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        info = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_mode & 0o222
+            or path.read_bytes() != payload
+        ):
+            raise SystemExit("existing actor-done marker conflicts")
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+}
+
 MARKERS=("$READY" "$DONE")
 [ -z "$ACTOR_DONE" ] || MARKERS+=("$ACTOR_DONE")
 for marker in "${MARKERS[@]}"; do
@@ -146,7 +244,7 @@ for ((second=0; second<READY_TIMEOUT; second++)); do
 done
 if [ "$ready" != 1 ]; then
     # Request a clean final drain rather than terminating the sidecar process.
-    : >"$DONE"
+    publish_finish_marker 2
     wait "$WATCHER_PID" || true
     echo "W&B sidecar readiness timed out" >&2
     exit 2
@@ -162,7 +260,8 @@ set -e
 # the sole sidecar drains the complete common telemetry stream.  Standalone
 # mode retains the original actor-scoped lifecycle.
 if [ "$PAIR_LIFECYCLE" = 1 ]; then
-    printf '%s\n' "$ACTOR_STATUS" >"$ACTOR_DONE"
+    publish_actor_done_marker "$ACTOR_STATUS"
+    PAIR_ORPHANED=0
     while [ ! -f "$DONE" ]; do
         if ! kill -0 "$WATCHER_PID" 2>/dev/null; then
             break
@@ -170,14 +269,19 @@ if [ "$PAIR_LIFECYCLE" = 1 ]; then
         NOW=$(date +%s)
         HEARTBEAT_MTIME=$(stat -c %Y "$PAIR_HEARTBEAT" 2>/dev/null || echo 0)
         if [ $((NOW - HEARTBEAT_MTIME)) -gt "$PAIR_ORPHAN_TIMEOUT" ]; then
-            : >"$DONE"
+            publish_finish_marker 2
+            PAIR_ORPHANED=1
             echo "W&B pair supervisor lease expired; self-finalizing sidecar" >&2
             break
         fi
         sleep 1
     done
 else
-    : >"$DONE"
+    if [ "$ACTOR_STATUS" -eq 0 ]; then
+        publish_finish_marker 0
+    else
+        publish_finish_marker 2
+    fi
 fi
 set +e
 wait "$WATCHER_PID"
@@ -187,6 +291,10 @@ set -e
 if [ "$ACTOR_STATUS" -ne 0 ]; then
     echo "actor cohort failed; immutable collection was not sealed" >&2
     exit "$ACTOR_STATUS"
+fi
+if [ "${PAIR_ORPHANED:-0}" -ne 0 ]; then
+    echo "actor cohort lost its pair supervisor lease" >&2
+    exit 2
 fi
 if [ "$WATCHER_STATUS" -ne 0 ]; then
     echo "W&B scalar/image/video sidecar failed" >&2
