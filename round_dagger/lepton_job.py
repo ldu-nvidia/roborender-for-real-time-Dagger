@@ -1111,6 +1111,18 @@ def validate_job_identity(
     )
     if name != job_name(request.identity_sha256, attempt) or labels != expected_labels:
         raise LeptonJobError("existing Lepton Job does not match the exact learner identity")
+    if state == "UNK":
+        # Lepton's create response can briefly expose a provider admission
+        # state that the pinned SDK maps to UNK before the first GET returns
+        # Starting.  Adopt it only at the pristine zero-work frontier; an
+        # unknown state after any execution evidence remains fail-closed.
+        status = _member(job, "status")
+        counters = tuple(
+            _member(status, name)
+            for name in ("ready", "active", "failed", "succeeded")
+        )
+        if counters == (0, 0, 0, 0) and _member(status, "completion_time") is None:
+            return "Starting"
     if state not in _ACTIVE_STATES | _FAILURE_STATES | _SUCCESS_STATES:
         raise LeptonJobError(f"Lepton Job returned an unsupported state: {state}")
     return state

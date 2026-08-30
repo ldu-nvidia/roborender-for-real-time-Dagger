@@ -161,6 +161,16 @@ def _job(request, contract, attempt, state):
     )
 
 
+def _unknown_job(request, contract, *, failed=0):
+    job = _job(request, contract, 1, "UNK")
+    job.status.ready = 0
+    job.status.active = 0
+    job.status.failed = failed
+    job.status.succeeded = 0
+    job.status.completion_time = None
+    return job
+
+
 class LeptonJobBackendTest(unittest.TestCase):
     def setUp(self):
         self.contract = lepton_job.load_contract(CONTRACT)
@@ -371,6 +381,22 @@ class LeptonJobBackendTest(unittest.TestCase):
                 FakeClient([missing_first]),
                 contract=self.contract,
                 request=self.request,
+            )
+
+    def test_pristine_unknown_admission_is_bounded_as_starting(self):
+        pristine = _unknown_job(self.request, self.contract)
+        self.assertEqual(
+            lepton_job.validate_job_identity(
+                pristine, contract=self.contract, request=self.request, attempt=1
+            ),
+            "Starting",
+        )
+        with self.assertRaisesRegex(lepton_job.LeptonJobError, "unsupported state"):
+            lepton_job.validate_job_identity(
+                _unknown_job(self.request, self.contract, failed=1),
+                contract=self.contract,
+                request=self.request,
+                attempt=1,
             )
 
     def test_reserved_node_preflight_is_scoped_to_exact_reservation(self):
