@@ -150,6 +150,55 @@ class SealedSourceVerifierTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["schema"], verifier.REPORT_SCHEMA)
 
+    def test_exact_canonical_root_name_preserves_content_addressed_manifest(self) -> None:
+        fixture = SealedSourceFixture(self)
+        canonical_root = fixture.base / verifier.CANONICAL_SOURCE_ROOT_NAME
+        canonical_inventory = fixture.base / "fast_roborender.inventory.json"
+        canonical_attestation = (
+            fixture.base / "fast_roborender.snapshot_attestation.json"
+        )
+        fixture.root.rename(canonical_root)
+        fixture.inventory_path.rename(canonical_inventory)
+        fixture.attestation_path.rename(canonical_attestation)
+        fixture.root = canonical_root
+        fixture.gr00t = canonical_root / "GR00T-VisualSim2Real"
+        fixture.inventory_path = canonical_inventory
+        fixture.attestation_path = canonical_attestation
+
+        report = verifier.verify(canonical_root, fixture.inventory_sha)
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["snapshot_name"], fixture.name)
+        self.assertEqual(report["root"], str(canonical_root))
+        self.assertEqual(report["inventory_path"], str(canonical_inventory))
+        self.assertEqual(report["attestation_path"], str(canonical_attestation))
+
+    def test_arbitrary_renamed_root_and_noncanonical_evidence_are_rejected(self) -> None:
+        fixture = SealedSourceFixture(self)
+        renamed_root = fixture.base / "fast_roborender_release"
+        renamed_inventory = fixture.base / "fast_roborender_release.inventory.json"
+        renamed_attestation = (
+            fixture.base / "fast_roborender_release.snapshot_attestation.json"
+        )
+        fixture.root.rename(renamed_root)
+        fixture.inventory_path.rename(renamed_inventory)
+        fixture.attestation_path.rename(renamed_attestation)
+        fixture.root = renamed_root
+        fixture.gr00t = renamed_root / "GR00T-VisualSim2Real"
+        fixture.inventory_path = renamed_inventory
+        fixture.attestation_path = renamed_attestation
+        with self.assertRaisesRegex(
+            verifier.VerificationError, "content-addressed snapshot name"
+        ):
+            verifier.verify(renamed_root, fixture.inventory_sha)
+
+        fixture = SealedSourceFixture(self)
+        canonical_root = fixture.base / verifier.CANONICAL_SOURCE_ROOT_NAME
+        fixture.root.rename(canonical_root)
+        fixture.root = canonical_root
+        fixture.gr00t = canonical_root / "GR00T-VisualSim2Real"
+        with self.assertRaisesRegex(verifier.VerificationError, "safely open"):
+            verifier.verify(canonical_root, fixture.inventory_sha)
+
     def test_filesystem_forced_directory_setgid_is_non_writable_and_allowed(self) -> None:
         fixture = SealedSourceFixture(self)
         for path in (fixture.gr00t, fixture.root):

@@ -17,13 +17,16 @@ import copy
 import math
 import os
 import re
-import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from round_dagger.artifacts import canonical_json_sha256, load_strict_json, sha256_file
+from round_dagger.artifacts import canonical_json_sha256, load_strict_json
+from round_dagger.checkpoint_compat import (
+    CheckpointCompatibilityError,
+    load_hash_pinned_policy_state_dict,
+)
 from round_dagger.policy_identity import (
     PolicyIdentityError,
     runtime_policy_identity_sha256,
@@ -670,32 +673,28 @@ def load_checkpoint_strict(
     expected_sha256: str,
     map_location: str = "cpu",
 ) -> dict[str, Any]:
-    """Load one exact GR00T policy state and reject missing/unexpected keys."""
+    """Load one exact GR00T policy state and reject missing/unexpected keys.
 
-    path = Path(checkpoint_path).expanduser()
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
-        raise GR00TPolicyError("policy checkpoint must be a regular non-symlink file")
-    path = path.resolve(strict=True)
-    if sha256_file(path) != _sha256(expected_sha256, "expected checkpoint SHA-256"):
-        raise GR00TPolicyError("policy checkpoint SHA-256 mismatch")
+    Auxiliary RTX trainer objects embedded beside the policy are deserialized
+    only as inert, discarded compatibility values.  The returned document is
+    intentionally sanitized to contain no trainer state.
+    """
+
     try:
-        import torch
-
-        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
-    except Exception as exc:
+        state = load_hash_pinned_policy_state_dict(
+            checkpoint_path,
+            expected_sha256=_sha256(
+                expected_sha256, "expected checkpoint SHA-256"
+            ),
+            map_location=map_location,
+        )
+    except CheckpointCompatibilityError as exc:
         raise GR00TPolicyError(f"cannot load policy checkpoint: {exc}") from exc
-    if not isinstance(checkpoint, Mapping) or "policy_state_dict" not in checkpoint:
-        raise GR00TPolicyError("checkpoint lacks policy_state_dict")
-    state = checkpoint["policy_state_dict"]
-    if not isinstance(state, Mapping):
-        raise GR00TPolicyError("policy_state_dict is malformed")
     try:
         policy.load_state_dict(state, strict=True)
     except Exception as exc:
         raise GR00TPolicyError(f"strict policy checkpoint load failed: {exc}") from exc
-    return dict(checkpoint)
+    return {"policy_state_dict": state}
 
 
 @dataclass(frozen=True)

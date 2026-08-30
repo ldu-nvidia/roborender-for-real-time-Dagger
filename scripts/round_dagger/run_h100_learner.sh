@@ -442,9 +442,9 @@ if restart.is_symlink() or not restart.is_file():
     raise SystemExit("restart checkpoint is unsafe")
 if bundle is None:
     raise SystemExit("cannot validate restart without a published learner bundle")
-import torch
+from round_dagger.checkpoint_compat import load_restricted_restart_document
 
-document = torch.load(restart, map_location="cpu", weights_only=False)
+document = load_restricted_restart_document(restart, map_location="cpu")
 if not isinstance(document, Mapping) or document.get("schema") != CHECKPOINT_SCHEMA:
     raise SystemExit("restart checkpoint schema mismatch")
 expected = {
@@ -550,10 +550,10 @@ if [[ $RECOVER_EXISTING_RESULT == 1 ]]; then
 import sys
 from collections.abc import Mapping
 
-import torch
+from round_dagger.checkpoint_compat import load_restricted_restart_document
 
 path, expected_steps = sys.argv[1:]
-document = torch.load(path, map_location="cpu", weights_only=False)
+document = load_restricted_restart_document(path, map_location="cpu")
 if not isinstance(document, Mapping) or document.get("completed_steps") != int(expected_steps):
     raise SystemExit("existing learner result restart is not at the final frontier")
 PY

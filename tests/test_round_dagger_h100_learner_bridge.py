@@ -356,6 +356,7 @@ class ImmutableLearnerBundleTest(unittest.TestCase):
         trainer._load_initial_checkpoint(
             model,
             checkpoint,
+            expected_checkpoint_sha256=artifacts.sha256_file(checkpoint),
             expected_policy_state_sha256=runtime_state_dict_sha256(
                 model.state_dict()
             ),
@@ -366,6 +367,7 @@ class ImmutableLearnerBundleTest(unittest.TestCase):
             trainer._load_initial_checkpoint(
                 model,
                 checkpoint,
+                expected_checkpoint_sha256=artifacts.sha256_file(checkpoint),
                 expected_policy_state_sha256="f" * 64,
             )
 
@@ -567,6 +569,8 @@ class H100LauncherDryRunTest(unittest.TestCase):
             runtime_sha=self.kwargs["runtime_policy_sha256"],
         )
         self.output = self.root / "learner"
+        self.gr00t_root = self.root / "GR00T-VisualSim2Real"
+        self.gr00t_root.mkdir()
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -611,6 +615,7 @@ class H100LauncherDryRunTest(unittest.TestCase):
             **os.environ,
             "DRY_RUN": "1",
             "ROUND_DAGGER_H100_PYTHON": sys.executable,
+            "GR00T_ROOT": str(self.gr00t_root),
             "ROUND_DAGGER_CAMPAIGN_ROOT": str(self.root),
             "ROUND_DAGGER_CAMPAIGN_ID": "production-test",
             "ROUND_DAGGER_MACRO_ROUND": "0",

@@ -397,15 +397,15 @@ import os
 import stat
 import sys
 
-import torch
 from round_dagger.artifacts import publish_immutable_json, sha256_file
+from round_dagger.checkpoint_compat import load_restricted_restart_document
 from round_dagger.learner import CHECKPOINT_SCHEMA
 
 (stopped_path, resumed_path, run_id, config_sha, identity_sha, container_sha,
  contract_sha, code_sha, snapshot_file_sha, snapshot_sha, parent_sha,
  parent_runtime_sha, output) = sys.argv[1:]
-stopped = torch.load(stopped_path, map_location="cpu", weights_only=False)
-resumed = torch.load(resumed_path, map_location="cpu", weights_only=False)
+stopped = load_restricted_restart_document(stopped_path, map_location="cpu")
+resumed = load_restricted_restart_document(resumed_path, map_location="cpu")
 for document, step, label in ((stopped, 1, "stopped"), (resumed, 2, "resumed")):
     if document.get("schema") != CHECKPOINT_SCHEMA or document.get("completed_steps") != step:
         raise SystemExit(f"{label} strict-resume checkpoint mismatch")

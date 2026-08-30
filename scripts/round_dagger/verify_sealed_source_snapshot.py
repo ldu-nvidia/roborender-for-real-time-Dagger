@@ -26,6 +26,7 @@ INVENTORY_SCHEMA = "fast_roborender.hsg_source_inventory.v1"
 MANIFEST_SCHEMA = "fast_roborender.hsg_source_snapshot.v2"
 ATTESTATION_SCHEMA = "fast_roborender.hsg_source_snapshot_attestation.v2"
 REPORT_SCHEMA = "fast_roborender.sealed_source_verification.v1"
+CANONICAL_SOURCE_ROOT_NAME = "fast_roborender"
 
 
 class VerificationError(RuntimeError):
@@ -356,7 +357,6 @@ def _validate_manifest(payload: dict[str, Any], root_name: str) -> dict[str, Any
     required = {
         "schema": MANIFEST_SCHEMA,
         "status": "sealed_tracked_hydrated_sources",
-        "snapshot_name": root_name,
         "export_method": "stage0-git-blobs-plus-verified-lfs-v2",
         "tracked_only": True,
         "lfs_pointer_oids_verified": True,
@@ -382,9 +382,15 @@ def _validate_manifest(payload: dict[str, Any], root_name: str) -> dict[str, Any
         f"fast_roborender_{payload['fast_roborender_revision'][:7]}_"
         f"{payload['gr00t_revision'][:7]}_sealed"
     )
-    if root_name != expected_name:
+    if payload["snapshot_name"] != expected_name:
         raise VerificationError(
-            f"sealed source snapshot name mismatch: {root_name!r} != {expected_name!r}"
+            "sealed source manifest snapshot name mismatch: "
+            f"{payload['snapshot_name']!r} != {expected_name!r}"
+        )
+    if root_name not in {expected_name, CANONICAL_SOURCE_ROOT_NAME}:
+        raise VerificationError(
+            "sealed source root name must be its content-addressed snapshot name "
+            f"or {CANONICAL_SOURCE_ROOT_NAME!r}: {root_name!r}"
         )
     return payload
 
@@ -546,7 +552,7 @@ def verify(root: Path, expected_inventory_sha256: str) -> dict[str, Any]:
         "schema": REPORT_SCHEMA,
         "status": "PASS",
         "root": str(root),
-        "snapshot_name": root.name,
+        "snapshot_name": manifest["snapshot_name"],
         "fast_roborender_revision": manifest["fast_roborender_revision"],
         "gr00t_revision": manifest["gr00t_revision"],
         "file_count": inventory["file_count"],

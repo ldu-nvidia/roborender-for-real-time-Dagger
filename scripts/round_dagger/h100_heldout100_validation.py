@@ -81,6 +81,7 @@ TRAIN_KEYS = {
     "replay_transitions_per_rank",
     "replay_transitions_global",
     "world_size",
+    "gradient_reduction",
 }
 HELDOUT_KEYS = {
     "schema",
@@ -483,6 +484,8 @@ def training_rows(
             or row.get("macro_round") != macro_round
             or row.get("optimizer_step") != step
             or row.get("world_size") != WORLD_SIZE
+            or row.get("gradient_reduction")
+            != "ordered_allgather_rank_sum_v1"
         ):
             raise Heldout100ValidationError(
                 "learner telemetry optimizer frontier or lineage mismatch"

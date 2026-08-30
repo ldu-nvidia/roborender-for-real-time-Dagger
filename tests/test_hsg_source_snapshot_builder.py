@@ -53,7 +53,9 @@ class HsgSourceSnapshotBuilderTests(unittest.TestCase):
         self.assertIn("REMOTE_VERIFY", self.script)
 
     def test_remote_transport_is_stream_compressed_and_fail_closed(self):
-        self.assertIn("ssh stat awk wc cmp dd grep unlink zstd", self.script)
+        self.assertIn('if [ "$LOCAL_ONLY" -eq 0 ]; then', self.script)
+        self.assertIn("for command in ssh zstd rsync", self.script)
+        self.assertIn("required remote-publication command is missing", self.script)
         self.assertIn("[ -x /usr/bin/zstd ]", self.script)
         self.assertIn("zstd -q -1 -T0 -c", self.script)
         self.assertIn("TRANSPORT_SHA256", self.script)

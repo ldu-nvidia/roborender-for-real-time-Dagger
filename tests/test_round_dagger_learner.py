@@ -28,6 +28,9 @@ if torch is not None:
         JsonlTelemetry,
         LearnerBundleConfig,
         LearnerError,
+        ORDERED_ALLGATHER_GRADIENT_REDUCTION,
+        SINGLE_PROCESS_GRADIENT_REDUCTION,
+        _ordered_allgather_gradient_hook,
         configure_deterministic_runtime,
         load_heldout_partition,
         load_replay_partition,
@@ -168,6 +171,52 @@ def _rollout_arrays(env_id, *, steps=8):
         "obs__actor_obs": actor,
         "obs__integer_feature": np.full((steps, 1, 1), env_id, dtype=np.int16),
     }
+
+
+@unittest.skipIf(torch is None, "ordered gradient reduction tests require PyTorch")
+class OrderedGradientReductionTest(unittest.TestCase):
+    def test_hook_averages_gathered_gradients_in_explicit_rank_order(self):
+        source = torch.tensor([17.0, -5.0], dtype=torch.float32)
+        source_before = source.clone()
+        rank_gradients = [
+            torch.tensor([1.0e20, 1.0], dtype=torch.float32),
+            torch.tensor([-1.0e20, 2.0], dtype=torch.float32),
+            torch.tensor([3.0, 3.0], dtype=torch.float32),
+            torch.tensor([4.0, 4.0], dtype=torch.float32),
+        ]
+        bucket = mock.Mock()
+        bucket.buffer.return_value = source
+
+        def gather(outputs, input_tensor):
+            self.assertIs(input_tensor, source)
+            self.assertEqual(len(outputs), len(rank_gradients))
+            for output, gradient in zip(outputs, rank_gradients):
+                output.copy_(gradient)
+
+        with mock.patch(
+            "round_dagger.learner.torch.distributed.all_gather",
+            side_effect=gather,
+        ) as all_gather:
+            reduced = _ordered_allgather_gradient_hook(
+                len(rank_gradients), bucket
+            ).wait()
+
+        # The first component is deliberately non-associative: this value is
+        # produced only by (((rank0 + rank1) + rank2) + rank3) / world_size.
+        torch.testing.assert_close(
+            reduced,
+            torch.tensor([1.75, 2.5], dtype=torch.float32),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(source, source_before, rtol=0, atol=0)
+        all_gather.assert_called_once()
+
+    def test_hook_rejects_a_single_rank_contract(self):
+        bucket = mock.Mock()
+        with self.assertRaisesRegex(LearnerError, "requires multiple ranks"):
+            _ordered_allgather_gradient_hook(1, bucket)
+        bucket.buffer.assert_not_called()
 
 
 @unittest.skipIf(torch is None, "round DAgger learner tests require PyTorch")
@@ -718,6 +767,9 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         )
         self.assertEqual(restart["completed_steps"], 40)
         self.assertEqual(restart["initial_loss"], full_result.initial_loss)
+        self.assertEqual(
+            restart["gradient_reduction"], SINGLE_PROCESS_GRADIENT_REDUCTION
+        )
         optimizer_group = restart["optimizer_state_dict"]["param_groups"][0]
         self.assertIs(optimizer_group["foreach"], False)
         self.assertIs(optimizer_group["fused"], False)
@@ -1096,6 +1148,19 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
                 output_dir=self.root / "mismatch-2",
                 max_steps=3,
                 resume_from=partial.restart_checkpoint,
+            )
+        tampered = torch.load(partial.restart_checkpoint, weights_only=False)
+        tampered["gradient_reduction"] = ORDERED_ALLGATHER_GRADIENT_REDUCTION
+        tampered_path = self.root / "wrong-gradient-reduction.pt"
+        torch.save(tampered, tampered_path)
+        with self.assertRaisesRegex(LearnerError, "gradient_reduction"):
+            train_from_replay(
+                TinyPolicy(),
+                snapshot_path=self.snapshot_path,
+                config=_config(),
+                output_dir=self.root / "mismatch-gradient-reduction",
+                max_steps=3,
+                resume_from=tampered_path,
             )
         tampered = torch.load(partial.restart_checkpoint, weights_only=False)
         tampered["replay_snapshot_sha256"] = "d" * 64

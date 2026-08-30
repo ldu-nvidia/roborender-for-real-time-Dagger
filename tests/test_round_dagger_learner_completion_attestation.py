@@ -106,6 +106,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 "replay_snapshot_file_sha256": snapshot_file_sha,
                 "completed_steps": 1200,
                 "world_size": 8,
+                "gradient_reduction": "ordered_allgather_rank_sum_v1",
                 "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
                 "model_state_dict": {},
                 "optimizer_state_dict": {},
@@ -358,6 +359,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
             "optimizer_step": 1,
             "loss": 0.5,
             "world_size": 8,
+            "gradient_reduction": "ordered_allgather_rank_sum_v1",
             "replay_transitions_rank": 1,
             "replay_transitions_per_rank": [1] * 8,
             "replay_transitions_global": 8,
@@ -416,6 +418,127 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                 heldout_eval_interval=100,
             )
         self.assertEqual(readback["heldout_evaluation"]["verified_steps"], [0])
+
+    def test_wandb_readback_rejects_conflicting_duplicate_quality_frontier(
+        self,
+    ) -> None:
+        training = {
+            1: {
+                "loss": 0.5,
+                "replay_transitions_rank": 1,
+                "replay_transitions_per_rank": [1] * 8,
+                "replay_transitions_global": 8,
+            }
+        }
+        heldout_record = {
+            "action_mse": 0.25,
+            "action_mae": 0.4,
+            "action_rmse": 0.5,
+            "action_cosine": 0.75,
+            "heldout_transitions_global": 16,
+            "per_action": {
+                "0": {"mse": 0.25, "mae": 0.4, "rmse": 0.5, "cosine": 0.75}
+            },
+        }
+        config = {
+            "campaign_id": "campaign",
+            "macro_round": 0,
+            "learner_code_sha256": "1" * 64,
+            "learner_config_sha256": "2" * 64,
+            "learner_identity_sha256": "3" * 64,
+            "model_lineage_sha256": "4" * 64,
+            "parent_runtime_policy_sha256": "5" * 64,
+            "runtime_container_sha256": "6" * 64,
+            "learner_contract_sha256": "7" * 64,
+            "replay_snapshot_file_sha256": "8" * 64,
+            "replay_snapshot_sha256": "9" * 64,
+            "heldout_snapshot_file_sha256": "a" * 64,
+            "heldout_snapshot_sha256": "b" * 64,
+            "heldout_eval_interval": 100,
+        }
+        quality_row = {
+            "_step": 0,
+            "quality/heldout_action_mse": 0.25,
+            "quality/heldout_action_mae": 0.4,
+            "quality/heldout_action_rmse": 0.5,
+            "quality/heldout_action_cosine": 0.75,
+            "quality/heldout_transitions": 16,
+            "quality/action_0/mse": 0.25,
+            "quality/action_0/mae": 0.4,
+            "quality/action_0/rmse": 0.5,
+            "quality/action_0/cosine": 0.75,
+        }
+        conflicting = dict(quality_row)
+        conflicting["quality/action_0/mse"] = 0.3
+        training_row = {
+            "schema": completion.TELEMETRY_SCHEMA,
+            "campaign_id": "campaign",
+            "macro_round": 0,
+            "optimizer_step": 1,
+            "loss": 0.5,
+            "world_size": 8,
+            "gradient_reduction": "ordered_allgather_rank_sum_v1",
+            "replay_transitions_rank": 1,
+            "replay_transitions_per_rank": [1] * 8,
+            "replay_transitions_global": 8,
+        }
+
+        class FakeRun:
+            state = "finished"
+
+            def __init__(self) -> None:
+                self.config = config
+
+            @staticmethod
+            def scan_history(*, page_size: int):
+                self.assertEqual(page_size, 500)
+                return [quality_row, conflicting, training_row]
+
+        fake_wandb = SimpleNamespace(
+            Api=lambda timeout: SimpleNamespace(run=lambda path: FakeRun())
+        )
+        identity = SimpleNamespace(
+            email="ldu@nvidia.com",
+            entity="nvidia",
+            authorization_scope="team",
+            team_member=True,
+            entity_is_team=True,
+            personal=False,
+        )
+        with mock.patch(
+            "scripts.scaling.wandb_preflight._load_wandb",
+            return_value=fake_wandb,
+        ), mock.patch(
+            "scripts.scaling.wandb_preflight.query_identity",
+            return_value=identity,
+        ):
+            with self.assertRaisesRegex(
+                completion.CompletionAttestationError,
+                "held-out history differs",
+            ):
+                completion._wandb_readback(
+                    telemetry=training,
+                    campaign_id="campaign",
+                    macro_round=0,
+                    code_sha256="1" * 64,
+                    config_sha256="2" * 64,
+                    learner_identity_sha256="3" * 64,
+                    parent_sha256="4" * 64,
+                    parent_runtime_policy_sha256="5" * 64,
+                    runtime_container_sha256="6" * 64,
+                    learner_contract_sha256="7" * 64,
+                    snapshot_file_sha256="8" * 64,
+                    snapshot_sha256="9" * 64,
+                    entity="nvidia",
+                    project="project",
+                    run_id="run",
+                    expected_email="ldu@nvidia.com",
+                    timeout_seconds=1,
+                    heldout_telemetry={0: heldout_record},
+                    heldout_snapshot_file_sha256="a" * 64,
+                    heldout_snapshot_sha256="b" * 64,
+                    heldout_eval_interval=100,
+                )
 
     @staticmethod
     def _verify_args(fixture: dict[str, object]) -> dict[str, object]:
@@ -545,6 +668,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                     "replay_transitions_per_rank": [1] * 8,
                     "replay_transitions_global": 8,
                     "world_size": 8,
+                    "gradient_reduction": "ordered_allgather_rank_sum_v1",
                 }
                 for step in (1, 2)
             ]
@@ -583,6 +707,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                     "replay_transitions_per_rank": [9, 1, 1, 1, 1, 1, 1, 1],
                     "replay_transitions_global": 16,
                     "world_size": 8,
+                    "gradient_reduction": "ordered_allgather_rank_sum_v1",
                 },
                 {
                     "schema": completion.TELEMETRY_SCHEMA,
@@ -594,6 +719,7 @@ class LearnerCompletionAttestationTest(unittest.TestCase):
                     "replay_transitions_per_rank": [8, 2, 1, 1, 1, 1, 1, 1],
                     "replay_transitions_global": 16,
                     "world_size": 8,
+                    "gradient_reduction": "ordered_allgather_rank_sum_v1",
                 },
             ]
             self._write_telemetry(path, rows)

@@ -25,9 +25,15 @@ if [ "$REMOTE_SEED_ROOT" != NONE ]; then
         fatal "unsafe absolute remote seed path: $REMOTE_SEED_ROOT"
 fi
 for command in git install find chmod mv python3 realpath mktemp tar sha256sum \
-               ssh stat awk wc cmp dd grep unlink zstd rsync; do
+               stat awk wc cmp dd grep unlink; do
     command -v "$command" >/dev/null 2>&1 || fatal "required command is missing: $command"
 done
+if [ "$LOCAL_ONLY" -eq 0 ]; then
+    for command in ssh zstd rsync; do
+        command -v "$command" >/dev/null 2>&1 || \
+            fatal "required remote-publication command is missing: $command"
+    done
+fi
 
 PUBLISH_COMPLETE=0
 REMOTE_PREPARED=0

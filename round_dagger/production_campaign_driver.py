@@ -27,18 +27,24 @@ from pathlib import Path
 from typing import Any
 
 from round_dagger import artifacts, state
-from round_dagger.orchestration import MacroRoundConfig
+from round_dagger.orchestration import (
+    BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+    LEARNER_BACKEND_OCI_NRT,
+    MacroRoundConfig,
+    trusted_train_hook_relative,
+    validate_learner_backend,
+)
 
 
 DRIVER_STATUS_SCHEMA = "fast_roborender.round_dagger.production_driver_status.v1"
-DRIVER_BINDING_SCHEMA = "fast_roborender.round_dagger.production_driver_binding.v1"
+DRIVER_BINDING_SCHEMA = "fast_roborender.round_dagger.production_driver_binding.v2"
 COLLECTION_FAILURE_SCHEMA = (
     "fast_roborender.round_dagger.collection_attempt_failure.v1"
 )
 COLLECTION_ATTEMPT_SCHEMA = (
     "fast_roborender.round_dagger.collection_launcher_attempt.v1"
 )
-ORCHESTRATION_SCHEMA = "fast_roborender.round_dagger.orchestration_config.v3"
+ORCHESTRATION_SCHEMA = BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
 PRODUCTION_MACRO_ROUNDS = 5
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _SENSITIVE_RE = re.compile(
@@ -315,11 +321,38 @@ class DriverInputs:
     launcher: Path
     launcher_sha256: str
     control_root: Path
+    learner_backend: str = LEARNER_BACKEND_OCI_NRT
+    lepton_backend_contract: Path | None = None
+    lepton_backend_contract_sha256: str | None = None
+    lepton_remote_backend_contract: str | None = None
+    lepton_control_exec_program: Path | None = None
+    lepton_sdk_python: Path | None = None
     heartbeat_seconds: float = 60.0
     collection_retry_limit: int = 2
     collection_retry_backoff_seconds: float = 30.0
 
     def validate(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        try:
+            validate_learner_backend(self.learner_backend)
+        except Exception as exc:
+            raise ProductionDriverError(f"invalid learner backend: {exc}") from exc
+        lepton_values = (
+            self.lepton_backend_contract,
+            self.lepton_backend_contract_sha256,
+            self.lepton_remote_backend_contract,
+            self.lepton_control_exec_program,
+            self.lepton_sdk_python,
+        )
+        if self.learner_backend == LEARNER_BACKEND_OCI_NRT:
+            if any(value is not None for value in lepton_values):
+                raise ProductionDriverError(
+                    "OCI learner backend forbids Lepton-specific inputs"
+                )
+        elif any(value is None for value in lepton_values):
+            raise ProductionDriverError(
+                "Lepton learner backend requires its exact contract, remote "
+                "contract path, control helper, and SDK Python"
+            )
         if self.heartbeat_seconds <= 0:
             raise ProductionDriverError("heartbeat_seconds must be positive")
         if (
@@ -353,6 +386,34 @@ class DriverInputs:
             "post-seal runtime campaign contract",
         )
         _verify_file(self.learner_contract, self.learner_contract_sha256, "learner contract")
+        if self.learner_backend != LEARNER_BACKEND_OCI_NRT:
+            assert self.lepton_backend_contract is not None
+            assert self.lepton_backend_contract_sha256 is not None
+            assert self.lepton_remote_backend_contract is not None
+            assert self.lepton_control_exec_program is not None
+            assert self.lepton_sdk_python is not None
+            _verify_file(
+                self.lepton_backend_contract,
+                self.lepton_backend_contract_sha256,
+                "Lepton backend contract",
+            )
+            remote_contract = self.lepton_remote_backend_contract
+            if (
+                not remote_contract.startswith(
+                    "/workspace/projects/roborender/"
+                )
+                or "//" in remote_contract
+                or any(part in {".", ".."} for part in Path(remote_contract).parts)
+            ):
+                raise ProductionDriverError(
+                    "Lepton remote backend contract path is unsafe"
+                )
+            for path, label in (
+                (self.lepton_control_exec_program, "Lepton control helper"),
+                (self.lepton_sdk_python, "Lepton SDK Python"),
+            ):
+                if not path.is_absolute() or not os.access(path, os.X_OK):
+                    raise ProductionDriverError(f"{label} is not executable")
         _verify_file(self.launcher, self.launcher_sha256, "production launcher")
         repository_root = Path(__file__).resolve().parents[1]
         expected_launcher = (
@@ -623,8 +684,17 @@ def _orchestration_document(
         raise ProductionDriverError("cannot materialize a config outside rounds 0..4")
     active = coordinator["active_policy"]
     repository_root = Path(__file__).resolve().parents[1]
+    backend_contract_sha256 = (
+        inputs.learner_contract_sha256
+        if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+        else inputs.lepton_backend_contract_sha256
+    )
+    if backend_contract_sha256 is None:
+        raise ProductionDriverError("learner backend contract identity is missing")
     document = {
         "schema": ORCHESTRATION_SCHEMA,
+        "learner_backend": inputs.learner_backend,
+        "learner_backend_contract_sha256": backend_contract_sha256,
         "campaign_root": str(inputs.campaign_root),
         "actor_root": str(inputs.campaign_root / "actors"),
         "macro_round": macro_round,
@@ -658,7 +728,7 @@ def _orchestration_document(
                 "argv": [
                     str(
                         repository_root
-                        / "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"
+                        / trusted_train_hook_relative(inputs.learner_backend)
                     )
                 ],
                 "timeout_seconds": 172800,
@@ -718,6 +788,26 @@ def materialize_orchestration_config(
         "campaign_contract_sha256": inputs.campaign_contract_sha256,
         "learner_contract_path": str(inputs.learner_contract),
         "learner_contract_sha256": inputs.learner_contract_sha256,
+        "learner_backend": inputs.learner_backend,
+        "learner_backend_contract_path": str(
+            inputs.learner_contract
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else inputs.lepton_backend_contract
+        ),
+        "learner_backend_contract_sha256": (
+            inputs.learner_contract_sha256
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else inputs.lepton_backend_contract_sha256
+        ),
+        "lepton_remote_backend_contract": inputs.lepton_remote_backend_contract,
+        "lepton_control_exec_program": (
+            None
+            if inputs.lepton_control_exec_program is None
+            else str(inputs.lepton_control_exec_program)
+        ),
+        "lepton_sdk_python": (
+            None if inputs.lepton_sdk_python is None else str(inputs.lepton_sdk_python)
+        ),
         "launcher_path": str(inputs.launcher),
         "launcher_sha256": inputs.launcher_sha256,
         "macro_round": coordinator["next_macro_round"],
@@ -743,6 +833,20 @@ def _launcher_argv(inputs: DriverInputs, config_path: Path, *, dry_run: bool) ->
         str(inputs.learner_contract),
         "--learner-contract-sha256",
         inputs.learner_contract_sha256,
+        "--learner-backend",
+        inputs.learner_backend,
+        "--learner-backend-contract",
+        str(
+            inputs.learner_contract
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else inputs.lepton_backend_contract
+        ),
+        "--learner-backend-contract-sha256",
+        (
+            inputs.learner_contract_sha256
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else str(inputs.lepton_backend_contract_sha256)
+        ),
         "--sealed-source-root",
         str(inputs.sealed_source_root),
         "--sealed-source-inventory-sha256",
@@ -752,6 +856,20 @@ def _launcher_argv(inputs: DriverInputs, config_path: Path, *, dry_run: bool) ->
         "--evaluation-sealed-source-inventory-sha256",
         inputs.evaluation_sealed_source_inventory_sha256,
     ]
+    if inputs.learner_backend != LEARNER_BACKEND_OCI_NRT:
+        assert inputs.lepton_remote_backend_contract is not None
+        assert inputs.lepton_control_exec_program is not None
+        assert inputs.lepton_sdk_python is not None
+        argv.extend(
+            [
+                "--lepton-remote-backend-contract",
+                inputs.lepton_remote_backend_contract,
+                "--lepton-control-exec-program",
+                str(inputs.lepton_control_exec_program),
+                "--lepton-sdk-python",
+                str(inputs.lepton_sdk_python),
+            ]
+        )
     if dry_run:
         argv.append("--dry-run")
     if any(_SENSITIVE_RE.search(item) for item in argv):
@@ -784,6 +902,26 @@ def _status_document(
         "campaign_root": str(inputs.campaign_root),
         "campaign_contract_path": str(inputs.campaign_contract),
         "campaign_contract_sha256": inputs.campaign_contract_sha256,
+        "learner_backend": inputs.learner_backend,
+        "learner_backend_contract_path": str(
+            inputs.learner_contract
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else inputs.lepton_backend_contract
+        ),
+        "learner_backend_contract_sha256": (
+            inputs.learner_contract_sha256
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else inputs.lepton_backend_contract_sha256
+        ),
+        "lepton_remote_backend_contract": inputs.lepton_remote_backend_contract,
+        "lepton_control_exec_program": (
+            None
+            if inputs.lepton_control_exec_program is None
+            else str(inputs.lepton_control_exec_program)
+        ),
+        "lepton_sdk_python": (
+            None if inputs.lepton_sdk_python is None else str(inputs.lepton_sdk_python)
+        ),
         "coordinator_phase": coordinator["phase"],
         "next_macro_round": coordinator["next_macro_round"],
         "macro_round_count": PRODUCTION_MACRO_ROUNDS,
@@ -1468,6 +1606,26 @@ def _reconcile_unmatched_attempt(
         "campaign_contract_sha256": inputs.campaign_contract_sha256,
         "learner_contract_path": str(inputs.learner_contract),
         "learner_contract_sha256": inputs.learner_contract_sha256,
+        "learner_backend": inputs.learner_backend,
+        "learner_backend_contract_path": str(
+            inputs.learner_contract
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else inputs.lepton_backend_contract
+        ),
+        "learner_backend_contract_sha256": (
+            inputs.learner_contract_sha256
+            if inputs.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else inputs.lepton_backend_contract_sha256
+        ),
+        "lepton_remote_backend_contract": inputs.lepton_remote_backend_contract,
+        "lepton_control_exec_program": (
+            None
+            if inputs.lepton_control_exec_program is None
+            else str(inputs.lepton_control_exec_program)
+        ),
+        "lepton_sdk_python": (
+            None if inputs.lepton_sdk_python is None else str(inputs.lepton_sdk_python)
+        ),
         "launcher_path": str(inputs.launcher),
         "launcher_sha256": inputs.launcher_sha256,
         "macro_round": frontier["macro_round"],
@@ -1916,6 +2074,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--launcher", type=Path, required=True)
     parser.add_argument("--launcher-sha256", required=True)
     parser.add_argument("--control-root", type=Path, required=True)
+    parser.add_argument(
+        "--learner-backend",
+        choices=("oci_nrt", "lepton_job_v1"),
+        default="oci_nrt",
+    )
+    parser.add_argument("--lepton-backend-contract", type=Path)
+    parser.add_argument("--lepton-backend-contract-sha256")
+    parser.add_argument("--lepton-remote-backend-contract")
+    parser.add_argument("--lepton-control-exec-program", type=Path)
+    parser.add_argument("--lepton-sdk-python", type=Path)
     parser.add_argument("--heartbeat-seconds", type=float, default=60.0)
     parser.add_argument("--collection-retry-limit", type=int, default=2)
     parser.add_argument(
@@ -1946,6 +2114,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             launcher=_absolute(arguments.launcher, "launcher"),
             launcher_sha256=arguments.launcher_sha256,
             control_root=_absolute(arguments.control_root, "control root"),
+            learner_backend=arguments.learner_backend,
+            lepton_backend_contract=(
+                None
+                if arguments.lepton_backend_contract is None
+                else _absolute(
+                    arguments.lepton_backend_contract,
+                    "Lepton backend contract",
+                )
+            ),
+            lepton_backend_contract_sha256=(
+                arguments.lepton_backend_contract_sha256
+            ),
+            lepton_remote_backend_contract=(
+                arguments.lepton_remote_backend_contract
+            ),
+            lepton_control_exec_program=(
+                None
+                if arguments.lepton_control_exec_program is None
+                else _absolute(
+                    arguments.lepton_control_exec_program,
+                    "Lepton control exec program",
+                )
+            ),
+            lepton_sdk_python=(
+                None
+                if arguments.lepton_sdk_python is None
+                else _absolute(arguments.lepton_sdk_python, "Lepton SDK Python")
+            ),
             heartbeat_seconds=arguments.heartbeat_seconds,
             collection_retry_limit=arguments.collection_retry_limit,
             collection_retry_backoff_seconds=(

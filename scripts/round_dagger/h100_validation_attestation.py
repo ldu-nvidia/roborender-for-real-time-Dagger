@@ -26,6 +26,7 @@ from round_dagger.artifacts import (  # noqa: E402
 )
 from round_dagger.learner import (  # noqa: E402
     CHECKPOINT_SCHEMA,
+    ORDERED_ALLGATHER_GRADIENT_REDUCTION,
     RESULT_SCHEMA,
     LearnerBundleConfig,
     LearnerError,
@@ -90,6 +91,7 @@ _CHECKPOINT_FIELDS = {
     "completed_steps",
     "initial_loss",
     "world_size",
+    "gradient_reduction",
     "model_state_dict",
     "optimizer_state_dict",
     "lr_scheduler_state_dict",
@@ -363,6 +365,12 @@ def _checkpoint(
         raise H100ValidationAttestationError(
             f"{label} Homie controller identity is malformed: {exc}"
         ) from exc
+    if document.get("world_size") != 8 or document.get(
+        "gradient_reduction"
+    ) != ORDERED_ALLGATHER_GRADIENT_REDUCTION:
+        raise H100ValidationAttestationError(
+            f"{label} distributed gradient-reduction contract is invalid"
+        )
     return checkpoint_path, document, digest
 
 

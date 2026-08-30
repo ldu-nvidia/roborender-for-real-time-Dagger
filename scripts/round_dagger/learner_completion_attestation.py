@@ -31,6 +31,10 @@ from round_dagger.artifacts import (  # noqa: E402
     publish_immutable_json,
     sha256_file,
 )
+from round_dagger.checkpoint_compat import (  # noqa: E402
+    CheckpointCompatibilityError,
+    load_restricted_restart_document,
+)
 from round_dagger.learner_identity import (  # noqa: E402
     learner_identity_sha256 as compute_learner_identity_sha256,
     learner_wandb_run_id,
@@ -87,6 +91,13 @@ ATTESTATION_KEYS = {
 
 class CompletionAttestationError(RuntimeError):
     pass
+
+
+def _restart_document(path: Path, label: str) -> Mapping[str, Any]:
+    try:
+        return load_restricted_restart_document(path, map_location="cpu")
+    except CheckpointCompatibilityError as exc:
+        raise CompletionAttestationError(f"{label} is unsafe: {exc}") from exc
 
 
 def _evaluation_steps(optimizer_steps: int, eval_interval: int) -> list[int]:
@@ -149,6 +160,7 @@ def _telemetry_records(
         "replay_transitions_per_rank",
         "replay_transitions_global",
         "world_size",
+        "gradient_reduction",
     }
     by_step: dict[int, dict[str, Any]] = {}
     try:
@@ -179,6 +191,8 @@ def _telemetry_records(
             or not isinstance(loss, (int, float))
             or not math.isfinite(float(loss))
             or row.get("world_size") != 8
+            or row.get("gradient_reduction")
+            != "ordered_allgather_rank_sum_v1"
             or type(row.get("replay_transitions_rank")) is not int
             or row["replay_transitions_rank"] < 1
             or not isinstance(transition_counts, list)
@@ -421,6 +435,8 @@ def _wandb_readback(
                     )
             observed = set()
             heldout_observed = set()
+            loss_signatures: dict[int, tuple[Any, ...]] = {}
+            quality_signatures: dict[int, tuple[tuple[str, float], ...]] = {}
             for row in run.scan_history(page_size=500):
                 if not isinstance(row, Mapping):
                     continue
@@ -428,27 +444,60 @@ def _wandb_readback(
                 local = telemetry.get(step) if type(step) is int else None
                 if local is not None:
                     loss = row.get("loss")
-                    if (
+                    has_loss = (
                         not isinstance(loss, bool)
                         and isinstance(loss, (int, float))
                         and math.isfinite(float(loss))
-                        and row.get("schema") == TELEMETRY_SCHEMA
-                        and math.isclose(
-                            float(loss),
-                            float(local["loss"]),
-                            rel_tol=1e-12,
-                            abs_tol=1e-12,
+                    )
+                    if has_loss:
+                        transition_counts = row.get(
+                            "replay_transitions_per_rank"
                         )
-                        and row.get("campaign_id") == campaign_id
-                        and row.get("macro_round") == macro_round
-                        and row.get("world_size") == 8
-                        and row.get("replay_transitions_rank")
-                        == local["replay_transitions_rank"]
-                        and row.get("replay_transitions_per_rank")
-                        == local["replay_transitions_per_rank"]
-                        and row.get("replay_transitions_global")
-                        == local["replay_transitions_global"]
-                    ):
+                        transition_signature: Any = (
+                            tuple(transition_counts)
+                            if isinstance(transition_counts, list)
+                            else repr(transition_counts)
+                        )
+                        signature = (
+                            float(loss),
+                            row.get("schema"),
+                            row.get("campaign_id"),
+                            row.get("macro_round"),
+                            row.get("world_size"),
+                            row.get("gradient_reduction"),
+                            row.get("replay_transitions_rank"),
+                            transition_signature,
+                            row.get("replay_transitions_global"),
+                        )
+                        previous = loss_signatures.get(step)
+                        if previous is not None and previous != signature:
+                            raise CompletionAttestationError(
+                                f"W&B training history has conflicting duplicate step {step}"
+                            )
+                        loss_signatures[step] = signature
+                        if not (
+                            row.get("schema") == TELEMETRY_SCHEMA
+                            and math.isclose(
+                                float(loss),
+                                float(local["loss"]),
+                                rel_tol=1e-12,
+                                abs_tol=1e-12,
+                            )
+                            and row.get("campaign_id") == campaign_id
+                            and row.get("macro_round") == macro_round
+                            and row.get("world_size") == 8
+                            and row.get("gradient_reduction")
+                            == "ordered_allgather_rank_sum_v1"
+                            and row.get("replay_transitions_rank")
+                            == local["replay_transitions_rank"]
+                            and row.get("replay_transitions_per_rank")
+                            == local["replay_transitions_per_rank"]
+                            and row.get("replay_transitions_global")
+                            == local["replay_transitions_global"]
+                        ):
+                            raise CompletionAttestationError(
+                                f"W&B training history differs at optimizer step {step}"
+                            )
                         observed.add(step)
                 quality_step = row.get("optimizer_step")
                 if type(quality_step) is not int:
@@ -476,17 +525,40 @@ def _wandb_readback(
                             expected_quality[
                                 f"quality/action_{action_index}/{metric}"
                             ] = metrics[metric]
-                    if all(
-                        not isinstance(row.get(key), bool)
+                    present_quality = {
+                        key: row.get(key)
+                        for key in expected_quality
+                        if not isinstance(row.get(key), bool)
                         and isinstance(row.get(key), (int, float))
-                        and math.isclose(
-                            float(row[key]),
-                            float(value),
-                            rel_tol=1e-12,
-                            abs_tol=1e-12,
+                        and math.isfinite(float(row[key]))
+                    }
+                    if present_quality:
+                        if set(present_quality) != set(expected_quality) or not all(
+                            math.isclose(
+                                float(present_quality[key]),
+                                float(value),
+                                rel_tol=1e-12,
+                                abs_tol=1e-12,
+                            )
+                            for key, value in expected_quality.items()
+                        ):
+                            raise CompletionAttestationError(
+                                "W&B held-out history differs at optimizer step "
+                                f"{quality_step}"
+                            )
+                        signature = tuple(
+                            sorted(
+                                (key, float(value))
+                                for key, value in present_quality.items()
+                            )
                         )
-                        for key, value in expected_quality.items()
-                    ):
+                        previous = quality_signatures.get(quality_step)
+                        if previous is not None and previous != signature:
+                            raise CompletionAttestationError(
+                                "W&B held-out history has conflicting duplicate step "
+                                f"{quality_step}"
+                            )
+                        quality_signatures[quality_step] = signature
                         heldout_observed.add(quality_step)
             heldout_complete = (
                 heldout_telemetry is None
@@ -624,7 +696,6 @@ def _validate_readback(
 
 
 def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
-    import torch
     from round_dagger.learner import LearnerBundleConfig
 
     output = Path(os.path.abspath(Path(args.output_dir).expanduser()))
@@ -794,7 +865,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         expected_checkpoint_sha256=result["checkpoint_sha256"],
         expected_runtime_policy_sha256=result["runtime_policy_sha256"],
     )
-    checkpoint = torch.load(restart, map_location="cpu", weights_only=False)
+    checkpoint = _restart_document(restart, "restart checkpoint")
     restart_expected = {
         "schema": CHECKPOINT_SCHEMA,
         "campaign_id": campaign_id,
@@ -809,6 +880,7 @@ def publish_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "replay_snapshot_file_sha256": snapshot_file_sha,
         "completed_steps": optimizer_steps,
         "world_size": 8,
+        "gradient_reduction": "ordered_allgather_rank_sum_v1",
         "homie_controller_sha256": policy_evidence[
             "homie_controller_sha256"
         ],
@@ -986,8 +1058,6 @@ def verify_attestation(
     learner_contract_sha256: str,
     learner_identity_sha256: str,
 ) -> dict[str, Any]:
-    import torch
-
     path = _regular(attestation, "learner completion attestation")
     if path.stat().st_mode & 0o222:
         raise CompletionAttestationError("completion attestation must be read-only")
@@ -1210,8 +1280,8 @@ def verify_attestation(
         raise CompletionAttestationError(
             "attested learner identity does not bind the exact semantic run"
         )
-    restart_document = torch.load(
-        resolved["restart"], map_location="cpu", weights_only=False
+    restart_document = _restart_document(
+        resolved["restart"], "attested restart checkpoint"
     )
     restart_expected = {
         "schema": CHECKPOINT_SCHEMA,
@@ -1227,6 +1297,7 @@ def verify_attestation(
         "replay_snapshot_file_sha256": snapshot_file_sha256,
         "completed_steps": optimizer_steps,
         "world_size": 8,
+        "gradient_reduction": "ordered_allgather_rank_sum_v1",
         "homie_controller_sha256": policy_evidence[
             "homie_controller_sha256"
         ],

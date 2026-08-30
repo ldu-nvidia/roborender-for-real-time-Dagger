@@ -10,7 +10,7 @@ from unittest import mock
 
 import numpy as np
 
-from round_dagger import artifacts, replay
+from round_dagger import artifacts, learner_identity, lepton_job, replay
 from round_dagger import production_data_lineage
 from round_dagger.orchestration import MacroRoundConfig
 from round_dagger.promotion import stage_bootstrap_policy
@@ -805,6 +805,116 @@ class ProductionLaunchTests(unittest.TestCase):
             ["ROUND_DAGGER_RUNTIME_ADAPTER_MODE"],
         )
 
+    def test_lepton_request_identity_uses_backend_image_not_oci_container(self) -> None:
+        root, orchestration = self._campaign_and_orchestration()
+        campaign, _, _, _ = self._materialized_campaign_fixture()
+        learner = production_launch.load_learner_contract(
+            self.campaign_learner_contract
+        )
+        environment = production_launch.build_environment(
+            campaign,
+            learner,
+            sealed_source_root="/workspace/projects/roborender/src/fast_roborender",
+            sealed_source_inventory_sha256="a" * 64,
+            evaluation_source_root="/local/sealed/evaluation",
+            evaluation_source_inventory_sha256="b" * 64,
+            sealed_teacher_checkpoint="/local/sealed/evaluation/teacher.pt",
+            learner_contract_sha256=artifacts.sha256_file(
+                self.campaign_learner_contract
+            ),
+        )
+        active = load_state(root)["active_policy"]
+        checkpoint = root / active["checkpoint_path"]
+        replay_snapshot = root / "replay/snapshot_round_000000.json"
+        replay_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        replay_snapshot.write_text("{}\n", encoding="utf-8")
+        output = root / "learner/macro_round_000000"
+        environment.update(
+            {
+                "ROUND_DAGGER_CAMPAIGN_ROOT": str(root),
+                "ROUND_DAGGER_CAMPAIGN_ID": "dagger_prod_run1",
+                "ROUND_DAGGER_MACRO_ROUND": "0",
+                "ROUND_DAGGER_POLICY_CHECKPOINT": str(checkpoint),
+                "ROUND_DAGGER_POLICY_SHA256": active["checkpoint_sha256"],
+                "ROUND_DAGGER_RUNTIME_POLICY_SHA256": active[
+                    "runtime_policy_sha256"
+                ],
+                "ROUND_DAGGER_REPLAY_SNAPSHOT": str(replay_snapshot),
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256": "1" * 64,
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256": "2" * 64,
+                "ROUND_DAGGER_LEARNER_OUTPUT_DIR": str(output),
+                "ROUND_DAGGER_LEARNER_RESULT": str(
+                    output / "learner_result_round_000000.json"
+                ),
+                "ROUND_DAGGER_LEARNER_CODE_SHA256": SOURCE_SHA,
+                "ROUND_DAGGER_LEARNER_CONFIG_SHA256": MacroRoundConfig.load(
+                    orchestration
+                ).learner_config_sha256,
+                "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": active[
+                    "checkpoint_sha256"
+                ],
+                "ROUND_DAGGER_BASE_POLICY_SPEC": f"{checkpoint}.policy_spec.json",
+                "ROUND_DAGGER_TARGET_ENVIRONMENTS": "256",
+                "ROUND_DAGGER_COHORT_COUNT": "4",
+                "ROUND_DAGGER_ENVIRONMENTS_PER_COHORT": "64",
+                "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "512",
+                "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "131072",
+                "ROUND_DAGGER_LEARNER_CONTRACT": str(
+                    self.campaign_learner_contract
+                ),
+            }
+        )
+        contract = lepton_job.load_contract(
+            ROOT
+            / "configs/round_dagger/production_learner_1x8h200_lepton.json"
+        )
+        identity = learner_identity.learner_identity_sha256(
+            campaign_id="dagger_prod_run1",
+            macro_round=0,
+            learner_code_sha256=environment[
+                "ROUND_DAGGER_LEARNER_CODE_SHA256"
+            ],
+            learner_config_sha256=environment[
+                "ROUND_DAGGER_LEARNER_CONFIG_SHA256"
+            ],
+            replay_snapshot_file_sha256=environment[
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256"
+            ],
+            replay_snapshot_sha256=environment[
+                "ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256"
+            ],
+            parent_checkpoint_sha256=active["checkpoint_sha256"],
+            parent_runtime_policy_sha256=active["runtime_policy_sha256"],
+            runtime_container_sha256=contract.image_digest,
+            learner_contract_sha256=artifacts.sha256_file(
+                self.campaign_learner_contract
+            ),
+        )
+        environment["ROUND_DAGGER_REMOTE_CONTAINER_SHA256"] = contract.image_digest
+        environment["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"] = identity
+        environment["ROUND_DAGGER_WANDB_RUN_ID"] = f"rrd-m000000-id{identity}"
+        request_path = self.base / "lepton-request.json"
+        request = lepton_job.materialize_request(
+            request_path,
+            contract=contract,
+            local_campaign_root=root,
+            remote_campaign_root=(
+                "/workspace/projects/roborender/campaigns/dagger_prod_run1/"
+                f"macro_round_000000/{identity}"
+            ),
+            remote_learner_output=(
+                "/workspace/projects/roborender/campaigns/dagger_prod_run1/"
+                f"macro_round_000000/{identity}/learner/macro_round_000000"
+            ),
+            source_environment=environment,
+        )
+        self.assertEqual(request.identity_sha256, identity)
+        self.assertNotEqual(contract.image_digest, learner["container"]["sha256"])
+        self.assertEqual(
+            request.environment["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"],
+            identity,
+        )
+
     def test_validate_launch_binds_campaign_source_config_and_static_environment(self) -> None:
         evaluation_inventory_sha = "d" * 64
         local_sealed_root = Path(
@@ -1045,6 +1155,70 @@ class ProductionLaunchTests(unittest.TestCase):
                 production_launch.load_learner_contract(
                     self.campaign_learner_contract
                 ),
+                deployment_sha,
+                SOURCE_SHA,
+                ROOT,
+            )
+
+    def test_production_hook_is_exactly_bound_to_explicit_backend(self) -> None:
+        _, orchestration = self._campaign_and_orchestration()
+        document = artifacts.load_strict_json(orchestration)
+        document.update(
+            {
+                "schema": "fast_roborender.round_dagger.orchestration_config.v4",
+                "learner_backend": "lepton_job_v1",
+                "learner_backend_contract_sha256": "f" * 64,
+            }
+        )
+        document["hooks"]["train"]["argv"] = [
+            str(
+                ROOT
+                / "scripts/round_dagger/run_production_lepton_learner_hook.sh"
+            )
+        ]
+        orchestration.chmod(0o644)
+        orchestration.write_text(
+            json.dumps(document, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        orchestration.chmod(0o444)
+        materialized, _, _, _ = self._materialized_campaign_fixture()
+        learner = production_launch.load_learner_contract(
+            self.campaign_learner_contract
+        )
+        deployment_sha = artifacts.sha256_file(self.campaign_learner_contract)
+        configuration, _, _, _ = (
+            production_launch._validate_orchestration_and_campaign(
+                orchestration,
+                materialized,
+                learner,
+                deployment_sha,
+                SOURCE_SHA,
+                ROOT,
+            )
+        )
+        self.assertEqual(configuration.learner_backend, "lepton_job_v1")
+
+        document["hooks"]["train"]["argv"] = [
+            str(
+                ROOT
+                / "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"
+            )
+        ]
+        orchestration.chmod(0o644)
+        orchestration.write_text(
+            json.dumps(document, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        orchestration.chmod(0o444)
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "train hook differs",
+        ):
+            production_launch._validate_orchestration_and_campaign(
+                orchestration,
+                materialized,
+                learner,
                 deployment_sha,
                 SOURCE_SHA,
                 ROOT,

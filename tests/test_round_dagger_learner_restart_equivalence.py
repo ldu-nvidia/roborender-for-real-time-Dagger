@@ -68,6 +68,7 @@ class RestartEquivalenceGateTest(unittest.TestCase):
                 "completed_steps": 2,
                 "initial_loss": 1.25,
                 "world_size": 1,
+                "gradient_reduction": "single_process_v1",
                 "model_state_dict": state,
                 "optimizer_state_dict": {
                     "state": {0: {"step": torch.tensor(2.0)}},
@@ -126,6 +127,24 @@ class RestartEquivalenceGateTest(unittest.TestCase):
                 uninterrupted_checkpoint=full,
                 resumed_checkpoint=resumed,
                 expected_completed_steps=3,
+            )
+
+    def test_gradient_reduction_must_match_world_size(self):
+        full = self.root / "full.pt"
+        resumed = self.root / "resumed.pt"
+        self._checkpoint(full)
+        self._checkpoint(resumed)
+        document = torch.load(full, map_location="cpu", weights_only=False)
+        document["gradient_reduction"] = "ordered_allgather_rank_sum_v1"
+        torch.save(document, full)
+        with self.assertRaisesRegex(
+            self.gate.RestartEquivalenceError,
+            "gradient_reduction is invalid for world_size",
+        ):
+            self.gate.verify(
+                uninterrupted_checkpoint=full,
+                resumed_checkpoint=resumed,
+                expected_completed_steps=2,
             )
 
     def test_malformed_homie_controller_identity_fails_closed(self):

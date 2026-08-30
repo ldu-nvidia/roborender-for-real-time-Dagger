@@ -108,6 +108,7 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
                 "replay_transitions_per_rank": [16384] * 8,
                 "replay_transitions_global": 131072,
                 "world_size": 8,
+                "gradient_reduction": "ordered_allgather_rank_sum_v1",
             },
             {
                 "schema": readback.TELEMETRY_SCHEMA,
@@ -119,6 +120,7 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
                 "replay_transitions_per_rank": [16384] * 8,
                 "replay_transitions_global": 131072,
                 "world_size": 8,
+                "gradient_reduction": "ordered_allgather_rank_sum_v1",
             },
         ]
         # Optimizer telemetry is deliberately a training-batch loss.  The
@@ -194,6 +196,7 @@ class H100ValidationWandbReadbackTest(unittest.TestCase):
             "completed_steps": completed_steps,
             "initial_loss": self.probe_initial_loss,
             "world_size": 8,
+            "gradient_reduction": "ordered_allgather_rank_sum_v1",
             "model_state_dict": policy_state,
             "optimizer_state_dict": {"state": {}, "param_groups": []},
             "lr_scheduler_state_dict": None,

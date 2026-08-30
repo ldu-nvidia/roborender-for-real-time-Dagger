@@ -86,6 +86,7 @@ def training_row(step: int) -> dict[str, object]:
         "replay_transitions_per_rank": [16] * 8,
         "replay_transitions_global": 128,
         "world_size": 8,
+        "gradient_reduction": "ordered_allgather_rank_sum_v1",
     }
 
 
@@ -747,6 +748,7 @@ class Heldout100FullReadbackTests(unittest.TestCase):
                 "completed_steps": completed_steps,
                 "initial_loss": 1.0,
                 "world_size": 8,
+                "gradient_reduction": "ordered_allgather_rank_sum_v1",
                 "rng_states": [{} for _ in range(8)],
             },
             path,

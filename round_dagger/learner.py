@@ -52,6 +52,10 @@ from round_dagger.policy_identity import (
     validate_homie_controller_sha256,
 )
 from round_dagger.replay import load_heldout_snapshot, load_snapshot
+from round_dagger.checkpoint_compat import (
+    CheckpointCompatibilityError,
+    load_restricted_restart_document,
+)
 
 
 BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
@@ -64,6 +68,8 @@ HELDOUT_TELEMETRY_SCHEMA = (
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 CUDA_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+SINGLE_PROCESS_GRADIENT_REDUCTION = "single_process_v1"
+ORDERED_ALLGATHER_GRADIENT_REDUCTION = "ordered_allgather_rank_sum_v1"
 _PROBE_SEED_DOMAIN = b"fast_roborender.round_dagger.loss_probe.v1"
 
 
@@ -113,6 +119,48 @@ def configure_deterministic_runtime(device: torch.device | str) -> None:
         or torch.get_float32_matmul_precision() != "highest"
     ):
         raise LearnerError("deterministic CUDA learner runtime did not take effect")
+
+
+def _ordered_allgather_gradient_hook(
+    world_size: int, bucket
+):
+    """Average one DDP bucket without a floating-point reduction collective.
+
+    NCCL all-reduce is numerically valid but its summation topology is not a
+    restart-stable semantic contract: recreating an eight-rank communicator
+    can change the order of floating-point additions.  That was sufficient to
+    change an Adam second moment on H200 even when the final model weights
+    happened to round to the same bytes.  All-gather transports each rank's
+    unreduced bytes, after which every rank performs the same elementwise adds
+    in explicit rank order.  The result is therefore independent of NCCL ring
+    construction while retaining DDP's averaged-gradient semantics.
+    """
+
+    if world_size <= 1:
+        raise LearnerError("ordered DDP reduction requires multiple ranks")
+    reduced = _ordered_allgather_sum(bucket.buffer(), world_size)
+    reduced.div_(world_size)
+    # Leave the public hook signature unannotated for ``bucket`` and the
+    # return value.  This module uses postponed annotations, while DDP's hook
+    # validator compares those two annotations to live Python types instead
+    # of resolving them first (PyTorch 2.13 included).  An otherwise-correct
+    # annotation is therefore seen as a string and rejected at registration.
+    future: torch.futures.Future[torch.Tensor] = torch.futures.Future()
+    future.set_result(reduced)
+    return future
+
+
+def _ordered_allgather_sum(source: torch.Tensor, world_size: int) -> torch.Tensor:
+    """Sum identically-shaped tensors in explicit rank order on every rank."""
+
+    if world_size <= 1:
+        raise LearnerError("ordered distributed sum requires multiple ranks")
+    gathered = [torch.empty_like(source) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, source)
+    reduced = gathered[0].clone()
+    for rank in range(1, world_size):
+        reduced.add_(gathered[rank])
+    return reduced
 
 
 def _require_sha256(value: Any, label: str) -> str:
@@ -1093,7 +1141,7 @@ def evaluate_heldout_actions(
     if statistics is None or action_indices is None:
         raise LearnerError("held-out replay evaluation produced no samples")
     if world_size > 1:
-        torch.distributed.all_reduce(statistics, op=torch.distributed.ReduceOp.SUM)
+        statistics = _ordered_allgather_sum(statistics, world_size)
     dimension = len(action_indices)
     element_count = float(statistics[2].item())
     row_count = float(statistics[4].item())
@@ -1249,8 +1297,7 @@ def _evaluate_loss_probe(
         model.train(prior_training)
         _restore_rng_state(prior_rng_state)
     if world_size > 1:
-        torch.distributed.all_reduce(scalar, op=torch.distributed.ReduceOp.SUM)
-        scalar = scalar / world_size
+        scalar = _ordered_allgather_sum(scalar, world_size) / world_size
     return float(scalar.cpu())
 
 
@@ -1297,6 +1344,7 @@ def _checkpoint_document(
     initial_loss: float,
     rng_states: Sequence[Mapping[str, Any]],
     world_size: int,
+    gradient_reduction: str,
     learner_identity_sha256: str | None,
     runtime_container_sha256: str | None,
     learner_contract_sha256: str | None,
@@ -1338,6 +1386,7 @@ def _checkpoint_document(
         # resumed run from replacing the comparable experiment baseline.
         "initial_loss": initial_loss,
         "world_size": world_size,
+        "gradient_reduction": gradient_reduction,
         "model_state_dict": policy_state,
         "optimizer_state_dict": optimizer.state_dict(),
         "lr_scheduler_state_dict": None,
@@ -1355,6 +1404,7 @@ def _load_restart(
     snapshot: Mapping[str, Any],
     rank: int,
     world_size: int,
+    gradient_reduction: str,
     learner_identity_sha256: str | None,
     runtime_container_sha256: str | None,
     learner_contract_sha256: str | None,
@@ -1362,8 +1412,8 @@ def _load_restart(
     if path.is_symlink() or not path.is_file():
         raise LearnerError("restart checkpoint must be a regular non-symlink file")
     try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:
+        checkpoint = load_restricted_restart_document(path, map_location="cpu")
+    except CheckpointCompatibilityError as exc:
         raise LearnerError(f"cannot load restart checkpoint: {exc}") from exc
     if (
         not isinstance(checkpoint, Mapping)
@@ -1382,6 +1432,7 @@ def _load_restart(
         "replay_snapshot_sha256": snapshot["snapshot_sha256"],
         "replay_snapshot_file_sha256": snapshot["file_sha256"],
         "world_size": world_size,
+        "gradient_reduction": gradient_reduction,
         "homie_controller_sha256": config.to_mapping()["model_config"].get(
             "homie_controller_sha256"
         ),
@@ -1779,10 +1830,18 @@ def train_from_replay(
             partition.snapshot, heldout_partition.snapshot
         )
     model = model.to(device)
+    gradient_reduction = SINGLE_PROCESS_GRADIENT_REDUCTION
     if world_size > 1 and not isinstance(model, DistributedDataParallel):
         model = DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
+        )
+        gradient_reduction = ORDERED_ALLGATHER_GRADIENT_REDUCTION
+        model.register_comm_hook(world_size, _ordered_allgather_gradient_hook)
+    elif world_size > 1:
+        raise LearnerError(
+            "caller-supplied DistributedDataParallel cannot prove the ordered "
+            "gradient-reduction contract"
         )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1808,6 +1867,7 @@ def train_from_replay(
             snapshot=partition.snapshot,
             rank=rank,
             world_size=world_size,
+            gradient_reduction=gradient_reduction,
             learner_identity_sha256=learner_identity_sha256,
             runtime_container_sha256=runtime_container_sha256,
             learner_contract_sha256=learner_contract_sha256,
@@ -1890,8 +1950,7 @@ def train_from_replay(
         optimizer.step()
         scalar = loss.detach()
         if world_size > 1:
-            torch.distributed.all_reduce(scalar, op=torch.distributed.ReduceOp.SUM)
-            scalar = scalar / world_size
+            scalar = _ordered_allgather_sum(scalar, world_size) / world_size
         loss_value = float(scalar.cpu())
         completed_steps = step + 1
         heldout_wandb: Mapping[str, Any] | None = None
@@ -1930,6 +1989,7 @@ def train_from_replay(
                     ),
                     "replay_transitions_global": partition.global_transition_count,
                     "world_size": world_size,
+                    "gradient_reduction": gradient_reduction,
                 },
                 wandb_extra=heldout_wandb,
             )
@@ -1957,6 +2017,7 @@ def train_from_replay(
                         initial_loss=first_loss,
                         rng_states=gathered_rng_states,
                         world_size=world_size,
+                        gradient_reduction=gradient_reduction,
                         learner_identity_sha256=learner_identity_sha256,
                         runtime_container_sha256=runtime_container_sha256,
                         learner_contract_sha256=learner_contract_sha256,
@@ -1984,6 +2045,7 @@ def train_from_replay(
                     initial_loss=first_loss,
                     rng_states=gathered_rng_states,
                     world_size=world_size,
+                    gradient_reduction=gradient_reduction,
                     learner_identity_sha256=learner_identity_sha256,
                     runtime_container_sha256=runtime_container_sha256,
                     learner_contract_sha256=learner_contract_sha256,
@@ -2085,8 +2147,8 @@ def publish_learner_result(
         Path(result.restart_checkpoint), checkpoint_path
     )
     try:
-        checkpoint_document = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=False
+        checkpoint_document = load_restricted_restart_document(
+            checkpoint_path, map_location="cpu"
         )
         if not isinstance(checkpoint_document, Mapping):
             raise LearnerError("candidate checkpoint root must be a mapping")
@@ -2119,6 +2181,7 @@ def publish_learner_result(
         ActorExportError,
         GR00TPolicyError,
         PolicyIdentityError,
+        CheckpointCompatibilityError,
         KeyError,
         TypeError,
     ) as exc:
@@ -2197,6 +2260,8 @@ __all__ = [
     "supervised_action_loss",
     "evaluate_heldout_actions",
     "CUDA_CUBLAS_WORKSPACE_CONFIG",
+    "SINGLE_PROCESS_GRADIENT_REDUCTION",
+    "ORDERED_ALLGATHER_GRADIENT_REDUCTION",
     "configure_deterministic_runtime",
     "train_from_replay",
     "publish_learner_result",

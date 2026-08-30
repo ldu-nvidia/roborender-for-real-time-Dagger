@@ -554,6 +554,7 @@ class H100ValidationAttestationTest(unittest.TestCase):
                 "replay_transitions_per_rank": [16384] * 8,
                 "replay_transitions_global": 131072,
                 "world_size": 8,
+                "gradient_reduction": "ordered_allgather_rank_sum_v1",
             }
             for step, loss in ((1, 1.0), (2, 0.75))
         ]
@@ -664,6 +665,7 @@ class H100ValidationAttestationTest(unittest.TestCase):
                 "completed_steps": steps,
                 "initial_loss": 1.0,
                 "world_size": 8,
+                "gradient_reduction": "ordered_allgather_rank_sum_v1",
                 "homie_controller_sha256": HOMIE_CONTROLLER_SHA256,
                 "model_state_dict": {
                     "weight": torch.tensor([1.0])

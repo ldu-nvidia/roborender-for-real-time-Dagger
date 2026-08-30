@@ -138,7 +138,13 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             f"_{active['checkpoint_sha256'][:12]}_attempt_000001.json"
         )
         document = {
-            "schema": "fast_roborender.round_dagger.orchestration_config.v3",
+            "schema": "fast_roborender.round_dagger.orchestration_config.v4",
+            "learner_backend": inputs.learner_backend,
+            "learner_backend_contract_sha256": (
+                inputs.learner_contract_sha256
+                if inputs.learner_backend == "oci_nrt"
+                else inputs.lepton_backend_contract_sha256
+            ),
             "campaign_root": str(inputs.campaign_root),
             "actor_root": str(inputs.campaign_root / "actors"),
             "macro_round": observed["next_macro_round"],
@@ -163,12 +169,36 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
         _publish_immutable(
             binding,
             {
-                "schema": "fast_roborender.round_dagger.production_driver_binding.v1",
+                "schema": "fast_roborender.round_dagger.production_driver_binding.v2",
                 "campaign_id": self.campaign["campaign_id"],
                 "campaign_contract_path": str(inputs.campaign_contract),
                 "campaign_contract_sha256": inputs.campaign_contract_sha256,
                 "learner_contract_path": str(inputs.learner_contract),
                 "learner_contract_sha256": inputs.learner_contract_sha256,
+                "learner_backend": inputs.learner_backend,
+                "learner_backend_contract_path": str(
+                    inputs.learner_contract
+                    if inputs.learner_backend == "oci_nrt"
+                    else inputs.lepton_backend_contract
+                ),
+                "learner_backend_contract_sha256": (
+                    inputs.learner_contract_sha256
+                    if inputs.learner_backend == "oci_nrt"
+                    else inputs.lepton_backend_contract_sha256
+                ),
+                "lepton_remote_backend_contract": (
+                    inputs.lepton_remote_backend_contract
+                ),
+                "lepton_control_exec_program": (
+                    None
+                    if inputs.lepton_control_exec_program is None
+                    else str(inputs.lepton_control_exec_program)
+                ),
+                "lepton_sdk_python": (
+                    None
+                    if inputs.lepton_sdk_python is None
+                    else str(inputs.lepton_sdk_python)
+                ),
                 "launcher_path": str(inputs.launcher),
                 "launcher_sha256": inputs.launcher_sha256,
                 "macro_round": observed["next_macro_round"],
@@ -842,10 +872,64 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
         self.assertEqual(first.stat().st_mode & 0o222, 0)
         self.assertEqual(second.stat().st_mode & 0o222, 0)
         self.assertEqual(json.loads(first.read_text())["macro_round_count"], 5)
+        self.assertEqual(json.loads(first.read_text())["learner_backend"], "oci_nrt")
+        self.assertEqual(
+            json.loads(first.with_suffix(".binding.json").read_text())[
+                "learner_backend"
+            ],
+            "oci_nrt",
+        )
         self.assertEqual(
             json.loads(first.read_text())["campaign_contract_sha256"],
             artifacts.sha256_file(self.contract),
         )
+
+    def test_explicit_lepton_backend_binds_only_trusted_lepton_hook(self) -> None:
+        observed = coordinator(0, "READY")
+        inputs = replace(
+            self.inputs,
+            learner_backend="lepton_job_v1",
+            control_root=self.control_root / "lepton",
+            lepton_backend_contract=(
+                ROOT
+                / "configs/round_dagger/production_learner_1x8h200_lepton.json"
+            ),
+            lepton_backend_contract_sha256=artifacts.sha256_file(
+                ROOT
+                / "configs/round_dagger/production_learner_1x8h200_lepton.json"
+            ),
+            lepton_remote_backend_contract=(
+                "/workspace/projects/roborender/manifests/backend.json"
+            ),
+            lepton_control_exec_program=Path("/bin/true"),
+            lepton_sdk_python=Path(sys.executable).resolve(),
+        )
+        with mock.patch(
+            "round_dagger.production_campaign_driver._derive_learner_bundle_sha",
+            return_value="f" * 64,
+        ):
+            config_path, _, binding_path = materialize_orchestration_config(
+                inputs, self.runtime_contract, self.campaign, observed
+            )
+        document = json.loads(config_path.read_text(encoding="utf-8"))
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["learner_backend"], "lepton_job_v1")
+        self.assertEqual(binding["learner_backend"], "lepton_job_v1")
+        self.assertEqual(
+            document["hooks"]["train"]["argv"],
+            [
+                str(
+                    ROOT
+                    / "scripts/round_dagger/run_production_lepton_learner_hook.sh"
+                )
+            ],
+        )
+        self.assertNotIn("submit_oci_nrt", json.dumps(document))
+
+    def test_driver_rejects_unknown_backend_without_autodetection(self) -> None:
+        inputs = replace(self._source_bound_inputs(), learner_backend="auto")
+        with self.assertRaisesRegex(ProductionDriverError, "invalid learner backend"):
+            inputs.validate()
 
     def test_launcher_binds_external_runtime_and_learner_contract_paths_and_shas(
         self,

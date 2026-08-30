@@ -37,6 +37,10 @@ from round_dagger.artifacts import (  # noqa: E402
     sha256_file,
     verify_cohort,
 )
+from round_dagger.checkpoint_compat import (  # noqa: E402
+    CheckpointCompatibilityError,
+    load_restricted_restart_document,
+)
 from round_dagger.handoff import transfer_local  # noqa: E402
 from round_dagger.actor import runtime_state_dict_sha256  # noqa: E402
 from round_dagger.gr00t_policy import (  # noqa: E402
@@ -184,7 +188,10 @@ class TinyPolicy(nn.Module):
 
 
 def _load_bootstrap(model: nn.Module, path: Path) -> None:
-    document = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        document = load_restricted_restart_document(path, map_location="cpu")
+    except CheckpointCompatibilityError as exc:
+        raise RuntimeError(f"cannot load smoke bootstrap: {exc}") from exc
     model.load_state_dict(document["policy_state_dict"], strict=True)
 
 

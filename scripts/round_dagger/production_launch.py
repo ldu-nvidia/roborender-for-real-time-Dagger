@@ -18,6 +18,7 @@ import json
 import netrc
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -47,6 +48,8 @@ from round_dagger.gr00t_policy import (  # noqa: E402
 from round_dagger.orchestration import (  # noqa: E402
     COHORT_COUNT,
     ENVIRONMENTS_PER_COHORT,
+    LEARNER_BACKEND_OCI_NRT,
+    LEARNER_BACKEND_LEPTON_JOB_V1,
     MacroRoundConfig,
     PRODUCTION_MACRO_ROUND_COUNT,
     STEPS_PER_ENVIRONMENT,
@@ -54,6 +57,7 @@ from round_dagger.orchestration import (  # noqa: E402
     TRANSITIONS_PER_COHORT,
     TRANSITIONS_PER_MACRO_ROUND,
     TRANSITIONS_PER_CAMPAIGN,
+    trusted_train_hook_relative,
 )
 from scripts.round_dagger.verify_anchor_pool import verify_anchor_pool  # noqa: E402
 from scripts.round_dagger.verify_sealed_source_snapshot import (  # noqa: E402
@@ -85,6 +89,15 @@ BOOTSTRAP_ROOT = (
 FLEET_ROOT = VALIDATION_ROOT / "fleet_two_gpu_provenance_v2"
 PRODUCTION_ASSET_ROOT = Path("/mnt/data2/ldu/roborender_round_dagger_assets")
 WANDB_NETRC = Path("/mnt/data2/ldu/roborender_round_dagger_credentials/.netrc")
+LEPTON_SDK_PYTHON = Path(
+    "/mnt/data2/ldu/roborender_lepton_control/env/bin/python"
+)
+LEPTON_SDK_FREEZE = Path(
+    "/mnt/data2/ldu/roborender_lepton_control/control.freeze.txt"
+)
+LEPTON_SDK_FREEZE_SHA256 = (
+    "aa3cadd8d69359f84997ffc76f71bcfeadbdd37f2aac249fb6a2ee9e04c58104"
+)
 CAMERA_ACCEPTANCE = (
     VALIDATION_ROOT
     / "production_inputs_v1/camera/camera_calibration_acceptance.json"
@@ -1436,6 +1449,88 @@ def _verify_remote_source(
     return report
 
 
+def _verify_lepton_remote_source(
+    root: str,
+    inventory_sha256: str,
+    *,
+    backend_contract: Any,
+    remote_backend_contract: str,
+    control_exec_program: Path,
+    sdk_python: Path,
+) -> dict[str, Any]:
+    """Verify the finalized contract and sealed source in the control Pod."""
+
+    _require_equal(root, str(backend_contract.source_root), "Lepton source root")
+    _require_equal(
+        inventory_sha256,
+        backend_contract.source_inventory_sha256,
+        "Lepton source inventory",
+    )
+    if (
+        not remote_backend_contract.startswith("/workspace/projects/roborender/")
+        or "//" in remote_backend_contract
+        or any(part in {".", ".."} for part in Path(remote_backend_contract).parts)
+    ):
+        raise ProductionLaunchError("Lepton remote backend contract path is unsafe")
+    command = " && ".join(
+        (
+            (
+                f"test $(sha256sum -- {shlex.quote(remote_backend_contract)} | "
+                f"awk '{{print $1}}') = {shlex.quote(backend_contract.sha256)}"
+            ),
+            shlex.join(
+                [
+                    str(backend_contract.python),
+                    str(backend_contract.source_verifier),
+                    "--root",
+                    root,
+                    "--expected-inventory-sha256",
+                    inventory_sha256,
+                ]
+            ),
+        )
+    )
+    try:
+        completed = subprocess.run(
+            [
+                str(sdk_python),
+                str(control_exec_program),
+                backend_contract.document["orchestration"]["control_deployment"],
+                command,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProductionLaunchError(
+            "Lepton sealed source verification could not run"
+        ) from exc
+    if completed.returncode != 0:
+        raise ProductionLaunchError("Lepton sealed source verification failed")
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProductionLaunchError(
+            "Lepton sealed source verifier returned invalid JSON"
+        ) from exc
+    if not isinstance(report, dict):
+        raise ProductionLaunchError("Lepton sealed source report is not an object")
+    _require_equal(report.get("schema"), SEALED_REPORT_SCHEMA, "sealed source report schema")
+    _require_equal(report.get("status"), "PASS", "sealed source status")
+    _require_equal(report.get("root"), root, "sealed source report root")
+    _require_equal(
+        report.get("inventory_sha256"),
+        inventory_sha256,
+        "sealed source inventory",
+    )
+    for key in ("fast_roborender_revision", "gr00t_revision"):
+        if not isinstance(report.get(key), str) or REVISION_RE.fullmatch(report[key]) is None:
+            raise ProductionLaunchError(f"sealed source report {key} is malformed")
+    return report
+
+
 def _verify_local_evaluation_seal(
     root: str | Path,
     inventory_sha256: str,
@@ -2010,7 +2105,13 @@ def _validate_orchestration_and_campaign(
         "collect": (str(REPOSITORY_ROOT / "scripts/round_dagger/run_production_actor_cohort_hook.sh"), 14400),
         "transfer": None,
         "ingest": None,
-        "train": (str(REPOSITORY_ROOT / "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"), 172800),
+        "train": (
+            str(
+                REPOSITORY_ROOT
+                / trusted_train_hook_relative(configuration.learner_backend)
+            ),
+            172800,
+        ),
         "evaluate": (
             str(
                 evaluation_source_root
@@ -2293,6 +2394,12 @@ def validate_launch(
     campaign_contract_sha256: str,
     learner_contract_path: Path,
     learner_contract_sha256: str,
+    learner_backend: str = LEARNER_BACKEND_OCI_NRT,
+    learner_backend_contract_path: Path | None = None,
+    learner_backend_contract_sha256: str | None = None,
+    lepton_remote_backend_contract: str | None = None,
+    lepton_control_exec_program: Path | None = None,
+    lepton_sdk_python: Path | None = None,
     sealed_source_root: str,
     sealed_source_inventory_sha256: str,
     evaluation_sealed_source_root: str | Path,
@@ -2314,6 +2421,35 @@ def validate_launch(
         raise ProductionLaunchError(
             f"strict orchestration config is invalid: {exc}"
         ) from exc
+    _require_equal(
+        preliminary_configuration.learner_backend,
+        learner_backend,
+        "orchestration/caller learner backend",
+    )
+    if (
+        learner_backend == LEARNER_BACKEND_OCI_NRT
+        and learner_backend_contract_path is None
+        and learner_backend_contract_sha256 is None
+    ):
+        # Compatibility for direct API callers: the only valid OCI backend
+        # contract is already the canonical campaign learner contract.
+        learner_backend_contract_path = learner_contract_path
+        learner_backend_contract_sha256 = learner_contract_sha256
+    if learner_backend_contract_path is None or learner_backend_contract_sha256 is None:
+        raise ProductionLaunchError("learner backend contract binding is missing")
+    backend_contract_sha = _require_sha(
+        learner_backend_contract_sha256,
+        "learner backend contract SHA-256",
+    )
+    _require_equal(
+        (
+            preliminary_configuration.learner_backend_contract_sha256
+            if preliminary_configuration.learner_backend_contract_sha256 is not None
+            else learner_contract_sha256
+        ),
+        backend_contract_sha,
+        "orchestration/learner backend contract identity",
+    )
     learner_contract, learner_deployment_contract_sha = (
         load_campaign_owned_learner_contract(
             learner_contract_path,
@@ -2321,12 +2457,126 @@ def validate_launch(
             expected_sha256=learner_contract_sha256,
         )
     )
+    lepton_backend_contract = None
+    if learner_backend == LEARNER_BACKEND_OCI_NRT:
+        _require_equal(
+            learner_backend_contract_path,
+            learner_contract_path,
+            "OCI backend/campaign learner contract path",
+        )
+        _require_equal(
+            backend_contract_sha,
+            learner_deployment_contract_sha,
+            "OCI backend/campaign learner contract identity",
+        )
+        if any(
+            value is not None
+            for value in (
+                lepton_remote_backend_contract,
+                lepton_control_exec_program,
+                lepton_sdk_python,
+            )
+        ):
+            raise ProductionLaunchError("OCI backend forbids Lepton-specific inputs")
+    elif learner_backend == LEARNER_BACKEND_LEPTON_JOB_V1:
+        if any(
+            value is None
+            for value in (
+                lepton_remote_backend_contract,
+                lepton_control_exec_program,
+                lepton_sdk_python,
+            )
+        ):
+            raise ProductionLaunchError("Lepton backend inputs are incomplete")
+        from round_dagger import lepton_job
+
+        try:
+            lepton_backend_contract = lepton_job.load_contract(
+                learner_backend_contract_path, immutable=True
+            )
+            lepton_job.require_finalized_supply_chain(lepton_backend_contract)
+        except Exception as exc:
+            raise ProductionLaunchError(
+                "finalized Lepton backend contract is invalid"
+            ) from exc
+        _require_equal(
+            lepton_backend_contract.sha256,
+            backend_contract_sha,
+            "Lepton backend contract identity",
+        )
+        assert lepton_control_exec_program is not None
+        assert lepton_sdk_python is not None
+        if (
+            lepton_control_exec_program.is_symlink()
+            or not lepton_control_exec_program.is_file()
+            or not os.access(lepton_control_exec_program, os.X_OK)
+        ):
+            raise ProductionLaunchError("Lepton control helper is unsafe")
+        try:
+            resolved_sdk_python = lepton_sdk_python.resolve(strict=True)
+        except OSError as exc:
+            raise ProductionLaunchError("Lepton SDK Python is unavailable") from exc
+        if not resolved_sdk_python.is_file() or not os.access(lepton_sdk_python, os.X_OK):
+            raise ProductionLaunchError("Lepton SDK Python is not executable")
+        _require_equal(
+            lepton_sdk_python,
+            LEPTON_SDK_PYTHON,
+            "pinned Lepton SDK Python",
+        )
+        freeze = _regular(LEPTON_SDK_FREEZE, "Lepton control environment freeze")
+        _require_equal(
+            artifacts.sha256_file(freeze),
+            LEPTON_SDK_FREEZE_SHA256,
+            "Lepton control environment freeze identity",
+        )
+        expected_freeze = freeze.read_bytes()
+        try:
+            freeze_probe = subprocess.run(
+                [str(lepton_sdk_python), "-m", "pip", "freeze", "--all"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                env={
+                    **os.environ,
+                    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONNOUSERSITE": "1",
+                },
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProductionLaunchError(
+                "Lepton control environment freeze probe could not run"
+            ) from exc
+        if (
+            freeze_probe.returncode != 0
+            or freeze_probe.stdout.replace(b"\r\n", b"\n") != expected_freeze
+        ):
+            raise ProductionLaunchError(
+                "Lepton control Python environment differs from its pinned freeze"
+            )
+    else:
+        raise ProductionLaunchError("unknown learner backend")
     _verify_static_inputs(campaign_contract)
-    source_report = _verify_remote_source(
-        sealed_source_root,
-        sealed_source_inventory_sha256,
-        learner_contract=learner_contract,
-    )
+    if learner_backend == LEARNER_BACKEND_OCI_NRT:
+        source_report = _verify_remote_source(
+            sealed_source_root,
+            sealed_source_inventory_sha256,
+            learner_contract=learner_contract,
+        )
+    else:
+        assert lepton_backend_contract is not None
+        assert lepton_remote_backend_contract is not None
+        assert lepton_control_exec_program is not None
+        assert lepton_sdk_python is not None
+        source_report = _verify_lepton_remote_source(
+            sealed_source_root,
+            sealed_source_inventory_sha256,
+            backend_contract=lepton_backend_contract,
+            remote_backend_contract=lepton_remote_backend_contract,
+            control_exec_program=lepton_control_exec_program,
+            sdk_python=lepton_sdk_python,
+        )
     local_seal_report = _verify_local_evaluation_seal(
         evaluation_sealed_source_root,
         evaluation_sealed_source_inventory_sha256,
@@ -2429,6 +2679,57 @@ def validate_launch(
         learner_contract_sha256=learner_deployment_contract_sha,
     )
     environment["ROUND_DAGGER_LAUNCH_ORCHESTRATION_SHA256"] = orchestration_sha
+    environment["ROUND_DAGGER_LEARNER_BACKEND"] = configuration.learner_backend
+    if configuration.learner_backend == LEARNER_BACKEND_LEPTON_JOB_V1:
+        assert lepton_backend_contract is not None
+        assert lepton_remote_backend_contract is not None
+        assert lepton_control_exec_program is not None
+        assert lepton_sdk_python is not None
+        try:
+            sdk_probe = subprocess.run(
+                [
+                    str(lepton_sdk_python),
+                    "-c",
+                    (
+                        "import leptonai, numpy; "
+                        "assert getattr(leptonai, '__version__', None) == '0.27.3'; "
+                        "assert numpy.__version__ == '2.2.6'"
+                    ),
+                ],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProductionLaunchError(
+                "explicit Lepton SDK Python validation could not run"
+            ) from exc
+        if sdk_probe.returncode != 0:
+            raise ProductionLaunchError(
+                "explicit Lepton SDK Python is not pinned to leptonai 0.27.3"
+            )
+        environment.update(
+            {
+                "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": (
+                    lepton_backend_contract.image_digest
+                ),
+                "ROUND_DAGGER_LEPTON_BACKEND_CONTRACT": str(
+                    learner_backend_contract_path
+                ),
+                "ROUND_DAGGER_LEPTON_BACKEND_CONTRACT_SHA256": (
+                    backend_contract_sha
+                ),
+                "ROUND_DAGGER_LEPTON_REMOTE_BACKEND_CONTRACT": (
+                    lepton_remote_backend_contract
+                ),
+                "ROUND_DAGGER_LEPTON_CONTROL_EXEC_PROGRAM": str(
+                    lepton_control_exec_program
+                ),
+                "ROUND_DAGGER_LEPTON_SDK_PYTHON": str(lepton_sdk_python),
+            }
+        )
     environment["ROUND_DAGGER_CAMPAIGN_CONTRACT"] = str(campaign_contract_path)
     environment["ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256"] = campaign_contract_sha
     environment["ROUND_DAGGER_DATA_LINEAGE_SHA256"] = campaign_contract[
@@ -2500,6 +2801,10 @@ def validate_launch(
         ),
         "local_source": local_source,
         "learner_deployment_contract_sha256": learner_deployment_contract_sha,
+        "learner_backend": configuration.learner_backend,
+        "learner_backend_contract_path": str(learner_backend_contract_path),
+        "learner_backend_contract_sha256": backend_contract_sha,
+        "lepton_remote_backend_contract": lepton_remote_backend_contract,
         "learner_contract_path": str(learner_contract_path),
         "learner_contract_projection_relative_path": "learner_contract.json",
         "learner_contract_remote_identity": (
@@ -2512,7 +2817,11 @@ def validate_launch(
         ],
         "data_lineage_sha256": campaign_contract["data_lineage_sha256"],
         "orchestration_config_sha256": orchestration_sha,
-        "learner": "1 OCI-NRT node / 8 H100 / batch 8 per rank / 1200 optimizer steps",
+        "learner": (
+            "1 OCI-NRT node / 8 H100 / batch 8 per rank / 1200 optimizer steps"
+            if configuration.learner_backend == LEARNER_BACKEND_OCI_NRT
+            else "1 Lepton reserved node / 8 H200 / batch 8 per rank / 1200 optimizer steps"
+        ),
         "wandb": "ldu@nvidia.com -> nvidia/roborender-round-dagger",
         "hooks": {
             name: None if hook is None else {"argv": list(hook.argv), "timeout_seconds": hook.timeout_seconds}
@@ -2549,6 +2858,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--campaign-contract-sha256", required=True)
     parser.add_argument("--learner-contract", type=Path, required=True)
     parser.add_argument("--learner-contract-sha256", required=True)
+    parser.add_argument(
+        "--learner-backend",
+        choices=(LEARNER_BACKEND_OCI_NRT, LEARNER_BACKEND_LEPTON_JOB_V1),
+        default=LEARNER_BACKEND_OCI_NRT,
+    )
+    parser.add_argument("--learner-backend-contract", type=Path, required=True)
+    parser.add_argument("--learner-backend-contract-sha256", required=True)
+    parser.add_argument("--lepton-remote-backend-contract")
+    parser.add_argument("--lepton-control-exec-program", type=Path)
+    parser.add_argument("--lepton-sdk-python", type=Path)
     parser.add_argument("--sealed-source-root", required=True)
     parser.add_argument("--sealed-source-inventory-sha256", required=True)
     parser.add_argument("--evaluation-sealed-source-root", type=Path, required=True)
@@ -2568,6 +2887,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             campaign_contract_sha256=arguments.campaign_contract_sha256,
             learner_contract_path=arguments.learner_contract,
             learner_contract_sha256=arguments.learner_contract_sha256,
+            learner_backend=arguments.learner_backend,
+            learner_backend_contract_path=arguments.learner_backend_contract,
+            learner_backend_contract_sha256=(
+                arguments.learner_backend_contract_sha256
+            ),
+            lepton_remote_backend_contract=(
+                arguments.lepton_remote_backend_contract
+            ),
+            lepton_control_exec_program=arguments.lepton_control_exec_program,
+            lepton_sdk_python=arguments.lepton_sdk_python,
             sealed_source_root=arguments.sealed_source_root,
             sealed_source_inventory_sha256=arguments.sealed_source_inventory_sha256,
             evaluation_sealed_source_root=arguments.evaluation_sealed_source_root,

@@ -9,7 +9,6 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +22,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from round_dagger.artifacts import sha256_file  # noqa: E402
 from round_dagger.actor import ActorExportError, runtime_state_dict_sha256  # noqa: E402
+from round_dagger.checkpoint_compat import (  # noqa: E402
+    CheckpointCompatibilityError,
+    load_hash_pinned_policy_state_dict,
+)
 from round_dagger.learner_identity import (  # noqa: E402
     learner_identity_sha256,
     learner_wandb_run_id,
@@ -57,23 +60,17 @@ def _load_initial_checkpoint(
     model: nn.Module,
     path: Path,
     *,
+    expected_checkpoint_sha256: str,
     expected_policy_state_sha256: str | None = None,
 ) -> None:
     try:
-        document = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:
+        state = load_hash_pinned_policy_state_dict(
+            path,
+            expected_sha256=expected_checkpoint_sha256,
+            map_location="cpu",
+        )
+    except CheckpointCompatibilityError as exc:
         raise LearnerError(f"cannot load initial policy checkpoint: {exc}") from exc
-    if not isinstance(document, Mapping):
-        raise LearnerError("initial policy checkpoint must contain a state mapping")
-    state = None
-    for key in ("model_state_dict", "policy_state_dict", "state_dict"):
-        if key in document:
-            state = document[key]
-            break
-    if state is None and all(isinstance(key, str) for key in document):
-        state = document
-    if not isinstance(state, Mapping):
-        raise LearnerError("initial policy checkpoint lacks a model state dictionary")
     try:
         policy_state_sha256 = runtime_state_dict_sha256(state)
     except ActorExportError as exc:
@@ -323,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         _load_initial_checkpoint(
             model,
             arguments.initial_checkpoint,
+            expected_checkpoint_sha256=config.initial_checkpoint_sha256,
             expected_policy_state_sha256=bundle_mapping["model_config"].get(
                 "policy_state_sha256"
             ),

@@ -255,14 +255,14 @@ PY
 import os
 import stat
 import sys
-import torch
 from round_dagger.artifacts import publish_immutable_json, sha256_file
+from round_dagger.checkpoint_compat import load_restricted_restart_document
 from round_dagger.learner import CHECKPOINT_SCHEMA
 
 (stopped_path, resumed_path, run_id, identity, config, code, replay_file, replay,
  container, contract, heldout_file, heldout, binding, production, output) = sys.argv[1:]
-stopped = torch.load(stopped_path, map_location="cpu", weights_only=False)
-resumed = torch.load(resumed_path, map_location="cpu", weights_only=False)
+stopped = load_restricted_restart_document(stopped_path, map_location="cpu")
+resumed = load_restricted_restart_document(resumed_path, map_location="cpu")
 for doc, step in ((stopped, 50), (resumed, 100)):
     if doc.get("schema") != CHECKPOINT_SCHEMA or doc.get("completed_steps") != step:
         raise SystemExit("strict-resume checkpoint frontier mismatch")

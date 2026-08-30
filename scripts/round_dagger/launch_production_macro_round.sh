@@ -21,6 +21,12 @@ EVALUATION_SEALED_SOURCE_ROOT=
 EVALUATION_SEALED_SOURCE_INVENTORY_SHA256=
 LEARNER_CONTRACT=
 LEARNER_CONTRACT_SHA256=
+LEARNER_BACKEND=oci_nrt
+LEARNER_BACKEND_CONTRACT=
+LEARNER_BACKEND_CONTRACT_SHA256=
+LEPTON_REMOTE_BACKEND_CONTRACT=
+LEPTON_CONTROL_EXEC_PROGRAM=
+LEPTON_SDK_PYTHON=
 
 usage() {
     cat >&2 <<'EOF'
@@ -30,6 +36,9 @@ usage: launch_production_macro_round.sh \
   --campaign-contract-sha256 LOWERCASE_SHA256 \
   --learner-contract ABSOLUTE_LEARNER_CONTRACT_JSON \
   --learner-contract-sha256 LOWERCASE_SHA256 \
+  --learner-backend {oci_nrt,lepton_job_v1} \
+  --learner-backend-contract ABSOLUTE_JSON \
+  --learner-backend-contract-sha256 LOWERCASE_SHA256 \
   --sealed-source-root ABSOLUTE_OCI_SOURCE_ROOT \
   --evaluation-sealed-source-root ABSOLUTE_RTX_SOURCE_ROOT \
   --evaluation-sealed-source-inventory-sha256 LOWERCASE_SHA256 \
@@ -63,6 +72,36 @@ while (($#)); do
         --learner-contract-sha256)
             (($# >= 2)) || usage
             LEARNER_CONTRACT_SHA256=$2
+            shift 2
+            ;;
+        --learner-backend)
+            (($# >= 2)) || usage
+            LEARNER_BACKEND=$2
+            shift 2
+            ;;
+        --learner-backend-contract)
+            (($# >= 2)) || usage
+            LEARNER_BACKEND_CONTRACT=$2
+            shift 2
+            ;;
+        --learner-backend-contract-sha256)
+            (($# >= 2)) || usage
+            LEARNER_BACKEND_CONTRACT_SHA256=$2
+            shift 2
+            ;;
+        --lepton-remote-backend-contract)
+            (($# >= 2)) || usage
+            LEPTON_REMOTE_BACKEND_CONTRACT=$2
+            shift 2
+            ;;
+        --lepton-control-exec-program)
+            (($# >= 2)) || usage
+            LEPTON_CONTROL_EXEC_PROGRAM=$2
+            shift 2
+            ;;
+        --lepton-sdk-python)
+            (($# >= 2)) || usage
+            LEPTON_SDK_PYTHON=$2
             shift 2
             ;;
         --sealed-source-root)
@@ -114,6 +153,34 @@ LEARNER_CONTRACT_MODE=$(stat -c %a -- "$LEARNER_CONTRACT") || \
     fatal "learner contract mode must be exactly 0444"
 [[ $(sha256sum -- "$LEARNER_CONTRACT" | awk '{print $1}') == \
    "$LEARNER_CONTRACT_SHA256" ]] || fatal "learner contract SHA-256 mismatch"
+[[ $LEARNER_BACKEND == oci_nrt || $LEARNER_BACKEND == lepton_job_v1 ]] || \
+    fatal "--learner-backend must be exactly oci_nrt or lepton_job_v1"
+if [[ $LEARNER_BACKEND == oci_nrt && -z $LEARNER_BACKEND_CONTRACT && \
+   -z $LEARNER_BACKEND_CONTRACT_SHA256 ]]; then
+    LEARNER_BACKEND_CONTRACT=$LEARNER_CONTRACT
+    LEARNER_BACKEND_CONTRACT_SHA256=$LEARNER_CONTRACT_SHA256
+fi
+[[ $LEARNER_BACKEND_CONTRACT == /* && -f $LEARNER_BACKEND_CONTRACT && \
+   ! -L $LEARNER_BACKEND_CONTRACT ]] || fatal "learner backend contract is unsafe"
+[[ $LEARNER_BACKEND_CONTRACT_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+    fatal "learner backend contract SHA-256 is malformed"
+[[ $(sha256sum -- "$LEARNER_BACKEND_CONTRACT" | awk '{print $1}') == \
+   "$LEARNER_BACKEND_CONTRACT_SHA256" ]] || \
+    fatal "learner backend contract SHA-256 mismatch"
+if [[ $LEARNER_BACKEND == oci_nrt ]]; then
+    [[ $LEARNER_BACKEND_CONTRACT == "$LEARNER_CONTRACT" && \
+       $LEARNER_BACKEND_CONTRACT_SHA256 == "$LEARNER_CONTRACT_SHA256" ]] || \
+        fatal "OCI backend contract must be the campaign learner contract"
+    [[ -z $LEPTON_REMOTE_BACKEND_CONTRACT && -z $LEPTON_CONTROL_EXEC_PROGRAM && \
+       -z $LEPTON_SDK_PYTHON ]] || fatal "OCI backend forbids Lepton inputs"
+else
+    [[ $LEPTON_REMOTE_BACKEND_CONTRACT == /workspace/projects/roborender/* ]] || \
+        fatal "Lepton remote backend contract is unsafe"
+    [[ $LEPTON_CONTROL_EXEC_PROGRAM == /* && -x $LEPTON_CONTROL_EXEC_PROGRAM ]] || \
+        fatal "Lepton control helper is unavailable"
+    [[ $LEPTON_SDK_PYTHON == /* && -x $LEPTON_SDK_PYTHON ]] || \
+        fatal "Lepton SDK Python is unavailable"
+fi
 [[ $SEALED_SOURCE_ROOT == /* ]] || fatal "--sealed-source-root must be absolute"
 [[ $EVALUATION_SEALED_SOURCE_ROOT == /* ]] || \
     fatal "--evaluation-sealed-source-root must be absolute"
@@ -160,20 +227,33 @@ chmod 0600 "$ENV_HANDOFF"
 cleanup() { rm -f -- "$ENV_HANDOFF"; }
 trap cleanup EXIT HUP INT TERM
 
+VALIDATOR_ARGS=(
+    --orchestration-config "$ORCHESTRATION_CONFIG"
+    --campaign-contract "$CAMPAIGN_CONTRACT"
+    --campaign-contract-sha256 "$CAMPAIGN_CONTRACT_SHA256"
+    --learner-contract "$LEARNER_CONTRACT"
+    --learner-contract-sha256 "$LEARNER_CONTRACT_SHA256"
+    --learner-backend "$LEARNER_BACKEND"
+    --learner-backend-contract "$LEARNER_BACKEND_CONTRACT"
+    --learner-backend-contract-sha256 "$LEARNER_BACKEND_CONTRACT_SHA256"
+    --sealed-source-root "$SEALED_SOURCE_ROOT"
+    --evaluation-sealed-source-root "$EVALUATION_SEALED_SOURCE_ROOT"
+    --evaluation-sealed-source-inventory-sha256
+        "$EVALUATION_SEALED_SOURCE_INVENTORY_SHA256"
+    --sealed-source-inventory-sha256 "$SEALED_SOURCE_INVENTORY_SHA256"
+    --env-output "$ENV_HANDOFF"
+)
+if [[ $LEARNER_BACKEND == lepton_job_v1 ]]; then
+    VALIDATOR_ARGS+=(
+        --lepton-remote-backend-contract "$LEPTON_REMOTE_BACKEND_CONTRACT"
+        --lepton-control-exec-program "$LEPTON_CONTROL_EXEC_PROGRAM"
+        --lepton-sdk-python "$LEPTON_SDK_PYTHON"
+    )
+fi
+
 PLAN=$(
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-        "$PYTHON" "$VALIDATOR" \
-        --orchestration-config "$ORCHESTRATION_CONFIG" \
-        --campaign-contract "$CAMPAIGN_CONTRACT" \
-        --campaign-contract-sha256 "$CAMPAIGN_CONTRACT_SHA256" \
-        --learner-contract "$LEARNER_CONTRACT" \
-        --learner-contract-sha256 "$LEARNER_CONTRACT_SHA256" \
-        --sealed-source-root "$SEALED_SOURCE_ROOT" \
-        --evaluation-sealed-source-root "$EVALUATION_SEALED_SOURCE_ROOT" \
-        --evaluation-sealed-source-inventory-sha256 \
-            "$EVALUATION_SEALED_SOURCE_INVENTORY_SHA256" \
-        --sealed-source-inventory-sha256 "$SEALED_SOURCE_INVENTORY_SHA256" \
-        --env-output "$ENV_HANDOFF"
+        "$PYTHON" "$VALIDATOR" "${VALIDATOR_ARGS[@]}"
 ) || fatal "fail-closed preflight rejected the launch"
 
 ENVIRONMENT_COUNT=0

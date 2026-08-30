@@ -9,6 +9,7 @@ from unittest import mock
 from round_dagger import artifacts
 from round_dagger.artifacts import publish_immutable_json, sha256_file
 from round_dagger.orchestration import (
+    BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
     COHORT_COUNT,
     BOUNDED_ORCHESTRATION_CONFIG_SCHEMA,
     ENVIRONMENTS_PER_COHORT,
@@ -634,6 +635,53 @@ class ConfigAndTopologyTest(unittest.TestCase):
             path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(OrchestrationError, "credential"):
                 MacroRoundConfig.load(path)
+
+    def test_backend_bound_config_is_strict_and_legacy_defaults_to_oci(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hook_mapping = {
+                "argv": [str(Path(sys.executable).resolve()), "-c", "pass"],
+                "timeout_seconds": 30,
+            }
+            document = {
+                "schema": BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                "learner_backend": "lepton_job_v1",
+                "learner_backend_contract_sha256": "f" * 64,
+                "campaign_root": str(root),
+                "actor_root": str(root / "actor"),
+                "macro_round": 0,
+                "macro_round_count": PRODUCTION_MACRO_ROUND_COUNT,
+                "campaign_contract_sha256": "0" * 64,
+                "runtime_policy_sha256": SHA["runtime"],
+                "learner_code_sha256": SHA["learner_code"],
+                "learner_config_sha256": SHA["learner_config"],
+                "learner_model_lineage_sha256": SHA["model_lineage"],
+                "evaluator_config_sha256": SHA["evaluator_config"],
+                "hooks": {
+                    "collect": hook_mapping,
+                    "transfer": None,
+                    "ingest": None,
+                    "train": hook_mapping,
+                    "evaluate": hook_mapping,
+                    "promote": None,
+                },
+            }
+            path = root / "backend-bound.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            loaded = MacroRoundConfig.load(path)
+            self.assertEqual(loaded.learner_backend, "lepton_job_v1")
+
+            document["learner_backend"] = "auto"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(OrchestrationError, "exactly one of"):
+                MacroRoundConfig.load(path)
+
+            document["learner_backend"] = "oci_nrt"
+            document["schema"] = "fast_roborender.round_dagger.orchestration_config.v3"
+            document.pop("learner_backend")
+            document.pop("learner_backend_contract_sha256")
+            path.write_text(json.dumps(document), encoding="utf-8")
+            self.assertEqual(MacroRoundConfig.load(path).learner_backend, "oci_nrt")
 
     def test_topology_is_exact_and_not_tunable(self):
         validate_production_topology(campaign(), contract())

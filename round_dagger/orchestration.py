@@ -49,6 +49,9 @@ BOUNDED_ORCHESTRATION_CONFIG_SCHEMA = (
 PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA = (
     "fast_roborender.round_dagger.orchestration_config.v3"
 )
+BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA = (
+    "fast_roborender.round_dagger.orchestration_config.v4"
+)
 EVALUATOR_RESULT_SCHEMA = "fast_roborender.round_dagger.evaluator_result.v2"
 WANDB_PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v2"
 PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA = (
@@ -71,16 +74,29 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _HOOK_NAMES = ("collect", "transfer", "ingest", "train", "evaluate", "promote")
 _REQUIRED_HOOKS = {"collect", "train", "evaluate"}
 _COORDINATOR_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+LEARNER_BACKEND_OCI_NRT = "oci_nrt"
+LEARNER_BACKEND_LEPTON_JOB_V1 = "lepton_job_v1"
+LEARNER_BACKENDS = (
+    LEARNER_BACKEND_OCI_NRT,
+    LEARNER_BACKEND_LEPTON_JOB_V1,
+)
 _TRUSTED_HOOK_RELATIVES = MappingProxyType(
     {
         "collect": Path(
             "scripts/round_dagger/run_production_actor_cohort_hook.sh"
         ),
-        "train": Path(
-            "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"
-        ),
         "evaluate": Path(
             "scripts/round_dagger/run_production_paired_evaluation_hook.sh"
+        ),
+    }
+)
+_TRUSTED_TRAIN_HOOK_RELATIVES = MappingProxyType(
+    {
+        LEARNER_BACKEND_OCI_NRT: Path(
+            "scripts/round_dagger/submit_oci_nrt_round_learner_and_wait.sh"
+        ),
+        LEARNER_BACKEND_LEPTON_JOB_V1: Path(
+            "scripts/round_dagger/run_production_lepton_learner_hook.sh"
         ),
     }
 )
@@ -213,6 +229,24 @@ def _safe_relative(value: str, label: str) -> PurePosixPath:
     return path
 
 
+def validate_learner_backend(value: Any) -> str:
+    """Return one immutable learner backend enum value or fail closed."""
+
+    if not isinstance(value, str) or value not in LEARNER_BACKENDS:
+        raise OrchestrationError(
+            "learner_backend must be exactly one of "
+            f"{list(LEARNER_BACKENDS)}"
+        )
+    return value
+
+
+def trusted_train_hook_relative(learner_backend: str) -> Path:
+    """Resolve a train primitive only from the explicit backend binding."""
+
+    backend = validate_learner_backend(learner_backend)
+    return _TRUSTED_TRAIN_HOOK_RELATIVES[backend]
+
+
 @dataclass(frozen=True)
 class HookSpec:
     """One argv-only hook. Credentials must be supplied through the environment."""
@@ -278,6 +312,8 @@ class MacroRoundConfig:
     sha256: str
     macro_round_count: int | None = None
     campaign_contract_sha256: str | None = None
+    learner_backend: str = LEARNER_BACKEND_OCI_NRT
+    learner_backend_contract_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for path, label in (
@@ -306,6 +342,12 @@ class MacroRoundConfig:
             _sha256(
                 self.campaign_contract_sha256,
                 "production campaign contract sha256",
+            )
+        validate_learner_backend(self.learner_backend)
+        if self.learner_backend_contract_sha256 is not None:
+            _sha256(
+                self.learner_backend_contract_sha256,
+                "learner backend contract sha256",
             )
         if not isinstance(self.hooks, Mapping) or set(self.hooks) != set(_HOOK_NAMES):
             raise OrchestrationError("hooks must contain exactly the six orchestration hooks")
@@ -351,6 +393,13 @@ class MacroRoundConfig:
             keys = base_keys | {
                 "macro_round_count",
                 "campaign_contract_sha256",
+            }
+        elif schema == BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA:
+            keys = base_keys | {
+                "macro_round_count",
+                "campaign_contract_sha256",
+                "learner_backend",
+                "learner_backend_contract_sha256",
             }
         else:
             raise OrchestrationError("orchestration config schema mismatch")
@@ -401,7 +450,24 @@ class MacroRoundConfig:
                     document["campaign_contract_sha256"],
                     "campaign_contract_sha256",
                 )
-                if schema == PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
+                if schema
+                in {
+                    PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                    BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                }
+                else None
+            ),
+            learner_backend=(
+                validate_learner_backend(document["learner_backend"])
+                if schema == BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
+                else LEARNER_BACKEND_OCI_NRT
+            ),
+            learner_backend_contract_sha256=(
+                _sha256(
+                    document["learner_backend_contract_sha256"],
+                    "learner_backend_contract_sha256",
+                )
+                if schema == BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
                 else None
             ),
         )
@@ -465,12 +531,21 @@ def _verified_source_hook(
     source seal.
     """
 
-    try:
-        relative_hook = _TRUSTED_HOOK_RELATIVES[name]
-    except KeyError as exc:
-        raise OrchestrationError(
-            f"{name} hook has no trusted sealed-dispatch contract"
-        ) from exc
+    if name == "train":
+        raw_backend = environment.get("ROUND_DAGGER_LEARNER_BACKEND")
+        try:
+            relative_hook = trusted_train_hook_relative(raw_backend)
+        except OrchestrationError as exc:
+            raise OrchestrationError(
+                "train hook requires an explicit valid learner backend binding"
+            ) from exc
+    else:
+        try:
+            relative_hook = _TRUSTED_HOOK_RELATIVES[name]
+        except KeyError as exc:
+            raise OrchestrationError(
+                f"{name} hook has no trusted sealed-dispatch contract"
+            ) from exc
 
     raw_root = environment.get("ROUND_DAGGER_EVALUATION_SOURCE_ROOT")
     inventory_sha256 = environment.get(
@@ -668,7 +743,7 @@ class SubprocessHookRunner:
                 raise OrchestrationError(
                     "sealed teacher is outside the trusted actor source"
                 ) from exc
-        if name in _TRUSTED_HOOK_RELATIVES:
+        if name in _TRUSTED_HOOK_RELATIVES or name == "train":
             (
                 verified_descriptor,
                 argv,
@@ -1619,6 +1694,7 @@ class MacroRoundOrchestrator:
             "ROUND_DAGGER_TRANSITIONS_PER_CAMPAIGN": str(
                 TRANSITIONS_PER_CAMPAIGN
             ),
+            "ROUND_DAGGER_LEARNER_BACKEND": self.config.learner_backend,
         }
         if self.config.campaign_contract_sha256 is not None:
             runtime_contract_path = os.environ.get(
@@ -2076,6 +2152,10 @@ __all__ = [
     "ORCHESTRATION_CONFIG_SCHEMA",
     "BOUNDED_ORCHESTRATION_CONFIG_SCHEMA",
     "PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA",
+    "BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA",
+    "LEARNER_BACKEND_OCI_NRT",
+    "LEARNER_BACKEND_LEPTON_JOB_V1",
+    "LEARNER_BACKENDS",
     "EVALUATOR_RESULT_SCHEMA",
     "WANDB_PUBLIC_CONFIG_SCHEMA",
     "PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA",
@@ -2091,6 +2171,8 @@ __all__ = [
     "OrchestrationError",
     "HookSpec",
     "MacroRoundConfig",
+    "validate_learner_backend",
+    "trusted_train_hook_relative",
     "HookRunner",
     "SubprocessHookRunner",
     "RoundTelemetry",

@@ -24,7 +24,16 @@ from round_dagger.artifacts import (  # noqa: E402
     publish_immutable_json,
     sha256_file,
 )
-from round_dagger.learner import CHECKPOINT_SCHEMA, RESULT_SCHEMA  # noqa: E402
+from round_dagger.checkpoint_compat import (  # noqa: E402
+    CheckpointCompatibilityError,
+    load_restricted_restart_document,
+)
+from round_dagger.learner import (  # noqa: E402
+    CHECKPOINT_SCHEMA,
+    ORDERED_ALLGATHER_GRADIENT_REDUCTION,
+    RESULT_SCHEMA,
+    SINGLE_PROCESS_GRADIENT_REDUCTION,
+)
 from round_dagger.policy_bundle import (  # noqa: E402
     PolicyBundleError,
     validate_policy_bundle_identity,
@@ -55,6 +64,7 @@ _CHECKPOINT_FIELDS = {
     "completed_steps",
     "initial_loss",
     "world_size",
+    "gradient_reduction",
     "model_state_dict",
     "optimizer_state_dict",
     "lr_scheduler_state_dict",
@@ -110,8 +120,8 @@ def _absolute_regular_file(value: Path, label: str) -> Path:
 def _load_checkpoint(path: Path, label: str) -> tuple[Path, Mapping[str, Any]]:
     path = _absolute_regular_file(path, label)
     try:
-        document = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:
+        document = load_restricted_restart_document(path, map_location="cpu")
+    except CheckpointCompatibilityError as exc:
         raise RestartEquivalenceError(f"cannot load {label}: {exc}") from exc
     if not isinstance(document, Mapping) or set(document) != _CHECKPOINT_FIELDS:
         raise RestartEquivalenceError(f"{label} has unexpected or missing fields")
@@ -135,6 +145,22 @@ def _load_checkpoint(path: Path, label: str) -> tuple[Path, Mapping[str, Any]]:
         or float(initial_loss) < 0.0
     ):
         raise RestartEquivalenceError(f"{label} initial_loss is invalid")
+    world_size = document.get("world_size")
+    if (
+        isinstance(world_size, bool)
+        or not isinstance(world_size, int)
+        or world_size < 1
+    ):
+        raise RestartEquivalenceError(f"{label} world_size is invalid")
+    expected_reduction = (
+        SINGLE_PROCESS_GRADIENT_REDUCTION
+        if world_size == 1
+        else ORDERED_ALLGATHER_GRADIENT_REDUCTION
+    )
+    if document.get("gradient_reduction") != expected_reduction:
+        raise RestartEquivalenceError(
+            f"{label} gradient_reduction is invalid for world_size"
+        )
     return path, document
 
 

@@ -26,6 +26,10 @@ from round_dagger.artifacts import (  # noqa: E402
     publish_immutable_json,
     sha256_file,
 )
+from round_dagger.checkpoint_compat import (  # noqa: E402
+    CheckpointCompatibilityError,
+    load_restricted_restart_document,
+)
 from round_dagger.learner import CHECKPOINT_SCHEMA, RESULT_SCHEMA  # noqa: E402
 from round_dagger.learner_identity import (  # noqa: E402
     LearnerIdentityError,
@@ -53,6 +57,7 @@ TELEMETRY_KEYS = {
     "replay_transitions_per_rank",
     "replay_transitions_global",
     "world_size",
+    "gradient_reduction",
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -215,6 +220,7 @@ def _telemetry(
             "macro_round": macro_round,
             "optimizer_step": index + 1,
             "world_size": 8,
+            "gradient_reduction": "ordered_allgather_rank_sum_v1",
         }
         if any(row.get(key) != value for key, value in expected.items()):
             raise H100ValidationReadbackError(
@@ -269,10 +275,8 @@ def _load_checkpoint(
 ) -> tuple[Path, dict[str, Any], str]:
     path = _regular(path, label)
     try:
-        import torch
-
-        value = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:
+        value = load_restricted_restart_document(path, map_location="cpu")
+    except CheckpointCompatibilityError as exc:
         raise H100ValidationReadbackError(f"cannot load {label}: {exc}") from exc
     expected = {
         "schema": CHECKPOINT_SCHEMA,
@@ -291,6 +295,7 @@ def _load_checkpoint(
         ],
         "completed_steps": completed_steps,
         "world_size": 8,
+        "gradient_reduction": "ordered_allgather_rank_sum_v1",
     }
     if not isinstance(value, Mapping) or any(
         value.get(key) != expected_value for key, expected_value in expected.items()
