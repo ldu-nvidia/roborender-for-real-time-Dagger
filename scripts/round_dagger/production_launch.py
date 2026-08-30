@@ -2019,6 +2019,7 @@ def _validate_orchestration_and_campaign(
     learner_contract: Mapping[str, Any],
     learner_deployment_contract_sha256: str,
     source_inventory_sha256: str,
+    evaluation_source_inventory_sha256: str,
     evaluation_source_root: Path,
 ) -> tuple[MacroRoundConfig, dict[str, Any], dict[str, Any], str]:
     _regular(orchestration_path, "orchestration config")
@@ -2149,7 +2150,11 @@ def _validate_orchestration_and_campaign(
         "renderer_sha256": campaign_contract["artifacts"]["renderer"]["cohort_identity_sha256"],
         "camera_mapping_sha256": campaign_contract["artifacts"]["camera_acceptance"]["sha256"],
         "training_config_sha256": campaign_contract["evaluation"]["hydra_config_sha256"],
-        "code_sha256": source_inventory_sha256,
+        # The durable campaign owns actor/evaluation lineage.  Learner code is
+        # independently pinned by the orchestration config and per-round
+        # learner bundle, so backend-only learner revisions must not rewrite
+        # an already initialized campaign manifest.
+        "code_sha256": evaluation_source_inventory_sha256,
         # This is the immutable bootstrap/deployment contract identity.  It is
         # deliberately distinct from the per-round LearnerBundleConfig digest
         # consumed by the H100 learner.
@@ -2660,6 +2665,7 @@ def validate_launch(
         learner_contract,
         learner_deployment_contract_sha,
         sealed_source_inventory_sha256,
+        evaluation_sealed_source_inventory_sha256,
         Path(local_seal_report["root"]),
     )
     _require_equal(

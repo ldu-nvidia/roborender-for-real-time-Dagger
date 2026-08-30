@@ -333,6 +333,7 @@ class ProductionLaunchTests(unittest.TestCase):
         self,
         *,
         learner_code_sha: str = SOURCE_SHA,
+        campaign_code_sha: str = SOURCE_SHA,
         learner_config_sha: str | None = None,
         evaluation_source_root: Path = ROOT,
     ) -> tuple[Path, Path]:
@@ -358,7 +359,7 @@ class ProductionLaunchTests(unittest.TestCase):
         bootstrap = stage_bootstrap_policy(
             root,
             checkpoint_source=source,
-            code_sha256=SOURCE_SHA,
+            code_sha256=campaign_code_sha,
             policy_config_sha256=learner_deployment_sha,
         )
         self.assertEqual(
@@ -921,6 +922,7 @@ class ProductionLaunchTests(unittest.TestCase):
             "/mnt/data2/ldu/roborender_source_snapshots/fast_roborender_source"
         )
         _, orchestration = self._campaign_and_orchestration(
+            campaign_code_sha=evaluation_inventory_sha,
             evaluation_source_root=local_sealed_root
         )
         materialized, runtime_contract, runtime_path, runtime_sha = (
@@ -1162,6 +1164,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 ),
                 deployment_sha,
                 SOURCE_SHA,
+                SOURCE_SHA,
                 ROOT,
             )
 
@@ -1199,6 +1202,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 learner,
                 deployment_sha,
                 SOURCE_SHA,
+                SOURCE_SHA,
                 ROOT,
             )
         )
@@ -1226,6 +1230,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 learner,
                 deployment_sha,
                 SOURCE_SHA,
+                SOURCE_SHA,
                 ROOT,
             )
 
@@ -1250,6 +1255,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 production_launch.load_campaign_contract(CAMPAIGN_CONTRACT),
                 production_launch.load_learner_contract(LEARNER_CONTRACT),
                 artifacts.sha256_file(LEARNER_CONTRACT),
+                SOURCE_SHA,
                 SOURCE_SHA,
                 ROOT,
             )
@@ -1297,6 +1303,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 production_launch.load_campaign_contract(CAMPAIGN_CONTRACT),
                 production_launch.load_learner_contract(LEARNER_CONTRACT),
                 artifacts.sha256_file(LEARNER_CONTRACT),
+                SOURCE_SHA,
                 SOURCE_SHA,
                 ROOT,
             )
