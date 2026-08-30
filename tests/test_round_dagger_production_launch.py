@@ -934,7 +934,9 @@ class ProductionLaunchTests(unittest.TestCase):
             "status": "PASS",
             "root": "/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build/src_snapshots/fast_roborender_source",
             "inventory_sha256": SOURCE_SHA,
-            "fast_roborender_revision": "1" * 40,
+            # The learner may advance independently from the already sealed
+            # RTX capture/evaluation source.
+            "fast_roborender_revision": "9" * 40,
             "gr00t_revision": "2" * 40,
             "gr00t_source_tree_sha256": "4" * 64,
         }
@@ -957,6 +959,7 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         local_seal_report = {
             "root": str(local_sealed_root),
+            "fast_roborender_revision": "1" * 40,
             "sealed_teacher_checkpoint": str(sealed_teacher),
             "sealed_teacher_sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38",
         }
@@ -1071,8 +1074,10 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertNotIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK", environment)
         self.assertEqual(
-            environment["ROUND_DAGGER_FAST_ROBORENDER_REVISION"], "1" * 40
+            environment["ROUND_DAGGER_FAST_ROBORENDER_REVISION"], "9" * 40
         )
+        self.assertEqual(plan["learner_source_revision"], "9" * 40)
+        self.assertEqual(plan["evaluation_source_revision"], "1" * 40)
         self.assertEqual(environment["ROUND_DAGGER_GR00T_REVISION"], "2" * 40)
         self.assertEqual(
             environment["ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256"], "4" * 64

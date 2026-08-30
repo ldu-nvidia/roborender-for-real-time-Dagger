@@ -2604,7 +2604,13 @@ def validate_launch(
     )
     capture_provenance = runtime_contract["capture_provenance"]
     provenance_expected = {
-        "fast_roborender_revision": source_report.get(
+        # Capture provenance belongs to the independently sealed RTX
+        # actor/evaluator source, not to the learner deployment.  Control-plane
+        # and learner-backend hardening may legitimately advance the remote
+        # learner revision without invalidating already accepted camera and
+        # held-out capture evidence.  The nested GR00T tree remains required
+        # to match both seals by _verify_camera_acceptance_source_bindings.
+        "fast_roborender_revision": local_seal_report.get(
             "fast_roborender_revision"
         ),
         "gr00t_revision": source_report.get("gr00t_revision"),
