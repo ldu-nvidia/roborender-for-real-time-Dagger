@@ -1137,32 +1137,43 @@ class LeptonControlDeploymentAdapter:
     deterministically invert the mutation without replaying the full Pod spec.
     """
 
-    def __init__(self, client: Any):
+    def __init__(
+        self,
+        client: Any,
+        *,
+        partial_builder: Callable[[int], Any] | None = None,
+    ):
         self.client = client
+        self.partial_builder = partial_builder
 
     def get(self, name_or_deployment: Any) -> Any:
         return self.client.get(name_or_deployment)
 
     def scale(self, name_or_deployment: Any, replicas: int) -> Any:
+        if name_or_deployment != CONTROL_DEPLOYMENT:
+            raise LeptonJobError("control deployment name mismatch")
         count = _true_int(replicas, "control replica count")
         if count not in {0, 1}:
             raise LeptonJobError("control replica count must be zero or one")
-        try:
-            from leptonai.api.v1.types.deployment import (
-                LeptonDeployment,
-                LeptonDeploymentUserSpec,
-                ResourceRequirement,
-            )
-        except ImportError as exc:  # pragma: no cover - deployment-only dependency
-            raise LeptonJobError("Lepton SDK is not installed") from exc
-        partial = LeptonDeployment(
-            spec=LeptonDeploymentUserSpec(
-                resource_requirement=ResourceRequirement(
-                    min_replicas=count,
-                    max_replicas=count,
+        if self.partial_builder is not None:
+            partial = self.partial_builder(count)
+        else:
+            try:
+                from leptonai.api.v1.types.deployment import (
+                    LeptonDeployment,
+                    LeptonDeploymentUserSpec,
+                    ResourceRequirement,
+                )
+            except ImportError as exc:  # pragma: no cover - deployment-only dependency
+                raise LeptonJobError("Lepton SDK is not installed") from exc
+            partial = LeptonDeployment(
+                spec=LeptonDeploymentUserSpec(
+                    resource_requirement=ResourceRequirement(
+                        min_replicas=count,
+                        max_replicas=count,
+                    )
                 )
             )
-        )
         return self.client.update(name_or_deployment, partial)
 
 
@@ -1471,7 +1482,6 @@ class ExclusiveNodeLifecycle:
                 raise LeptonJobError(
                     "control Pod is not Ready and is not owned by this lifecycle"
                 )
-            preflight()
             self._transition("control_stop_requested", attempt)
         else:  # pragma: no cover - guarded by strict journal parser
             raise LeptonJobError("unsupported exclusive-node lifecycle phase")
@@ -1479,6 +1489,11 @@ class ExclusiveNodeLifecycle:
         _deployment, state = self._get()
         if self.phase == "control_stop_requested":
             if state == _CONTROL_READY:
+                # The journal records intent before mutation.  If the
+                # coordinator crashed before scale-down, the recovered call
+                # must obtain a fresh preflight rather than reuse stale node
+                # idleness or staged-byte observations.
+                preflight()
                 try:
                     self.client.scale(CONTROL_DEPLOYMENT, 0)
                 except Exception as exc:

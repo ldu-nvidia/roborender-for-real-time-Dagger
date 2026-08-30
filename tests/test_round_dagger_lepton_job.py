@@ -120,6 +120,7 @@ class FakeDeploymentClient:
     def __init__(self, state: str = "Ready"):
         self.state = state
         self.events: list[str] = []
+        self.raise_before_scale_down = False
         self.raise_after_scale_down = False
 
     def get(self, name):
@@ -130,6 +131,8 @@ class FakeDeploymentClient:
 
     def scale(self, name, replicas):
         self.events.append(f"scale:{name}:{replicas}")
+        if replicas == 0 and self.raise_before_scale_down:
+            raise RuntimeError("provider detail must not escape")
         self.state = "Stopped" if replicas == 0 else "Ready"
         if replicas == 0 and self.raise_after_scale_down:
             raise RuntimeError("provider detail must not escape")
@@ -500,7 +503,19 @@ class LeptonJobBackendTest(unittest.TestCase):
                 return partial
 
         raw = RawClient()
-        adapter = lepton_job.LeptonControlDeploymentAdapter(raw)
+        def partial(count):
+            return types.SimpleNamespace(
+                spec=types.SimpleNamespace(
+                    resource_requirement=types.SimpleNamespace(
+                        min_replicas=count,
+                        max_replicas=count,
+                    )
+                )
+            )
+
+        adapter = lepton_job.LeptonControlDeploymentAdapter(
+            raw, partial_builder=partial
+        )
         adapter.scale(lepton_job.CONTROL_DEPLOYMENT, 0)
         adapter.scale(lepton_job.CONTROL_DEPLOYMENT, 1)
         self.assertEqual(
@@ -510,6 +525,13 @@ class LeptonJobBackendTest(unittest.TestCase):
                 (lepton_job.CONTROL_DEPLOYMENT, 1, 1),
             ],
         )
+        for invalid in (False, -1, 2):
+            with self.assertRaises(lepton_job.LeptonJobError):
+                adapter.scale(lepton_job.CONTROL_DEPLOYMENT, invalid)
+        with self.assertRaisesRegex(
+            lepton_job.LeptonJobError, "control deployment name mismatch"
+        ):
+            adapter.scale("another-deployment", 0)
 
     def test_exclusive_lifecycle_recovers_crash_after_effective_stop(self):
         client = FakeDeploymentClient()
@@ -545,6 +567,41 @@ class LeptonJobBackendTest(unittest.TestCase):
             self.assertEqual(recovered.phase, "control_stopped")
             recovered.ensure_ready()
         self.assertEqual(client.state, "Ready")
+
+    def test_exclusive_lifecycle_rechecks_preflight_after_crash_before_scale(self):
+        client = FakeDeploymentClient()
+        client.raise_before_scale_down = True
+        lifecycle_path = self.root / "exclusive-node-before-scale.json"
+        with lepton_job.ExclusiveNodeLifecycle(
+            lifecycle_path,
+            contract=self.contract,
+            request=self.request,
+            client=client,
+            timeout_seconds=30,
+            sleep=lambda _seconds: None,
+        ) as lifecycle:
+            with self.assertRaisesRegex(
+                lepton_job.LeptonJobError, "could not scale down"
+            ):
+                lifecycle.ensure_stopped(1, preflight=lambda: None)
+            self.assertEqual(client.state, "Ready")
+            self.assertEqual(lifecycle.phase, "control_stop_requested")
+
+        client.raise_before_scale_down = False
+        calls = []
+        with lepton_job.ExclusiveNodeLifecycle(
+            lifecycle_path,
+            contract=self.contract,
+            request=self.request,
+            client=client,
+            timeout_seconds=30,
+            sleep=lambda _seconds: None,
+        ) as recovered:
+            recovered.ensure_stopped(
+                1, preflight=lambda: calls.append("fresh-preflight")
+            )
+            self.assertEqual(calls, ["fresh-preflight"])
+            recovered.ensure_ready()
 
     def test_exclusive_lifecycle_rejects_unowned_stopped_control_pod(self):
         client = FakeDeploymentClient("Stopped")
