@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Immutable entrypoint for one fixed four-step, eight-rank Lepton smoke Job.
 set -Eeuo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
 
 fatal() { echo "FATAL: $*" >&2; exit 2; }
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Immutable Lepton Job entrypoint for one camera-free 8xH200 learner attempt.
 set -Eeuo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
 
 fatal() { echo "FATAL: $*" >&2; exit 2; }
 

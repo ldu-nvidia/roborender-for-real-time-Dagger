@@ -80,6 +80,19 @@ class LeptonBoundedSmokeTest(unittest.TestCase):
         self.assertEqual(spec["envs"][-1]["value_from"]["secret_name_ref"],
                          "LEO_ROBORENDER_WANDB_API_KEY.ldu")
 
+    def test_job_entrypoints_disable_source_bytecode_before_import(self) -> None:
+        for relative in (
+            "scripts/round_dagger/run_lepton_h200_smoke_job.sh",
+            "scripts/round_dagger/run_lepton_h200_learner_job.sh",
+        ):
+            source = (ROOT / relative).read_text()
+            self.assertIn("export PYTHONDONTWRITEBYTECODE=1", source)
+            self.assertIn("export PYTHONNOUSERSITE=1", source)
+            self.assertLess(
+                source.index("export PYTHONDONTWRITEBYTECODE=1"),
+                source.index("python3"),
+            )
+
     def test_execute_orders_supply_chain_smoke_readback_then_marker(self) -> None:
         source = self.root / "sealed-source"
         source.mkdir()
