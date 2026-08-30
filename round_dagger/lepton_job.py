@@ -18,6 +18,7 @@ restart frontier, and one W&B run ID.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -27,6 +28,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1533,9 +1535,7 @@ def verify_control_preflight(
     if program.is_symlink() or not program.is_file() or not os.access(program, os.X_OK):
         raise LeptonJobError("control deployment exec program is missing or unsafe")
     script = r'''import hashlib, json, os, pathlib, stat, subprocess, sys
-(contract_path, contract_sha, request_path, request_sha, entrypoint, python_path,
- source_root, source_inventory, source_inventory_sha, source_verifier,
- python_freeze, python_freeze_sha, output) = sys.argv[1:]
+(contract_path, contract_sha, request_path, request_sha) = sys.argv[1:]
 def regular_immutable(path_text, expected_sha):
     path = pathlib.Path(path_text)
     info = path.lstat()
@@ -1563,8 +1563,26 @@ def executable(path_text, allow_external_target=False):
         or not os.access(resolved, os.X_OK)
     ):
         raise SystemExit(32)
-regular_immutable(contract_path, contract_sha)
-regular_immutable(request_path, request_sha)
+contract_bytes = regular_immutable(contract_path, contract_sha)
+request_bytes = regular_immutable(request_path, request_sha)
+try:
+    contract_doc = json.loads(contract_bytes.decode("utf-8"))
+    request_doc = json.loads(request_bytes.decode("utf-8"))
+    supply = contract_doc["supply_chain"]
+    container = contract_doc["container"]
+    source_root = supply["source_root"]
+    source_inventory = supply["source_inventory"]
+    source_inventory_sha = supply["source_inventory_sha256"]
+    source_verifier = supply["source_verifier"]
+    python_freeze = supply["python_freeze"]
+    python_freeze_sha = supply["python_freeze_sha256"]
+    python_path = container["python"]
+    entrypoint = container["entrypoint"]
+    if request_doc["schema"] == "fast_roborender.round_dagger.lepton_bounded_smoke_request.v1":
+        entrypoint = source_root + "/scripts/round_dagger/run_lepton_h200_smoke_job.sh"
+    output = request_doc["paths"]["learner_output"]
+except Exception:
+    raise SystemExit(41)
 inventory_bytes = regular_immutable(source_inventory, source_inventory_sha)
 freeze_bytes = regular_immutable(python_freeze, python_freeze_sha)
 executable(entrypoint)
@@ -1644,7 +1662,6 @@ gpu = subprocess.run(
 )
 if gpu.returncode != 0 or any(line.strip() for line in gpu.stdout.splitlines()):
     raise SystemExit(38)
-print("LEPTON_EXCLUSIVE_NODE_PREFLIGHT_OK")
 '''
     contract_path = _project_path(
         str(remote_contract), "remote contract", root=contract.project_root
@@ -1657,19 +1674,37 @@ print("LEPTON_EXCLUSIVE_NODE_PREFLIGHT_OK")
         contract.sha256,
         str(request_path),
         request.sha256,
-        str(contract.entrypoint),
-        str(contract.python),
-        str(contract.source_root),
-        str(contract.source_inventory),
-        contract.source_inventory_sha256,
-        str(contract.source_verifier),
-        str(contract.python_freeze),
-        contract.python_freeze_sha256,
-        str(request.paths["learner_output"]),
     ]
-    command = " ".join(
-        ["python3", "-c", shlex.quote(script), *(shlex.quote(item) for item in arguments)]
+    # The control helper writes through a Kubernetes TTY. Linux canonical TTY
+    # input truncates a single line above 4095 bytes; the readable source plus
+    # its identity arguments exceeds that boundary. Compress only this fixed,
+    # public program (never credentials), keep every reviewed path and digest
+    # as a separately quoted argv item, and fail closed if future growth would
+    # cross the terminal limit again.
+    encoded_script = base64.b85encode(
+        zlib.compress(script.encode("utf-8"), level=9)
+    ).decode("ascii")
+    bootstrap = (
+        "import base64,zlib;"
+        "exec(zlib.decompress(base64.b85decode("
+        f"{encoded_script!r})))"
     )
+    command = " ".join(
+        [
+            "python3",
+            "-c",
+            shlex.quote(bootstrap),
+            *(shlex.quote(item) for item in arguments),
+        ]
+    )
+    # The helper base64-encodes this command into its own TTY line. Keep the
+    # raw command below 2.8 KiB so the expanded wrapper remains below 4095.
+    command_bytes = len(command.encode("utf-8"))
+    if command_bytes > 2800:
+        raise LeptonJobError(
+            "control deployment preflight exceeds the Kubernetes TTY line limit "
+            f"({command_bytes} raw bytes)"
+        )
     try:
         completed = command_runner(
             [str(program), CONTROL_DEPLOYMENT, command],
