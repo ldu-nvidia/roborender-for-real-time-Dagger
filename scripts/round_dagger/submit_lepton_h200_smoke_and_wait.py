@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from round_dagger.lepton_job import (  # noqa: E402
     ExclusiveNodeLifecycle,
+    LeptonControlDeploymentAdapter,
     LeptonJobError,
     build_job_document,
     fetch_completion_pair,
@@ -44,7 +45,7 @@ def _clients() -> tuple[Any, Any]:
     except ImportError as exc:
         raise LeptonJobError("Lepton SDK is not installed") from exc
     client = APIClient()
-    return client.job, client.deployment
+    return client.job, LeptonControlDeploymentAdapter(client.deployment)
 
 
 def _load(arguments: argparse.Namespace):

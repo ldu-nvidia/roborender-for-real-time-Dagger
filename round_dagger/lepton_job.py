@@ -1124,8 +1124,46 @@ class JobClient(Protocol):
 
 class ControlDeploymentClient(Protocol):
     def get(self, name_or_deployment: Any) -> Any: ...
-    def stop(self, name_or_deployment: Any) -> Any: ...
-    def restart(self, name_or_deployment: Any) -> Any: ...
+    def scale(self, name_or_deployment: Any, replicas: int) -> Any: ...
+
+
+class LeptonControlDeploymentAdapter:
+    """Expose explicit zero/one Pod scaling over the deployment SDK.
+
+    Lepton's deployment ``stop`` helper only patches ``min_replicas`` and its
+    ``restart`` endpoint cannot revive a Pod with zero replicas.  The provider
+    normalizes a stopped Pod to ``min_replicas=max_replicas=0``.  Use one
+    symmetric, partial public update for both directions so crash recovery can
+    deterministically invert the mutation without replaying the full Pod spec.
+    """
+
+    def __init__(self, client: Any):
+        self.client = client
+
+    def get(self, name_or_deployment: Any) -> Any:
+        return self.client.get(name_or_deployment)
+
+    def scale(self, name_or_deployment: Any, replicas: int) -> Any:
+        count = _true_int(replicas, "control replica count")
+        if count not in {0, 1}:
+            raise LeptonJobError("control replica count must be zero or one")
+        try:
+            from leptonai.api.v1.types.deployment import (
+                LeptonDeployment,
+                LeptonDeploymentUserSpec,
+                ResourceRequirement,
+            )
+        except ImportError as exc:  # pragma: no cover - deployment-only dependency
+            raise LeptonJobError("Lepton SDK is not installed") from exc
+        partial = LeptonDeployment(
+            spec=LeptonDeploymentUserSpec(
+                resource_requirement=ResourceRequirement(
+                    min_replicas=count,
+                    max_replicas=count,
+                )
+            )
+        )
+        return self.client.update(name_or_deployment, partial)
 
 
 def _member(value: Any, name: str) -> Any:
@@ -1170,10 +1208,9 @@ def validate_control_deployment(
         raise LeptonJobError("control deployment is not the canonical eight-H200 shape")
     minimum = _member(requirement, "min_replicas")
     maximum = _member(requirement, "max_replicas")
-    if maximum != 1 or minimum not in {0, 1}:
+    replicas = (minimum, maximum)
+    if replicas not in {(0, 0), (1, 1)}:
         raise LeptonJobError("control deployment replica contract changed")
-    if state == _CONTROL_READY and minimum != 1:
-        raise LeptonJobError("Ready control deployment does not own exactly one replica")
 
     affinity = _member(requirement, "affinity")
     allowed_groups = _member(affinity, "allowed_dedicated_node_groups")
@@ -1206,6 +1243,18 @@ def validate_control_deployment(
     ]
     if len(canonical_mounts) != 1:
         raise LeptonJobError("control deployment persistent NFS mount changed")
+
+    # Pod scale-to-zero is represented by Lepton as (0, 0, "Not Ready"), not
+    # the deployment-oriented (0, 1, "Stopped") projection.  Normalize status
+    # only after every immutable allocation field above has been checked.
+    if replicas == (0, 0):
+        if state in {_CONTROL_STOPPED, "Not Ready"}:
+            return _CONTROL_STOPPED
+        return _CONTROL_STOPPING
+    if state == _CONTROL_READY:
+        return _CONTROL_READY
+    if state in {_CONTROL_STOPPED, _CONTROL_STOPPING}:
+        return "Starting"
     return state
 
 
@@ -1431,9 +1480,11 @@ class ExclusiveNodeLifecycle:
         if self.phase == "control_stop_requested":
             if state == _CONTROL_READY:
                 try:
-                    self.client.stop(CONTROL_DEPLOYMENT)
+                    self.client.scale(CONTROL_DEPLOYMENT, 0)
                 except Exception as exc:
-                    raise LeptonJobError("could not stop Lepton control deployment") from exc
+                    raise LeptonJobError(
+                        "could not scale down Lepton control deployment"
+                    ) from exc
                 state = validate_control_deployment(
                     wait_for_control_state(
                         self.client,
@@ -1496,9 +1547,11 @@ class ExclusiveNodeLifecycle:
             )
         if state == _CONTROL_STOPPED:
             try:
-                self.client.restart(CONTROL_DEPLOYMENT)
+                self.client.scale(CONTROL_DEPLOYMENT, 1)
             except Exception as exc:
-                raise LeptonJobError("could not restore Lepton control deployment") from exc
+                raise LeptonJobError(
+                    "could not scale up Lepton control deployment"
+                ) from exc
         elif state not in _CONTROL_RESTORING:
             raise LeptonJobError("control deployment diverged during restoration")
         ready = wait_for_control_state(

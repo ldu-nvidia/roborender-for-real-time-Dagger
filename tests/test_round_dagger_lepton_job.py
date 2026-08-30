@@ -95,7 +95,7 @@ def _control_deployment(state: str, *, minimum: int) -> types.SimpleNamespace:
                 resource_shape=lepton_job.RESOURCE_SHAPE,
                 shared_memory_size=524288,
                 min_replicas=minimum,
-                max_replicas=1,
+                max_replicas=minimum,
                 affinity=types.SimpleNamespace(
                     allowed_dedicated_node_groups=[lepton_job.NODE_GROUP]
                 ),
@@ -120,7 +120,7 @@ class FakeDeploymentClient:
     def __init__(self, state: str = "Ready"):
         self.state = state
         self.events: list[str] = []
-        self.raise_after_stop = False
+        self.raise_after_scale_down = False
 
     def get(self, name):
         self.events.append(f"get:{name}:{self.state}")
@@ -128,16 +128,11 @@ class FakeDeploymentClient:
             self.state, minimum=1 if self.state == "Ready" else 0
         )
 
-    def stop(self, name):
-        self.events.append(f"stop:{name}")
-        self.state = "Stopped"
-        if self.raise_after_stop:
+    def scale(self, name, replicas):
+        self.events.append(f"scale:{name}:{replicas}")
+        self.state = "Stopped" if replicas == 0 else "Ready"
+        if replicas == 0 and self.raise_after_scale_down:
             raise RuntimeError("provider detail must not escape")
-        return self.get(name)
-
-    def restart(self, name):
-        self.events.append(f"restart:{name}")
-        self.state = "Ready"
         return self.get(name)
 
 
@@ -469,17 +464,56 @@ class LeptonJobBackendTest(unittest.TestCase):
             self.assertEqual(client.state, "Ready")
             self.assertEqual(lifecycle.phase, "control_ready")
         self.assertLess(
-            client.events.index("stop:leo-cosmos-h200-dev"),
-            client.events.index("restart:leo-cosmos-h200-dev"),
+            client.events.index("scale:leo-cosmos-h200-dev:0"),
+            client.events.index("scale:leo-cosmos-h200-dev:1"),
         )
         document = json.loads(lifecycle_path.read_text())
         self.assertEqual(document["learner_identity_sha256"], self.request.identity_sha256)
         self.assertEqual(document["phase"], "control_ready")
         self.assertEqual(stat.S_IMODE(lifecycle_path.stat().st_mode), 0o600)
 
+    def test_control_pod_zero_replica_not_ready_is_normalized_as_stopped(self):
+        stopped = _control_deployment("Not Ready", minimum=0)
+        self.assertEqual(
+            lepton_job.validate_control_deployment(stopped, contract=self.contract),
+            "Stopped",
+        )
+        transient = _control_deployment("Ready", minimum=0)
+        self.assertEqual(
+            lepton_job.validate_control_deployment(transient, contract=self.contract),
+            "Stopping",
+        )
+
+    def test_control_adapter_uses_symmetric_partial_replica_updates(self):
+        class RawClient:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, name):
+                return name
+
+            def update(self, name, partial):
+                requirement = partial.spec.resource_requirement
+                self.calls.append(
+                    (name, requirement.min_replicas, requirement.max_replicas)
+                )
+                return partial
+
+        raw = RawClient()
+        adapter = lepton_job.LeptonControlDeploymentAdapter(raw)
+        adapter.scale(lepton_job.CONTROL_DEPLOYMENT, 0)
+        adapter.scale(lepton_job.CONTROL_DEPLOYMENT, 1)
+        self.assertEqual(
+            raw.calls,
+            [
+                (lepton_job.CONTROL_DEPLOYMENT, 0, 0),
+                (lepton_job.CONTROL_DEPLOYMENT, 1, 1),
+            ],
+        )
+
     def test_exclusive_lifecycle_recovers_crash_after_effective_stop(self):
         client = FakeDeploymentClient()
-        client.raise_after_stop = True
+        client.raise_after_scale_down = True
         lifecycle_path = self.root / "exclusive-node-crash.json"
         with lepton_job.ExclusiveNodeLifecycle(
             lifecycle_path,
@@ -490,13 +524,13 @@ class LeptonJobBackendTest(unittest.TestCase):
             sleep=lambda _seconds: None,
         ) as lifecycle:
             with self.assertRaisesRegex(
-                lepton_job.LeptonJobError, "could not stop"
+                lepton_job.LeptonJobError, "could not scale down"
             ):
                 lifecycle.ensure_stopped(1, preflight=lambda: None)
             self.assertEqual(client.state, "Stopped")
             self.assertEqual(lifecycle.phase, "control_stop_requested")
 
-        client.raise_after_stop = False
+        client.raise_after_scale_down = False
         calls: list[str] = []
         with lepton_job.ExclusiveNodeLifecycle(
             lifecycle_path,
@@ -526,7 +560,7 @@ class LeptonJobBackendTest(unittest.TestCase):
                 lepton_job.LeptonJobError, "not Ready.*not owned"
             ):
                 lifecycle.ensure_stopped(1, preflight=lambda: None)
-        self.assertNotIn("restart:leo-cosmos-h200-dev", client.events)
+        self.assertNotIn("scale:leo-cosmos-h200-dev:1", client.events)
 
     def test_exclusive_lifecycle_identity_and_lock_are_fail_closed(self):
         path = self.root / "exclusive-identity.json"
@@ -944,19 +978,13 @@ class LeptonJobBackendTest(unittest.TestCase):
         deployment = FakeDeploymentClient()
         events: list[str] = []
         completed_job = _job(self.request, self.contract, 1, "Completed")
-        original_stop = deployment.stop
-        original_restart = deployment.restart
+        original_scale = deployment.scale
 
-        def stop(name):
-            events.append("stop")
-            return original_stop(name)
+        def scale(name, replicas):
+            events.append("stop" if replicas == 0 else "restart")
+            return original_scale(name, replicas)
 
-        def restart(name):
-            events.append("restart")
-            return original_restart(name)
-
-        deployment.stop = stop
-        deployment.restart = restart
+        deployment.scale = scale
 
         def submit_attempt(*_args, **_kwargs):
             events.append("job_submit")
@@ -1052,8 +1080,8 @@ class LeptonJobBackendTest(unittest.TestCase):
             ],
         )
         self.assertLess(
-            deployment.events.index("stop:leo-cosmos-h200-dev"),
-            deployment.events.index("restart:leo-cosmos-h200-dev"),
+            deployment.events.index("scale:leo-cosmos-h200-dev:0"),
+            deployment.events.index("scale:leo-cosmos-h200-dev:1"),
         )
 
 
