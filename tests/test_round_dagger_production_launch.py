@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from round_dagger import artifacts
+import numpy as np
+
+from round_dagger import artifacts, replay
 from round_dagger import production_data_lineage
 from round_dagger.orchestration import MacroRoundConfig
 from round_dagger.promotion import stage_bootstrap_policy
@@ -30,13 +32,6 @@ RUNTIME_SHA = "b" * 64
 EVALUATION_CONFIG_SHA = (
     "bd3d61082149e3b87855ea3ab396e7cae7479d9bfe9d9d3aab99c839353ed7a2"
 )
-# Independently cross-checked against prepare_gr00t_learner_bundle.prepare_bundle
-# in the Torch-enabled learner environment for this deterministic fixture.
-EXPECTED_DERIVED_BUNDLE_SHA = (
-    "3b452de0200f62866a65d6b5580d7ef3e2e7a704e33df0ff4330fffb9a75332f"
-)
-
-
 class ProductionLaunchTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="rr_production_launch_")
@@ -51,6 +46,81 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.addCleanup(local_temporary.cleanup)
         self.local_base = Path(local_temporary.name)
+
+    @staticmethod
+    def _heldout_rollout_arrays(global_env_id: int) -> dict[str, np.ndarray]:
+        expert = np.full((1, 1, 26), 0.25, dtype=np.float32)
+        return {
+            "policy_rgb": np.full(
+                (1, 1, 324, 192, 3), global_env_id, dtype=np.uint8
+            ),
+            "expert_actions": expert,
+            "student_actions": np.zeros_like(expert),
+            "behavior_actions": expert.copy(),
+            "expert_mask": np.ones((1, 1), dtype=np.bool_),
+            "dones": np.zeros((1, 1), dtype=np.bool_),
+            "observation_is_raytraced": np.ones((1, 1), dtype=np.bool_),
+            "global_env_ids": np.asarray([global_env_id], dtype=np.int64),
+            "episode_ids": np.asarray([[global_env_id]], dtype=np.int64),
+            "episode_steps": np.zeros((1, 1), dtype=np.int64),
+            "obs__actor_obs": np.zeros((1, 1, 113), dtype=np.float32),
+        }
+
+    def _materialize_campaign_learner_contract(
+        self, campaign_root: Path
+    ) -> Path:
+        """Create a self-contained heldout-bound learner contract fixture."""
+
+        campaign_root.mkdir(parents=True, exist_ok=True)
+        cohort = campaign_root / "heldout" / "cohort_00"
+        provenance = {
+            "campaign_id": "dagger_prod_run1",
+            "macro_round": 0,
+            "cohort_index": 0,
+            "purpose": "eval",
+            "policy_sha256": "1" * 64,
+            "runtime_policy_sha256": "2" * 64,
+            "teacher_sha256": "3" * 64,
+            "renderer_sha256": "4" * 64,
+            "beta_sha256": "5" * 64,
+            "config_sha256": "6" * 64,
+        }
+        artifacts.create_cohort(
+            cohort,
+            expected_ranks=[0],
+            expected_global_env_ids=[0],
+            expected_transitions=1,
+            view_contract={
+                "dtype": "uint8",
+                "layout": "vertical",
+                "shape": [324, 192, 3],
+                "views": ["head_color", "hand_left", "hand_right"],
+            },
+            action_contract={"dtype": "float32", "shape": [26]},
+            **provenance,
+        )
+        artifacts.publish_rollout_shard(
+            cohort,
+            rank=0,
+            rollout_id=0,
+            part_index=0,
+            arrays=self._heldout_rollout_arrays(0),
+            **provenance,
+        )
+        artifacts.seal_cohort(cohort)
+        heldout_path = campaign_root / "heldout_snapshot.json"
+        heldout = replay.build_heldout_snapshot([cohort], output=heldout_path)
+
+        contract = artifacts.load_strict_json(LEARNER_CONTRACT)
+        contract["heldout_evaluation"] = {
+            "snapshot_path": str(heldout_path),
+            "snapshot_file_sha256": heldout["file_sha256"],
+            "snapshot_sha256": heldout["snapshot_sha256"],
+            "interval_steps": 100,
+        }
+        contract_path = campaign_root / "learner_contract.json"
+        artifacts.publish_immutable_json(contract_path, contract)
+        return contract_path
 
     def _materialized_campaign_fixture(
         self,
@@ -271,9 +341,17 @@ class ProductionLaunchTests(unittest.TestCase):
                 evaluation_source_root=evaluation_source_root
             )
         )
-        learner_deployment_sha = artifacts.sha256_file(LEARNER_CONTRACT)
-        learner_contract = production_launch.load_learner_contract(LEARNER_CONTRACT)
         root = self.base / "campaign"
+        campaign_learner_contract = self._materialize_campaign_learner_contract(
+            root
+        )
+        self.campaign_learner_contract = campaign_learner_contract
+        learner_deployment_sha = artifacts.sha256_file(
+            campaign_learner_contract
+        )
+        learner_contract = production_launch.load_learner_contract(
+            campaign_learner_contract
+        )
         source = self.base / "bootstrap-source.pt"
         source.write_bytes(b"fresh-untrained-student")
         publish_policy_bundle(source, RUNTIME_SHA)
@@ -282,6 +360,10 @@ class ProductionLaunchTests(unittest.TestCase):
             checkpoint_source=source,
             code_sha256=SOURCE_SHA,
             policy_config_sha256=learner_deployment_sha,
+        )
+        self.assertEqual(
+            artifacts.sha256_file(campaign_learner_contract),
+            learner_deployment_sha,
         )
         initialize_campaign(
             root,
@@ -480,6 +562,71 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(learner["cluster"]["account"], "general_cs_infra__ngcsre")
         self.assertEqual(learner["cluster"]["partition"], "batch_singlenode")
         self.assertEqual(learner["cluster"]["qos"], "normal")
+
+    def test_campaign_owned_learner_contract_is_canonical_immutable_and_hashed(
+        self,
+    ) -> None:
+        campaign_root = self.base / "contract-campaign"
+        contract_path = self._materialize_campaign_learner_contract(
+            campaign_root
+        )
+        expected_sha = artifacts.sha256_file(contract_path)
+        loaded, observed_sha = production_launch.load_campaign_owned_learner_contract(
+            contract_path,
+            campaign_root=campaign_root,
+            expected_sha256=expected_sha,
+        )
+        self.assertEqual(observed_sha, expected_sha)
+        self.assertEqual(
+            loaded, production_launch.load_learner_contract(contract_path)
+        )
+
+        alternate = campaign_root / "alternate.json"
+        alternate.write_bytes(contract_path.read_bytes())
+        alternate.chmod(0o444)
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError, "canonical campaign-owned"
+        ):
+            production_launch.load_campaign_owned_learner_contract(
+                alternate,
+                campaign_root=campaign_root,
+                expected_sha256=expected_sha,
+            )
+
+        contract_path.chmod(0o400)
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError, "exactly 0444"
+        ):
+            production_launch.load_campaign_owned_learner_contract(
+                contract_path,
+                campaign_root=campaign_root,
+                expected_sha256=expected_sha,
+            )
+        contract_path.chmod(0o444)
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError, "SHA-256 mismatch"
+        ):
+            production_launch.load_campaign_owned_learner_contract(
+                contract_path,
+                campaign_root=campaign_root,
+                expected_sha256="f" * 64,
+            )
+
+        unbound_root = self.base / "unbound-contract-campaign"
+        unbound_root.mkdir()
+        unbound_path = unbound_root / "learner_contract.json"
+        unbound = artifacts.load_strict_json(contract_path)
+        unbound.pop("heldout_evaluation")
+        artifacts.publish_immutable_json(unbound_path, unbound)
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "must bind fixed-256 held-out evaluation",
+        ):
+            production_launch.load_campaign_owned_learner_contract(
+                unbound_path,
+                campaign_root=unbound_root,
+                expected_sha256=artifacts.sha256_file(unbound_path),
+            )
 
     def test_source_owned_paths_rebind_to_the_executing_repository(self) -> None:
         raw = artifacts.load_strict_json(CAMPAIGN_CONTRACT)
@@ -734,7 +881,12 @@ class ProductionLaunchTests(unittest.TestCase):
                 orchestration_config=orchestration,
                 campaign_contract_path=runtime_path,
                 campaign_contract_sha256=runtime_sha,
-                learner_contract_path=LEARNER_CONTRACT,
+                learner_contract_path=(
+                    self.base / "campaign" / "learner_contract.json"
+                ),
+                learner_contract_sha256=artifacts.sha256_file(
+                    self.campaign_learner_contract
+                ),
                 sealed_source_root=source_report["root"],
                 sealed_source_inventory_sha256=SOURCE_SHA,
                 evaluation_sealed_source_root=local_sealed_root,
@@ -823,17 +975,28 @@ class ProductionLaunchTests(unittest.TestCase):
             environment["ROUND_DAGGER_LAUNCH_ORCHESTRATION_SHA256"],
             artifacts.sha256_file(orchestration),
         )
-        deployment_sha = artifacts.sha256_file(LEARNER_CONTRACT)
+        deployment_sha = artifacts.sha256_file(
+            self.campaign_learner_contract
+        )
         orchestration_contract = MacroRoundConfig.load(orchestration)
         self.assertEqual(
             plan["learner_deployment_contract_sha256"], deployment_sha
         )
         self.assertEqual(
-            plan["derived_learner_bundle_sha256"],
-            orchestration_contract.learner_config_sha256,
+            plan["learner_contract_path"],
+            str(self.base / "campaign" / "learner_contract.json"),
         )
         self.assertEqual(
-            plan["derived_learner_bundle_sha256"], EXPECTED_DERIVED_BUNDLE_SHA
+            plan["learner_contract_projection_relative_path"],
+            "learner_contract.json",
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_LEARNER_CONTRACT"],
+            str(self.base / "campaign" / "learner_contract.json"),
+        )
+        self.assertEqual(
+            plan["derived_learner_bundle_sha256"],
+            orchestration_contract.learner_config_sha256,
         )
         self.assertNotEqual(
             plan["learner_deployment_contract_sha256"],
@@ -859,10 +1022,18 @@ class ProductionLaunchTests(unittest.TestCase):
             production_launch._verify_first_condition_bundles(campaign)
 
     def test_static_deployment_contract_sha_is_rejected_as_round_bundle_sha(self) -> None:
-        deployment_sha = artifacts.sha256_file(LEARNER_CONTRACT)
-        _, orchestration = self._campaign_and_orchestration(
-            learner_config_sha=deployment_sha
+        _, orchestration = self._campaign_and_orchestration()
+        deployment_sha = artifacts.sha256_file(
+            self.campaign_learner_contract
         )
+        orchestration_document = artifacts.load_strict_json(orchestration)
+        orchestration_document["learner_config_sha256"] = deployment_sha
+        orchestration.chmod(0o644)
+        orchestration.write_text(
+            json.dumps(orchestration_document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        orchestration.chmod(0o444)
         materialized, _, _, _ = self._materialized_campaign_fixture()
         with self.assertRaisesRegex(
             production_launch.ProductionLaunchError,
@@ -871,7 +1042,9 @@ class ProductionLaunchTests(unittest.TestCase):
             production_launch._validate_orchestration_and_campaign(
                 orchestration,
                 materialized,
-                production_launch.load_learner_contract(LEARNER_CONTRACT),
+                production_launch.load_learner_contract(
+                    self.campaign_learner_contract
+                ),
                 deployment_sha,
                 SOURCE_SHA,
                 ROOT,
@@ -949,7 +1122,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 ROOT,
             )
 
-    def test_remote_source_verifier_binds_report_root_inventory_and_contract(self) -> None:
+    def test_remote_source_verifier_binds_report_root_and_inventory(self) -> None:
         learner = production_launch.load_learner_contract(LEARNER_CONTRACT)
         root = (
             learner["cluster"]["stage_root"]
@@ -963,26 +1136,23 @@ class ProductionLaunchTests(unittest.TestCase):
             "fast_roborender_revision": "1" * 40,
             "gr00t_revision": "2" * 40,
         }
-        responses = [
-            mock.Mock(returncode=0, stdout=json.dumps(report), stderr=""),
-            mock.Mock(
-                returncode=0,
-                stdout=f"{artifacts.sha256_file(LEARNER_CONTRACT)}  contract.json\n",
-                stderr="",
-            ),
-        ]
         with (
             mock.patch.object(production_launch.shutil, "which", return_value="/usr/bin/ssh"),
-            mock.patch.object(production_launch.subprocess, "run", side_effect=responses) as run,
+            mock.patch.object(
+                production_launch.subprocess,
+                "run",
+                return_value=mock.Mock(
+                    returncode=0, stdout=json.dumps(report), stderr=""
+                ),
+            ) as run,
         ):
             observed = production_launch._verify_remote_source(
                 root,
                 SOURCE_SHA,
                 learner_contract=learner,
-                learner_contract_path=LEARNER_CONTRACT,
             )
         self.assertEqual(observed["root"], root)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
         flattened = " ".join(str(argument) for call in run.call_args_list for argument in call.args[0])
         self.assertNotIn("wandb_v1_", flattened)
         self.assertIn(root, flattened)
@@ -1189,14 +1359,12 @@ class ProductionLaunchTests(unittest.TestCase):
                 "/lustre/sealed/../other;touch-x",
                 SOURCE_SHA,
                 learner_contract=production_launch.load_learner_contract(LEARNER_CONTRACT),
-                learner_contract_path=LEARNER_CONTRACT,
             )
         with self.assertRaisesRegex(production_launch.ProductionLaunchError, "accepted OCI source area"):
             production_launch._verify_remote_source(
                 "/lustre/sealed/otherwise-safe-source",
                 SOURCE_SHA,
                 learner_contract=production_launch.load_learner_contract(LEARNER_CONTRACT),
-                learner_contract_path=LEARNER_CONTRACT,
             )
 
     def test_source_owned_path_binding_rejects_mixed_roots_traversal_and_suffixes(
@@ -1250,9 +1418,8 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertIn("--evaluation-sealed-source-inventory-sha256", script)
         self.assertIn("--learner-contract", script)
         self.assertIn("--learner-contract-sha256", script)
-        self.assertIn(
-            "production_learner_8xh100_1200_dagger_prod_run1.json", script
-        )
+        self.assertIn("canonical campaign-owned learner_contract.json", script)
+        self.assertIn("learner contract mode must be exactly 0444", script)
         self.assertIn("learner contract SHA-256 mismatch", script)
         self.assertIn("unset WANDB_API_KEY", script)
         self.assertIn('exec "$PYTHON" "$ORCHESTRATOR"', script)

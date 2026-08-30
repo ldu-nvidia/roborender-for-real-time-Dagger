@@ -2,7 +2,7 @@
   "schema": "fast_roborender.round_dagger.heldout100_validation_contract.v1",
   "purpose": "live_h100_fixed256_step100_wandb_restart_gate",
   "validation_target": {
-    "campaign_id": "dagger_prod_run1",
+    "campaign_id_binding": "runtime_exact",
     "macro_round": 0
   },
   "allocation": {
@@ -27,10 +27,8 @@
     "required_optimizer_steps": [0, 100],
     "case_count": 256,
     "cohort_count": 8,
-    "source_root": "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829",
     "snapshot_relative_path": "heldout_snapshot.json",
-    "snapshot_file_sha256": "42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9",
-    "snapshot_sha256": "c80ee79dae99bb048f9f75bb38aae75fb3e305e665eedfc83d43470babd08bde"
+    "snapshot_binding": "runtime_exact_file_and_semantic_sha256"
   },
   "quality_gate": {
     "minimum_relative_action_mse_reduction": 0.001,
@@ -48,7 +46,7 @@
     "account": "general_cs_infra__ngcsre",
     "partition": "batch_singlenode",
     "qos": "normal",
-    "time_limit_minutes": 240
+    "time_limit_minutes": 225
   },
   "container": {
     "path": "/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build/containers/roborender-isaac-gr00t-x86_64-sm90-isaac5.1.sqsh",
@@ -63,8 +61,6 @@
     "project": "roborender-round-dagger-validation"
   },
   "production_target": {
-    "run_name": "dagger_prod_run1",
-    "learner_contract_path": "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json",
-    "learner_contract_sha256": "e4a1d23a3426d879aac93f934eb9e213a657b0451b54f4f4918e425a357d73e5"
+    "campaign_contract_binding": "campaign_json_policy_config_sha256"
   }
 }

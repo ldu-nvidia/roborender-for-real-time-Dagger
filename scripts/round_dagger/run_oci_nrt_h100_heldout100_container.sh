@@ -24,6 +24,10 @@ RUNTIME_SHA=${ROUND_DAGGER_HELDOUT100_RUNTIME_POLICY_SHA256:?missing runtime pol
 CONFIG_SHA=${ROUND_DAGGER_HELDOUT100_LEARNER_CONFIG_SHA256:?missing learner bundle identity}
 CONTRACT=${ROUND_DAGGER_HELDOUT100_CONTRACT:?missing heldout100 contract}
 CONTRACT_SHA=${ROUND_DAGGER_HELDOUT100_CONTRACT_SHA256:?missing heldout100 contract identity}
+BINDING_SHA=${ROUND_DAGGER_HELDOUT100_BINDING_SHA256:?missing fresh-campaign binding identity}
+PRODUCTION_CONTRACT_SHA=${ROUND_DAGGER_HELDOUT100_PRODUCTION_CONTRACT_SHA256:?missing campaign-owned production contract identity}
+HELDOUT_FILE_SHA=${ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_FILE_SHA256:?missing held-out file identity}
+HELDOUT_SHA=${ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_SHA256:?missing held-out semantic identity}
 LEARNER_IDENTITY_SHA=${ROUND_DAGGER_HELDOUT100_LEARNER_IDENTITY_SHA256:?missing learner identity}
 CAMPAIGN_ID=${ROUND_DAGGER_HELDOUT100_CAMPAIGN_ID:?missing campaign ID}
 MACRO_ROUND=${ROUND_DAGGER_HELDOUT100_MACRO_ROUND:?missing macro round}
@@ -39,15 +43,16 @@ AUTH_SCOPE=${ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE:?missing W&B authorization s
 [[ $CAMPAIGN == /* && -d $CAMPAIGN && ! -L $CAMPAIGN ]] || fatal "campaign mount is unsafe"
 [[ $OUTPUT == "$CAMPAIGN"/* && -d $OUTPUT && ! -L $OUTPUT ]] || fatal "output mount is not nested"
 [[ $JOB == /round_dagger_heldout100_job && -d $JOB && ! -L $JOB ]] || fatal "job scratch mount is non-canonical"
-[[ $HELDOUT == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829/heldout_snapshot.json ]] || \
-    fatal "fixed-256 held-out snapshot path changed"
+[[ $HELDOUT == "$CAMPAIGN/heldout_snapshot.json" ]] || \
+    fatal "fixed-256 held-out snapshot is not campaign-owned"
 [[ $CONTRACT == "$ROOT/configs/round_dagger/validation_learner_1x8h100_heldout100.json" ]] || fatal "heldout100 contract path changed"
-[[ $CAMPAIGN_ID == dagger_prod_run1 && $MACRO_ROUND == 0 ]] || fatal "campaign/round identity is invalid"
+[[ -n $CAMPAIGN_ID && $MACRO_ROUND == 0 ]] || fatal "campaign/round identity is invalid"
 [[ $PROJECT == roborender-round-dagger-validation && $ENTITY == nvidia && \
    $EXPECTED_EMAIL == ldu@nvidia.com && $AUTH_SCOPE == team ]] || fatal "W&B contract changed"
 for name in SOURCE_SHA SNAPSHOT_FILE_SHA SNAPSHOT_SHA CHECKPOINT_SHA SPEC_SHA \
             MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA LEARNER_IDENTITY_SHA \
-            CONTAINER_SHA; do
+            CONTAINER_SHA BINDING_SHA PRODUCTION_CONTRACT_SHA HELDOUT_FILE_SHA \
+            HELDOUT_SHA; do
     [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
 for path in "$SNAPSHOT" "$HELDOUT" "$CHECKPOINT" "$SPEC" "$MANIFEST" "$CONTRACT" "$CONTAINER_PATH"; do
@@ -60,6 +65,7 @@ done
 [[ $(sha256sum "$CHECKPOINT" | awk '{print $1}') == "$CHECKPOINT_SHA" ]] || fatal "checkpoint digest mismatch"
 [[ $(sha256sum "$SPEC" | awk '{print $1}') == "$SPEC_SHA" ]] || fatal "policy spec digest mismatch"
 [[ $(sha256sum "$MANIFEST" | awk '{print $1}') == "$MANIFEST_SHA" ]] || fatal "policy manifest digest mismatch"
+[[ $(sha256sum "$HELDOUT" | awk '{print $1}') == "$HELDOUT_FILE_SHA" ]] || fatal "held-out snapshot digest mismatch"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT:${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}${PYTHONPATH:+:$PYTHONPATH}"
@@ -67,7 +73,22 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 "$PYTHON" "$ROOT/scripts/round_dagger/h100_heldout100_validation.py" contract \
     --path "$CONTRACT" --sha256 "$CONTRACT_SHA" --source-root "$ROOT" >/dev/null
 "$PYTHON" "$ROOT/scripts/round_dagger/h100_heldout100_validation.py" snapshot \
-    --path "$HELDOUT" --campaign-id "$CAMPAIGN_ID" >/dev/null
+    --path "$HELDOUT" --campaign-root "$CAMPAIGN" \
+    --campaign-id "$CAMPAIGN_ID" --file-sha256 "$HELDOUT_FILE_SHA" \
+    --semantic-sha256 "$HELDOUT_SHA" >/dev/null
+BOUND=$(
+    "$PYTHON" "$ROOT/scripts/round_dagger/h100_heldout100_validation.py" binding \
+        --contract "$CONTRACT" --contract-sha256 "$CONTRACT_SHA" \
+        --source-root "$ROOT" --campaign-root "$CAMPAIGN" \
+        --campaign-id "$CAMPAIGN_ID" --heldout-snapshot "$HELDOUT" \
+        --heldout-snapshot-file-sha256 "$HELDOUT_FILE_SHA" \
+        --heldout-snapshot-sha256 "$HELDOUT_SHA" \
+        --production-contract-sha256 "$PRODUCTION_CONTRACT_SHA" | \
+        "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["binding_sha256"])'
+)
+[[ $BOUND == "$BINDING_SHA" ]] || fatal "fresh-campaign binding digest mismatch"
+[[ $RUN_ID == "rrd-m000000-id${LEARNER_IDENTITY_SHA}-b${BINDING_SHA:0:32}" ]] || \
+    fatal "W&B run ID is not binding-qualified"
 "$PYTHON" -m round_dagger.policy_bundle \
     --checkpoint "$CHECKPOINT" --policy-spec "$SPEC" --manifest "$MANIFEST" \
     --expected-checkpoint-sha256 "$CHECKPOINT_SHA" \
@@ -213,6 +234,7 @@ PY
         --output-dir "$RESUMED" --telemetry-jsonl "$RESUMED/telemetry.jsonl" \
         --heldout-telemetry-jsonl "$RESUMED/heldout.jsonl" \
         --wandb-project "$PROJECT" --wandb-entity "$ENTITY" --wandb-run-id "$RUN_ID" \
+        --wandb-run-binding-sha256 "$BINDING_SHA" \
         --wandb-resume-never --no-publish-result --validation-stop-at-step 50
     cp --reflink=auto --preserve=mode "$RESUMED/restart.pt" "$OUTPUT/intentional_stop_step_50.pt"
     chmod 0444 "$OUTPUT/intentional_stop_step_50.pt"
@@ -221,13 +243,15 @@ PY
         --output-dir "$RESUMED" --telemetry-jsonl "$RESUMED/telemetry.jsonl" \
         --heldout-telemetry-jsonl "$RESUMED/heldout.jsonl" \
         --wandb-project "$PROJECT" --wandb-entity "$ENTITY" --wandb-run-id "$RUN_ID" \
+        --wandb-run-binding-sha256 "$BINDING_SHA" \
         --resume-from "$RESUMED/restart.pt"
 
     RESUME_EVIDENCE="$JOB/evidence/strict_resume_invocation.json"
     "$PYTHON" - "$OUTPUT/intentional_stop_step_50.pt" "$RESUMED/restart.pt" \
         "$RUN_ID" "$LEARNER_IDENTITY_SHA" "$CONFIG_SHA" "$SOURCE_SHA" \
         "$SNAPSHOT_FILE_SHA" "$SNAPSHOT_SHA" "$CONTAINER_SHA" "$CONTRACT_SHA" \
-        "$RESUME_EVIDENCE" <<'PY'
+        "$HELDOUT_FILE_SHA" "$HELDOUT_SHA" "$BINDING_SHA" \
+        "$PRODUCTION_CONTRACT_SHA" "$RESUME_EVIDENCE" <<'PY'
 import os
 import stat
 import sys
@@ -236,7 +260,7 @@ from round_dagger.artifacts import publish_immutable_json, sha256_file
 from round_dagger.learner import CHECKPOINT_SCHEMA
 
 (stopped_path, resumed_path, run_id, identity, config, code, replay_file, replay,
- container, contract, output) = sys.argv[1:]
+ container, contract, heldout_file, heldout, binding, production, output) = sys.argv[1:]
 stopped = torch.load(stopped_path, map_location="cpu", weights_only=False)
 resumed = torch.load(resumed_path, map_location="cpu", weights_only=False)
 for doc, step in ((stopped, 50), (resumed, 100)):
@@ -255,8 +279,10 @@ report = {
     "learner_identity_sha256": identity, "learner_config_sha256": config,
     "learner_code_sha256": code, "replay_snapshot_file_sha256": replay_file,
     "replay_snapshot_sha256": replay,
-    "heldout_snapshot_file_sha256": "42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9",
-    "heldout_snapshot_sha256": "c80ee79dae99bb048f9f75bb38aae75fb3e305e665eedfc83d43470babd08bde",
+    "heldout_snapshot_file_sha256": heldout_file,
+    "heldout_snapshot_sha256": heldout,
+    "validation_binding_sha256": binding,
+    "production_contract_sha256": production,
     "runtime_container_sha256": container, "learner_contract_sha256": contract,
     "stopped_checkpoint_sha256": sha256_file(stopped_path),
     "resumed_checkpoint_sha256": sha256_file(resumed_path),
@@ -293,12 +319,21 @@ PY
         --learner-identity-sha256 "$LEARNER_IDENTITY_SHA" \
         --runtime-container-sha256 "$CONTAINER_SHA" \
         --validation-contract-sha256 "$CONTRACT_SHA" --project "$PROJECT" \
+        --validation-binding-sha256 "$BINDING_SHA" \
+        --production-contract-sha256 "$PRODUCTION_CONTRACT_SHA" \
+        --heldout-snapshot-file-sha256 "$HELDOUT_FILE_SHA" \
+        --heldout-snapshot-sha256 "$HELDOUT_SHA" \
         --expected-email "$EXPECTED_EMAIL" --entity "$ENTITY" \
         --authorization-scope "$AUTH_SCOPE" --output "$READBACK" >/dev/null
 
     "$PYTHON" "$ROOT/scripts/round_dagger/h100_heldout100_validation.py" attest \
         --contract "$CONTRACT" --contract-sha256 "$CONTRACT_SHA" --source-root "$ROOT" \
+        --campaign-root "$CAMPAIGN" \
         --heldout-snapshot "$HELDOUT" --campaign-id "$CAMPAIGN_ID" \
+        --heldout-snapshot-file-sha256 "$HELDOUT_FILE_SHA" \
+        --heldout-snapshot-sha256 "$HELDOUT_SHA" \
+        --production-contract-sha256 "$PRODUCTION_CONTRACT_SHA" \
+        --validation-binding-sha256 "$BINDING_SHA" \
         --readback "$READBACK" --restart-report "$RESTART_REPORT" \
         --output "$OUTPUT/success_attestation.json" >/dev/null
     echo "OCI_NRT_H100_HELDOUT100_LEARNER_SEQUENCE_PASS"

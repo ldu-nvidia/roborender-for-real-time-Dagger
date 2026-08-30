@@ -652,7 +652,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 project=arguments.project,
                 entity=arguments.entity,
                 id=run_id,
-                name=f"{campaign['campaign_id']}-student-quality",
+                name=(
+                    f"{campaign['campaign_id']}-{campaign_sha[:8]}-student-quality"
+                ),
                 resume="must" if remote_initialized else "allow",
                 dir=str(wandb_dir),
                 config={
@@ -741,7 +743,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 driver_state = status_summary["campaign/driver_state"]
                 if driver_state == "FAILED":
-                    exit_code = 2
+                    # Campaign failure is observed data, not an observer or
+                    # W&B delivery failure.  Preserve it in metrics/summary but
+                    # finish the telemetry process cleanly so operators do not
+                    # mistake the observer itself for the failed component.
+                    exit_code = 0
                     break
                 if driver_state == "COMPLETE":
                     exit_code = 0

@@ -25,6 +25,8 @@ HELDOUT = Path(
     "/mnt/data2/ldu/roborender_round_dagger_production/"
     "dagger_prod_run1_resilient_20260829/heldout_snapshot.json"
 )
+HELDOUT_FILE_SHA = "a" * 64
+HELDOUT_SHA = "b" * 64
 
 from scripts.round_dagger import h100_heldout100_validation as validation  # noqa: E402
 from scripts.round_dagger import train_learner  # noqa: E402
@@ -58,8 +60,8 @@ def quality_row(step: int) -> dict[str, object]:
         "campaign_id": "dagger_prod_run1",
         "macro_round": 0,
         "optimizer_step": step,
-        "heldout_snapshot_sha256": validation.HELDOUT_SNAPSHOT_SHA256,
-        "heldout_snapshot_file_sha256": validation.HELDOUT_SNAPSHOT_FILE_SHA256,
+        "heldout_snapshot_sha256": HELDOUT_SHA,
+        "heldout_snapshot_file_sha256": HELDOUT_FILE_SHA,
         "heldout_transitions_rank": 32,
         "heldout_transitions_per_rank": [32] * 8,
         "heldout_transitions_global": 256,
@@ -100,16 +102,20 @@ class FakeRemote:
 
     def scan_history(self, *, keys, page_size):
         del page_size
-        if "_step" not in keys:
+        if "optimizer_step" not in keys:
             return []
         return self.quality
 
 
 class FakeWandbRun:
+    def define_metric(self, *args, **kwargs):
+        del args, kwargs
+
     def log(self, *args, **kwargs):
         del args, kwargs
 
-    def finish(self):
+    def finish(self, *args, **kwargs):
+        del args, kwargs
         return None
 
 
@@ -138,7 +144,11 @@ class FullFakeRun:
 
     def scan_history(self, *, keys, page_size):
         del page_size
-        return list(self.quality if "_step" in keys else self.training)
+        return list(
+            self.quality
+            if "quality/heldout_action_mse" in keys
+            else self.training
+        )
 
 
 class FullFakeApi:
@@ -176,7 +186,7 @@ class Heldout100ValidationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_checked_in_contract_is_exact_and_binds_production(self) -> None:
+    def test_checked_in_contract_is_reusable_and_pins_gate(self) -> None:
         document = validation.load_contract(CONTRACT, source_root=ROOT)
         self.assertEqual(document["optimization"]["optimizer_steps"], 100)
         self.assertEqual(document["optimization"]["intentional_stop_step"], 50)
@@ -192,12 +202,103 @@ class Heldout100ValidationTests(unittest.TestCase):
         self.assertEqual(
             document["restart_validation"]["first_invocation_resume"], "never"
         )
+        self.assertEqual(document["cluster"]["time_limit_minutes"], 225)
+        serialized = CONTRACT.read_text(encoding="utf-8")
+        self.assertNotIn("dagger_prod_run1_resilient_20260829", serialized)
+        self.assertNotIn("snapshot_file_sha256", document["heldout_evaluation"])
+        self.assertNotIn("learner_contract_sha256", document["production_target"])
 
     def test_historical_two_step_contract_is_untouched(self) -> None:
         document = json.loads(OLD_CONTRACT.read_text(encoding="utf-8"))
         self.assertEqual(document["optimization"]["optimizer_steps"], 2)
         self.assertEqual(document["optimization"]["intentional_stop_step"], 1)
         self.assertNotIn("heldout_evaluation", document)
+
+    def test_runtime_binding_is_fresh_campaign_specific(self) -> None:
+        contract_sha = sha256_file(CONTRACT)
+        production_sha = "c" * 64
+        reports = []
+        for name in ("campaign-a", "campaign-b"):
+            campaign = self.root / name
+            campaign.mkdir()
+            (campaign / "campaign.json").write_text(
+                json.dumps(
+                    {
+                        "campaign_id": "fresh-campaign",
+                        "policy_config_sha256": production_sha,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            heldout = campaign / "heldout_snapshot.json"
+            heldout.write_text("{}\n", encoding="utf-8")
+            with mock.patch.object(
+                validation,
+                "verify_heldout_snapshot",
+                return_value={
+                    "file_sha256": HELDOUT_FILE_SHA,
+                    "snapshot_sha256": HELDOUT_SHA,
+                },
+            ):
+                reports.append(
+                    validation.runtime_binding(
+                        contract=CONTRACT,
+                        contract_sha256=contract_sha,
+                        source_root=ROOT,
+                        campaign_root=campaign,
+                        campaign_id="fresh-campaign",
+                        heldout_snapshot=heldout,
+                        heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+                        heldout_snapshot_sha256=HELDOUT_SHA,
+                        production_contract_sha256=production_sha,
+                    )
+                )
+        self.assertNotEqual(
+            reports[0]["binding_sha256"], reports[1]["binding_sha256"]
+        )
+        self.assertEqual(
+            reports[0]["production_contract_sha256"], production_sha
+        )
+
+    def test_runtime_binding_rejects_non_campaign_production_contract(self) -> None:
+        campaign = self.root / "campaign"
+        campaign.mkdir()
+        (campaign / "campaign.json").write_text(
+            json.dumps(
+                {
+                    "campaign_id": "fresh-campaign",
+                    "policy_config_sha256": "c" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        heldout = campaign / "heldout_snapshot.json"
+        heldout.write_text("{}\n", encoding="utf-8")
+        with (
+            mock.patch.object(
+                validation,
+                "verify_heldout_snapshot",
+                return_value={
+                    "file_sha256": HELDOUT_FILE_SHA,
+                    "snapshot_sha256": HELDOUT_SHA,
+                },
+            ),
+            self.assertRaisesRegex(
+                validation.Heldout100ValidationError,
+                "does not own",
+            ),
+        ):
+            validation.runtime_binding(
+                contract=CONTRACT,
+                contract_sha256=sha256_file(CONTRACT),
+                source_root=ROOT,
+                campaign_root=campaign,
+                campaign_id="fresh-campaign",
+                heldout_snapshot=heldout,
+                heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+                heldout_snapshot_sha256=HELDOUT_SHA,
+                production_contract_sha256="d" * 64,
+            )
 
     def test_contract_rejects_weakened_optimizer_horizon(self) -> None:
         document = json.loads(CONTRACT.read_text(encoding="utf-8"))
@@ -209,7 +310,7 @@ class Heldout100ValidationTests(unittest.TestCase):
         ):
             validation.load_contract(path)
 
-    def test_contract_rejects_different_snapshot_identity(self) -> None:
+    def test_contract_rejects_static_snapshot_identity(self) -> None:
         document = json.loads(CONTRACT.read_text(encoding="utf-8"))
         document["heldout_evaluation"]["snapshot_sha256"] = "0" * 64
         path = self.root / "contract.json"
@@ -221,7 +322,13 @@ class Heldout100ValidationTests(unittest.TestCase):
         if not HELDOUT.exists():
             self.skipTest("live fixed-256 snapshot is not materialized")
         snapshot = validation.verify_heldout_snapshot(
-            HELDOUT, campaign_id="dagger_prod_run1"
+            HELDOUT,
+            campaign_root=HELDOUT.parent,
+            campaign_id="dagger_prod_run1",
+            expected_file_sha256=sha256_file(HELDOUT),
+            expected_snapshot_sha256=json.loads(
+                HELDOUT.read_text(encoding="utf-8")
+            )["snapshot_sha256"],
         )
         self.assertEqual(snapshot["transition_count"], 256)
         self.assertEqual(len(snapshot["resolved_shards"]), 8)
@@ -248,7 +355,11 @@ class Heldout100ValidationTests(unittest.TestCase):
         path = self.root / "quality.jsonl"
         write_jsonl(path, [quality_row(0), quality_row(100)])
         _, rows = validation.heldout_rows(
-            path, campaign_id="dagger_prod_run1", macro_round=0
+            path,
+            campaign_id="dagger_prod_run1",
+            macro_round=0,
+            heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+            heldout_snapshot_sha256=HELDOUT_SHA,
         )
         self.assertEqual([row["optimizer_step"] for row in rows], [0, 100])
         self.assertEqual(len(validation.quality_payload(rows[0])), 49)
@@ -282,7 +393,11 @@ class Heldout100ValidationTests(unittest.TestCase):
             validation.Heldout100ValidationError, "only steps 0 and 100"
         ):
             validation.heldout_rows(
-                path, campaign_id="dagger_prod_run1", macro_round=0
+                path,
+                campaign_id="dagger_prod_run1",
+                macro_round=0,
+                heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+                heldout_snapshot_sha256=HELDOUT_SHA,
             )
 
     def test_quality_history_rejects_wrong_case_count(self) -> None:
@@ -294,7 +409,11 @@ class Heldout100ValidationTests(unittest.TestCase):
             validation.Heldout100ValidationError, "identity mismatch"
         ):
             validation.heldout_rows(
-                path, campaign_id="dagger_prod_run1", macro_round=0
+                path,
+                campaign_id="dagger_prod_run1",
+                macro_round=0,
+                heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+                heldout_snapshot_sha256=HELDOUT_SHA,
             )
 
     def test_quality_history_rejects_torn_record(self) -> None:
@@ -304,14 +423,20 @@ class Heldout100ValidationTests(unittest.TestCase):
             validation.Heldout100ValidationError, "torn final record"
         ):
             validation.heldout_rows(
-                path, campaign_id="dagger_prod_run1", macro_round=0
+                path,
+                campaign_id="dagger_prod_run1",
+                macro_round=0,
+                heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+                heldout_snapshot_sha256=HELDOUT_SHA,
             )
 
     def test_remote_quality_projection_has_all_49_keys_at_both_steps(self) -> None:
         rows = []
         for step in (0, 100):
             local = quality_row(step)
-            rows.append({"_step": step, **validation.quality_payload(local)})
+            rows.append(
+                {"optimizer_step": step, **validation.quality_payload(local)}
+            )
         observed = validation._remote_quality(FakeRemote(rows))
         self.assertEqual([row["optimizer_step"] for row in observed], [0, 100])
         self.assertEqual(len(observed[0]), 50)
@@ -390,6 +515,20 @@ class Heldout100ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(LearnerError, "cannot be combined"):
             train_learner._wandb_resume_modes(first)
 
+    def test_train_cli_accepts_only_exact_binding_qualified_run_id(self) -> None:
+        canonical = "rrd-m000000-id" + "a" * 64
+        binding = "b" * 64
+        self.assertEqual(
+            train_learner._expected_wandb_run_id(canonical, None), canonical
+        )
+        self.assertEqual(
+            train_learner._expected_wandb_run_id(canonical, binding),
+            canonical + "-b" + binding[:32],
+        )
+        for malformed in ("b" * 63, "B" * 64, "b" * 65, "arbitrary"):
+            with self.assertRaisesRegex(LearnerError, "lowercase SHA-256"):
+                train_learner._expected_wandb_run_id(canonical, malformed)
+
     def test_shell_profiles_are_syntax_valid_and_pin_topology(self) -> None:
         names = (
             "submit_oci_nrt_h100_heldout100.sh",
@@ -404,13 +543,15 @@ class Heldout100ValidationTests(unittest.TestCase):
             combined += path.read_text(encoding="utf-8")
         for token in (
             "--gpus-per-node=8",
-            "expected exactly 27 heldout100 arguments",
+            "expected exactly 31 heldout100 arguments",
             "ROUND_DAGGER_LEARNER_MAX_STEPS=100",
             "--validation-stop-at-step 50",
             "--heldout-eval-interval 100",
             "--expected-completed-steps 100",
             "--wandb-resume-never",
+            "--wandb-run-binding-sha256",
             "heldout_snapshot.json",
+            "--time=03:45:00",
         ):
             self.assertIn(token, combined)
         self.assertNotIn("REMOTE_HELDOUT", combined)
@@ -419,6 +560,7 @@ class Heldout100ValidationTests(unittest.TestCase):
         self.assertIn("#SBATCH --partition=batch_singlenode", combined)
         self.assertIn("tree_disjoint", combined)
         self.assertIn("realpath -e", combined)
+        self.assertNotIn("--time=04:00:00", combined)
 
     def test_remote_layout_accepts_only_canonical_disjoint_roots(self) -> None:
         campaign = self.root / "campaign"
@@ -507,6 +649,8 @@ class Heldout100FullReadbackTests(unittest.TestCase):
         self.runtime_sha = "6" * 64
         self.container_sha = "7" * 64
         self.contract_sha = "8" * 64
+        self.binding_sha = "9" * 64
+        self.production_contract_sha = "c" * 64
         self.identity_sha = learner_identity_sha256(
             campaign_id=self.campaign_id,
             macro_round=self.macro_round,
@@ -523,7 +667,7 @@ class Heldout100FullReadbackTests(unittest.TestCase):
             campaign_id=self.campaign_id,
             macro_round=self.macro_round,
             learner_identity_sha256=self.identity_sha,
-        )
+        ) + f"-b{self.binding_sha[:32]}"
         self.training = [training_row(step) for step in range(1, 101)]
         self.quality = [quality_row(0), quality_row(100)]
         self.full_training = self.root / "full_training.jsonl"
@@ -550,7 +694,10 @@ class Heldout100FullReadbackTests(unittest.TestCase):
         self._resume_evidence()
 
         quality_history = [
-            {"_step": row["optimizer_step"], **validation.quality_payload(row)}
+            {
+                "optimizer_step": row["optimizer_step"],
+                **validation.quality_payload(row),
+            }
             for row in self.quality
         ]
         self.remote_config = {
@@ -565,8 +712,8 @@ class Heldout100FullReadbackTests(unittest.TestCase):
             "learner_identity_sha256": self.identity_sha,
             "runtime_container_sha256": self.container_sha,
             "learner_contract_sha256": self.contract_sha,
-            "heldout_snapshot_file_sha256": validation.HELDOUT_SNAPSHOT_FILE_SHA256,
-            "heldout_snapshot_sha256": validation.HELDOUT_SNAPSHOT_SHA256,
+            "heldout_snapshot_file_sha256": HELDOUT_FILE_SHA,
+            "heldout_snapshot_sha256": HELDOUT_SHA,
             "heldout_eval_interval": 100,
             "heldout_transitions": 256,
         }
@@ -642,8 +789,10 @@ class Heldout100FullReadbackTests(unittest.TestCase):
                     "learner_code_sha256": self.code_sha,
                     "replay_snapshot_file_sha256": self.replay_file_sha,
                     "replay_snapshot_sha256": self.replay_sha,
-                    "heldout_snapshot_file_sha256": validation.HELDOUT_SNAPSHOT_FILE_SHA256,
-                    "heldout_snapshot_sha256": validation.HELDOUT_SNAPSHOT_SHA256,
+                    "heldout_snapshot_file_sha256": HELDOUT_FILE_SHA,
+                    "heldout_snapshot_sha256": HELDOUT_SHA,
+                    "validation_binding_sha256": self.binding_sha,
+                    "production_contract_sha256": self.production_contract_sha,
                     "runtime_container_sha256": self.container_sha,
                     "learner_contract_sha256": self.contract_sha,
                     "stopped_checkpoint_sha256": sha256_file(
@@ -684,6 +833,10 @@ class Heldout100FullReadbackTests(unittest.TestCase):
             learner_identity_sha256=self.identity_sha,
             runtime_container_sha256=self.container_sha,
             validation_contract_sha256=self.contract_sha,
+            validation_binding_sha256=self.binding_sha,
+            production_contract_sha256=self.production_contract_sha,
+            heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+            heldout_snapshot_sha256=HELDOUT_SHA,
             project="roborender-round-dagger-validation",
             expected_email="ldu@nvidia.com",
             entity="nvidia",
@@ -754,13 +907,27 @@ class Heldout100FullReadbackTests(unittest.TestCase):
             mock.patch.object(
                 validation, "load_contract", return_value=contract_document
             ),
-            mock.patch.object(validation, "verify_heldout_snapshot"),
+            mock.patch.object(
+                validation,
+                "runtime_binding",
+                return_value={
+                    "binding_sha256": self.binding_sha,
+                    "production_contract_sha256": self.production_contract_sha,
+                    "heldout_snapshot_file_sha256": HELDOUT_FILE_SHA,
+                    "heldout_snapshot_sha256": HELDOUT_SHA,
+                },
+            ),
         ):
             report = validation.build_attestation(
                 contract=self.root / "contract.json",
                 contract_sha256=self.contract_sha,
                 source_root=self.root,
+                campaign_root=self.root,
                 heldout_snapshot=self.root / "heldout.json",
+                heldout_snapshot_file_sha256=HELDOUT_FILE_SHA,
+                heldout_snapshot_sha256=HELDOUT_SHA,
+                production_contract_sha256=self.production_contract_sha,
+                validation_binding_sha256=self.binding_sha,
                 campaign_id=self.campaign_id,
                 readback_path=readback_path,
                 restart_report=restart_path,

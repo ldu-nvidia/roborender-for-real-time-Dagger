@@ -563,6 +563,12 @@ def load_or_create_run_id(path: Path) -> str:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(payload)
             handle.flush()
+            # The watcher runs as container root in production, while the
+            # actor-pair delivery verifier runs as the unprivileged host
+            # operator.  This identifier is public provenance, not a secret;
+            # publish it read-only for both identities before linking it into
+            # the canonical namespace.
+            os.fchmod(handle.fileno(), 0o444)
             os.fsync(handle.fileno())
         try:
             os.link(
@@ -645,6 +651,10 @@ def save_state(
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
+            # This durable cursor is consumed by the host-side delivery gate
+            # after the root-owned W&B sidecar exits.  It contains only public
+            # artifact fingerprints and must cross that UID boundary.
+            os.fchmod(handle.fileno(), 0o444)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -735,6 +745,7 @@ def write_initialized_marker(
             )
             handle.write("\n")
             handle.flush()
+            os.fchmod(handle.fileno(), 0o444)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
@@ -889,6 +900,9 @@ class WandbArtifactWatcher:
                 )
                 output.write("\n")
                 output.flush()
+                # The receipt is the host launcher's proof that the remote
+                # sender drained the exact cursor above.
+                os.fchmod(output.fileno(), 0o444)
                 os.fsync(output.fileno())
             os.replace(temporary, path)
             directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -940,6 +954,7 @@ def write_ready_marker(
             json.dump(payload, handle, sort_keys=True)
             handle.write("\n")
             handle.flush()
+            os.fchmod(handle.fileno(), 0o444)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:

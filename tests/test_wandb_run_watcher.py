@@ -381,6 +381,7 @@ class WandbRunWatcherTest(unittest.TestCase):
             self.assertEqual(payload["telemetry_scope"], "production")
             self.assertEqual(payload["wandb_run_id"], "stable_run_1")
             self.assertNotIn("key", json.dumps(payload).lower())
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o444)
 
     def test_run_id_and_upload_state_are_durably_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -391,7 +392,7 @@ class WandbRunWatcherTest(unittest.TestCase):
             first = watcher.load_or_create_run_id(run_id_file)
             second = watcher.load_or_create_run_id(run_id_file)
             self.assertEqual(first, second)
-            self.assertEqual(run_id_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(run_id_file.stat().st_mode & 0o777, 0o444)
 
             # Legacy fingerprints must not suppress uploads into a new run.
             watcher.save_state(state_file, {"telemetry/images/old.png": "1:2"})
@@ -402,6 +403,7 @@ class WandbRunWatcherTest(unittest.TestCase):
             payload = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertEqual(payload["wandb_run_id"], first)
             self.assertEqual(payload["artifacts"], {})
+            self.assertEqual(state_file.stat().st_mode & 0o777, 0o444)
 
             watcher.save_state(state_file, {"x": "y"}, run_id="other_run")
             with self.assertRaisesRegex(watcher.ArtifactError, "different sidecar run"):
@@ -619,6 +621,18 @@ watcher.load_or_create_run_id(Path(sys.argv[1]))
                 (root / "telemetry" / "WANDB_DELIVERY_RECEIPT.json").read_text()
             )
             self.assertEqual(receipt["outcome"], "SUCCEEDED")
+            for public_evidence in (
+                root / "telemetry" / "WANDB_SIDECAR_RUN_ID",
+                root / "telemetry" / ".wandb_upload_state.json",
+                root / "telemetry" / "WANDB_SIDECAR_INITIALIZED.json",
+                root / "telemetry" / "WANDB_WATCHER_READY.json",
+                root / "telemetry" / "WANDB_DELIVERY_RECEIPT.json",
+            ):
+                self.assertEqual(
+                    public_evidence.stat().st_mode & 0o777,
+                    0o444,
+                    public_evidence,
+                )
 
     def test_precreated_id_without_initialized_marker_recovers_with_allow(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -665,6 +679,7 @@ watcher.load_or_create_run_id(Path(sys.argv[1]))
                     marker, expected_run_id="interrupted_local_id"
                 )
             )
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o444)
 
     def test_remote_initialization_failure_is_sanitized_and_not_acknowledged(self):
         with tempfile.TemporaryDirectory() as temporary:

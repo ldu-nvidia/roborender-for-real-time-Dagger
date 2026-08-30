@@ -45,7 +45,13 @@ def _safe_run_id(path: Path) -> str | None:
         raise WandbDeliveryError("W&B sidecar run ID is unsafe")
     try:
         return watcher._validate_run_id(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, watcher.ArtifactError) as exc:
+    except PermissionError as exc:
+        raise WandbDeliveryError(
+            "W&B sidecar run ID is not readable across runtime identities"
+        ) from exc
+    except OSError as exc:
+        raise WandbDeliveryError("W&B sidecar run ID is unreadable") from exc
+    except (UnicodeError, watcher.ArtifactError) as exc:
         raise WandbDeliveryError("W&B sidecar run ID is invalid") from exc
 
 

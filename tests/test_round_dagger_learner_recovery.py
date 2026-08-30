@@ -46,6 +46,13 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
             policy_config_sha256=self.learner_contract_sha,
         )
         self.root = self.base / "campaign"
+        self.learner_contract = self.root / "learner_contract.json"
+        self.learner_contract.write_bytes(LEARNER_CONTRACT.read_bytes())
+        self.learner_contract.chmod(0o444)
+        self.assertEqual(
+            artifacts.sha256_file(self.learner_contract),
+            self.learner_contract_sha,
+        )
         state.initialize_campaign(
             self.root,
             campaign_id=campaign_contract["campaign_id"],
@@ -134,7 +141,7 @@ class IngestedLearnerRecoveryTest(unittest.TestCase):
             ],
             "campaign_contract_path": CAMPAIGN_CONTRACT,
             "expected_campaign_contract_sha256": self.campaign_contract_sha,
-            "learner_contract_path": LEARNER_CONTRACT,
+            "learner_contract_path": self.learner_contract,
             "expected_learner_contract_sha256": self.learner_contract_sha,
             "sealed_source_root": "/sealed/recovery/source",
             "sealed_source_inventory_sha256": SOURCE_SHA,

@@ -5,6 +5,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from round_dagger import wandb_delivery
 from scripts.scaling import wandb_run_watcher as watcher
@@ -78,6 +79,19 @@ class WandbDeliveryTest(unittest.TestCase):
             self._receipt(run, run_id)
             report = wandb_delivery.verify_delivery(run)
             self.assertEqual(report["recovered_delivery_failure_count"], 1)
+
+    def test_cross_identity_permission_error_is_reported_precisely(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_id = Path(temporary) / "WANDB_SIDECAR_RUN_ID"
+            run_id.write_text("stable_run\n", encoding="utf-8")
+            with mock.patch.object(
+                Path, "read_text", side_effect=PermissionError("denied")
+            ):
+                with self.assertRaisesRegex(
+                    wandb_delivery.WandbDeliveryError,
+                    "not readable across runtime identities",
+                ):
+                    wandb_delivery._safe_run_id(run_id)
 
 
 if __name__ == "__main__":

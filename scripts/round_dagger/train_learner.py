@@ -7,6 +7,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -37,6 +38,9 @@ from round_dagger.learner import (  # noqa: E402
     train_from_replay,
 )
 from round_dagger.replay import load_heldout_snapshot, load_snapshot  # noqa: E402
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _symbol(specification: str) -> Any:
@@ -131,6 +135,28 @@ def _wandb_resume_modes(arguments: argparse.Namespace) -> tuple[bool, bool]:
     return resume_must, resume_never
 
 
+def _expected_wandb_run_id(
+    canonical_run_id: str, binding_sha256: str | None
+) -> str:
+    """Derive the exact external run ID, optionally bound to a live gate.
+
+    Ordinary production learners retain the canonical semantic learner ID.
+    The heldout-100 validation gate additionally binds its fresh campaign,
+    held-out snapshot, and production contract into ``binding_sha256``.  Do
+    not accept an arbitrary caller suffix: it must be the deterministic first
+    32 hex characters of a full SHA-256 supplied on its dedicated argument.
+    """
+
+    if binding_sha256 is None:
+        return canonical_run_id
+    if _SHA256_RE.fullmatch(binding_sha256) is None:
+        raise LearnerError("W&B run binding must be a lowercase SHA-256")
+    run_id = f"{canonical_run_id}-b{binding_sha256[:32]}"
+    if len(run_id) > 128:
+        raise LearnerError("binding-qualified W&B run ID exceeds 128 characters")
+    return run_id
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a policy from a sealed cumulative DAgger replay snapshot"
@@ -178,6 +204,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-project")
     parser.add_argument("--wandb-entity")
     parser.add_argument("--wandb-run-id")
+    parser.add_argument(
+        "--wandb-run-binding-sha256",
+        help=(
+            "validation-only full SHA-256 used to derive the exact -b<32hex> "
+            "suffix on the canonical learner W&B run ID"
+        ),
+    )
     parser.add_argument(
         "--wandb-resume-never",
         action="store_true",
@@ -258,6 +291,13 @@ def main(argv: list[str] | None = None) -> int:
             "--validation-stop-at-step must be in [1, max_steps)"
         )
     wandb_resume_must, wandb_resume_never = _wandb_resume_modes(arguments)
+    if arguments.wandb_run_binding_sha256 is not None and (
+        arguments.wandb_project is None or arguments.wandb_run_id is None
+    ):
+        raise LearnerError(
+            "--wandb-run-binding-sha256 requires --wandb-project and "
+            "--wandb-run-id"
+        )
     bundle_mapping = config.to_mapping()
     if (
         config.initial_checkpoint_sha256 is not None
@@ -373,10 +413,13 @@ def main(argv: list[str] | None = None) -> int:
                 "learner identity SHA-256 does not bind the exact semantic run"
             )
         if arguments.wandb_project:
-            expected_run_id = learner_wandb_run_id(
-                campaign_id=config.campaign_id,
-                macro_round=config.macro_round,
-                learner_identity_sha256=identity_sha256,
+            expected_run_id = _expected_wandb_run_id(
+                learner_wandb_run_id(
+                    campaign_id=config.campaign_id,
+                    macro_round=config.macro_round,
+                    learner_identity_sha256=identity_sha256,
+                ),
+                arguments.wandb_run_binding_sha256,
             )
             if arguments.wandb_run_id != expected_run_id:
                 raise LearnerError("W&B run ID is not bound to learner identity")
@@ -385,6 +428,10 @@ def main(argv: list[str] | None = None) -> int:
             runtime_container_sha256=arguments.runtime_container_sha256,
             learner_contract_sha256=arguments.learner_contract_sha256,
         )
+        if arguments.wandb_run_binding_sha256 is not None:
+            wandb_config["wandb_run_binding_sha256"] = (
+                arguments.wandb_run_binding_sha256
+            )
     telemetry = JsonlTelemetry(
         arguments.telemetry_jsonl,
         enabled=rank == 0,
@@ -397,6 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         wandb_config=wandb_config,
     )
     result = None
+    telemetry_exit_code = 2
     try:
         result = train_from_replay(
             model,
@@ -416,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime_container_sha256=arguments.runtime_container_sha256,
             learner_contract_sha256=arguments.learner_contract_sha256,
         )
+        telemetry_exit_code = 0
     finally:
         # A canonical learner result is the recovery commit point.  Close and
         # flush the authenticated W&B run before publishing it so a process
@@ -424,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         # enter the distributed barrier even if rank-zero W&B finalization
         # raises, otherwise the other ranks can hang indefinitely.
         try:
-            telemetry.close()
+            telemetry.close(exit_code=telemetry_exit_code)
         finally:
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()

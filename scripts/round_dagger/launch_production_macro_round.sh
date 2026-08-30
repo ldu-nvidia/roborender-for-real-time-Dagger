@@ -10,7 +10,6 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 VALIDATOR="$ROOT/scripts/round_dagger/production_launch.py"
 ORCHESTRATOR="$ROOT/scripts/round_dagger/orchestrate_macro_round.py"
 INVARIANT_PROFILE="$ROOT/configs/round_dagger/production_campaign_256x512.json"
-EXPECTED_LEARNER_CONTRACT="$ROOT/configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json"
 PYTHON=${ROUND_DAGGER_CONTROL_PYTHON:-/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python}
 DRY_RUN=${DRY_RUN:-0}
 ORCHESTRATION_CONFIG=
@@ -104,16 +103,15 @@ done
     fatal "external campaign contract is missing or unsafe"
 [[ $(sha256sum -- "$CAMPAIGN_CONTRACT" | awk '{print $1}') == \
    "$CAMPAIGN_CONTRACT_SHA256" ]] || fatal "external campaign contract SHA-256 mismatch"
-[[ $LEARNER_CONTRACT == "$EXPECTED_LEARNER_CONTRACT" ]] || \
-    fatal "--learner-contract must be the canonical dagger_prod_run1 contract"
+[[ $LEARNER_CONTRACT == /* ]] || fatal "--learner-contract must be absolute"
 [[ $LEARNER_CONTRACT_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
     fatal "--learner-contract-sha256 must be lowercase SHA-256"
 [[ -f $LEARNER_CONTRACT && ! -L $LEARNER_CONTRACT ]] || \
     fatal "learner contract is missing or unsafe"
 LEARNER_CONTRACT_MODE=$(stat -c %a -- "$LEARNER_CONTRACT") || \
     fatal "cannot inspect learner contract permissions"
-(( (8#$LEARNER_CONTRACT_MODE & 8#222) == 0 )) || \
-    fatal "learner contract must be immutable"
+[[ $LEARNER_CONTRACT_MODE == 444 ]] || \
+    fatal "learner contract mode must be exactly 0444"
 [[ $(sha256sum -- "$LEARNER_CONTRACT" | awk '{print $1}') == \
    "$LEARNER_CONTRACT_SHA256" ]] || fatal "learner contract SHA-256 mismatch"
 [[ $SEALED_SOURCE_ROOT == /* ]] || fatal "--sealed-source-root must be absolute"
@@ -136,6 +134,21 @@ PYTHON_REAL=$(realpath -e -- "$PYTHON") || fatal "cannot resolve validated contr
 # Preserve the venv entry point for execution.  Calling its resolved base
 # interpreter path would discard the venv's sys.prefix and site-packages.
 
+EXPECTED_LEARNER_CONTRACT=$(
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" - "$ORCHESTRATION_CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+from round_dagger.orchestration import MacroRoundConfig
+
+configuration = MacroRoundConfig.load(Path(sys.argv[1]))
+print(configuration.campaign_root / "learner_contract.json")
+PY
+) || fatal "cannot derive canonical campaign-owned learner contract path"
+[[ $LEARNER_CONTRACT == "$EXPECTED_LEARNER_CONTRACT" ]] || \
+    fatal "--learner-contract must be the canonical campaign-owned learner_contract.json"
+
 # Local actor telemetry and the OCI learner both authenticate from protected
 # netrc state.  Do not allow a caller's ambient key/token to enter child
 # process environments or a process listing.
@@ -154,6 +167,7 @@ PLAN=$(
         --campaign-contract "$CAMPAIGN_CONTRACT" \
         --campaign-contract-sha256 "$CAMPAIGN_CONTRACT_SHA256" \
         --learner-contract "$LEARNER_CONTRACT" \
+        --learner-contract-sha256 "$LEARNER_CONTRACT_SHA256" \
         --sealed-source-root "$SEALED_SOURCE_ROOT" \
         --evaluation-sealed-source-root "$EVALUATION_SEALED_SOURCE_ROOT" \
         --evaluation-sealed-source-inventory-sha256 \

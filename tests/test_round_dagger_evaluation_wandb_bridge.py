@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,9 +28,12 @@ class FakeRun:
         self.logs: list[dict[str, int | float]] = []
         self.steps: list[int] = []
 
-    def log(self, payload: dict[str, int | float], *, step: int) -> None:
+    def log(
+        self, payload: dict[str, int | float], *, step: int | None = None
+    ) -> None:
         self.logs.append(dict(payload))
-        self.steps.append(step)
+        if step is not None:
+            self.steps.append(step)
 
 
 def _inventory(root: Path) -> dict[str, str]:
@@ -49,6 +54,18 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
         (self.evaluation / "contract.json").write_text("{}\n", encoding="utf-8")
         (self.evaluation / "result.json").write_text("{}\n", encoding="utf-8")
         self.state_dir = self.tmp / "observer-state"
+        self.driver_status = self.tmp / "driver_status.json"
+        self.driver_status.write_text(
+            json.dumps(
+                {
+                    "schema": bridge.DRIVER_STATUS_SCHEMA,
+                    "campaign_root": str(self.root),
+                    "state": "LAUNCHING",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -123,10 +140,12 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
         with patches[0] as verify, patches[1], patches[2]:
             self.assertEqual(observer.poll_once(fake_run), 1)
             self.assertEqual(observer.poll_once(fake_run), 0)
+        self.assertFalse(observer.state_path.exists())
+        observer.commit_session()
 
         self.assertEqual(verify.call_count, 2, "every poll must re-verify evidence")
         self.assertEqual(len(fake_run.logs), 1)
-        self.assertEqual(fake_run.steps, [0])
+        self.assertEqual(fake_run.steps, [])
         payload = fake_run.logs[0]
         self.assertEqual(payload["eval/macro_round"], 0)
         self.assertEqual(payload["eval/case_count"], 256)
@@ -185,12 +204,47 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
         patches = self._patch_evidence(result_sha=_sha("result-v1"))
         with patches[0], patches[1], patches[2]:
             self.assertEqual(first.poll_once(fake_run), 1)
+        first.commit_session()
 
         patches = self._patch_evidence(result_sha=_sha("result-v2"))
         with patches[0], patches[1], patches[2]:
             with self.assertRaisesRegex(bridge.BridgeError, "changed after upload"):
                 second.poll_once(fake_run)
         self.assertEqual(len(fake_run.logs), 1)
+
+    def test_cursor_is_committed_only_after_wandb_drain(self) -> None:
+        first = bridge.EvaluationWandbBridge(
+            campaign_root=self.root,
+            state_dir=self.state_dir,
+            entity="nvidia",
+            project="roborender-round-dagger",
+        )
+        first_run = FakeRun()
+        patches = self._patch_evidence()
+        with patches[0], patches[1], patches[2]:
+            self.assertEqual(first.poll_once(first_run), 1)
+        self.assertFalse(first.state_path.exists())
+
+        # Simulate SIGKILL before W&B's finish/drain boundary: a new process
+        # must replay the record rather than trusting an unacknowledged cursor.
+        restarted = bridge.EvaluationWandbBridge(
+            campaign_root=self.root,
+            state_dir=self.state_dir,
+            entity="nvidia",
+            project="roborender-round-dagger",
+        )
+        restarted_run = FakeRun()
+        patches = self._patch_evidence()
+        with patches[0], patches[1], patches[2]:
+            self.assertEqual(restarted.poll_once(restarted_run), 1)
+        restarted.commit_session()
+        persisted = bridge.load_bridge_state(
+            restarted.state_path, restarted.expected_state
+        )
+        self.assertEqual(
+            persisted["uploaded_result_sha256_by_macro_round"],
+            {"0": _sha("result-v1")},
+        )
 
     def test_external_state_lock_is_exclusive(self) -> None:
         observer = bridge.EvaluationWandbBridge(
@@ -203,6 +257,76 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
             with self.assertRaisesRegex(bridge.BridgeError, "another evaluation"):
                 with bridge.exclusive_bridge_lock(observer.state_dir):
                     self.fail("a second observer unexpectedly acquired the lock")
+
+    def test_driver_lifecycle_is_bound_to_the_exact_campaign(self) -> None:
+        self.assertEqual(
+            bridge.load_driver_state(
+                self.driver_status, campaign_root=self.root
+            ),
+            "LAUNCHING",
+        )
+        document = json.loads(self.driver_status.read_text(encoding="utf-8"))
+        document["campaign_root"] = str(self.tmp / "another-campaign")
+        self.driver_status.write_text(json.dumps(document) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(bridge.BridgeError, "mismatched"):
+            bridge.load_driver_state(self.driver_status, campaign_root=self.root)
+
+    def test_ready_marker_is_written_only_after_first_successful_poll(self) -> None:
+        ready = self.state_dir / "EVALUATION_WANDB_READY.json"
+
+        class Run:
+            def __init__(self) -> None:
+                self.summary: dict[str, object] = {}
+                self.finished: list[int] = []
+
+            def define_metric(self, *_args, **_kwargs) -> None:
+                return None
+
+            def log(self, *_args, **_kwargs) -> None:
+                return None
+
+            def finish(self, *, exit_code: int) -> None:
+                self.finished.append(exit_code)
+
+        run = Run()
+        wandb = mock.Mock()
+        wandb.init.return_value = run
+        arguments = [
+            "--campaign-root", str(self.root),
+            "--state-dir", str(self.state_dir),
+            "--project", "roborender-round-dagger",
+            "--entity", "nvidia",
+            "--expected-email", "ldu@nvidia.com",
+            "--authorization-scope", "team",
+            "--driver-status", str(self.driver_status),
+            "--ready-marker", str(ready),
+        ]
+        with (
+            mock.patch.object(bridge, "_load_wandb", return_value=wandb),
+            mock.patch.object(bridge, "query_identity"),
+            mock.patch.object(
+                bridge.EvaluationWandbBridge, "poll_once", return_value=0
+            ) as poll,
+        ):
+            self.assertEqual(bridge.main(arguments), 0)
+        poll.assert_called_once_with(run)
+        document = json.loads(ready.read_text(encoding="utf-8"))
+        self.assertEqual(document["schema"], bridge.READY_SCHEMA)
+        self.assertEqual(document["process_id"], os.getpid())
+        self.assertEqual(document["wandb_run_id"], wandb.init.call_args.kwargs["id"])
+        self.assertEqual(run.finished, [0])
+
+    def test_ready_marker_must_be_direct_child_of_external_state(self) -> None:
+        observer = bridge.EvaluationWandbBridge(
+            campaign_root=self.root,
+            state_dir=self.state_dir,
+            entity="nvidia",
+            project="roborender-round-dagger",
+        )
+        with self.assertRaisesRegex(bridge.BridgeError, "direct child"):
+            bridge.ready_marker_path(
+                observer.state_dir, self.tmp / "somewhere" / "ready.json"
+            )
 
     def test_main_acquires_state_lock_before_loading_wandb(self) -> None:
         observer = bridge.EvaluationWandbBridge(
@@ -224,6 +348,8 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
             "ldu@nvidia.com",
             "--authorization-scope",
             "team",
+            "--driver-status",
+            str(self.driver_status),
         ]
         with bridge.exclusive_bridge_lock(observer.state_dir):
             with mock.patch.object(

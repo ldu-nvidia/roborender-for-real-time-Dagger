@@ -147,6 +147,7 @@ def _coordinator(campaign_root: Path) -> dict[str, Any]:
         raise ProductionMonitorError("campaign is not the bounded five-round production run")
     return {
         "campaign_id": campaign["campaign_id"],
+        "campaign_sha256": artifacts.canonical_json_sha256(campaign),
         "phase": coordinator["phase"],
         "next_macro_round": coordinator["next_macro_round"],
         "open_macro_round": coordinator["open_macro_round"],
@@ -246,7 +247,10 @@ def _bound_process_matches(
         "state_dir",
         "driver_status",
     }
-    expected_schema = "fast_roborender.round_dagger.student_quality_bridge_process.v1"
+    expected_schemas = {
+        "fast_roborender.round_dagger.student_quality_bridge_process.v1",
+        "fast_roborender.round_dagger.evaluation_bridge_process.v1",
+    }
     for pidfile in pidfiles:
         key = str(pidfile)
         report: dict[str, Any] = {"healthy": False, "pid": None}
@@ -258,7 +262,7 @@ def _bound_process_matches(
             document = artifacts.load_strict_json(pidfile)
             if not isinstance(document, Mapping) or set(document) != expected_keys:
                 raise ValueError("invalid_pidfile_contract")
-            if document.get("schema") != expected_schema:
+            if document.get("schema") not in expected_schemas:
                 raise ValueError("invalid_pidfile_schema")
             pid = document.get("pid")
             start_ticks = document.get("start_ticks")
@@ -719,8 +723,18 @@ def _wandb_remote_health(
     expected_email: str,
     netrc_path: Path,
     campaign_id: str,
+    campaign_sha256: str | None = None,
+    campaign_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Read recent campaign-bound W&B runs without downloading or mutating them."""
+    """Read recent immutable-campaign-bound W&B runs without mutating them.
+
+    ``campaign_id`` remains supported by itself for non-production callers.
+    Production callers provide both immutable digests.  A remote run must then
+    carry at least one matching digest, and every digest it carries must match.
+    This keeps legacy actor telemetry (contract-bound) and the newer quality
+    and evaluation runs (campaign-bound) in one view without mixing a stale
+    campaign incarnation that reused the same human-readable campaign ID.
+    """
 
     for value, label in (
         (entity, "W&B entity"),
@@ -729,6 +743,16 @@ def _wandb_remote_health(
     ):
         if _TOKEN_RE.fullmatch(value) is None:
             raise ProductionMonitorError(f"unsafe {label}")
+    expected_campaign_sha = (
+        _sha(campaign_sha256, "W&B campaign SHA-256")
+        if campaign_sha256 is not None
+        else None
+    )
+    expected_contract_sha = (
+        _sha(campaign_contract_sha256, "W&B campaign contract SHA-256")
+        if campaign_contract_sha256 is not None
+        else None
+    )
     try:
         info = os.lstat(netrc_path)
     except FileNotFoundError as exc:
@@ -742,7 +766,15 @@ def _wandb_remote_health(
         "project": project,
         "expected_email": expected_email,
         "viewer_email": None,
+        "campaign_sha256": expected_campaign_sha,
+        "campaign_contract_sha256": expected_contract_sha,
         "campaign_run_count": 0,
+        "immutable_binding_counts": {},
+        "ignored_run_counts": {
+            "other_campaign_id": 0,
+            "immutable_mismatch": 0,
+            "missing_immutable_binding": 0,
+        },
         "runs": [],
         "error": None,
         "read_only": True,
@@ -765,18 +797,82 @@ def _wandb_remote_health(
         viewer_email = _viewer_value(viewer, "email")
         report["viewer_email"] = viewer_email
         report["authorized"] = viewer_email == expected_email
+        remote_filters: dict[str, Any] = {
+            "config.round_dagger/campaign_id": campaign_id
+        }
+        immutable_filters = []
+        if expected_campaign_sha is not None:
+            immutable_filters.append(
+                {
+                    "config.round_dagger/campaign_sha256": expected_campaign_sha
+                }
+            )
+        if expected_contract_sha is not None:
+            immutable_filters.append(
+                {
+                    "config.round_dagger/campaign_contract_sha256": (
+                        expected_contract_sha
+                    )
+                }
+            )
+        if immutable_filters:
+            remote_filters = {
+                "$and": [
+                    remote_filters,
+                    {"$or": immutable_filters},
+                ]
+            }
         remote_runs = api.runs(
             f"{entity}/{project}",
             order="-updated_at",
             per_page=100,
+            filters=remote_filters,
         )
         runs: list[dict[str, Any]] = []
+        binding_counts: dict[str, int] = {}
         for remote in remote_runs:
             config = getattr(remote, "config", {})
-            if not isinstance(config, Mapping) or config.get(
-                "round_dagger/campaign_id"
-            ) != campaign_id:
+            if (
+                not isinstance(config, Mapping)
+                or config.get("round_dagger/campaign_id") != campaign_id
+            ):
+                report["ignored_run_counts"]["other_campaign_id"] += 1
                 continue
+            observed_bindings: list[str] = []
+            immutable_mismatch = False
+            for key, expected, label in (
+                (
+                    "round_dagger/campaign_sha256",
+                    expected_campaign_sha,
+                    "campaign_sha256",
+                ),
+                (
+                    "round_dagger/campaign_contract_sha256",
+                    expected_contract_sha,
+                    "campaign_contract_sha256",
+                ),
+            ):
+                observed = config.get(key)
+                if expected is None or observed is None:
+                    continue
+                if observed != expected:
+                    immutable_mismatch = True
+                else:
+                    observed_bindings.append(label)
+            if immutable_mismatch:
+                report["ignored_run_counts"]["immutable_mismatch"] += 1
+                continue
+            if immutable_filters and not observed_bindings:
+                report["ignored_run_counts"]["missing_immutable_binding"] += 1
+                continue
+            immutable_binding = (
+                "+".join(observed_bindings)
+                if observed_bindings
+                else "campaign_id_only"
+            )
+            binding_counts[immutable_binding] = (
+                binding_counts.get(immutable_binding, 0) + 1
+            )
             runs.append(
                 {
                     "id": str(getattr(remote, "id", "")),
@@ -786,12 +882,14 @@ def _wandb_remote_health(
                     "last_history_step": int(
                         getattr(remote, "lastHistoryStep", 0) or 0
                     ),
+                    "immutable_binding": immutable_binding,
                 }
             )
             if len(runs) >= 50:
                 break
         report["reachable"] = True
         report["campaign_run_count"] = len(runs)
+        report["immutable_binding_counts"] = binding_counts
         report["runs"] = runs
     except Exception as exc:
         # Never serialize exception text: third-party clients can include
@@ -982,6 +1080,8 @@ def collect_report(
             expected_email=wandb_expected_email,
             netrc_path=wandb_netrc,
             campaign_id=coordinator["campaign_id"],
+            campaign_sha256=coordinator.get("campaign_sha256"),
+            campaign_contract_sha256=campaign_contract_sha256,
         )
         remote_wandb_progressed = _wandb_remote_progress(wandb_remote, previous)
         remote_wandb_stale_polls = _stale_poll_count(

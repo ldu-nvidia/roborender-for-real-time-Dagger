@@ -34,6 +34,10 @@ HANDOFF_ROOT=${ROUND_DAGGER_REMOTE_HANDOFF_ROOT:-/mnt/data2/ldu/roborender_round
 DRY_RUN=${DRY_RUN:-0}
 POLL_SECONDS=${ROUND_DAGGER_REMOTE_POLL_SECONDS:-30}
 MAX_ATTEMPTS=${ROUND_DAGGER_REMOTE_MAX_ATTEMPTS:-3}
+# OCI allocations are administratively revoked at the four-hour boundary.
+# Leave a 15-minute checkpoint/finalization margin and keep this immutable so
+# an ambient scheduler option cannot silently recreate the failure mode.
+LEARNER_WALLTIME=03:45:00
 
 case "$DRY_RUN" in 0|1) ;; *) fatal "DRY_RUN must be exactly 0 or 1" ;; esac
 [[ $REMOTE =~ ^[A-Za-z0-9_.-]+$ ]] || fatal "remote host is malformed"
@@ -48,6 +52,7 @@ case "$DRY_RUN" in 0|1) ;; *) fatal "DRY_RUN must be exactly 0 or 1" ;; esac
 for value in "$POLL_SECONDS" "$MAX_ATTEMPTS"; do
     [[ $value =~ ^[1-9][0-9]*$ ]] || fatal "poll/attempt values must be positive integers"
 done
+[[ $LEARNER_WALLTIME == 03:45:00 ]] || fatal "learner walltime contract changed"
 for path in "$STAGE_ROOT" "$REMOTE_SOURCE" "$REMOTE_CONTAINER" "$REMOTE_NETRC" \
             "$REMOTE_SLURM_BIN" "$HANDOFF_ROOT"; do
     safe_absolute_path "$path" || \
@@ -120,6 +125,17 @@ done
 CAMPAIGN_ROOT=$ROUND_DAGGER_CAMPAIGN_ROOT
 [[ $CAMPAIGN_ROOT == /* && -d $CAMPAIGN_ROOT && ! -L $CAMPAIGN_ROOT ]] || \
     fatal "campaign root is missing or unsafe"
+ROUND_DAGGER_LEARNER_CONTRACT=${ROUND_DAGGER_LEARNER_CONTRACT:-$CAMPAIGN_ROOT/learner_contract.json}
+[[ $ROUND_DAGGER_LEARNER_CONTRACT == "$CAMPAIGN_ROOT/learner_contract.json" ]] || \
+    fatal "learner contract is not the canonical campaign-owned file"
+[[ -f $ROUND_DAGGER_LEARNER_CONTRACT && \
+   ! -L $ROUND_DAGGER_LEARNER_CONTRACT ]] || \
+    fatal "campaign-owned learner contract is missing or unsafe"
+[[ $(stat -c %a -- "$ROUND_DAGGER_LEARNER_CONTRACT") == 444 ]] || \
+    fatal "campaign-owned learner contract mode must be exactly 0444"
+[[ $(sha256sum -- "$ROUND_DAGGER_LEARNER_CONTRACT" | awk '{print $1}') == \
+   "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" ]] || \
+    fatal "campaign-owned learner contract SHA mismatch"
 for path in "$CAMPAIGN_ROOT" "$ROUND_DAGGER_POLICY_CHECKPOINT" \
             "$ROUND_DAGGER_POLICY_SPEC" "$ROUND_DAGGER_POLICY_MANIFEST" \
             "$ROUND_DAGGER_REPLAY_SNAPSHOT" "$ROUND_DAGGER_LEARNER_OUTPUT_DIR" \
@@ -268,23 +284,27 @@ HELDOUT100_CONTRACT_SHA256=
 HELDOUT100_CONFIG_SHA256=
 HELDOUT100_IDENTITY_SHA256=
 HELDOUT100_WANDB_RUN_ID=
-HELDOUT100_PRODUCTION_CONTRACT_SHA256=e4a1d23a3426d879aac93f934eb9e213a657b0451b54f4f4918e425a357d73e5
-if [[ $ROUND_DAGGER_CAMPAIGN_ID == dagger_prod_run1 && $ROUND_DECIMAL == 0 ]]; then
-    if [[ $ROUND_DAGGER_LEARNER_CONTRACT_SHA256 != \
-          "$HELDOUT100_PRODUCTION_CONTRACT_SHA256" ]]; then
-        # Historical unit fixtures use the campaign contract's production
-        # name with the legacy learner contract.  Permit only their explicitly
-        # untrusted, read-only bridge dry run; every executable dispatch for
-        # dagger_prod_run1 fails closed on contract substitution.
-        if [[ $DRY_RUN == 1 && ${ROUND_DAGGER_TRUSTED_TRAIN_DISPATCH:-0} != 1 ]]; then
-            :
-        else
-            fatal "dagger_prod_run1 round-0 learner contract is not the heldout100 production target"
-        fi
-    else
+HELDOUT100_BINDING_SHA256=
+HELDOUT100_PRODUCTION_CONTRACT_SHA256=
+if [[ ${ROUND_DAGGER_TRUSTED_TRAIN_DISPATCH:-0} == 1 ]]; then
+    if [[ ${ROUND_DAGGER_REQUIRE_HELDOUT100_GATE+set} == set ]]; then
+        [[ $ROUND_DAGGER_REQUIRE_HELDOUT100_GATE == 1 ]] || \
+            fatal "trusted production dispatch cannot disable the heldout100 gate"
+    fi
+    # This is a production safety/quality gate, not an operator-tunable knob.
+    # An inherited environment must never weaken a trusted coordinator dispatch.
+    HELDOUT100_REQUIRED=1
+else
+    HELDOUT100_REQUIRED=${ROUND_DAGGER_REQUIRE_HELDOUT100_GATE:-0}
+fi
+[[ $HELDOUT100_REQUIRED == 0 || $HELDOUT100_REQUIRED == 1 ]] || \
+    fatal "heldout100 gate requirement must be 0 or 1"
+if ((HELDOUT100_REQUIRED && ! HELDOUT_ENABLED)); then
+    fatal "trusted production dispatch requires fixed-256 held-out evaluation"
+fi
+if [[ $ROUND_DECIMAL == 0 ]] && ((HELDOUT100_REQUIRED)); then
     HELDOUT100_GATE_ENABLED=1
-    ((HELDOUT_ENABLED == 1)) || \
-        fatal "round-0 heldout100 gate requires the fixed held-out replay"
+    HELDOUT100_PRODUCTION_CONTRACT_SHA256=$ROUND_DAGGER_LEARNER_CONTRACT_SHA256
     HELDOUT100_CONTRACT="$ROOT/configs/round_dagger/validation_learner_1x8h100_heldout100.json"
     [[ -f $HELDOUT100_CONTRACT && ! -L $HELDOUT100_CONTRACT ]] || \
         fatal "round-0 heldout100 validation contract is missing or unsafe"
@@ -294,6 +314,22 @@ if [[ $ROUND_DAGGER_CAMPAIGN_ID == dagger_prod_run1 && $ROUND_DECIMAL == 0 ]]; t
         --path "$HELDOUT100_CONTRACT" \
         --sha256 "$HELDOUT100_CONTRACT_SHA256" \
         --source-root "$ROOT" >/dev/null
+    HELDOUT100_BINDING_REPORT=$(PYTHONPATH="$ROOT" "$PYTHON" \
+        "$ROOT/scripts/round_dagger/h100_heldout100_validation.py" binding \
+        --contract "$HELDOUT100_CONTRACT" \
+        --contract-sha256 "$HELDOUT100_CONTRACT_SHA256" \
+        --source-root "$ROOT" --campaign-root "$CAMPAIGN_ROOT" \
+        --campaign-id "$ROUND_DAGGER_CAMPAIGN_ID" \
+        --heldout-snapshot "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT" \
+        --heldout-snapshot-file-sha256 \
+            "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256" \
+        --heldout-snapshot-sha256 \
+            "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256" \
+        --production-contract-sha256 \
+            "$HELDOUT100_PRODUCTION_CONTRACT_SHA256")
+    HELDOUT100_BINDING_SHA256=$(printf '%s\n' "$HELDOUT100_BINDING_REPORT" | \
+        "$PYTHON" -c 'import json,re,sys; value=json.load(sys.stdin).get("binding_sha256"); assert isinstance(value,str) and re.fullmatch(r"[0-9a-f]{64}",value); print(value)') || \
+        fatal "cannot derive the fresh-campaign heldout100 binding identity"
 
     HELDOUT100_BUNDLE_REPORT=$(PYTHONPATH="$ROOT" "$PYTHON" \
         "$ROOT/scripts/round_dagger/prepare_gr00t_learner_bundle.py" \
@@ -326,12 +362,11 @@ if [[ $ROUND_DAGGER_CAMPAIGN_ID == dagger_prod_run1 && $ROUND_DECIMAL == 0 ]]; t
     ((${#HELDOUT100_IDENTITY[@]} == 2)) || \
         fatal "round-0 heldout100 learner identity derivation failed"
     HELDOUT100_IDENTITY_SHA256=${HELDOUT100_IDENTITY[0]}
-    HELDOUT100_WANDB_RUN_ID=${HELDOUT100_IDENTITY[1]}
+    HELDOUT100_WANDB_RUN_ID="${HELDOUT100_IDENTITY[1]}-b${HELDOUT100_BINDING_SHA256:0:32}"
     [[ $HELDOUT100_IDENTITY_SHA256 =~ ^[0-9a-f]{64}$ && \
        $HELDOUT100_WANDB_RUN_ID == \
-       "rrd-m000000-id${HELDOUT100_IDENTITY_SHA256}" ]] || \
+       "rrd-m000000-id${HELDOUT100_IDENTITY_SHA256}-b${HELDOUT100_BINDING_SHA256:0:32}" ]] || \
         fatal "round-0 heldout100 learner identity is malformed"
-    fi
 fi
 
 LEARNER_NAMESPACE=identity_${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}
@@ -352,7 +387,7 @@ LOCAL_OUTPUT_INVENTORY="$LOCAL_HANDOFF/learner_output.inventory.json"
 TRANSFER_TOOL="$ROOT/scripts/round_dagger/remote_campaign_transfer.py"
 HELDOUT100_OUTPUT_RELATIVE=-
 if ((HELDOUT100_GATE_ENABLED)); then
-    HELDOUT100_NAMESPACE=identity_${HELDOUT100_IDENTITY_SHA256}
+    HELDOUT100_NAMESPACE=identity_${HELDOUT100_IDENTITY_SHA256}_binding_${HELDOUT100_BINDING_SHA256}
     HELDOUT100_REMOTE_ROOT="$REMOTE_RUN/heldout100_gate/$HELDOUT100_NAMESPACE"
     HELDOUT100_REMOTE_STAGE="$HELDOUT100_REMOTE_ROOT/.incoming-campaign-input"
     HELDOUT100_REMOTE_CAMPAIGN="$HELDOUT100_REMOTE_ROOT/campaign_input"
@@ -373,8 +408,9 @@ if ((DRY_RUN)); then
         "$JOB_NAME" "$LOCAL_HANDOFF" "$REMOTE_RUN"
     printf 'DRY_RUN local_campaign=%q projection=learner-inputs-only\n' \
         "$CAMPAIGN_ROOT"
-    printf 'DRY_RUN remote_host=%s account=%s partition=%s gpus=8 updates=%s save_every=5\n' \
-        "$REMOTE" "$ACCOUNT" "$PARTITION" "$ROUND_DAGGER_LEARNER_MAX_STEPS"
+    printf 'DRY_RUN remote_host=%s account=%s partition=%s gpus=8 updates=%s save_every=5 walltime=%s\n' \
+        "$REMOTE" "$ACCOUNT" "$PARTITION" "$ROUND_DAGGER_LEARNER_MAX_STEPS" \
+        "$LEARNER_WALLTIME"
     printf 'DRY_RUN heldout_eval=%s cadence=%s\n' \
         "$HELDOUT_ENABLED" "${ROUND_DAGGER_HELDOUT_EVAL_INTERVAL:-disabled}"
     if ((HELDOUT100_GATE_ENABLED)); then
@@ -414,7 +450,8 @@ fi
 "$PYTHON" "$TRANSFER_TOOL" verify --root "$LOCAL_PROJECTION" \
     --inventory "$LOCAL_INVENTORY" >/dev/null
 for source in "$ROUND_DAGGER_POLICY_CHECKPOINT" "$ROUND_DAGGER_POLICY_SPEC" \
-              "$ROUND_DAGGER_POLICY_MANIFEST" "$ROUND_DAGGER_REPLAY_SNAPSHOT"; do
+              "$ROUND_DAGGER_POLICY_MANIFEST" "$ROUND_DAGGER_REPLAY_SNAPSHOT" \
+              "$ROUND_DAGGER_LEARNER_CONTRACT"; do
     [[ $source == "$CAMPAIGN_ROOT"/* ]] || fatal "learner input is outside campaign"
     relative=${source#"$CAMPAIGN_ROOT"/}
     projected="$LOCAL_PROJECTION/$relative"
@@ -463,6 +500,12 @@ ssh -o BatchMode=yes "$REMOTE" env PYTHONDONTWRITEBYTECODE=1 \
     python3 "$REMOTE_SOURCE/scripts/round_dagger/remote_campaign_transfer.py" publish \
     --stage "$REMOTE_STAGE" --destination "$REMOTE_CAMPAIGN" \
     --inventory "$REMOTE_INVENTORY" >/dev/null
+REMOTE_LEARNER_CONTRACT_SHA=$(
+    ssh -o BatchMode=yes "$REMOTE" sha256sum -- \
+        "$REMOTE_CAMPAIGN/learner_contract.json" | awk '{print $1}'
+) || fatal "cannot hash projected remote learner contract"
+[[ $REMOTE_LEARNER_CONTRACT_SHA == "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" ]] || \
+    fatal "projected remote learner contract SHA mismatch"
 HELDOUT100_NEEDS_SEAL=0
 if ((HELDOUT100_GATE_ENABLED)) && \
    [[ ! -e $HELDOUT100_LOCAL_EVIDENCE && ! -L $HELDOUT100_LOCAL_EVIDENCE ]]; then
@@ -663,6 +706,7 @@ def finite(value, label, *, nonnegative=False):
     learner_config_sha256,
     learner_identity_sha256,
     validation_contract_sha256,
+    validation_binding_sha256,
     production_contract_sha256,
     replay_file_sha256,
     replay_sha256,
@@ -681,6 +725,7 @@ for label, value in (
     ("learner config", learner_config_sha256),
     ("learner identity", learner_identity_sha256),
     ("validation contract", validation_contract_sha256),
+    ("validation binding", validation_binding_sha256),
     ("production contract", production_contract_sha256),
     ("training replay file", replay_file_sha256),
     ("training replay semantic", replay_sha256),
@@ -692,8 +737,11 @@ for label, value in (
 ):
     expect(sha_pattern.fullmatch(value) is not None, f"{label} digest is malformed")
 expect(
-    wandb_run_id == f"rrd-m000000-id{learner_identity_sha256}",
-    "W&B run ID is not identity-bound",
+    wandb_run_id == (
+        f"rrd-m000000-id{learner_identity_sha256}"
+        f"-b{validation_binding_sha256[:32]}"
+    ),
+    "W&B run ID is not identity-and-binding-bound",
 )
 
 evidence = Path(os.path.abspath(evidence_value))
@@ -721,7 +769,8 @@ attestation_keys = {
     "optimizer_steps", "intentional_stop_step", "heldout_optimizer_steps",
     "heldout_case_count", "heldout_snapshot_path",
     "heldout_snapshot_file_sha256", "heldout_snapshot_sha256",
-    "validation_contract_sha256", "production_target_contract_sha256",
+    "validation_contract_sha256", "validation_binding_sha256",
+    "production_target_contract_sha256",
     "learner_code_sha256", "learner_config_sha256",
     "learner_identity_sha256", "runtime_container_sha256",
     "training_replay_snapshot_file_sha256",
@@ -757,6 +806,7 @@ exact_values(
         "heldout_snapshot_file_sha256": heldout_file_sha256,
         "heldout_snapshot_sha256": heldout_sha256,
         "validation_contract_sha256": validation_contract_sha256,
+        "validation_binding_sha256": validation_binding_sha256,
         "production_target_contract_sha256": production_contract_sha256,
         "learner_code_sha256": learner_code_sha256,
         "learner_config_sha256": learner_config_sha256,
@@ -810,6 +860,8 @@ exact_values(
         "parent_runtime_policy_sha256": parent_runtime_policy_sha256,
         "learner_contract_sha256": validation_contract_sha256,
         "validation_contract_sha256": validation_contract_sha256,
+        "validation_binding_sha256": validation_binding_sha256,
+        "production_contract_sha256": production_contract_sha256,
         "heldout_snapshot_file_sha256": heldout_file_sha256,
         "heldout_snapshot_sha256": heldout_sha256,
         "heldout_case_count": 256,
@@ -923,6 +975,7 @@ if ((HELDOUT100_GATE_ENABLED)); then
         "$ROUND_DAGGER_CAMPAIGN_ID" "$ROUND_DECIMAL"
         "$ROUND_DAGGER_LEARNER_CODE_SHA256" "$HELDOUT100_CONFIG_SHA256"
         "$HELDOUT100_IDENTITY_SHA256" "$HELDOUT100_CONTRACT_SHA256"
+        "$HELDOUT100_BINDING_SHA256"
         "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256"
         "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256"
         "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256"
@@ -1072,6 +1125,11 @@ REMOTE_HELDOUT100_PREPARE
                     ROUND_DAGGER_HELDOUT100_LEARNER_CONFIG_SHA256="$HELDOUT100_CONFIG_SHA256" \
                     ROUND_DAGGER_HELDOUT100_CONTRACT="$REMOTE_SOURCE/configs/round_dagger/validation_learner_1x8h100_heldout100.json" \
                     ROUND_DAGGER_HELDOUT100_CONTRACT_SHA256="$HELDOUT100_CONTRACT_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_BINDING_SHA256="$HELDOUT100_BINDING_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_PRODUCTION_CONTRACT_SHA256="$HELDOUT100_PRODUCTION_CONTRACT_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_FILE_SHA256="$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_SHA256="$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256" \
+                    ROUND_DAGGER_HELDOUT100_WANDB_RUN_ID="$HELDOUT100_WANDB_RUN_ID" \
                     ROUND_DAGGER_HELDOUT100_CAMPAIGN_ID="$ROUND_DAGGER_CAMPAIGN_ID" \
                     ROUND_DAGGER_HELDOUT100_MACRO_ROUND="$ROUND_DECIMAL" \
                     bash "$REMOTE_SOURCE/scripts/round_dagger/submit_oci_nrt_h100_heldout100.sh" >/dev/null || \
@@ -1129,6 +1187,7 @@ export_names=(
     ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256 ROUND_DAGGER_LEARNER_OUTPUT_DIR
     ROUND_DAGGER_LEARNER_RESULT ROUND_DAGGER_LEARNER_CODE_SHA256
     ROUND_DAGGER_LEARNER_CONFIG_SHA256 ROUND_DAGGER_LEARNER_CONTRACT_SHA256
+    ROUND_DAGGER_LEARNER_CONTRACT
     ROUND_DAGGER_LEARNER_IDENTITY_SHA256
     ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256 ROUND_DAGGER_BASE_POLICY_SPEC
     ROUND_DAGGER_LEARNER_BATCH_SIZE ROUND_DAGGER_LEARNER_MAX_STEPS
@@ -1158,7 +1217,7 @@ exports+=",ROUND_DAGGER_REMOTE_WANDB_NETRC=$REMOTE_NETRC"
 exports+=",ROUND_DAGGER_REMOTE_JOB_ROOT=$REMOTE_JOB_ROOT"
 exports+=",ROUND_DAGGER_REMOTE_SUCCESS_MARKER=$REMOTE_SUCCESS_MARKER"
 
-retryable='^(PREEMPTED|NODE_FAIL|BOOT_FAIL|TIMEOUT)$'
+retryable='^(PREEMPTED|NODE_FAIL|BOOT_FAIL|TIMEOUT|REVOKED)$'
 attempt=1
 REMOTE_RESULT_REL=${ROUND_DAGGER_LEARNER_RESULT#"$ROUND_DAGGER_LEARNER_OUTPUT_DIR"/}
 [[ $REMOTE_RESULT_REL != "$ROUND_DAGGER_LEARNER_RESULT" && \
@@ -1266,7 +1325,7 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
                 submission=$(ssh -o BatchMode=yes "$REMOTE" sbatch --parsable \
                 --account="$ACCOUNT" --partition="$PARTITION" --qos="$QOS" \
                 --nodes=1 --ntasks=1 --gpus-per-node=8 --cpus-per-task=64 --mem=0 \
-                --time=04:00:00 \
+                --time="$LEARNER_WALLTIME" \
                 --job-name="$JOB_NAME" \
                 --output="$REMOTE_JOB_ROOT/slurm_%j.out" \
                 --error="$REMOTE_JOB_ROOT/slurm_%j.err" --export="$exports" \
@@ -1337,6 +1396,9 @@ while ((remote_result_complete == 0 && attempt <= MAX_ATTEMPTS)); do
         fi
     fi
     if [[ $state =~ $retryable && $attempt -lt $MAX_ATTEMPTS ]]; then
+        # PREEMPTED/TIMEOUT/REVOKED all resubmit the exact same semantic
+        # identity and remote output namespace.  run_h100_learner.sh validates
+        # restart.pt lineage before advancing beyond the save-every=5 frontier.
         echo "OCI-NRT learner state=$state; resubmitting from durable restart" >&2
         attempt=$((attempt + 1))
         continue

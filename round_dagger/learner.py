@@ -1478,6 +1478,15 @@ class JsonlTelemetry:
                     ),
                     config=dict(wandb_config or {}),
                 )
+                # Bind every model-quality series to the actual optimizer
+                # frontier.  Without this declaration W&B's generated panels
+                # can collapse sparse held-out evaluations into one-value bar
+                # summaries, which obscures whether the student improves.
+                self.wandb_run.define_metric("optimizer_step")
+                self.wandb_run.define_metric("loss", step_metric="optimizer_step")
+                self.wandb_run.define_metric(
+                    "quality/*", step_metric="optimizer_step"
+                )
             except Exception as exc:
                 raise LearnerError(f"W&B initialization failed: {exc}") from exc
 
@@ -1540,6 +1549,7 @@ class JsonlTelemetry:
     @staticmethod
     def _heldout_wandb_payload(record: Mapping[str, Any]) -> dict[str, Any]:
         payload = {
+            "optimizer_step": record["optimizer_step"],
             "quality/heldout_action_mse": record["action_mse"],
             "quality/heldout_action_mae": record["action_mae"],
             "quality/heldout_action_rmse": record["action_rmse"],
@@ -1625,17 +1635,28 @@ class JsonlTelemetry:
         clean = dict(record)
         self._persist(self.path, clean)
         if self.wandb_run is not None:
-            step = int(clean.get("optimizer_step", 0))
             wandb_record = dict(clean)
             if wandb_extra is not None:
-                duplicate = set(wandb_record) & set(wandb_extra)
-                if duplicate:
+                extension = dict(wandb_extra)
+                duplicate = set(wandb_record) & set(extension)
+                conflicting = {
+                    key
+                    for key in duplicate
+                    if wandb_record[key] != extension[key]
+                }
+                if conflicting:
                     raise LearnerError(
-                        "W&B telemetry extension duplicates base fields: "
-                        + ", ".join(sorted(duplicate))
+                        "W&B telemetry extension conflicts with base fields: "
+                        + ", ".join(sorted(conflicting))
                     )
-                wandb_record.update(wandb_extra)
-            self.wandb_run.log(wandb_record, step=step)
+                for key in duplicate:
+                    extension.pop(key)
+                wandb_record.update(extension)
+            # W&B's internal step remains append-only across restarts.  The
+            # explicit optimizer_step field is the declared custom x-axis, so
+            # replaying an equal/older durable frontier cannot be discarded as
+            # an out-of-order global-step update.
+            self.wandb_run.log(wandb_record)
 
     def log_heldout(
         self, record: Mapping[str, Any], *, log_wandb: bool = True
@@ -1656,14 +1677,12 @@ class JsonlTelemetry:
         # deterministic, while the local history still contains exactly one
         # canonical row per step.
         if log_wandb and self.wandb_run is not None:
-            self.wandb_run.log(
-                wandb_payload, step=int(clean.get("optimizer_step", 0))
-            )
+            self.wandb_run.log(wandb_payload)
         return wandb_payload
 
-    def close(self) -> None:
+    def close(self, *, exit_code: int = 0) -> None:
         if self.wandb_run is not None:
-            self.wandb_run.finish()
+            self.wandb_run.finish(exit_code=exit_code)
 
 
 @dataclass(frozen=True)

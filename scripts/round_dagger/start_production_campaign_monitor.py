@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.round_dagger import start_evaluation_wandb_bridge as evaluation_starter  # noqa: E402
 from scripts.round_dagger import start_student_quality_wandb_bridge as quality_starter  # noqa: E402
 
 
@@ -28,8 +29,7 @@ _SENSITIVE_RE = re.compile(
 )
 
 
-class StarterError(RuntimeError):
-    pass
+StarterError = quality_starter.StarterError
 
 
 def _absolute(value: str | os.PathLike[str], label: str) -> Path:
@@ -220,8 +220,23 @@ def start_production_observers(
     quality_pidfile: Path,
     quality_logfile: Path,
     quality_ready_timeout_seconds: float,
+    evaluation_campaign_root: Path,
+    evaluation_state_dir: Path,
+    evaluation_driver_status: Path,
+    evaluation_project: str,
+    evaluation_entity: str,
+    evaluation_expected_email: str,
+    evaluation_poll_seconds: float,
+    evaluation_pidfile: Path,
+    evaluation_logfile: Path,
+    evaluation_ready_timeout_seconds: float,
 ) -> dict[str, object]:
-    """Start the required quality bridge, await readiness, then its monitor."""
+    """Start both required W&B bridges, await readiness, then their monitor."""
+
+    if evaluation_campaign_root != quality_campaign_root:
+        raise StarterError("quality and evaluation campaign roots must match")
+    if evaluation_driver_status != quality_driver_status:
+        raise StarterError("quality and evaluation driver status paths must match")
 
     quality = quality_starter.start_bridge(
         python=python,
@@ -236,11 +251,31 @@ def start_production_observers(
         logfile=quality_logfile,
         ready_timeout_seconds=quality_ready_timeout_seconds,
     )
-    monitored_arguments = list(monitor_arguments)
-    if "--required-process-pidfile" not in monitored_arguments:
-        monitored_arguments.extend(
-            ("--required-process-pidfile", str(quality_pidfile))
+    try:
+        evaluation = evaluation_starter.start_bridge(
+            python=python,
+            campaign_root=evaluation_campaign_root,
+            state_dir=evaluation_state_dir,
+            driver_status=evaluation_driver_status,
+            project=evaluation_project,
+            entity=evaluation_entity,
+            expected_email=evaluation_expected_email,
+            poll_seconds=evaluation_poll_seconds,
+            pidfile=evaluation_pidfile,
+            logfile=evaluation_logfile,
+            ready_timeout_seconds=evaluation_ready_timeout_seconds,
         )
+    except BaseException:
+        _stop_bound_process(quality)
+        raise
+    monitored_arguments = list(monitor_arguments)
+    for required_pidfile in (quality_pidfile, evaluation_pidfile):
+        pair = ("--required-process-pidfile", str(required_pidfile))
+        if not any(
+            tuple(monitored_arguments[index : index + 2]) == pair
+            for index in range(len(monitored_arguments) - 1)
+        ):
+            monitored_arguments.extend(pair)
     try:
         monitor = start_monitor(
             python=python,
@@ -248,7 +283,8 @@ def start_production_observers(
             logfile=logfile,
             monitor_arguments=monitored_arguments,
         )
-    except Exception:
+    except BaseException:
+        _stop_bound_process(evaluation)
         _stop_bound_process(quality)
         raise
     return {
@@ -256,8 +292,11 @@ def start_production_observers(
         "read_only": True,
         "monitor": monitor,
         "student_quality_bridge": quality,
+        "evaluation_bridge": evaluation,
         "quality_bridge_ready": True,
         "quality_bridge_monitored": True,
+        "evaluation_bridge_ready": True,
+        "evaluation_bridge_monitored": True,
     }
 
 
@@ -276,6 +315,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--quality-pidfile", type=Path, required=True)
     parser.add_argument("--quality-logfile", type=Path, required=True)
     parser.add_argument("--quality-ready-timeout-seconds", type=float, default=45.0)
+    parser.add_argument("--evaluation-campaign-root", type=Path, required=True)
+    parser.add_argument("--evaluation-state-dir", type=Path, required=True)
+    parser.add_argument("--evaluation-driver-status", type=Path, required=True)
+    parser.add_argument("--evaluation-project", required=True)
+    parser.add_argument("--evaluation-entity", required=True)
+    parser.add_argument("--evaluation-expected-email", required=True)
+    parser.add_argument("--evaluation-poll-seconds", type=float, default=60.0)
+    parser.add_argument("--evaluation-pidfile", type=Path, required=True)
+    parser.add_argument("--evaluation-logfile", type=Path, required=True)
+    parser.add_argument(
+        "--evaluation-ready-timeout-seconds", type=float, default=45.0
+    )
     parser.add_argument("monitor_arguments", nargs=argparse.REMAINDER)
     return parser
 
@@ -308,6 +359,28 @@ def main(argv: list[str] | None = None) -> int:
             quality_pidfile=_absolute(arguments.quality_pidfile, "quality pidfile"),
             quality_logfile=_absolute(arguments.quality_logfile, "quality logfile"),
             quality_ready_timeout_seconds=arguments.quality_ready_timeout_seconds,
+            evaluation_campaign_root=_absolute(
+                arguments.evaluation_campaign_root, "evaluation campaign root"
+            ),
+            evaluation_state_dir=_absolute(
+                arguments.evaluation_state_dir, "evaluation state"
+            ),
+            evaluation_driver_status=_absolute(
+                arguments.evaluation_driver_status, "evaluation driver status"
+            ),
+            evaluation_project=arguments.evaluation_project,
+            evaluation_entity=arguments.evaluation_entity,
+            evaluation_expected_email=arguments.evaluation_expected_email,
+            evaluation_poll_seconds=arguments.evaluation_poll_seconds,
+            evaluation_pidfile=_absolute(
+                arguments.evaluation_pidfile, "evaluation pidfile"
+            ),
+            evaluation_logfile=_absolute(
+                arguments.evaluation_logfile, "evaluation logfile"
+            ),
+            evaluation_ready_timeout_seconds=(
+                arguments.evaluation_ready_timeout_seconds
+            ),
         )
     except StarterError as exc:
         print(f"monitor starter failed: {exc}", file=sys.stderr)

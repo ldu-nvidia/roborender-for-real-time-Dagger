@@ -759,6 +759,7 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         fake_run = types.SimpleNamespace(
             log=mock.Mock(),
             finish=mock.Mock(),
+            define_metric=mock.Mock(),
         )
         fake_wandb = types.SimpleNamespace(
             init=mock.Mock(return_value=fake_run),
@@ -782,6 +783,10 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
 
         self.assertEqual(fake_wandb.init.call_args_list[0].kwargs["resume"], "allow")
         self.assertEqual(fake_wandb.init.call_args_list[1].kwargs["resume"], "must")
+        self.assertEqual(
+            [call.kwargs["exit_code"] for call in fake_run.finish.call_args_list],
+            [0, 0],
+        )
         with self.assertRaisesRegex(LearnerError, "durable prior run ID"):
             JsonlTelemetry(
                 None,
@@ -789,6 +794,21 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
                 wandb_project="project",
                 wandb_resume_must=True,
             )
+
+    def test_wandb_close_propagates_training_failure_status(self):
+        fake_run = types.SimpleNamespace(
+            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
+        )
+        fake_wandb = types.SimpleNamespace(init=mock.Mock(return_value=fake_run))
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            telemetry = JsonlTelemetry(
+                None,
+                enabled=True,
+                wandb_project="quality-project",
+                wandb_run_id="failed-quality-run",
+            )
+            telemetry.close(exit_code=2)
+        fake_run.finish.assert_called_once_with(exit_code=2)
 
     def test_jsonl_telemetry_is_durable_and_step_monotonic(self):
         path = self.root / "telemetry" / "learner.jsonl"
@@ -906,7 +926,9 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             )
 
     def test_heldout_quality_is_merged_into_one_wandb_record_per_step(self):
-        fake_run = types.SimpleNamespace(log=mock.Mock(), finish=mock.Mock())
+        fake_run = types.SimpleNamespace(
+            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
+        )
         fake_wandb = types.SimpleNamespace(
             init=mock.Mock(return_value=fake_run),
         )
@@ -934,14 +956,22 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             finally:
                 telemetry.close()
         self.assertEqual(
-            [call.kwargs["step"] for call in fake_run.log.call_args_list],
+            [call.args[0]["optimizer_step"] for call in fake_run.log.call_args_list],
             [0, 1, 2],
+        )
+        self.assertTrue(
+            all("step" not in call.kwargs for call in fake_run.log.call_args_list)
         )
         initial_quality = fake_run.log.call_args_list[0].args[0]
         final_combined = fake_run.log.call_args_list[2].args[0]
         self.assertIn("quality/heldout_action_mse", initial_quality)
+        self.assertEqual(initial_quality["optimizer_step"], 0)
         self.assertIn("loss", final_combined)
         self.assertIn("quality/heldout_action_mse", final_combined)
+        fake_run.define_metric.assert_any_call("optimizer_step")
+        fake_run.define_metric.assert_any_call(
+            "quality/*", step_metric="optimizer_step"
+        )
 
     def test_resume_relogs_due_heldout_frontier_without_duplicate_jsonl(self):
         heldout_path = self.root / "quality-resume" / "heldout.jsonl"
@@ -974,7 +1004,9 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             [0, 2],
         )
 
-        fake_run = types.SimpleNamespace(log=mock.Mock(), finish=mock.Mock())
+        fake_run = types.SimpleNamespace(
+            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
+        )
         fake_wandb = types.SimpleNamespace(init=mock.Mock(return_value=fake_run))
         with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
             resumed_telemetry = JsonlTelemetry(
@@ -1001,7 +1033,7 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
                 resumed_telemetry.close()
 
         self.assertEqual(
-            [call.kwargs["step"] for call in fake_run.log.call_args_list],
+            [call.args[0]["optimizer_step"] for call in fake_run.log.call_args_list],
             [2, 3, 4],
         )
         self.assertIn(

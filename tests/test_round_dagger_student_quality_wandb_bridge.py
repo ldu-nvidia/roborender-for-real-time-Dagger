@@ -144,11 +144,11 @@ class StudentQualityWandbBridgeTest(unittest.TestCase):
             with mock.patch.object(bridge, "_load_wandb", return_value=fake), mock.patch.object(
                 bridge, "query_identity", return_value=identity
             ):
-                self.assertEqual(bridge.main(arguments), 2)
+                self.assertEqual(bridge.main(arguments), 0)
 
             self.assertEqual(len(fake.init_calls), 1, "empty campaigns must initialize W&B")
             run = fake.runs[0]
-            self.assertEqual(run.finished, [2])
+            self.assertEqual(run.finished, [0])
             campaign_log = next(
                 payload
                 for payload, _step in run.logs
@@ -267,7 +267,7 @@ class StudentQualityWandbBridgeTest(unittest.TestCase):
             self.assertEqual(metrics["campaign/data_ready"], 1)
             self.assertEqual(summary["campaign/data_ready"], 1)
 
-    def test_polling_run_stays_open_then_finishes_failed_nonzero(self) -> None:
+    def test_polling_run_reports_campaign_failure_but_observer_finishes_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = _campaign(Path(temporary) / "fixture")
             state_dir = Path(temporary) / "quality-observer"
@@ -313,11 +313,11 @@ class StudentQualityWandbBridgeTest(unittest.TestCase):
             ), mock.patch.object(
                 bridge, "_driver_status", side_effect=[active, failed]
             ), mock.patch.object(bridge.time, "sleep", return_value=None):
-                self.assertEqual(bridge.main(arguments), 2)
+                self.assertEqual(bridge.main(arguments), 0)
 
             self.assertEqual(len(fake.init_calls), 1)
             self.assertEqual(len(fake.runs), 1)
-            self.assertEqual(fake.runs[0].finished, [2])
+            self.assertEqual(fake.runs[0].finished, [0])
             self.assertEqual(len(fake.runs[0].logs), 2)
             self.assertEqual(fake.runs[0].logs[0][0]["campaign/failed"], 0)
             self.assertEqual(fake.runs[0].logs[1][0]["campaign/failed"], 1)
@@ -614,10 +614,10 @@ class StudentQualityWandbBridgeTest(unittest.TestCase):
             ) as summarize, mock.patch.object(
                 bridge.time, "sleep", side_effect=between_polls
             ):
-                self.assertEqual(bridge.main(arguments), 2)
+                self.assertEqual(bridge.main(arguments), 0)
 
             summarize.assert_called_once()
-            self.assertEqual(run.finished, [2])
+            self.assertEqual(run.finished, [0])
             cursor = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 cursor["uploaded_seal_sha256_by_event"],

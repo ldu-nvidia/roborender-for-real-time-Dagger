@@ -11,6 +11,7 @@ an uninterrupted 100-update execution.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -38,6 +39,7 @@ from round_dagger.learner import (  # noqa: E402
     RESULT_SCHEMA,
     TELEMETRY_SCHEMA,
 )
+from round_dagger.learner_identity import learner_wandb_run_id  # noqa: E402
 from round_dagger.replay import load_heldout_snapshot  # noqa: E402
 from scripts.round_dagger.h100_validation_wandb_readback import (  # noqa: E402
     _load_checkpoint,
@@ -59,21 +61,7 @@ ATTESTATION_SCHEMA = (
 CONTRACT_RELATIVE_PATH = Path(
     "configs/round_dagger/validation_learner_1x8h100_heldout100.json"
 )
-PRODUCTION_CONTRACT_RELATIVE_PATH = Path(
-    "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json"
-)
-HELDOUT_SOURCE_ROOT = Path(
-    "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829"
-)
-HELDOUT_SNAPSHOT_FILE_SHA256 = (
-    "42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9"
-)
-HELDOUT_SNAPSHOT_SHA256 = (
-    "c80ee79dae99bb048f9f75bb38aae75fb3e305e665eedfc83d43470babd08bde"
-)
-PRODUCTION_CONTRACT_SHA256 = (
-    "e4a1d23a3426d879aac93f934eb9e213a657b0451b54f4f4918e425a357d73e5"
-)
+BINDING_SCHEMA = "fast_roborender.round_dagger.heldout100_runtime_binding.v1"
 TRAIN_STEPS = 100
 STOP_STEP = 50
 HELDOUT_STEPS = [0, 100]
@@ -295,7 +283,7 @@ def load_contract(
         "schema": CONTRACT_SCHEMA,
         "purpose": "live_h100_fixed256_step100_wandb_restart_gate",
         "validation_target": {
-            "campaign_id": "dagger_prod_run1",
+            "campaign_id_binding": "runtime_exact",
             "macro_round": 0,
         },
         "allocation": {
@@ -320,10 +308,8 @@ def load_contract(
             "required_optimizer_steps": HELDOUT_STEPS,
             "case_count": HELDOUT_CASES,
             "cohort_count": 8,
-            "source_root": str(HELDOUT_SOURCE_ROOT),
             "snapshot_relative_path": "heldout_snapshot.json",
-            "snapshot_file_sha256": HELDOUT_SNAPSHOT_FILE_SHA256,
-            "snapshot_sha256": HELDOUT_SNAPSHOT_SHA256,
+            "snapshot_binding": "runtime_exact_file_and_semantic_sha256",
         },
         "quality_gate": {
             "minimum_relative_action_mse_reduction": (
@@ -343,7 +329,7 @@ def load_contract(
             "account": "general_cs_infra__ngcsre",
             "partition": "batch_singlenode",
             "qos": "normal",
-            "time_limit_minutes": 240,
+            "time_limit_minutes": 225,
         },
         "container": {
             "path": (
@@ -364,37 +350,37 @@ def load_contract(
             "project": "roborender-round-dagger-validation",
         },
         "production_target": {
-            "run_name": "dagger_prod_run1",
-            "learner_contract_path": str(PRODUCTION_CONTRACT_RELATIVE_PATH),
-            "learner_contract_sha256": PRODUCTION_CONTRACT_SHA256,
+            "campaign_contract_binding": "campaign_json_policy_config_sha256",
         },
     }
     if dict(document) != exact:
         raise Heldout100ValidationError("validation contract semantics mismatch")
-    if source_root is not None:
-        production = _regular(
-            Path(source_root).resolve(strict=True)
-            / PRODUCTION_CONTRACT_RELATIVE_PATH,
-            "production target learner contract",
-        )
-        if sha256_file(production) != PRODUCTION_CONTRACT_SHA256:
-            raise Heldout100ValidationError(
-                "production target learner contract digest mismatch"
-            )
     return dict(document)
 
 
-def verify_heldout_snapshot(path: Path, *, campaign_id: str) -> dict[str, Any]:
-    if campaign_id != "dagger_prod_run1":
-        raise Heldout100ValidationError("heldout100 campaign ID must be exact")
+def verify_heldout_snapshot(
+    path: Path,
+    *,
+    campaign_root: Path,
+    campaign_id: str,
+    expected_file_sha256: str,
+    expected_snapshot_sha256: str,
+) -> dict[str, Any]:
+    root = _canonical_directory(campaign_root, "heldout100 campaign root")
     path = _regular(path, "fixed-256 held-out snapshot")
-    if path != HELDOUT_SOURCE_ROOT / "heldout_snapshot.json":
+    if path != root / "heldout_snapshot.json":
         raise Heldout100ValidationError(
-            "fixed-256 held-out snapshot path is not exact"
+            "fixed-256 held-out snapshot is not at the campaign root"
         )
+    file_sha256 = _digest(
+        expected_file_sha256, "held-out snapshot file SHA-256"
+    )
+    semantic_sha256 = _digest(
+        expected_snapshot_sha256, "held-out snapshot semantic SHA-256"
+    )
     try:
         snapshot = load_heldout_snapshot(
-            path, expected_file_sha256=HELDOUT_SNAPSHOT_FILE_SHA256
+            path, expected_file_sha256=file_sha256
         )
     except Exception as exc:
         raise Heldout100ValidationError(
@@ -405,8 +391,8 @@ def verify_heldout_snapshot(path: Path, *, campaign_id: str) -> dict[str, Any]:
         "purpose": "eval",
         "cohort_count": 8,
         "transition_count": HELDOUT_CASES,
-        "snapshot_sha256": HELDOUT_SNAPSHOT_SHA256,
-        "file_sha256": HELDOUT_SNAPSHOT_FILE_SHA256,
+        "snapshot_sha256": semantic_sha256,
+        "file_sha256": file_sha256,
     }
     if any(snapshot.get(key) != value for key, value in expected.items()):
         raise Heldout100ValidationError("fixed-256 held-out identity mismatch")
@@ -417,12 +403,71 @@ def verify_heldout_snapshot(path: Path, *, campaign_id: str) -> dict[str, Any]:
     return snapshot
 
 
+def runtime_binding(
+    *,
+    contract: Path,
+    contract_sha256: str,
+    source_root: Path,
+    campaign_root: Path,
+    campaign_id: str,
+    heldout_snapshot: Path,
+    heldout_snapshot_file_sha256: str,
+    heldout_snapshot_sha256: str,
+    production_contract_sha256: str,
+) -> dict[str, Any]:
+    """Bind the reusable source profile to one exact fresh campaign."""
+
+    load_contract(
+        contract,
+        expected_sha256=contract_sha256,
+        source_root=source_root,
+    )
+    root = _canonical_directory(campaign_root, "heldout100 campaign root")
+    snapshot = verify_heldout_snapshot(
+        heldout_snapshot,
+        campaign_root=root,
+        campaign_id=campaign_id,
+        expected_file_sha256=heldout_snapshot_file_sha256,
+        expected_snapshot_sha256=heldout_snapshot_sha256,
+    )
+    campaign_path = _regular(root / "campaign.json", "campaign contract")
+    campaign = load_strict_json(campaign_path)
+    production_sha256 = _digest(
+        production_contract_sha256, "production learner contract SHA-256"
+    )
+    if (
+        not isinstance(campaign, Mapping)
+        or campaign.get("campaign_id") != campaign_id
+        or campaign.get("policy_config_sha256") != production_sha256
+    ):
+        raise Heldout100ValidationError(
+            "campaign does not own the supplied production learner contract"
+        )
+    values = {
+        "schema": BINDING_SCHEMA,
+        "campaign_root": str(root),
+        "campaign_id": campaign_id,
+        "campaign_contract_file_sha256": sha256_file(campaign_path),
+        "macro_round": 0,
+        "heldout_snapshot_path": str(Path(heldout_snapshot).resolve(strict=True)),
+        "heldout_snapshot_file_sha256": snapshot["file_sha256"],
+        "heldout_snapshot_sha256": snapshot["snapshot_sha256"],
+        "production_contract_sha256": production_sha256,
+        "validation_contract_sha256": _digest(
+            contract_sha256, "validation contract SHA-256"
+        ),
+    }
+    payload = ("\n".join(f"{key}={values[key]}" for key in values) + "\n").encode()
+    values["binding_sha256"] = hashlib.sha256(payload).hexdigest()
+    return values
+
+
 def training_rows(
     path: Path, *, campaign_id: str, macro_round: int
 ) -> tuple[Path, list[dict[str, Any]]]:
-    if campaign_id != "dagger_prod_run1" or macro_round != 0:
+    if not campaign_id or macro_round != 0:
         raise Heldout100ValidationError(
-            "heldout100 learner telemetry must be campaign dagger_prod_run1 round 0"
+            "heldout100 learner telemetry must be bound to campaign round 0"
         )
     path, rows = _jsonl(path, "learner telemetry")
     if len(rows) != TRAIN_STEPS:
@@ -465,11 +510,22 @@ def training_rows(
 
 
 def heldout_rows(
-    path: Path, *, campaign_id: str, macro_round: int
+    path: Path,
+    *,
+    campaign_id: str,
+    macro_round: int,
+    heldout_snapshot_file_sha256: str,
+    heldout_snapshot_sha256: str,
 ) -> tuple[Path, list[dict[str, Any]]]:
-    if campaign_id != "dagger_prod_run1" or macro_round != 0:
+    file_sha256 = _digest(
+        heldout_snapshot_file_sha256, "held-out snapshot file SHA-256"
+    )
+    semantic_sha256 = _digest(
+        heldout_snapshot_sha256, "held-out snapshot semantic SHA-256"
+    )
+    if not campaign_id or macro_round != 0:
         raise Heldout100ValidationError(
-            "heldout100 quality telemetry must be campaign dagger_prod_run1 round 0"
+            "heldout100 quality telemetry must be bound to campaign round 0"
         )
     path, rows = _jsonl(path, "held-out quality telemetry")
     if len(rows) != 2 or [row.get("optimizer_step") for row in rows] != HELDOUT_STEPS:
@@ -483,8 +539,8 @@ def heldout_rows(
             row.get("campaign_id") != campaign_id
             or row.get("macro_round") != macro_round
             or row.get("heldout_snapshot_file_sha256")
-            != HELDOUT_SNAPSHOT_FILE_SHA256
-            or row.get("heldout_snapshot_sha256") != HELDOUT_SNAPSHOT_SHA256
+            != file_sha256
+            or row.get("heldout_snapshot_sha256") != semantic_sha256
             or row.get("heldout_transitions_rank") != 32
             or row.get("heldout_transitions_per_rank") != [32] * WORLD_SIZE
             or row.get("heldout_transitions_global") != HELDOUT_CASES
@@ -653,7 +709,9 @@ def _remote_quality(remote: object) -> list[dict[str, Any]]:
     }))
     try:
         raw = list(
-            remote.scan_history(keys=["_step", *quality_keys], page_size=1000)
+            remote.scan_history(
+                keys=["optimizer_step", *quality_keys], page_size=1000
+            )
         )
     except Exception as exc:
         raise Heldout100ValidationError(
@@ -665,7 +723,7 @@ def _remote_quality(remote: object) -> list[dict[str, Any]]:
             continue
         if row.get("quality/heldout_action_mse") is None:
             continue
-        result = {"optimizer_step": row.get("_step")}
+        result = {"optimizer_step": row.get("optimizer_step")}
         result.update({key: row.get(key) for key in quality_keys})
         rows.append(result)
     return rows
@@ -703,6 +761,10 @@ def readback(
     learner_identity_sha256: str,
     runtime_container_sha256: str,
     validation_contract_sha256: str,
+    validation_binding_sha256: str,
+    production_contract_sha256: str,
+    heldout_snapshot_file_sha256: str,
+    heldout_snapshot_sha256: str,
     project: str,
     expected_email: str,
     entity: str,
@@ -713,13 +775,35 @@ def readback(
 ) -> dict[str, Any]:
     if timeout_s <= 0 or poll_interval_s <= 0:
         raise Heldout100ValidationError("W&B readback timing must be positive")
-    if campaign_id != "dagger_prod_run1" or macro_round != 0:
+    binding_sha256 = _digest(
+        validation_binding_sha256, "heldout100 runtime binding SHA-256"
+    )
+    production_sha256 = _digest(
+        production_contract_sha256, "production learner contract SHA-256"
+    )
+    heldout_file_sha256 = _digest(
+        heldout_snapshot_file_sha256, "held-out snapshot file SHA-256"
+    )
+    heldout_semantic_sha256 = _digest(
+        heldout_snapshot_sha256, "held-out snapshot semantic SHA-256"
+    )
+    if not campaign_id or macro_round != 0:
         raise Heldout100ValidationError(
-            "heldout100 readback must be campaign dagger_prod_run1 round 0"
+            "heldout100 readback must be bound to campaign round 0"
+        )
+    canonical_run_id = learner_wandb_run_id(
+        campaign_id=campaign_id,
+        macro_round=macro_round,
+        learner_identity_sha256=learner_identity_sha256,
+    )
+    expected_run_id = f"{canonical_run_id}-b{binding_sha256[:32]}"
+    if run_id != expected_run_id:
+        raise Heldout100ValidationError(
+            "W&B run ID is not bound to the fresh campaign validation binding"
         )
     try:
         semantic = _semantic_identity(
-            run_id=run_id,
+            run_id=canonical_run_id,
             campaign_id=campaign_id,
             macro_round=macro_round,
             learner_code_sha256=learner_code_sha256,
@@ -746,10 +830,18 @@ def readback(
             "uninterrupted and resumed learner histories differ"
         )
     full_quality_path, full_quality = heldout_rows(
-        uninterrupted_heldout, campaign_id=campaign_id, macro_round=macro_round
+        uninterrupted_heldout,
+        campaign_id=campaign_id,
+        macro_round=macro_round,
+        heldout_snapshot_file_sha256=heldout_file_sha256,
+        heldout_snapshot_sha256=heldout_semantic_sha256,
     )
     resumed_quality_path, resumed_quality = heldout_rows(
-        resumed_heldout, campaign_id=campaign_id, macro_round=macro_round
+        resumed_heldout,
+        campaign_id=campaign_id,
+        macro_round=macro_round,
+        heldout_snapshot_file_sha256=heldout_file_sha256,
+        heldout_snapshot_sha256=heldout_semantic_sha256,
     )
     if full_quality != resumed_quality:
         raise Heldout100ValidationError(
@@ -837,8 +929,10 @@ def readback(
         "learner_code_sha256": learner_code_sha256,
         "replay_snapshot_file_sha256": replay_snapshot_file_sha256,
         "replay_snapshot_sha256": replay_snapshot_sha256,
-        "heldout_snapshot_file_sha256": HELDOUT_SNAPSHOT_FILE_SHA256,
-        "heldout_snapshot_sha256": HELDOUT_SNAPSHOT_SHA256,
+        "heldout_snapshot_file_sha256": heldout_file_sha256,
+        "heldout_snapshot_sha256": heldout_semantic_sha256,
+        "validation_binding_sha256": binding_sha256,
+        "production_contract_sha256": production_sha256,
         "runtime_container_sha256": runtime_container_sha256,
         "learner_contract_sha256": validation_contract_sha256,
         "stopped_checkpoint_sha256": stop_checkpoint_sha,
@@ -874,8 +968,8 @@ def readback(
             config = getattr(remote, "config", None)
             expected_config = {
                 **semantic,
-                "heldout_snapshot_file_sha256": HELDOUT_SNAPSHOT_FILE_SHA256,
-                "heldout_snapshot_sha256": HELDOUT_SNAPSHOT_SHA256,
+                "heldout_snapshot_file_sha256": heldout_file_sha256,
+                "heldout_snapshot_sha256": heldout_semantic_sha256,
                 "heldout_eval_interval": 100,
                 "heldout_transitions": HELDOUT_CASES,
             }
@@ -939,8 +1033,10 @@ def readback(
         # identity code and validation-specific attestation code bind the same
         # immutable bytes without an implicit alias.
         "validation_contract_sha256": semantic["learner_contract_sha256"],
-        "heldout_snapshot_file_sha256": HELDOUT_SNAPSHOT_FILE_SHA256,
-        "heldout_snapshot_sha256": HELDOUT_SNAPSHOT_SHA256,
+        "validation_binding_sha256": binding_sha256,
+        "production_contract_sha256": production_sha256,
+        "heldout_snapshot_file_sha256": heldout_file_sha256,
+        "heldout_snapshot_sha256": heldout_semantic_sha256,
         "heldout_case_count": HELDOUT_CASES,
         "heldout_optimizer_steps": HELDOUT_STEPS,
         "quality_improvement": quality_delta,
@@ -971,16 +1067,35 @@ def build_attestation(
     contract: Path,
     contract_sha256: str,
     source_root: Path,
+    campaign_root: Path,
     heldout_snapshot: Path,
+    heldout_snapshot_file_sha256: str,
+    heldout_snapshot_sha256: str,
+    production_contract_sha256: str,
+    validation_binding_sha256: str,
     campaign_id: str,
     readback_path: Path,
     restart_report: Path,
     output: Path,
 ) -> dict[str, Any]:
+    binding = runtime_binding(
+        contract=contract,
+        contract_sha256=contract_sha256,
+        source_root=source_root,
+        campaign_root=campaign_root,
+        campaign_id=campaign_id,
+        heldout_snapshot=heldout_snapshot,
+        heldout_snapshot_file_sha256=heldout_snapshot_file_sha256,
+        heldout_snapshot_sha256=heldout_snapshot_sha256,
+        production_contract_sha256=production_contract_sha256,
+    )
+    if binding["binding_sha256"] != _digest(
+        validation_binding_sha256, "heldout100 runtime binding SHA-256"
+    ):
+        raise Heldout100ValidationError("heldout100 runtime binding digest mismatch")
     contract_doc = load_contract(
         contract, expected_sha256=contract_sha256, source_root=source_root
     )
-    verify_heldout_snapshot(heldout_snapshot, campaign_id=campaign_id)
     readback_path = _regular(readback_path, "heldout100 W&B readback")
     readback_doc = load_strict_json(readback_path)
     if (
@@ -990,10 +1105,14 @@ def build_attestation(
         or readback_doc.get("campaign_id") != campaign_id
         or readback_doc.get("validation_contract_sha256") != contract_sha256
         or readback_doc.get("learner_contract_sha256") != contract_sha256
+        or readback_doc.get("validation_binding_sha256")
+        != binding["binding_sha256"]
+        or readback_doc.get("production_contract_sha256")
+        != binding["production_contract_sha256"]
         or readback_doc.get("heldout_snapshot_file_sha256")
-        != HELDOUT_SNAPSHOT_FILE_SHA256
+        != binding["heldout_snapshot_file_sha256"]
         or readback_doc.get("heldout_snapshot_sha256")
-        != HELDOUT_SNAPSHOT_SHA256
+        != binding["heldout_snapshot_sha256"]
         or readback_doc.get("heldout_case_count") != HELDOUT_CASES
         or readback_doc.get("heldout_optimizer_steps") != HELDOUT_STEPS
         or readback_doc.get("account_email") != "ldu@nvidia.com"
@@ -1049,10 +1168,13 @@ def build_attestation(
         "heldout_optimizer_steps": HELDOUT_STEPS,
         "heldout_case_count": HELDOUT_CASES,
         "heldout_snapshot_path": str(heldout_snapshot),
-        "heldout_snapshot_file_sha256": HELDOUT_SNAPSHOT_FILE_SHA256,
-        "heldout_snapshot_sha256": HELDOUT_SNAPSHOT_SHA256,
+        "heldout_snapshot_file_sha256": binding["heldout_snapshot_file_sha256"],
+        "heldout_snapshot_sha256": binding["heldout_snapshot_sha256"],
         "validation_contract_sha256": contract_sha256,
-        "production_target_contract_sha256": PRODUCTION_CONTRACT_SHA256,
+        "validation_binding_sha256": binding["binding_sha256"],
+        "production_target_contract_sha256": binding[
+            "production_contract_sha256"
+        ],
         "learner_code_sha256": readback_doc["learner_code_sha256"],
         "learner_config_sha256": readback_doc["learner_config_sha256"],
         "learner_identity_sha256": readback_doc["learner_identity_sha256"],
@@ -1104,6 +1226,10 @@ def _add_readback_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--learner-identity-sha256", required=True)
     parser.add_argument("--runtime-container-sha256", required=True)
     parser.add_argument("--validation-contract-sha256", required=True)
+    parser.add_argument("--validation-binding-sha256", required=True)
+    parser.add_argument("--production-contract-sha256", required=True)
+    parser.add_argument("--heldout-snapshot-file-sha256", required=True)
+    parser.add_argument("--heldout-snapshot-sha256", required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--expected-email", required=True)
     parser.add_argument("--entity", required=True)
@@ -1120,14 +1246,29 @@ def _parser() -> argparse.ArgumentParser:
     contract.add_argument("--path", required=True, type=Path)
     contract.add_argument("--sha256")
     contract.add_argument("--source-root", type=Path)
+    binding = commands.add_parser("binding")
+    binding.add_argument("--contract", required=True, type=Path)
+    binding.add_argument("--contract-sha256", required=True)
+    binding.add_argument("--source-root", required=True, type=Path)
+    binding.add_argument("--campaign-root", required=True, type=Path)
+    binding.add_argument("--campaign-id", required=True)
+    binding.add_argument("--heldout-snapshot", required=True, type=Path)
+    binding.add_argument("--heldout-snapshot-file-sha256", required=True)
+    binding.add_argument("--heldout-snapshot-sha256", required=True)
+    binding.add_argument("--production-contract-sha256", required=True)
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("--path", required=True, type=Path)
+    snapshot.add_argument("--campaign-root", required=True, type=Path)
     snapshot.add_argument("--campaign-id", required=True)
+    snapshot.add_argument("--file-sha256", required=True)
+    snapshot.add_argument("--semantic-sha256", required=True)
     local = commands.add_parser("local")
     local.add_argument("--telemetry", required=True, type=Path)
     local.add_argument("--heldout", required=True, type=Path)
     local.add_argument("--campaign-id", required=True)
     local.add_argument("--macro-round", required=True, type=int)
+    local.add_argument("--heldout-snapshot-file-sha256", required=True)
+    local.add_argument("--heldout-snapshot-sha256", required=True)
     layout = commands.add_parser("remote-layout")
     layout.add_argument("--campaign", required=True, type=Path)
     layout.add_argument("--output", required=True, type=Path)
@@ -1140,7 +1281,12 @@ def _parser() -> argparse.ArgumentParser:
     attest.add_argument("--contract", required=True, type=Path)
     attest.add_argument("--contract-sha256", required=True)
     attest.add_argument("--source-root", required=True, type=Path)
+    attest.add_argument("--campaign-root", required=True, type=Path)
     attest.add_argument("--heldout-snapshot", required=True, type=Path)
+    attest.add_argument("--heldout-snapshot-file-sha256", required=True)
+    attest.add_argument("--heldout-snapshot-sha256", required=True)
+    attest.add_argument("--production-contract-sha256", required=True)
+    attest.add_argument("--validation-binding-sha256", required=True)
     attest.add_argument("--campaign-id", required=True)
     attest.add_argument("--readback", required=True, type=Path)
     attest.add_argument("--restart-report", required=True, type=Path)
@@ -1156,9 +1302,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_sha256=arguments.sha256,
             source_root=arguments.source_root,
         )
+    elif arguments.command == "binding":
+        report = runtime_binding(
+            contract=arguments.contract,
+            contract_sha256=arguments.contract_sha256,
+            source_root=arguments.source_root,
+            campaign_root=arguments.campaign_root,
+            campaign_id=arguments.campaign_id,
+            heldout_snapshot=arguments.heldout_snapshot,
+            heldout_snapshot_file_sha256=(
+                arguments.heldout_snapshot_file_sha256
+            ),
+            heldout_snapshot_sha256=arguments.heldout_snapshot_sha256,
+            production_contract_sha256=arguments.production_contract_sha256,
+        )
     elif arguments.command == "snapshot":
         snapshot = verify_heldout_snapshot(
-            arguments.path, campaign_id=arguments.campaign_id
+            arguments.path,
+            campaign_root=arguments.campaign_root,
+            campaign_id=arguments.campaign_id,
+            expected_file_sha256=arguments.file_sha256,
+            expected_snapshot_sha256=arguments.semantic_sha256,
         )
         report = {
             "status": "PASS",
@@ -1177,6 +1341,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.heldout,
             campaign_id=arguments.campaign_id,
             macro_round=arguments.macro_round,
+            heldout_snapshot_file_sha256=(
+                arguments.heldout_snapshot_file_sha256
+            ),
+            heldout_snapshot_sha256=arguments.heldout_snapshot_sha256,
         )
         improvement = quality_improvement(quality)
         report = {
@@ -1208,7 +1376,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             contract=arguments.contract,
             contract_sha256=arguments.contract_sha256,
             source_root=arguments.source_root,
+            campaign_root=arguments.campaign_root,
             heldout_snapshot=arguments.heldout_snapshot,
+            heldout_snapshot_file_sha256=(
+                arguments.heldout_snapshot_file_sha256
+            ),
+            heldout_snapshot_sha256=arguments.heldout_snapshot_sha256,
+            production_contract_sha256=arguments.production_contract_sha256,
+            validation_binding_sha256=arguments.validation_binding_sha256,
             campaign_id=arguments.campaign_id,
             readback_path=arguments.readback,
             restart_report=arguments.restart_report,

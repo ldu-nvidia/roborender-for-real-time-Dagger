@@ -253,6 +253,10 @@ class BoundedWandbReadbackTest(unittest.TestCase):
         marker = self.root / "telemetry" / "WANDB_WATCHER_READY.json"
         payload = json.loads(marker.read_text(encoding="utf-8"))
         payload["telemetry_scope"] = "production"
+        # Delivery evidence is intentionally immutable/readable across the
+        # root-container -> host-user boundary.  Replace the fixture inode
+        # instead of weakening that production permission contract in place.
+        marker.unlink()
         marker.write_text(json.dumps(payload), encoding="utf-8")
         with mock.patch.object(
             readback, "_load_wandb", side_effect=AssertionError("must fail first")

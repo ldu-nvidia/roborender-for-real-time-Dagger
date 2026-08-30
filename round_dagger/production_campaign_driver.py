@@ -44,6 +44,7 @@ _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _SENSITIVE_RE = re.compile(
     r"(?i)(api[_-]?key|password|secret|access[_-]?token|identity[_-]?token)"
 )
+_WANDB_SECRET_RE = re.compile(r"wandb_v1_[A-Za-z0-9_-]+")
 _PHASES = {"READY", "COLLECTING", "COLLECTED", "INGESTED", "TRAINED", "EVALUATED"}
 _ATTEMPT_STAGING_RE = re.compile(
     r"^\.macro_round_[0-9]{6}_policy_[0-9]{6}_[0-9a-f]{12}_"
@@ -139,6 +140,8 @@ def _reject_secrets(value: Any, label: str = "input") -> None:
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             _reject_secrets(child, f"{label}[{index}]")
+    elif isinstance(value, str) and _WANDB_SECRET_RE.search(value):
+        raise ProductionDriverError(f"{label} contains a W&B credential")
 
 
 def _atomic_json(path: Path, document: Mapping[str, Any], *, mode: int = 0o600) -> None:
@@ -355,10 +358,7 @@ class DriverInputs:
         expected_launcher = (
             repository_root / "scripts/round_dagger/launch_production_macro_round.sh"
         )
-        expected_learner = (
-            repository_root
-            / "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json"
-        )
+        expected_learner = self.campaign_root / "learner_contract.json"
         # The driver and actor hooks deliberately execute from the live RTX
         # checkout whose revisions are matched to the remote learner seal by
         # production_launch.  Evaluation consumes a separate immutable local
@@ -370,20 +370,32 @@ class DriverInputs:
             raise ProductionDriverError("launcher must belong to the driver source root")
         if self.learner_contract != expected_learner:
             raise ProductionDriverError(
-                "learner contract must belong to the driver source root"
+                "learner contract must be the canonical campaign-owned "
+                "learner_contract.json"
+            )
+        if stat.S_IMODE(os.lstat(self.learner_contract).st_mode) != 0o444:
+            raise ProductionDriverError(
+                "campaign-owned learner contract mode must be exactly 0444"
             )
         try:
-            learner_contract = artifacts.load_strict_json(self.learner_contract)
+            from scripts.round_dagger import production_launch
+
+            learner_contract = production_launch.load_learner_contract(
+                self.learner_contract
+            )
             campaign = state.load_campaign(self.campaign_root)
         except Exception as exc:
             raise ProductionDriverError(f"cannot validate immutable inputs: {exc}") from exc
         _reject_secrets(learner_contract, "learner contract")
+        if campaign.get("policy_config_sha256") != self.learner_contract_sha256:
+            raise ProductionDriverError(
+                "durable campaign policy_config_sha256 differs from the "
+                "campaign-owned learner contract"
+            )
         invariant_profile = (
             repository_root / "configs/round_dagger/production_campaign_256x512.json"
         )
         try:
-            from scripts.round_dagger import production_launch
-
             materialized_contract, runtime_evidence, _lineage = (
                 production_launch.materialize_campaign_contract(
                     invariant_profile,
@@ -421,6 +433,15 @@ class DriverInputs:
         except Exception as exc:
             raise ProductionDriverError(f"unsafe driver control root: {exc}") from exc
         _lstat_directory(self.control_root, "driver control root")
+        _verify_file(
+            self.learner_contract,
+            self.learner_contract_sha256,
+            "campaign-owned learner contract",
+        )
+        if stat.S_IMODE(os.lstat(self.learner_contract).st_mode) != 0o444:
+            raise ProductionDriverError(
+                "campaign-owned learner contract mode changed during validation"
+            )
         return dict(materialized_contract), dict(learner_contract), campaign
 
 
@@ -1116,6 +1137,73 @@ def _load_collection_failures(
     return matching
 
 
+def _collection_progress_signature(
+    recovery: Mapping[str, Any] | None,
+) -> tuple[int, ...] | None:
+    """Project recovery evidence onto a monotonic durable-data frontier.
+
+    Retry limits protect against repeatedly failing at the *same* collection
+    frontier.  They must not permanently consume the whole round's budget when
+    an attempt has meanwhile sealed a cohort (or durably completed an actor
+    rank).  Older/minimal recovery documents do not carry cohort detail; those
+    conservatively return ``None`` and retain the historical bounded behavior.
+    """
+
+    if not isinstance(recovery, Mapping) or recovery.get("safe_to_retry") is not True:
+        return None
+    cohorts = recovery.get("cohorts")
+    if not isinstance(cohorts, list) or not cohorts:
+        return None
+    signature: list[int] = []
+    for expected_index, cohort in enumerate(cohorts):
+        if (
+            not isinstance(cohort, Mapping)
+            or cohort.get("cohort_index") != expected_index
+        ):
+            return None
+        state = cohort.get("state")
+        if state == "absent":
+            signature.append(0)
+            continue
+        if state == "sealed":
+            signature.append(3)
+            continue
+        if state != "unsealed":
+            return None
+        rank_states = cohort.get("rank_states")
+        if not isinstance(rank_states, Mapping) or set(rank_states) != {"0", "1"}:
+            return None
+        if any(value not in {"empty", "resumable", "complete"} for value in rank_states.values()):
+            return None
+        # Partial/resumable shards remain useful for the actor's own restart,
+        # but only an immutable rank completion advances the global retry
+        # budget.  The joint seal is the final stage above.
+        signature.append(sum(value == "complete" for value in rank_states.values()))
+    return tuple(signature)
+
+
+def _collection_retry_streak(
+    failures: Sequence[Mapping[str, Any]],
+) -> int:
+    """Count consecutive failures since the last durable frontier advance."""
+
+    streak = 0
+    previous_signature: tuple[int, ...] | None = None
+    for failure in failures:
+        signature = _collection_progress_signature(failure.get("recovery"))
+        progressed = (
+            signature is not None
+            and previous_signature is not None
+            and len(signature) == len(previous_signature)
+            and all(new >= old for new, old in zip(signature, previous_signature))
+            and any(new > old for new, old in zip(signature, previous_signature))
+        )
+        streak = 1 if progressed else streak + 1
+        if signature is not None:
+            previous_signature = signature
+    return streak
+
+
 def _publish_collection_failure(
     *,
     inputs: DriverInputs,
@@ -1563,7 +1651,8 @@ def run_driver(
                 else None
             )
             failure_count = len(collection_failures)
-            retry_count = min(failure_count, inputs.collection_retry_limit)
+            retry_streak = _collection_retry_streak(collection_failures)
+            retry_count = min(retry_streak, inputs.collection_retry_limit)
             latest_failure_path = None
             if collection_failures:
                 frontier = _retry_frontier(campaign, coordinator)
@@ -1595,7 +1684,7 @@ def run_driver(
                     last_failure["operator_cancelled"]
                     or last_failure["recovery"] is None
                     or fresh_recovery is None
-                    or failure_count > inputs.collection_retry_limit
+                    or retry_streak > inputs.collection_retry_limit
                 ):
                     failed = _status_document(
                         inputs=inputs,
@@ -1707,6 +1796,7 @@ def run_driver(
                 )
                 failure_ledger_path = None
                 next_failure_count = failure_count
+                next_retry_streak = retry_streak
                 if not dry_run:
                     next_failure_count = failure_count + 1
                     failure_ledger_path = _publish_collection_failure(
@@ -1720,11 +1810,20 @@ def run_driver(
                         operator_cancelled=operator_cancelled,
                         recovery=recovery,
                     )
+                    next_retry_streak = _collection_retry_streak(
+                        [
+                            *collection_failures,
+                            {
+                                "recovery": recovery,
+                                "operator_cancelled": operator_cancelled,
+                            },
+                        ]
+                    )
                 if (
                     recovery is not None
-                    and next_failure_count <= inputs.collection_retry_limit
+                    and next_retry_streak <= inputs.collection_retry_limit
                 ):
-                    next_retry = next_failure_count
+                    next_retry = next_retry_streak
                     retrying = _status_document(
                         inputs=inputs,
                         coordinator=after,

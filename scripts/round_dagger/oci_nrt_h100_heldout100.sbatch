@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=0
-#SBATCH --time=04:00:00
+#SBATCH --time=03:45:00
 #SBATCH --job-name=rr_h100_heldout100
 set -Eeuo pipefail
 
@@ -27,7 +27,7 @@ tree_disjoint() {
     [[ $1 != "$2" && $1 != "$2"/* && $2 != "$1"/* ]]
 }
 
-[[ $# == 27 ]] || fatal "expected exactly 27 heldout100 arguments"
+[[ $# == 31 ]] || fatal "expected exactly 31 heldout100 arguments"
 REMOTE_SOURCE=$1
 SOURCE_SHA=$2
 CONTAINER=$3
@@ -53,16 +53,18 @@ MACRO_ROUND=${22}
 PROJECT=${23}
 REMOTE_CONTRACT=${24}
 CONTRACT_SHA=${25}
-LEARNER_IDENTITY_SHA=${26}
-WANDB_RUN_ID=${27}
+BINDING_SHA=${26}
+PRODUCTION_CONTRACT_SHA=${27}
+HELDOUT_FILE_SHA=${28}
+HELDOUT_SHA=${29}
+LEARNER_IDENTITY_SHA=${30}
+WANDB_RUN_ID=${31}
 SPEC="${CHECKPOINT}.policy_spec.json"
 MANIFEST="${CHECKPOINT}.manifest.json"
 HELDOUT_SNAPSHOT="$LOCAL_CAMPAIGN/heldout_snapshot.json"
 
 [[ ${SLURM_JOB_NUM_NODES:-} == 1 ]] || fatal "heldout100 requires one node"
 [[ ${SLURM_GPUS_ON_NODE:-8} =~ (^|[^0-9])8([^0-9]|$)|^8$ ]] || fatal "heldout100 requires eight H100 GPUs"
-[[ $LOCAL_CAMPAIGN == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829 ]] || \
-    fatal "campaign mount does not preserve fixed-256 artifact paths"
 for path in "$REMOTE_SOURCE" "$CONTAINER" "$REMOTE_CAMPAIGN" "$LOCAL_CAMPAIGN" \
             "$REMOTE_OUTPUT" "$LOCAL_OUTPUT" \
             "$REMOTE_JOB" "$REMOTE_LOG" "$NETRC" "$SNAPSHOT" "$CHECKPOINT" \
@@ -70,7 +72,9 @@ for path in "$REMOTE_SOURCE" "$CONTAINER" "$REMOTE_CAMPAIGN" "$LOCAL_CAMPAIGN" \
     safe_path "$path" || fatal "unsafe heldout100 path: $path"
 done
 for name in SOURCE_SHA CONTAINER_SHA SNAPSHOT_FILE_SHA SNAPSHOT_SHA CHECKPOINT_SHA \
-            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA LEARNER_IDENTITY_SHA; do
+            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA BINDING_SHA \
+            PRODUCTION_CONTRACT_SHA HELDOUT_FILE_SHA HELDOUT_SHA \
+            LEARNER_IDENTITY_SHA; do
     [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
 [[ $CAMPAIGN_ID == dagger_prod_run1 && $MACRO_ROUND == 0 ]] || fatal "campaign/round identity is invalid"
@@ -137,6 +141,10 @@ COMMON_ENV=(
     ROUND_DAGGER_HELDOUT100_LEARNER_CONFIG_SHA256="$CONFIG_SHA"
     ROUND_DAGGER_HELDOUT100_CONTRACT=/workspace/fast_roborender/configs/round_dagger/validation_learner_1x8h100_heldout100.json
     ROUND_DAGGER_HELDOUT100_CONTRACT_SHA256="$CONTRACT_SHA"
+    ROUND_DAGGER_HELDOUT100_BINDING_SHA256="$BINDING_SHA"
+    ROUND_DAGGER_HELDOUT100_PRODUCTION_CONTRACT_SHA256="$PRODUCTION_CONTRACT_SHA"
+    ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_FILE_SHA256="$HELDOUT_FILE_SHA"
+    ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_SHA256="$HELDOUT_SHA"
     ROUND_DAGGER_HELDOUT100_LEARNER_IDENTITY_SHA256="$LEARNER_IDENTITY_SHA"
     ROUND_DAGGER_HELDOUT100_CAMPAIGN_ID="$CAMPAIGN_ID"
     ROUND_DAGGER_HELDOUT100_MACRO_ROUND="$MACRO_ROUND"

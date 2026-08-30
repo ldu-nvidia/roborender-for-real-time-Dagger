@@ -66,10 +66,13 @@ from scripts.scaling.wandb_preflight import (
 STATE_SCHEMA = "fast_roborender.round_dagger.evaluation_wandb_bridge_state.v1"
 BRIDGE_SCHEMA = "fast_roborender.round_dagger.evaluation_wandb_bridge.v1"
 RUN_ID_SCHEMA = "fast_roborender.round_dagger.evaluation_wandb_run_id.v1"
+READY_SCHEMA = "fast_roborender.round_dagger.evaluation_wandb_ready.v1"
 ROUND_RE = re.compile(r"macro_round_([0-9]{6})\Z")
 RECOVERY_RE = re.compile(r"hardened-[0-9a-f]{20}\Z")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
+DRIVER_STATUS_SCHEMA = "fast_roborender.round_dagger.production_driver_status.v1"
+DRIVER_STATES = {"LAUNCHING", "DRY_RUN_VALIDATED", "COMPLETE", "FAILED", "RETRYING"}
 
 
 class BridgeError(RuntimeError):
@@ -177,6 +180,26 @@ def prepare_state_directory(campaign_root: Path, state_dir: str | Path) -> Path:
     return state
 
 
+def ready_marker_path(state_dir: Path, value: str | Path | None) -> Path | None:
+    """Validate an optional process-owned readiness marker."""
+
+    if value is None:
+        return None
+    path = _absolute(value)
+    if path.parent != state_dir:
+        raise BridgeError(
+            "ready marker must be a direct child of bridge state directory"
+        )
+    if path in {
+        state_dir / "evaluation_wandb_bridge.lock",
+        state_dir / "evaluation_wandb_bridge_state.json",
+    }:
+        raise BridgeError("ready marker collides with bridge state")
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise BridgeError("ready marker is unsafe")
+    return path
+
+
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -207,6 +230,20 @@ def _load_json(path: Path) -> Any:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise BridgeError(f"cannot read bridge state ({type(exc).__name__})") from None
+
+
+def load_driver_state(path: str | Path, *, campaign_root: Path) -> str:
+    """Read the operational lifecycle that owns this observer's termination."""
+
+    document = _load_json(_absolute(path))
+    if (
+        not isinstance(document, Mapping)
+        or document.get("schema") != DRIVER_STATUS_SCHEMA
+        or document.get("campaign_root") != str(campaign_root)
+        or document.get("state") not in DRIVER_STATES
+    ):
+        raise BridgeError("production driver status is malformed or mismatched")
+    return str(document["state"])
 
 
 def _initial_state(
@@ -476,6 +513,14 @@ class EvaluationWandbBridge:
             entity=entity,
             project=project,
         )
+        # W&B ``log`` is asynchronous.  Keep this process's accepted records
+        # in memory and advance the durable cursor only after ``run.finish``
+        # returns successfully.  A crash can therefore replay a record, but it
+        # cannot silently mark a record delivered before the SDK has drained
+        # it.  The explicit ``eval/macro_round`` axis makes such replay safe to
+        # inspect and prevents W&B's global-step monotonicity from discarding
+        # backfilled rounds.
+        self._session_uploaded: dict[str, str] = {}
 
     @property
     def wandb_config(self) -> dict[str, Any]:
@@ -488,10 +533,17 @@ class EvaluationWandbBridge:
         }
 
     def poll_once(self, wandb_run: Any) -> int:
-        """Verify and upload newly completed rounds, then advance external state."""
+        """Verify and enqueue newly completed rounds for at-least-once delivery."""
 
         state = load_bridge_state(self.state_path, self.expected_state)
         uploaded = dict(state["uploaded_result_sha256_by_macro_round"])
+        for key, digest in self._session_uploaded.items():
+            previous = uploaded.get(key)
+            if previous is not None and previous != digest:
+                raise BridgeError(
+                    f"macro-round {key} result conflicts with durable bridge state"
+                )
+            uploaded[key] = digest
         count = 0
         for record in discover_verified_evaluations(self.campaign_root):
             key = str(record.macro_round)
@@ -503,21 +555,34 @@ class EvaluationWandbBridge:
                     )
                 continue
             payload = wandb_metrics(record)
-            # The dedicated run's internal step is the macro-round.  If this
-            # process dies after W&B accepts the log but before the cursor is
-            # fsynced, the retry targets the same run and same step rather than
-            # creating a second chronological sample.
-            wandb_run.log(payload, step=record.macro_round)
+            # Do not use W&B's global ``step`` here.  A resumed bridge may need
+            # to replay an older macro-round, and the SDK/server can discard a
+            # record whose global step is lower than one it already observed.
+            wandb_run.log(payload)
             uploaded[key] = record.result_sha256
-            state = {
-                **state,
-                "uploaded_result_sha256_by_macro_round": dict(
-                    sorted(uploaded.items(), key=lambda item: int(item[0]))
-                ),
-            }
-            _atomic_write_json(self.state_path, state)
+            self._session_uploaded[key] = record.result_sha256
             count += 1
         return count
+
+    def commit_session(self) -> None:
+        """Persist records only after the caller has drained the W&B run."""
+
+        state = load_bridge_state(self.state_path, self.expected_state)
+        uploaded = dict(state["uploaded_result_sha256_by_macro_round"])
+        for key, digest in self._session_uploaded.items():
+            previous = uploaded.get(key)
+            if previous is not None and previous != digest:
+                raise BridgeError(
+                    f"macro-round {key} result conflicts with durable bridge state"
+                )
+            uploaded[key] = digest
+        committed = {
+            **state,
+            "uploaded_result_sha256_by_macro_round": dict(
+                sorted(uploaded.items(), key=lambda item: int(item[0]))
+            ),
+        }
+        _atomic_write_json(self.state_path, committed)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -528,6 +593,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--entity", required=True)
     parser.add_argument("--expected-email", required=True)
     parser.add_argument("--authorization-scope", choices=("team",), required=True)
+    parser.add_argument(
+        "--driver-status",
+        required=True,
+        help="production driver_status.json used to terminate this observer",
+    )
+    parser.add_argument(
+        "--ready-marker",
+        help=(
+            "optional direct child of --state-dir written atomically after "
+            "W&B initialization and the first successful telemetry poll"
+        ),
+    )
     parser.add_argument("--poll-seconds", type=float, default=0.0)
     parser.add_argument("--identity-timeout-seconds", type=float, default=15.0)
     return parser
@@ -549,6 +626,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # run.  A second bridge must not resume and finish that run before it
         # discovers that this process already owns the cursor.
         with exclusive_bridge_lock(bridge.state_dir):
+            ready_path = ready_marker_path(bridge.state_dir, args.ready_marker)
+            if ready_path is not None:
+                # Never let a prior process's marker acknowledge this process.
+                ready_path.unlink(missing_ok=True)
             wandb = _load_wandb()
             query_identity(
                 wandb,
@@ -563,7 +644,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 project=args.project,
                 entity=args.entity,
                 id=bridge.run_id,
-                name=f"{bridge.campaign_id}-evaluation",
+                name=f"{bridge.campaign_id}-{bridge.campaign_sha256[:8]}-evaluation",
                 resume="allow",
                 dir=str(wandb_dir),
                 config=bridge.wandb_config,
@@ -571,17 +652,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             run.define_metric("eval/macro_round")
             run.define_metric("eval/*", step_metric="eval/macro_round")
+            run.define_metric("campaign/status_event")
+            run.define_metric("campaign/*", step_metric="campaign/status_event")
             exit_code = 0
+            status_event = 0
+            ready_written = False
             try:
                 while True:
                     uploaded = bridge.poll_once(run)
+                    driver_state = load_driver_state(
+                        args.driver_status, campaign_root=bridge.campaign_root
+                    )
+                    run.log(
+                        {
+                            "campaign/status_event": status_event,
+                            "campaign/driver_failed": int(driver_state == "FAILED"),
+                            "campaign/driver_complete": int(driver_state == "COMPLETE"),
+                        }
+                    )
+                    run.summary["campaign/driver_state"] = driver_state
+                    if ready_path is not None and not ready_written:
+                        _atomic_write_json(
+                            ready_path,
+                            {
+                                "schema": READY_SCHEMA,
+                                "campaign_id": bridge.campaign_id,
+                                "wandb_run_id": bridge.run_id,
+                                "process_id": os.getpid(),
+                                "ready_unix_ns": time.time_ns(),
+                            },
+                        )
+                        ready_written = True
                     print(
                         f"EVALUATION_WANDB_POLL_OK uploaded={uploaded} "
                         f"run_id={bridge.run_id}",
                         flush=True,
                     )
+                    if driver_state == "FAILED":
+                        # The observer successfully reported a failed owner;
+                        # that is not itself an observer-process failure.
+                        break
+                    if driver_state == "COMPLETE":
+                        break
                     if args.poll_seconds == 0:
                         break
+                    status_event += 1
                     time.sleep(args.poll_seconds)
             except KeyboardInterrupt:
                 print("EVALUATION_WANDB_BRIDGE_STOPPED", flush=True)
@@ -590,6 +705,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise
             finally:
                 run.finish(exit_code=exit_code)
+                # ``finish`` is the SDK's public drain boundary.  If it raises,
+                # this line is intentionally not reached and a restart replays
+                # the uncommitted session instead of losing telemetry.
+                bridge.commit_session()
     except (BridgeError, EvaluationError, WandbPreflightError, OSError, ValueError) as exc:
         # Never interpolate third-party exceptions here: API errors can include
         # authentication settings.  Our own exceptions contain bounded labels.

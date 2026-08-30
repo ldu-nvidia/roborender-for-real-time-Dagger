@@ -4,9 +4,10 @@
 This program is the non-mutating preflight used by
 ``launch_production_macro_round.sh``.  It deliberately does not initialize a
 campaign, change coordinator state, or submit a job.  A successful result
-means that the two checked-in production contracts, the durable campaign, the
-strict per-round orchestration config, every local static input, and the
-sealed OCI-NRT source snapshot all agree byte-for-byte.
+means that the checked-in invariant profile, the campaign-owned learner
+contract, the durable campaign, the strict per-round orchestration config,
+every local static input, and the sealed OCI-NRT source snapshot all agree
+byte-for-byte.
 """
 
 from __future__ import annotations
@@ -73,6 +74,10 @@ PLAN_SCHEMA = "fast_roborender.round_dagger.production_launch_plan.v2"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SAFE_REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9_./-]+")
+SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|password|secret|access[_-]?token|identity[_-]?token)"
+)
+WANDB_SECRET_RE = re.compile(r"wandb_v1_[A-Za-z0-9_-]+")
 VALIDATION_ROOT = Path("/mnt/data2/ldu/roborender_round_dagger_validation")
 BOOTSTRAP_ROOT = (
     VALIDATION_ROOT / "fresh_bootstrap_v6_complete_identity_20260827T061620Z"
@@ -169,6 +174,23 @@ def _require_sha(value: Any, label: str) -> str:
     if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
         raise ProductionLaunchError(f"{label} must be a lowercase SHA-256")
     return value
+
+
+def _reject_secrets(value: Any, label: str) -> None:
+    """Reject credential-shaped contract fields and embedded W&B keys."""
+
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if not isinstance(key, str) or SENSITIVE_KEY_RE.search(key):
+                raise ProductionLaunchError(
+                    f"{label} contains a credential-shaped key"
+                )
+            _reject_secrets(child, f"{label}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _reject_secrets(child, f"{label}[{index}]")
+    elif isinstance(value, str) and WANDB_SECRET_RE.search(value):
+        raise ProductionLaunchError(f"{label} contains a W&B credential")
 
 
 def _absolute(value: Any, label: str) -> Path:
@@ -1086,7 +1108,60 @@ def load_learner_contract(path: Path) -> dict[str, Any]:
             heldout["snapshot_sha256"],
             "held-out replay snapshot semantic identity",
         )
+    _reject_secrets(contract, "learner contract")
     return contract
+
+
+def load_campaign_owned_learner_contract(
+    path: Path,
+    *,
+    campaign_root: Path,
+    expected_sha256: str,
+) -> tuple[dict[str, Any], str]:
+    """Load the one immutable learner contract owned by a campaign.
+
+    The held-out contract materializer publishes this file at the campaign
+    root.  Keeping the file in the campaign makes it part of the existing
+    learner-input projection and its recursively verified remote inventory;
+    accepting an arbitrary checked-in or operator-selected path would sever
+    that projection binding.
+    """
+
+    root = _directory(campaign_root, "campaign root")
+    expected_path = root / "learner_contract.json"
+    if path != expected_path:
+        raise ProductionLaunchError(
+            "learner contract must be the canonical campaign-owned "
+            f"file: {expected_path}"
+        )
+    target = _regular(path, "campaign-owned learner contract")
+    try:
+        metadata = os.lstat(target)
+    except OSError as exc:  # pragma: no cover - _regular/lstat race defense
+        raise ProductionLaunchError(
+            "campaign-owned learner contract became unavailable"
+        ) from exc
+    if stat.S_IMODE(metadata.st_mode) != 0o444:
+        raise ProductionLaunchError(
+            "campaign-owned learner contract mode must be exactly 0444"
+        )
+    expected_sha = _require_sha(
+        expected_sha256, "caller learner contract SHA-256"
+    )
+    observed_sha = artifacts.sha256_file(target)
+    if observed_sha != expected_sha:
+        raise ProductionLaunchError("learner contract SHA-256 mismatch")
+    contract = load_learner_contract(target)
+    if artifacts.sha256_file(target) != expected_sha:
+        raise ProductionLaunchError(
+            "campaign-owned learner contract changed while it was validated"
+        )
+    if "heldout_evaluation" not in contract:
+        raise ProductionLaunchError(
+            "campaign-owned learner contract must bind fixed-256 held-out "
+            "evaluation"
+        )
+    return contract, expected_sha
 
 
 def _verify_static_inputs(campaign_contract: Mapping[str, Any]) -> None:
@@ -1302,7 +1377,6 @@ def _verify_remote_source(
     inventory_sha256: str,
     *,
     learner_contract: Mapping[str, Any],
-    learner_contract_path: Path,
 ) -> dict[str, Any]:
     if (
         SAFE_REMOTE_PATH_RE.fullmatch(root) is None
@@ -1359,27 +1433,6 @@ def _verify_remote_source(
         if not isinstance(report.get(key), str) or REVISION_RE.fullmatch(report[key]) is None:
             raise ProductionLaunchError(f"sealed source report {key} is malformed")
 
-    # The remote learner must consume the exact checked-in learner contract,
-    # not another file that happens to be covered by the same operator-provided
-    # inventory string.
-    remote_contract = f"{root}/configs/round_dagger/{learner_contract_path.name}"
-    try:
-        remote_hash = subprocess.run(
-            [ssh, "-o", "BatchMode=yes", host, "sha256sum", "--", remote_contract],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ProductionLaunchError("sealed learner contract verification could not run") from exc
-    expected_contract_sha = artifacts.sha256_file(learner_contract_path)
-    if (
-        remote_hash.returncode != 0
-        or not remote_hash.stdout.split()
-        or remote_hash.stdout.split()[0] != expected_contract_sha
-    ):
-        raise ProductionLaunchError("sealed source contains a different learner contract")
     return report
 
 
@@ -2239,6 +2292,7 @@ def validate_launch(
     campaign_contract_path: Path,
     campaign_contract_sha256: str,
     learner_contract_path: Path,
+    learner_contract_sha256: str,
     sealed_source_root: str,
     sealed_source_inventory_sha256: str,
     evaluation_sealed_source_root: str | Path,
@@ -2253,15 +2307,25 @@ def validate_launch(
         runtime_contract_path=campaign_contract_path,
         runtime_contract_sha256=campaign_contract_sha,
     )
-    learner_deployment_contract_sha = artifacts.sha256_file(learner_contract_path)
     orchestration_sha = artifacts.sha256_file(orchestration_config)
-    learner_contract = load_learner_contract(learner_contract_path)
+    try:
+        preliminary_configuration = MacroRoundConfig.load(orchestration_config)
+    except Exception as exc:
+        raise ProductionLaunchError(
+            f"strict orchestration config is invalid: {exc}"
+        ) from exc
+    learner_contract, learner_deployment_contract_sha = (
+        load_campaign_owned_learner_contract(
+            learner_contract_path,
+            campaign_root=preliminary_configuration.campaign_root,
+            expected_sha256=learner_contract_sha256,
+        )
+    )
     _verify_static_inputs(campaign_contract)
     source_report = _verify_remote_source(
         sealed_source_root,
         sealed_source_inventory_sha256,
         learner_contract=learner_contract,
-        learner_contract_path=learner_contract_path,
     )
     local_seal_report = _verify_local_evaluation_seal(
         evaluation_sealed_source_root,
@@ -2342,6 +2406,16 @@ def validate_launch(
         sealed_source_inventory_sha256,
         Path(local_seal_report["root"]),
     )
+    _require_equal(
+        configuration.campaign_root,
+        preliminary_configuration.campaign_root,
+        "preflight orchestration campaign root",
+    )
+    _require_equal(
+        campaign["policy_config_sha256"],
+        learner_deployment_contract_sha,
+        "campaign/learner contract identity",
+    )
     environment = build_environment(
         campaign_contract,
         learner_contract,
@@ -2360,9 +2434,18 @@ def validate_launch(
     environment["ROUND_DAGGER_DATA_LINEAGE_SHA256"] = campaign_contract[
         "data_lineage_sha256"
     ]
+    environment["ROUND_DAGGER_LEARNER_CONTRACT"] = str(learner_contract_path)
+    environment["ROUND_DAGGER_LEARNER_CONTRACT_RELATIVE"] = "learner_contract.json"
     if artifacts.sha256_file(campaign_contract_path) != campaign_contract_sha:
         raise ProductionLaunchError("campaign contract changed during preflight")
-    if artifacts.sha256_file(learner_contract_path) != learner_deployment_contract_sha:
+    learner_contract_final = _regular(
+        learner_contract_path, "campaign-owned learner contract"
+    )
+    if stat.S_IMODE(os.lstat(learner_contract_final).st_mode) != 0o444:
+        raise ProductionLaunchError(
+            "campaign-owned learner contract mode changed during preflight"
+        )
+    if artifacts.sha256_file(learner_contract_final) != learner_deployment_contract_sha:
         raise ProductionLaunchError("learner contract changed during preflight")
     if artifacts.sha256_file(orchestration_config) != orchestration_sha:
         raise ProductionLaunchError("orchestration config changed during preflight")
@@ -2417,6 +2500,11 @@ def validate_launch(
         ),
         "local_source": local_source,
         "learner_deployment_contract_sha256": learner_deployment_contract_sha,
+        "learner_contract_path": str(learner_contract_path),
+        "learner_contract_projection_relative_path": "learner_contract.json",
+        "learner_contract_remote_identity": (
+            "campaign projection inventory + learner contract SHA-256"
+        ),
         "derived_learner_bundle_sha256": derived_learner_bundle_sha,
         "campaign_contract_sha256": campaign_contract_sha,
         "invariant_profile_sha256": campaign_contract[
@@ -2460,6 +2548,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--campaign-contract", type=Path, required=True)
     parser.add_argument("--campaign-contract-sha256", required=True)
     parser.add_argument("--learner-contract", type=Path, required=True)
+    parser.add_argument("--learner-contract-sha256", required=True)
     parser.add_argument("--sealed-source-root", required=True)
     parser.add_argument("--sealed-source-inventory-sha256", required=True)
     parser.add_argument("--evaluation-sealed-source-root", type=Path, required=True)
@@ -2478,6 +2567,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             campaign_contract_path=arguments.campaign_contract,
             campaign_contract_sha256=arguments.campaign_contract_sha256,
             learner_contract_path=arguments.learner_contract,
+            learner_contract_sha256=arguments.learner_contract_sha256,
             sealed_source_root=arguments.sealed_source_root,
             sealed_source_inventory_sha256=arguments.sealed_source_inventory_sha256,
             evaluation_sealed_source_root=arguments.evaluation_sealed_source_root,

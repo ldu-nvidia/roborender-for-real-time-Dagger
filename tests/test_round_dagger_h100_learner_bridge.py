@@ -487,7 +487,7 @@ class ImmutableLearnerBundleTest(unittest.TestCase):
         bundle_path = self.root / "learner_bundle.json"
         artifacts.publish_immutable_json(bundle_path, bundle.to_mapping())
         trainer = _load_train_entrypoint()
-        telemetry = types.SimpleNamespace(close=lambda: None)
+        telemetry = types.SimpleNamespace(close=lambda *, exit_code=0: None)
         trained = types.SimpleNamespace(
             completed_steps=11,
             target_steps=11,

@@ -41,15 +41,17 @@ RUNTIME_SHA=${ROUND_DAGGER_HELDOUT100_RUNTIME_POLICY_SHA256:?set runtime policy 
 CONFIG_SHA=${ROUND_DAGGER_HELDOUT100_LEARNER_CONFIG_SHA256:?set exact heldout-enabled 100-step bundle SHA-256}
 CONTRACT=${ROUND_DAGGER_HELDOUT100_CONTRACT:-$SOURCE/configs/round_dagger/validation_learner_1x8h100_heldout100.json}
 CONTRACT_SHA=${ROUND_DAGGER_HELDOUT100_CONTRACT_SHA256:?set heldout100 validation contract SHA-256}
+BINDING_SHA=${ROUND_DAGGER_HELDOUT100_BINDING_SHA256:?set fresh-campaign binding SHA-256}
+PRODUCTION_CONTRACT_SHA=${ROUND_DAGGER_HELDOUT100_PRODUCTION_CONTRACT_SHA256:?set campaign-owned production contract SHA-256}
+HELDOUT_FILE_SHA=${ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_FILE_SHA256:?set held-out file SHA-256}
+HELDOUT_SHA=${ROUND_DAGGER_HELDOUT100_HELDOUT_SNAPSHOT_SHA256:?set held-out semantic SHA-256}
+EXPECTED_WANDB_RUN_ID=${ROUND_DAGGER_HELDOUT100_WANDB_RUN_ID:?set binding-qualified W&B run ID}
 CAMPAIGN_ID=${ROUND_DAGGER_HELDOUT100_CAMPAIGN_ID:?set replay campaign ID}
 MACRO_ROUND=${ROUND_DAGGER_HELDOUT100_MACRO_ROUND:?set replay frontier macro round}
 PROJECT=${ROUND_DAGGER_HELDOUT100_WANDB_PROJECT:-roborender-round-dagger-validation}
 DRY_RUN=${DRY_RUN:-0}
 
 [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || fatal "DRY_RUN must be 0 or 1"
-[[ $LOCAL_CAMPAIGN == /mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1_resilient_20260829 ]] || \
-    fatal "campaign mount must preserve the exact fixed-256 artifact paths"
-[[ $CAMPAIGN_ID == dagger_prod_run1 ]] || fatal "heldout100 campaign must be dagger_prod_run1"
 [[ $MACRO_ROUND == 0 ]] || fatal "heldout100 macro round must be exactly zero"
 [[ $PROJECT == roborender-round-dagger-validation ]] || fatal "W&B validation project changed"
 for path in "$SBATCH_BIN" "$SOURCE" "$CONTAINER" "$REMOTE_CAMPAIGN" \
@@ -59,7 +61,8 @@ for path in "$SBATCH_BIN" "$SOURCE" "$CONTAINER" "$REMOTE_CAMPAIGN" \
     safe_path "$path" || fatal "unsafe heldout100 path: $path"
 done
 for name in SOURCE_SHA CONTAINER_SHA SNAPSHOT_FILE_SHA SNAPSHOT_SHA CHECKPOINT_SHA \
-            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA; do
+            SPEC_SHA MANIFEST_SHA RUNTIME_SHA CONFIG_SHA CONTRACT_SHA BINDING_SHA \
+            PRODUCTION_CONTRACT_SHA HELDOUT_FILE_SHA HELDOUT_SHA; do
     [[ ${!name} =~ ^[0-9a-f]{64}$ ]] || fatal "$name is not a lowercase SHA-256"
 done
 [[ -x $SBATCH_BIN ]] || fatal "sbatch is unavailable"
@@ -126,8 +129,46 @@ done
 [[ -f $REMOTE_CAMPAIGN/heldout_snapshot.json && ! -L $REMOTE_CAMPAIGN/heldout_snapshot.json ]] || \
     fatal "staged fixed-256 held-out snapshot is absent"
 [[ $(sha256sum "$REMOTE_CAMPAIGN/heldout_snapshot.json" | awk '{print $1}') == \
-   42b81d927c1a22979bbb48fff76fe176c651ba5986220df3a6ceb6f4564be6a9 ]] || \
+   "$HELDOUT_FILE_SHA" ]] || \
     fatal "staged held-out snapshot file identity mismatch"
+[[ -f $REMOTE_CAMPAIGN/campaign.json && ! -L $REMOTE_CAMPAIGN/campaign.json ]] || \
+    fatal "staged campaign contract is absent"
+mapfile -t CAMPAIGN_BINDING < <(PYTHONDONTWRITEBYTECODE=1 python3 - \
+    "$REMOTE_CAMPAIGN/campaign.json" "$CAMPAIGN_ID" "$PRODUCTION_CONTRACT_SHA" \
+    "$LOCAL_CAMPAIGN" "$LOCAL_CAMPAIGN/heldout_snapshot.json" \
+    "$HELDOUT_FILE_SHA" "$HELDOUT_SHA" "$CONTRACT_SHA" <<'PY'
+import hashlib
+import json
+import sys
+
+(campaign_path, campaign_id, production_sha, campaign_root, heldout_path,
+ heldout_file_sha, heldout_sha, validation_sha) = sys.argv[1:]
+with open(campaign_path, encoding="utf-8") as handle:
+    campaign = json.load(handle)
+with open(campaign_path, "rb") as handle:
+    campaign_file_sha = hashlib.sha256(handle.read()).hexdigest()
+if campaign.get("campaign_id") != campaign_id:
+    raise SystemExit("campaign ID mismatch")
+if campaign.get("policy_config_sha256") != production_sha:
+    raise SystemExit("campaign-owned production contract mismatch")
+values = {
+    "schema": "fast_roborender.round_dagger.heldout100_runtime_binding.v1",
+    "campaign_root": campaign_root,
+    "campaign_id": campaign_id,
+    "campaign_contract_file_sha256": campaign_file_sha,
+    "macro_round": 0,
+    "heldout_snapshot_path": heldout_path,
+    "heldout_snapshot_file_sha256": heldout_file_sha,
+    "heldout_snapshot_sha256": heldout_sha,
+    "production_contract_sha256": production_sha,
+    "validation_contract_sha256": validation_sha,
+}
+payload = ("\n".join(f"{key}={values[key]}" for key in values) + "\n").encode()
+print(hashlib.sha256(payload).hexdigest())
+PY
+)
+[[ ${#CAMPAIGN_BINDING[@]} == 1 && ${CAMPAIGN_BINDING[0]} == "$BINDING_SHA" ]] || \
+    fatal "fresh-campaign heldout100 binding mismatch"
 
 mapfile -t IDENTITY < <(
     PYTHONDONTWRITEBYTECODE=1 python3 "$SOURCE/round_dagger/learner_identity.py" \
@@ -137,7 +178,9 @@ mapfile -t IDENTITY < <(
 )
 [[ ${#IDENTITY[@]} == 2 ]] || fatal "learner identity derivation failed"
 LEARNER_IDENTITY_SHA=${IDENTITY[0]}
-WANDB_RUN_ID=${IDENTITY[1]}
+WANDB_RUN_ID="${IDENTITY[1]}-b${BINDING_SHA:0:32}"
+[[ $WANDB_RUN_ID == "$EXPECTED_WANDB_RUN_ID" ]] || \
+    fatal "binding-qualified W&B run ID mismatch"
 
 PYTHONDONTWRITEBYTECODE=1 python3 "$SOURCE/scripts/round_dagger/verify_sealed_source_snapshot.py" \
     --root "$SOURCE" --expected-inventory-sha256 "$SOURCE_SHA" >/dev/null
@@ -146,7 +189,7 @@ BATCH="$SOURCE/scripts/round_dagger/oci_nrt_h100_heldout100.sbatch"
 COMMAND=(
     "$SBATCH_BIN" --parsable --wait --export=NONE
     --account=general_cs_infra__ngcsre --partition=batch_singlenode --qos=normal
-    --nodes=1 --gpus-per-node=8 --cpus-per-task=64 --mem=0 --time=04:00:00
+    --nodes=1 --gpus-per-node=8 --cpus-per-task=64 --mem=0 --time=03:45:00
     --job-name="rr-heldout100-${LEARNER_IDENTITY_SHA:0:12}"
     --output="$REMOTE_LOG/slurm_%j.out" --error="$REMOTE_LOG/slurm_%j.err"
     "$BATCH" "$SOURCE" "$SOURCE_SHA" "$CONTAINER" "$CONTAINER_SHA"
@@ -155,6 +198,7 @@ COMMAND=(
     "$SNAPSHOT" "$SNAPSHOT_FILE_SHA" "$SNAPSHOT_SHA" "$CHECKPOINT"
     "$CHECKPOINT_SHA" "$SPEC_SHA" "$MANIFEST_SHA" "$RUNTIME_SHA" "$CONFIG_SHA"
     "$CAMPAIGN_ID" "$MACRO_ROUND" "$PROJECT" "$CONTRACT" "$CONTRACT_SHA"
+    "$BINDING_SHA" "$PRODUCTION_CONTRACT_SHA" "$HELDOUT_FILE_SHA" "$HELDOUT_SHA"
     "$LEARNER_IDENTITY_SHA" "$WANDB_RUN_ID"
 )
 if ((DRY_RUN)); then

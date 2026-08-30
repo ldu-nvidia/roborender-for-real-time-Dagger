@@ -73,6 +73,12 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         ]
         snapshot = snapshot_dir / "through_macro_round_000000.json"
         snapshot.write_text("{}\n", encoding="utf-8")
+        learner_contract = campaign / "learner_contract.json"
+        learner_contract.write_text(
+            json.dumps({"schema": "fixture.campaign-owned-learner.v1"}) + "\n",
+            encoding="utf-8",
+        )
+        learner_contract.chmod(0o444)
         wandb = campaign / "actors/cohort_00/.wandb_media"
         wandb.mkdir(parents=True)
         (wandb / "latest").symlink_to(snapshot)
@@ -103,7 +109,10 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             ),
             "ROUND_DAGGER_LEARNER_CODE_SHA256": "4" * 64,
             "ROUND_DAGGER_LEARNER_CONFIG_SHA256": "5" * 64,
-            "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": "6" * 64,
+            "ROUND_DAGGER_LEARNER_CONTRACT": str(learner_contract),
+            "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": artifacts.sha256_file(
+                learner_contract
+            ),
             "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": "7" * 64,
             "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": checkpoint_sha,
             "ROUND_DAGGER_BASE_POLICY_SPEC": str(spec),
@@ -135,6 +144,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             completed = self._run(environment, cwd=root)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("gpus=8 updates=1200 save_every=5", completed.stdout)
+            self.assertIn("walltime=03:45:00", completed.stdout)
             self.assertIn("OCI_NRT_ROUND_LEARNER_BRIDGE_DRY_RUN_OK", completed.stdout)
             self.assertFalse(handoff.exists())
 
@@ -159,6 +169,65 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(
                 "not bound to the exact learner identity",
+                completed.stderr,
+            )
+
+            bad_contract_path = dict(
+                environment,
+                ROUND_DAGGER_LEARNER_CONTRACT=str(root / "other.json"),
+            )
+            completed = self._run(bad_contract_path, cwd=root)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("canonical campaign-owned", completed.stderr)
+
+            contract = Path(environment["ROUND_DAGGER_LEARNER_CONTRACT"])
+            contract.chmod(0o400)
+            completed = self._run(environment, cwd=root)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("exactly 0444", completed.stderr)
+
+    def test_trusted_dispatch_cannot_disable_mandatory_heldout100_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment, _ = self._fixture(root)
+
+            # Untrusted dry-run validation retains its explicit opt-out
+            # behavior and therefore remains usable for dependency-light
+            # control-plane tests.
+            untrusted = dict(
+                environment,
+                ROUND_DAGGER_REQUIRE_HELDOUT100_GATE="0",
+            )
+            completed = self._run(untrusted, cwd=root)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            trusted = dict(
+                environment,
+                ROUND_DAGGER_TRUSTED_TRAIN_DISPATCH="1",
+                ROUND_DAGGER_COORDINATOR_SOURCE_ROOT=str(ROOT),
+                ROUND_DAGGER_TRUSTED_HOOK_SOURCE_INVENTORY_SHA256="4" * 64,
+            )
+            inherited_disable = dict(
+                trusted,
+                ROUND_DAGGER_REQUIRE_HELDOUT100_GATE="0",
+            )
+            completed = self._run(inherited_disable, cwd=root)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(
+                "trusted production dispatch cannot disable the heldout100 gate",
+                completed.stderr,
+            )
+
+            # With no override, trusted dispatch still forces the gate.  This
+            # minimal fixture intentionally has no held-out fields, so it must
+            # fail before any remote access rather than silently dry-run the
+            # production learner.
+            completed = self._run(trusted, cwd=root)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(
+                "trusted production dispatch requires fixed-256 held-out evaluation",
                 completed.stderr,
             )
 
@@ -227,6 +296,33 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             self.assertIn(f"identity={third_identity}", third_run.stdout)
             self.assertFalse(handoff_root.exists())
 
+    def test_revoked_allocation_reuses_semantic_identity_and_restart_frontier(
+        self,
+    ) -> None:
+        bridge = BRIDGE.read_text(encoding="utf-8")
+        learner = (
+            ROOT / "scripts/round_dagger/run_h100_learner.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "retryable='^(PREEMPTED|NODE_FAIL|BOOT_FAIL|TIMEOUT|REVOKED)$'",
+            bridge,
+        )
+        self.assertIn(
+            "LEARNER_NAMESPACE=identity_${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}",
+            bridge,
+        )
+        self.assertIn(
+            'JOB_NAME="rr-rd-${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"',
+            bridge,
+        )
+        retry_loop = bridge.split("retryable=", 1)[1]
+        self.assertNotIn("LEARNER_NAMESPACE=", retry_loop)
+        self.assertNotIn("REMOTE_OUTPUT=", retry_loop)
+        self.assertIn("$state =~ $retryable", retry_loop)
+        self.assertIn('RESTART="$ROUND_DAGGER_LEARNER_OUTPUT_DIR/restart.pt"', learner)
+        self.assertIn('COMMAND+=(--resume-from "$RESUME_PATH")', learner)
+        self.assertIn("--save-every", learner)
+
     def test_scripts_pin_restart_security_and_topology_contracts(self) -> None:
         bridge = BRIDGE.read_text(encoding="utf-8")
         batch = BATCH.read_text(encoding="utf-8")
@@ -259,10 +355,18 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn("remote_learner_success.py\" verify", bridge)
         self.assertIn("LOCAL_SUCCESS_MARKER", bridge)
         self.assertIn("remote learner inventory changed across bridge restart", bridge)
+        self.assertIn("projected remote learner contract SHA mismatch", bridge)
+        self.assertIn(
+            '"$REMOTE_CAMPAIGN/learner_contract.json"',
+            bridge,
+        )
         incoming_verify = bridge.index('--result "$INCOMING_RESULT"')
         atomic_publish = bridge.index('publish --stage "$INCOMING_OUTPUT"')
         self.assertLess(incoming_verify, atomic_publish)
-        self.assertIn("PREEMPTED|NODE_FAIL|BOOT_FAIL|TIMEOUT", bridge)
+        self.assertIn(
+            "retryable='^(PREEMPTED|NODE_FAIL|BOOT_FAIL|TIMEOUT|REVOKED)$'",
+            bridge,
+        )
         for non_retryable in ("CANCELLED", "FAILED", "OUT_OF_MEMORY"):
             self.assertNotIn(f"PREEMPTED|{non_retryable}", bridge)
         self.assertIn("--gpus-per-node=8", bridge)
@@ -271,8 +375,12 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             bridge,
         )
         self.assertIn("partition must be batch_singlenode", bridge)
-        self.assertIn("--time=04:00:00", bridge)
+        self.assertIn("LEARNER_WALLTIME=03:45:00", bridge)
+        self.assertIn('--time="$LEARNER_WALLTIME"', bridge)
+        self.assertNotIn("--time=04:00:00", bridge)
         self.assertNotIn("--time=08:00:00", bridge)
+        self.assertIn("#SBATCH --time=03:45:00", batch)
+        self.assertNotIn("#SBATCH --time=04:00:00", batch)
         self.assertIn("/cm/shared/apps/slurm/current/bin", bridge)
         self.assertIn("--gpus-per-task=8", batch)
         self.assertIn("/round_dagger_job", batch)
@@ -293,12 +401,34 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn('"256:4:64:512:131072"', batch)
         self.assertIn("LEARNER_NAMESPACE=identity_", bridge)
         self.assertIn('JOB_NAME="rr-rd-${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}"', bridge)
+        self.assertIn(
+            "LEARNER_NAMESPACE=identity_${ROUND_DAGGER_LEARNER_IDENTITY_SHA256}",
+            bridge,
+        )
+        self.assertIn('$REMOTE_OUTPUT/restart.pt', bridge)
+        self.assertIn("restart.pt lineage", bridge)
         self.assertIn("learner_run_identity.v2", bridge)
         self.assertIn("runtime_container_sha256=", bridge)
         self.assertIn("learner_contract_sha256=", bridge)
         self.assertIn(
-            "ROUND_DAGGER_CAMPAIGN_ID == dagger_prod_run1 && $ROUND_DECIMAL == 0",
+            "$ROUND_DECIMAL == 0 ]] && ((HELDOUT100_REQUIRED))",
             bridge,
+        )
+        self.assertIn(
+            "HELDOUT100_REQUIRED && ! HELDOUT_ENABLED", bridge
+        )
+        self.assertIn(
+            "trusted production dispatch requires fixed-256 held-out evaluation",
+            bridge,
+        )
+        self.assertIn("HELDOUT100_REQUIRED=1", bridge)
+        self.assertIn(
+            "trusted production dispatch cannot disable the heldout100 gate",
+            bridge,
+        )
+        self.assertIn("HELDOUT100_BINDING_SHA256", bridge)
+        self.assertNotIn(
+            "HELDOUT100_PRODUCTION_CONTRACT_SHA256=e4a1d23", bridge
         )
         self.assertIn("submit_oci_nrt_h100_heldout100.sh", bridge)
         self.assertIn("BEGIN_HELDOUT100_GATE_EVIDENCE_VERIFIER", bridge)
@@ -336,6 +466,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             "config": "2" * 64,
             "identity": "3" * 64,
             "validation": "4" * 64,
+            "binding": "f" * 64,
             "production": "5" * 64,
             "replay_file": "6" * 64,
             "replay": "7" * 64,
@@ -345,7 +476,9 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             "heldout_file": "b" * 64,
             "heldout": "c" * 64,
         }
-        run_id = f"rrd-m000000-id{sha['identity']}"
+        run_id = (
+            f"rrd-m000000-id{sha['identity']}-b{sha['binding'][:32]}"
+        )
         heldout_path = "/mnt/data2/ldu/roborender_round_dagger_production/dagger_prod_run1/heldout_snapshot.json"
         quality = {
             "initial_action_mse": 2.0,
@@ -385,6 +518,8 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             "parent_runtime_policy_sha256": sha["runtime"],
             "learner_contract_sha256": sha["validation"],
             "validation_contract_sha256": sha["validation"],
+            "validation_binding_sha256": sha["binding"],
+            "production_contract_sha256": sha["production"],
             "heldout_snapshot_file_sha256": sha["heldout_file"],
             "heldout_snapshot_sha256": sha["heldout"],
             "heldout_case_count": 256,
@@ -453,6 +588,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
                 "heldout_snapshot_file_sha256": sha["heldout_file"],
                 "heldout_snapshot_sha256": sha["heldout"],
                 "validation_contract_sha256": sha["validation"],
+                "validation_binding_sha256": sha["binding"],
                 "production_target_contract_sha256": sha["production"],
                 "learner_code_sha256": sha["code"],
                 "learner_config_sha256": sha["config"],
@@ -484,7 +620,7 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
             arguments = [
                 str(evidence), "dagger_prod_run1", "0", sha["code"],
                 sha["config"], sha["identity"], sha["validation"],
-                sha["production"], sha["replay_file"], sha["replay"],
+                sha["binding"], sha["production"], sha["replay_file"], sha["replay"],
                 sha["parent"], sha["runtime"], sha["container"], heldout_path,
                 sha["heldout_file"], sha["heldout"], run_id,
             ]

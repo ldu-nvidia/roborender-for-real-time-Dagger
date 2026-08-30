@@ -9,7 +9,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=0
-#SBATCH --time=04:00:00
+#SBATCH --time=03:45:00
 #SBATCH --job-name=round_dagger_h100_learner
 set -Eeuo pipefail
 

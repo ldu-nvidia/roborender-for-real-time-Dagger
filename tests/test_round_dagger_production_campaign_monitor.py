@@ -101,6 +101,46 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
         self.assertTrue(report[str(pidfile)]["healthy"])
         self.assertEqual(report[str(pidfile)]["pid"], 123)
 
+    def test_bound_evaluation_process_uses_the_same_exact_identity_contract(self) -> None:
+        pidfile = self.base / "evaluation.pid.json"
+        entrypoint = "/sealed/scripts/round_dagger/evaluation_wandb_bridge.py"
+        state_dir = "/state/evaluation"
+        driver_status = "/control/driver_status.json"
+        pidfile.write_text(
+            json.dumps(
+                {
+                    "schema": "fast_roborender.round_dagger.evaluation_bridge_process.v1",
+                    "pid": 789,
+                    "start_ticks": 654,
+                    "entrypoint": entrypoint,
+                    "campaign_root": str(self.campaign),
+                    "state_dir": state_dir,
+                    "driver_status": driver_status,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        argv = (
+            "/python", entrypoint,
+            "--campaign-root", str(self.campaign),
+            "--state-dir", state_dir,
+            "--driver-status", driver_status,
+        )
+        with (
+            mock.patch(
+                "round_dagger.production_campaign_monitor._process_start_ticks",
+                return_value=654,
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._process_argv",
+                return_value=argv,
+            ),
+        ):
+            report = _bound_process_matches((pidfile,), campaign_root=self.campaign)
+        self.assertTrue(report[str(pidfile)]["healthy"])
+        self.assertEqual(report[str(pidfile)]["pid"], 789)
+
     def test_bounded_test_poll_writes_atomic_latest_and_history(self) -> None:
         counter = 0
 
@@ -532,7 +572,140 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
         self.assertTrue(report["read_only"])
         self.assertEqual(report["campaign_run_count"], 1)
         self.assertEqual(report["runs"][0]["last_history_step"], 17)
+        self.assertEqual(report["runs"][0]["immutable_binding"], "campaign_id_only")
         self.assertNotIn("password", json.dumps(report).lower())
+
+    def test_remote_wandb_readback_rejects_stale_campaign_incarnations(self) -> None:
+        netrc = self.base / ".netrc"
+        netrc.write_text(
+            "machine api.wandb.ai login user password hidden\n",
+            encoding="utf-8",
+        )
+        netrc.chmod(0o600)
+        campaign_sha = "a" * 64
+        contract_sha = "b" * 64
+
+        class Run:
+            name = "telemetry"
+            state = "running"
+            updated_at = "2026-08-28T01:02:03Z"
+            lastHistoryStep = 17
+
+            def __init__(self, run_id, config):
+                self.id = run_id
+                self.config = config
+
+        runs = [
+            Run(
+                "campaign-bound",
+                {
+                    "round_dagger/campaign_id": "campaign",
+                    "round_dagger/campaign_sha256": campaign_sha,
+                },
+            ),
+            Run(
+                "contract-bound",
+                {
+                    "round_dagger/campaign_id": "campaign",
+                    "round_dagger/campaign_contract_sha256": contract_sha,
+                },
+            ),
+            Run(
+                "both-bound",
+                {
+                    "round_dagger/campaign_id": "campaign",
+                    "round_dagger/campaign_sha256": campaign_sha,
+                    "round_dagger/campaign_contract_sha256": contract_sha,
+                },
+            ),
+            Run(
+                "stale-campaign",
+                {
+                    "round_dagger/campaign_id": "campaign",
+                    "round_dagger/campaign_sha256": "c" * 64,
+                },
+            ),
+            Run(
+                "conflicting-binders",
+                {
+                    "round_dagger/campaign_id": "campaign",
+                    "round_dagger/campaign_sha256": campaign_sha,
+                    "round_dagger/campaign_contract_sha256": "d" * 64,
+                },
+            ),
+            Run("unbound", {"round_dagger/campaign_id": "campaign"}),
+            Run(
+                "other-campaign",
+                {
+                    "round_dagger/campaign_id": "other",
+                    "round_dagger/campaign_sha256": campaign_sha,
+                },
+            ),
+        ]
+        observed_query = {}
+
+        class Api:
+            viewer = {"email": "ldu@nvidia.com"}
+
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            def runs(self, _path, **kwargs):
+                observed_query.update(kwargs)
+                # Deliberately return records that a conforming server-side
+                # filter would remove, proving the local filter is fail closed.
+                return runs
+
+        fake_wandb = mock.Mock(Api=Api)
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            report = _wandb_remote_health(
+                entity="nvidia",
+                project="roborender-round-dagger",
+                expected_email="ldu@nvidia.com",
+                netrc_path=netrc,
+                campaign_id="campaign",
+                campaign_sha256=campaign_sha,
+                campaign_contract_sha256=contract_sha,
+            )
+
+        self.assertEqual(
+            {item["id"] for item in report["runs"]},
+            {"campaign-bound", "contract-bound", "both-bound"},
+        )
+        self.assertEqual(
+            report["immutable_binding_counts"],
+            {
+                "campaign_sha256": 1,
+                "campaign_contract_sha256": 1,
+                "campaign_sha256+campaign_contract_sha256": 1,
+            },
+        )
+        self.assertEqual(
+            report["ignored_run_counts"],
+            {
+                "other_campaign_id": 1,
+                "immutable_mismatch": 2,
+                "missing_immutable_binding": 1,
+            },
+        )
+        self.assertEqual(
+            observed_query["filters"],
+            {
+                "$and": [
+                    {"config.round_dagger/campaign_id": "campaign"},
+                    {
+                        "$or": [
+                            {
+                                "config.round_dagger/campaign_sha256": campaign_sha
+                            },
+                            {
+                                "config.round_dagger/campaign_contract_sha256": contract_sha
+                            },
+                        ]
+                    },
+                ]
+            },
+        )
 
     def test_remote_wandb_progress_detects_history_or_update_movement(self) -> None:
         previous = {

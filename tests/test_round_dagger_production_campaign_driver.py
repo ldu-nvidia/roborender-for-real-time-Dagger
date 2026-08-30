@@ -17,6 +17,7 @@ from round_dagger.production_campaign_driver import (
     ExclusiveLauncherExecutionLock,
     ProductionDriverError,
     _check_path_chain,
+    _collection_retry_streak,
     _is_operator_cancellation,
     _load_collection_attempts,
     _load_collection_failures,
@@ -78,8 +79,13 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.contract.chmod(0o444)
-        self.learner = self.base / "learner.json"
-        self.learner.write_text("{}\n", encoding="utf-8")
+        self.learner = self.campaign_root / "learner_contract.json"
+        self.learner.write_bytes(
+            (
+                ROOT
+                / "configs/round_dagger/production_learner_8xh100_1200.json"
+            ).read_bytes()
+        )
         self.learner.chmod(0o444)
         self.evaluation_source = self.base / "evaluation-source"
         self.evaluation_source.mkdir()
@@ -106,7 +112,19 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             "topology": {"macro_round_count": 5},
             "evaluation": {"hydra_config_sha256": EVALUATOR},
         }
-        self.campaign = {"campaign_id": "campaign", "macro_round_count": 5}
+        self.campaign = {
+            "campaign_id": "campaign",
+            "macro_round_count": 5,
+            "policy_config_sha256": artifacts.sha256_file(self.learner),
+        }
+
+    def _source_bound_inputs(self) -> DriverInputs:
+        launcher = ROOT / "scripts/round_dagger/launch_production_macro_round.sh"
+        return replace(
+            self.inputs,
+            launcher=launcher,
+            launcher_sha256=artifacts.sha256_file(launcher),
+        )
 
     def _publish_unmatched_attempt_fixture(
         self, inputs: DriverInputs, observed: dict
@@ -449,6 +467,44 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
         self.assertEqual(status["state"], "FAILED")
         self.assertEqual(status["collection_retry_count"], 1)
         self.assertIn("retry limit", status["detail"])
+
+    def test_retry_budget_resets_after_a_cohort_is_durably_sealed(self) -> None:
+        empty = {
+            "safe_to_retry": True,
+            "cohorts": [
+                {
+                    "cohort_index": 0,
+                    "state": "unsealed",
+                    "rank_states": {"0": "empty", "1": "empty"},
+                },
+                *(
+                    {"cohort_index": index, "state": "absent"}
+                    for index in range(1, 4)
+                ),
+            ],
+        }
+        sealed = {
+            "safe_to_retry": True,
+            "cohorts": [
+                {"cohort_index": 0, "state": "sealed"},
+                *(
+                    {"cohort_index": index, "state": "absent"}
+                    for index in range(1, 4)
+                ),
+            ],
+        }
+        failures = [{"recovery": empty} for _ in range(5)]
+        self.assertEqual(_collection_retry_streak(failures), 5)
+        self.assertEqual(
+            _collection_retry_streak([*failures, {"recovery": sealed}]),
+            1,
+        )
+        self.assertEqual(
+            _collection_retry_streak(
+                [*failures, {"recovery": sealed}, {"recovery": sealed}]
+            ),
+            2,
+        )
 
     def test_retry_budget_survives_driver_crash_and_restart(self) -> None:
         initial = coordinator(1, "COLLECTING")
@@ -878,9 +934,8 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             campaign_root=self.campaign_root,
             campaign_contract=self.contract,
             campaign_contract_sha256=artifacts.sha256_file(self.contract),
-            learner_contract=ROOT
-            / "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json",
-            learner_contract_sha256="a" * 64,
+            learner_contract=self.learner,
+            learner_contract_sha256=artifacts.sha256_file(self.learner),
             sealed_source_root=Path("/remote/sealed/source"),
             sealed_source_inventory_sha256=SHA,
             evaluation_sealed_source_root=self.evaluation_source,
@@ -893,7 +948,7 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             mock.patch("round_dagger.production_campaign_driver._verify_file"),
             mock.patch(
                 "round_dagger.production_campaign_driver.state.load_campaign",
-                return_value={"campaign_id": "campaign", "macro_round_count": 5},
+                return_value=self.campaign,
             ),
             mock.patch(
                 "scripts.round_dagger.production_launch.materialize_campaign_contract",
@@ -908,14 +963,47 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             runtime_contract_sha256=artifacts.sha256_file(self.contract),
         )
 
+    def test_validate_rejects_noncanonical_or_mutable_learner_contract(self) -> None:
+        inputs = self._source_bound_inputs()
+        alternate = self.base / "alternate-learner-contract.json"
+        alternate.write_bytes(self.learner.read_bytes())
+        alternate.chmod(0o444)
+        with mock.patch("round_dagger.production_campaign_driver._verify_file"):
+            with self.assertRaisesRegex(
+                ProductionDriverError, "canonical campaign-owned"
+            ):
+                replace(
+                    inputs,
+                    learner_contract=alternate,
+                    learner_contract_sha256=artifacts.sha256_file(alternate),
+                ).validate()
+
+        self.learner.chmod(0o400)
+        with mock.patch("round_dagger.production_campaign_driver._verify_file"):
+            with self.assertRaisesRegex(ProductionDriverError, "exactly 0444"):
+                inputs.validate()
+
+    def test_validate_rejects_campaign_policy_contract_identity_mismatch(self) -> None:
+        inputs = self._source_bound_inputs()
+        with (
+            mock.patch("round_dagger.production_campaign_driver._verify_file"),
+            mock.patch(
+                "round_dagger.production_campaign_driver.state.load_campaign",
+                return_value={**self.campaign, "policy_config_sha256": "f" * 64},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ProductionDriverError, "policy_config_sha256 differs"
+            ):
+                inputs.validate()
+
     def test_validate_rejects_relative_evaluation_seal(self) -> None:
         relative = DriverInputs(
             campaign_root=self.campaign_root,
             campaign_contract=self.contract,
             campaign_contract_sha256=artifacts.sha256_file(self.contract),
-            learner_contract=ROOT
-            / "configs/round_dagger/production_learner_8xh100_1200_dagger_prod_run1.json",
-            learner_contract_sha256="a" * 64,
+            learner_contract=self.learner,
+            learner_contract_sha256=artifacts.sha256_file(self.learner),
             sealed_source_root=Path("/remote/sealed/source"),
             sealed_source_inventory_sha256=SHA,
             evaluation_sealed_source_root=Path("relative-evaluation-seal"),
