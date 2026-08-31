@@ -1,0 +1,53 @@
+# Credentials and local account state
+.env
+.env.*
+!.env.example
+.netrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.kubeconfig
+credentials*.json
+service-account*.json
+.aws/
+.config/gcloud/
+
+# Python and test state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Models, datasets, rollouts, and generated media
+artifacts/
+checkpoints/
+data/
+datasets/
+outputs/
+runtime/
+wandb/
+telemetry/
+*.npz
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine
+*.mp4
+*.webm
+*.png
+*.jpg
+*.jpeg
+
+# Local/editor files
+.DS_Store
+.vscode/
+.idea/
+*.log
