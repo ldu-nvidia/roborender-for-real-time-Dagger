@@ -114,9 +114,11 @@ elif [ "$DRY_RUN" != 1 ]; then
     exit 2
 fi
 
-mkdir -p "$TRAIN_DIR/logs" "$TRAIN_DIR/actor_pair_attempts"
+TERMINAL_ATTEMPTS_DIR="$TRAIN_DIR/actor_pair_terminal_attempts"
+mkdir -p "$TRAIN_DIR/logs" "$TRAIN_DIR/actor_pair_attempts" "$TERMINAL_ATTEMPTS_DIR"
 [ ! -L "$TRAIN_DIR" ] && [ ! -L "$TRAIN_DIR/logs" ] && \
-    [ ! -L "$TRAIN_DIR/actor_pair_attempts" ] || {
+    [ ! -L "$TRAIN_DIR/actor_pair_attempts" ] && \
+    [ ! -L "$TERMINAL_ATTEMPTS_DIR" ] || {
     echo "actor pair run directories must not be symbolic links" >&2; exit 2;
 }
 
@@ -166,7 +168,7 @@ recover_wandb_delivery() {
 publish_recovery_terminal() {
     local recovery_attempt terminal
     recovery_attempt=$(mktemp -d \
-        "$TRAIN_DIR/actor_pair_attempts/wandb_recovery_$(date -u +%Y%m%dT%H%M%SZ)_$$_XXXXXXXX")
+        "$TERMINAL_ATTEMPTS_DIR/wandb_recovery_$(date -u +%Y%m%dT%H%M%SZ)_$$_XXXXXXXX")
     terminal=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m round_dagger.actor_pair_terminal \
             --attempt-dir "$recovery_attempt" --run-dir "$TRAIN_DIR" \
@@ -288,7 +290,7 @@ if [ "${#LAUNCH_RANKS[@]}" -eq 0 ]; then
     printf '%s\n' "$SEALED_JSON"
     publish_student_quality
     RECOVERY_ATTEMPT_DIR=$(mktemp -d \
-        "$TRAIN_DIR/actor_pair_attempts/recovered_complete_$(date -u +%Y%m%dT%H%M%SZ)_$$_XXXXXXXX")
+        "$TERMINAL_ATTEMPTS_DIR/recovered_complete_$(date -u +%Y%m%dT%H%M%SZ)_$$_XXXXXXXX")
     RECOVERY_TERMINAL_JSON=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         python3 -m round_dagger.actor_pair_terminal \
             --attempt-dir "$RECOVERY_ATTEMPT_DIR" --run-dir "$TRAIN_DIR" \

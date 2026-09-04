@@ -21,6 +21,7 @@ import io
 import json
 import math
 import os
+import pickle
 import random
 import re
 import stat
@@ -39,11 +40,89 @@ EVALUATION_CHECKPOINT_SCHEMA = "fast_roborender.eval_checkpoint.v1"
 EVALUATION_PROVENANCE_SCHEMA = "fast_roborender.eval_checkpoint_provenance.v1"
 POLICY_STATE_KEYS = ("actor_model_state_dict", "policy_state_dict")
 AUXILIARY_STATE_KEYS = ("value_state_dict", "homie_state_dict")
-EVALUATION_STATE_KEYS = frozenset((*POLICY_STATE_KEYS, *AUXILIARY_STATE_KEYS))
+TENSOR_STATE_KEYS = frozenset((*POLICY_STATE_KEYS, *AUXILIARY_STATE_KEYS))
+HOMIE_CONTROLLER_SHA256_KEY = "homie_controller_sha256"
+EVALUATION_METADATA_KEYS = frozenset((HOMIE_CONTROLLER_SHA256_KEY,))
+EVALUATION_STATE_KEYS = TENSOR_STATE_KEYS | EVALUATION_METADATA_KEYS
+HOMIE_CONTROLLER_ROLES = frozenset(("walk", "stand"))
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class GateError(RuntimeError):
     """The evaluation contract is incomplete or malformed."""
+
+
+class _DiscardedNumpyArray:
+    """Inert placeholder for non-model NumPy state removed after source load."""
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "_DiscardedNumpyArray":
+        del args, kwargs
+        return super().__new__(cls)
+
+    def __setstate__(self, state: Any) -> None:
+        del state
+
+
+def _discard_numpy_reconstruct(*args: Any, **kwargs: Any) -> _DiscardedNumpyArray:
+    del args, kwargs
+    return _DiscardedNumpyArray()
+
+
+class _ContractedSourceUnpickler(pickle.Unpickler):
+    """Discard only NumPy-2 ndarray objects that evaluation never retains."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module == "numpy._core.multiarray" and name == "_reconstruct":
+            return _discard_numpy_reconstruct
+        if module == "numpy" and name == "ndarray":
+            return _DiscardedNumpyArray
+        return super().find_class(module, name)
+
+
+class _ContractedSourcePickleModule:
+    """Minimal pickle-module interface consumed by ``torch.load``."""
+
+    __name__ = "pickle"
+    Unpickler = _ContractedSourceUnpickler
+    Pickler = pickle.Pickler
+    load = staticmethod(pickle.load)
+    loads = staticmethod(pickle.loads)
+    dump = staticmethod(pickle.dump)
+    dumps = staticmethod(pickle.dumps)
+
+
+def _torch_load_contracted(
+    torch: Any,
+    payload: bytes,
+    *,
+    pickle_module: Any | None = None,
+) -> Any:
+    """Load a contracted checkpoint on current or legacy PyTorch."""
+
+    kwargs: dict[str, Any] = {"map_location": "cpu"}
+    if pickle_module is not None:
+        kwargs["pickle_module"] = pickle_module
+    try:
+        return torch.load(io.BytesIO(payload), weights_only=False, **kwargs)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        return torch.load(io.BytesIO(payload), **kwargs)
+
+
+def _load_contracted_source(torch: Any, payload: bytes) -> Any:
+    """Load a hash-contracted source, discarding incompatible NumPy-2 RNG arrays."""
+
+    try:
+        return _torch_load_contracted(torch, payload)
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"numpy._core", "numpy._core.multiarray"}:
+            raise
+    return _torch_load_contracted(
+        torch,
+        payload,
+        pickle_module=_ContractedSourcePickleModule,
+    )
 
 
 def _utc_now() -> str:
@@ -143,17 +222,22 @@ def load_checkpoint_file(
     # file descriptor would permit an in-place write between hash and pickle
     # execution, even if a later fstat detected the change.
     try:
-        checkpoint = torch.load(
-            io.BytesIO(payload),
-            map_location="cpu",
-            weights_only=weights_only,
-        )
+        if weights_only:
+            checkpoint = torch.load(
+                io.BytesIO(payload),
+                map_location="cpu",
+                weights_only=True,
+            )
+        else:
+            checkpoint = _load_contracted_source(torch, payload)
     except TypeError as exc:
         if weights_only:
             raise GateError(
                 "safe staged checkpoint loading requires PyTorch weights_only"
             ) from exc
-        checkpoint = torch.load(io.BytesIO(payload), map_location="cpu")
+        raise GateError(
+            f"cannot contracted-load {label}: TypeError: {exc}"
+        ) from None
     except Exception as exc:
         mode = "safe" if weights_only else "contracted"
         raise GateError(
@@ -167,7 +251,7 @@ def load_checkpoint_file(
 def minimal_evaluation_checkpoint(
     checkpoint: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[str], list[str]]:
-    """Extract only model state consumed by the evaluation loader."""
+    """Extract model state and bounded identity metadata used by the loader."""
 
     if any(not isinstance(key, str) for key in checkpoint):
         raise GateError("checkpoint top-level keys must be strings")
@@ -180,15 +264,37 @@ def minimal_evaluation_checkpoint(
     for key in AUXILIARY_STATE_KEYS:
         if checkpoint.get(key) is not None:
             retained.append(key)
+    if HOMIE_CONTROLLER_SHA256_KEY in checkpoint:
+        retained.append(HOMIE_CONTROLLER_SHA256_KEY)
     minimal = {key: checkpoint[key] for key in retained}
+    if HOMIE_CONTROLLER_SHA256_KEY in minimal:
+        minimal[HOMIE_CONTROLLER_SHA256_KEY] = _validate_homie_controller_sha256(
+            minimal[HOMIE_CONTROLLER_SHA256_KEY]
+        )
     validate_evaluation_checkpoint(minimal)
     retained.sort()
     removed = sorted(set(checkpoint) - set(retained))
     return minimal, retained, removed
 
 
+def _validate_homie_controller_sha256(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != HOMIE_CONTROLLER_ROLES:
+        raise GateError(
+            "homie_controller_sha256 must contain exactly walk and stand"
+        )
+    normalized: dict[str, str] = {}
+    for role in HOMIE_CONTROLLER_ROLES:
+        digest = value[role]
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise GateError(
+                f"Homie {role} controller SHA-256 must be a lowercase SHA-256"
+            )
+        normalized[role] = digest
+    return normalized
+
+
 def validate_evaluation_checkpoint(checkpoint: Mapping[str, Any]) -> None:
-    """Require the exact tensor-only structure accepted for evaluation."""
+    """Require the exact tensor state and bounded metadata accepted for evaluation."""
 
     try:
         import torch
@@ -199,7 +305,12 @@ def validate_evaluation_checkpoint(checkpoint: Mapping[str, Any]) -> None:
         raise GateError("evaluation checkpoint contains an unsupported top-level key")
     if len(keys.intersection(POLICY_STATE_KEYS)) != 1:
         raise GateError("evaluation checkpoint policy state is missing or ambiguous")
-    for section, state_dict in checkpoint.items():
+    if HOMIE_CONTROLLER_SHA256_KEY in checkpoint:
+        _validate_homie_controller_sha256(
+            checkpoint[HOMIE_CONTROLLER_SHA256_KEY]
+        )
+    for section in sorted(keys.intersection(TENSOR_STATE_KEYS)):
+        state_dict = checkpoint[section]
         if not isinstance(state_dict, Mapping) or not state_dict:
             raise GateError(f"evaluation checkpoint {section} must be a non-empty mapping")
         if any(not isinstance(name, str) or not name for name in state_dict):
@@ -237,6 +348,18 @@ def checkpoint_semantic_sha256(checkpoint: Mapping[str, Any]) -> str:
     digest.update(EVALUATION_CHECKPOINT_SCHEMA.encode("ascii") + b"\0")
     for section in sorted(checkpoint):
         _semantic_field(digest, section.encode("utf-8"))
+        if section == HOMIE_CONTROLLER_SHA256_KEY:
+            metadata = checkpoint[section]
+            _semantic_field(
+                digest,
+                json.dumps(
+                    metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("ascii"),
+            )
+            continue
         state_dict = checkpoint[section]
         for name in sorted(state_dict):
             tensor = state_dict[name].detach().to(device="cpu").contiguous()
@@ -252,12 +375,14 @@ def checkpoint_semantic_sha256(checkpoint: Mapping[str, Any]) -> str:
 
 
 def sanitize_checkpoint(source: Path, output: Path, expected_sha256: str) -> dict[str, Any]:
-    """Create a tensor-only evaluation checkpoint bound to the source semantics.
+    """Create a safe evaluation checkpoint bound to the source semantics.
 
     GR00T checkpoints contain ``env_state_dict`` and its loader restores that state after
     Isaac has been seeded.  Leaving it in would make nominally fixed-seed comparisons use
     checkpoint-dependent simulator state.  All non-model state is omitted, making the
-    result safe to independently load with ``weights_only=True``.
+    result safe to independently load with ``weights_only=True``.  The only
+    non-tensor field retained is the exact walk/stand controller identity that
+    the production Homie loader requires before executing a policy.
     """
 
     source = Path(os.path.abspath(source))

@@ -274,6 +274,7 @@ class PairedEvaluationTest(unittest.TestCase):
         safety: list[bool],
         action_mse: float,
         renderer_errors: int = 0,
+        renderer_initial_errors: int = 0,
         bad_scenario: bool = False,
         omit_view: bool = False,
         attempt: int = 1,
@@ -396,7 +397,11 @@ class PairedEvaluationTest(unittest.TestCase):
                     "response": {
                         "server_id": "renderer-0",
                         "runtime_identity": self.renderer_identity,
-                        "metrics": {"requests": 10, "errors": 0, "replays": 0},
+                        "metrics": {
+                            "requests": 10,
+                            "errors": renderer_initial_errors,
+                            "replays": 0,
+                        },
                     },
                 }
             ]
@@ -404,7 +409,7 @@ class PairedEvaluationTest(unittest.TestCase):
         after = json.loads(json.dumps(before))
         after["selected"][0]["response"]["metrics"] = {
             "requests": 10 + generated_frames,
-            "errors": renderer_errors,
+            "errors": renderer_initial_errors + renderer_errors,
             "replays": 0,
         }
         paths = raw / "metrics.json", raw / "before.json", raw / "after.json"
@@ -1259,6 +1264,32 @@ class PairedEvaluationTest(unittest.TestCase):
                         ),
                         output=f"evaluation/bad/{index}/outcome.json",
                     )
+
+    def test_preexisting_renderer_error_counter_is_allowed_when_delta_is_zero(self) -> None:
+        role = "parent"
+        seed = self.contract["seeds"][0]
+        metrics, before, after = self._raw_evidence(
+            role,
+            seed,
+            successes=[True, False, False, False],
+            safety=[False] * 4,
+            action_mse=1.0,
+            renderer_initial_errors=16,
+        )
+        outcome = attest_outcome(
+            self.root,
+            contract_path=self.contract["contract_path"],
+            role=role,
+            seed=seed,
+            metrics_path=metrics,
+            renderer_before_path=before,
+            renderer_after_path=after,
+            image3f_run_id=evaluation_run_id(
+                self.contract, role=role, seed=seed, attempt=1
+            ),
+            output="evaluation/preexisting-errors/outcome.json",
+        )
+        self.assertEqual(outcome["renderer_errors"], 0)
 
     def test_actual_initial_conditions_must_match_the_paired_contract(self) -> None:
         for role in ("parent", "candidate"):

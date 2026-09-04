@@ -654,6 +654,9 @@ class RemoteLearnerBridgeContractTest(unittest.TestCase):
         self.assertIn("existing learner result restart is not at the final frontier", launcher)
         self.assertIn("H100_LEARNER_RECOVERY_CLEANUP", launcher)
         self.assertIn("recovered=attested", launcher)
+        self.assertIn(
+            '--result "$(basename "$ROUND_DAGGER_LEARNER_RESULT")"', launcher
+        )
 
     def test_batch_host_dry_run_does_not_require_python_or_numpy(self) -> None:
         batch = ROOT / "scripts/round_dagger/oci_nrt_round_learner.sbatch"

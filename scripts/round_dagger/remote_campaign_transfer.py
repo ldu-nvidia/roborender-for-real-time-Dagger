@@ -263,12 +263,24 @@ def publish_inventory(path: str | os.PathLike[str], document: Mapping[str, Any])
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        # Set the immutable mode on the inode *before* exposing it at the
+        # canonical name.  Linking first creates a crash window in which a
+        # consumer can adopt a writable file as immutable evidence.
+        os.chmod(temporary, 0o444)
         try:
             os.link(temporary, destination, follow_symlinks=False)
         except FileExistsError:
             if destination.is_symlink() or destination.read_bytes() != payload:
                 raise TransferInventoryError("competing inventory publication differs")
-        os.chmod(destination, 0o444)
+        if os.stat(destination, follow_symlinks=False).st_mode & 0o222:
+            raise TransferInventoryError("published inventory is unexpectedly writable")
+        directory = os.open(
+            destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
 

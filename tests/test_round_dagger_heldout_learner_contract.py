@@ -18,7 +18,7 @@ from round_dagger.heldout_learner_contract import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE_CONTRACT = (
-    ROOT / "configs/round_dagger/production_learner_8xh100_1200.json"
+    ROOT / "configs/round_dagger/production_learner_8rank_1200.json"
 )
 CAMPAIGN_ID = "dagger_prod_run1"
 

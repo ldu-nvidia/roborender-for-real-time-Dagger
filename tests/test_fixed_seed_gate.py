@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+import zipfile
 from unittest import mock
 from pathlib import Path
 
@@ -14,6 +15,11 @@ try:
     import torch
 except ImportError:  # pragma: no cover - exercised in the production venv
     torch = None
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - torch production images provide NumPy
+    np = None
 
 
 class FixedSeedGateTest(unittest.TestCase):
@@ -112,6 +118,10 @@ class FixedSeedGateTest(unittest.TestCase):
         output = self.root / "staged.pt"
         torch.save({
             "policy_state_dict": {"weight": torch.ones(2, 2)},
+            "homie_controller_sha256": {
+                "walk": "a" * 64,
+                "stand": "b" * 64,
+            },
             "env_state_dict": {"rng": 99},
             "optimizer_state_dict": {"momentum": 1},
             "lr_scheduler_state_dict": {"step": 10},
@@ -123,9 +133,83 @@ class FixedSeedGateTest(unittest.TestCase):
         saved = torch.load(output, map_location="cpu", weights_only=True)
         self.assertTrue(output.is_file())
         self.assertIn("policy_state_dict", saved)
+        self.assertEqual(
+            saved["homie_controller_sha256"],
+            {"walk": "a" * 64, "stand": "b" * 64},
+        )
+        self.assertIn("homie_controller_sha256", provenance["retained_keys"])
         self.assertNotIn("env_state_dict", saved)
         self.assertNotIn("optimizer_state_dict", saved)
         self.assertFalse(provenance["environment_state_restored"])
+
+    def test_sanitized_checkpoint_rejects_malformed_homie_identity(self):
+        if torch is None:
+            self.skipTest("torch is required for checkpoint sanitization")
+        source = self.root / "malformed_homie.pt"
+        output = self.root / "staged_malformed_homie.pt"
+        torch.save(
+            {
+                "policy_state_dict": {"weight": torch.ones(2, 2)},
+                "homie_controller_sha256": {"walk": "a" * 64},
+            },
+            source,
+        )
+        with self.assertRaisesRegex(
+            gate.GateError, "must contain exactly walk and stand"
+        ):
+            gate.sanitize_checkpoint(source, output, gate.sha256_file(source))
+        self.assertFalse(output.exists())
+
+    def test_sanitizer_reads_numpy2_rng_state_on_numpy1_runtime(self):
+        if torch is None or np is None:
+            self.skipTest("torch and NumPy are required for checkpoint sanitization")
+        native = self.root / "native_numpy_checkpoint.pt"
+        source = self.root / "numpy2_checkpoint.pt"
+        output = self.root / "staged_numpy2_checkpoint.pt"
+        torch.save(
+            {
+                "policy_state_dict": {"weight": torch.ones(2, 2)},
+                "homie_controller_sha256": {
+                    "walk": "a" * 64,
+                    "stand": "b" * 64,
+                },
+                "env_state_dict": {"numpy_rng": np.arange(8, dtype=np.uint32)},
+            },
+            native,
+        )
+        replaced = False
+        with zipfile.ZipFile(native, "r") as source_archive:
+            entries = [
+                (entry, source_archive.read(entry.filename))
+                for entry in source_archive.infolist()
+            ]
+        with zipfile.ZipFile(source, "w") as rewritten_archive:
+            for entry, payload in entries:
+                if entry.filename.endswith("/data.pkl"):
+                    updated = payload.replace(
+                        b"numpy.core.multiarray", b"numpy._core.multiarray"
+                    )
+                    replaced = replaced or updated != payload
+                    payload = updated
+                rewritten_archive.writestr(entry, payload)
+        # NumPy 2 already emits the underscored module name; NumPy 1 exercises
+        # the byte-level rewrite and the narrow discard-unpickler fallback.
+        if np.__version__.split(".", 1)[0] == "1":
+            self.assertTrue(replaced)
+            self.assertNotIn("numpy._core", sys.modules)
+
+        provenance = gate.sanitize_checkpoint(
+            source, output, gate.sha256_file(source)
+        )
+        saved = torch.load(output, map_location="cpu", weights_only=True)
+        self.assertEqual(
+            saved["homie_controller_sha256"],
+            {"walk": "a" * 64, "stand": "b" * 64},
+        )
+        self.assertNotIn("env_state_dict", saved)
+        self.assertFalse(provenance["environment_state_restored"])
+        if np.__version__.split(".", 1)[0] == "1":
+            self.assertNotIn("numpy._core", sys.modules)
 
     def test_checkpoint_loader_deserializes_immutable_accepted_snapshot(self):
         if torch is None:
@@ -227,6 +311,7 @@ class EvalMetricsAdapterTest(unittest.TestCase):
             patched,
             metrics_adapter.EVAL_CALL_RE,
         )
+        self.assertIn("__roborender_install_replay_anchor_compat(trainer)", patched)
 
     def test_adapter_executes_original_program_and_atomically_records_return(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -269,6 +354,187 @@ if __name__ == "__main__":
             self.assertEqual(
                 payload["_roborender_eval_adapter"]["image3f_run_id"],
                 "rde-deadbeef-parent-s17-a000001",
+            )
+            self.assertEqual(
+                payload["_roborender_eval_adapter"]["paired_replay_anchor_compat"],
+                {"enabled": False},
+            )
+
+    def _compat_trainer(self, *, raise_after_commit: bool = False):
+        if np is None:
+            self.skipTest("NumPy is required for replay-anchor compatibility")
+
+        class TRLDistillTrainerVideoGen:
+            def __init__(self):
+                self._in_train_rollout = False
+                self._first_condition_bundle_mode = "replay"
+                self.vg_view_names = ["head_color", "hand_left", "hand_right"]
+                self._id_anchors = [
+                    {
+                        view: np.full((2, 3, 3), 1, dtype=np.uint8)
+                        for view in self.vg_view_names
+                    }
+                ]
+                self._id_use_raytraced = {0: False}
+                self._first_condition_replay_consumed = set()
+                self.relabel_call_count = 0
+                self._first_condition_bundle = {
+                    "requests_by_env": {
+                        0: (
+                            {
+                                view: np.full((2, 3), 2, dtype=np.uint8)
+                                for view in self.vg_view_names
+                            },
+                            {
+                                view: np.full((2, 3, 3), 3, dtype=np.uint8)
+                                for view in self.vg_view_names
+                            },
+                            {
+                                view: np.full((2, 3, 3), 4, dtype=np.uint8)
+                                for view in self.vg_view_names
+                            },
+                        )
+                    }
+                }
+
+            def _image_dagger_relabel(self, obs_dict, cur_dones):
+                self.relabel_call_count += 1
+                self._first_condition_replay_consumed.add(0)
+                if raise_after_commit:
+                    raise RuntimeError("renderer failed")
+                return {"ok": True}
+
+        return TRLDistillTrainerVideoGen()
+
+    def test_paired_replay_compat_commits_canonical_anchor_after_success(self):
+        trainer = self._compat_trainer()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "trainer.py"
+            source.write_text("# accepted trainer fixture\n", encoding="utf-8")
+            digest = metrics_adapter.sha256_bytes(source.read_bytes())
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "IMAGE_DAGGER_PAIRED_EVAL": "1",
+                        "IMAGE_DAGGER_FIRST_CONDITION_MODE": "replay",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(metrics_adapter.inspect, "getsourcefile", return_value=str(source)),
+                mock.patch.object(metrics_adapter, "PAIRED_REPLAY_TRAINER_SHA256", digest),
+            ):
+                provenance = metrics_adapter.install_replay_anchor_compat(trainer)
+                self.assertTrue(provenance["enabled"])
+                self.assertEqual(trainer._image_dagger_relabel({}, None), {"ok": True})
+        for view in trainer.vg_view_names:
+            np.testing.assert_array_equal(
+                trainer._id_anchors[0][view],
+                trainer._first_condition_bundle["requests_by_env"][0][2][view],
+            )
+        self.assertTrue(trainer._id_anchors[0]["head_color"].flags.c_contiguous)
+        self.assertIsNot(
+            trainer._id_anchors[0]["head_color"],
+            trainer._first_condition_bundle["requests_by_env"][0][2]["head_color"],
+        )
+
+    def test_paired_replay_compat_defers_bundle_mode_check_until_eval_lifecycle(self):
+        """The evaluator installs its wrapper before ``trainer.eval()`` resets state."""
+
+        trainer = self._compat_trainer()
+        trainer._first_condition_bundle_mode = None
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "trainer.py"
+            source.write_text("# accepted trainer fixture\n", encoding="utf-8")
+            digest = metrics_adapter.sha256_bytes(source.read_bytes())
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "IMAGE_DAGGER_PAIRED_EVAL": "1",
+                        "IMAGE_DAGGER_FIRST_CONDITION_MODE": "replay",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    metrics_adapter.inspect,
+                    "getsourcefile",
+                    return_value=str(source),
+                ),
+                mock.patch.object(metrics_adapter, "PAIRED_REPLAY_TRAINER_SHA256", digest),
+            ):
+                # This must succeed before GR00T's eval lifecycle loads the
+                # replay bundle and sets its mode.
+                metrics_adapter.install_replay_anchor_compat(trainer)
+                trainer._first_condition_bundle_mode = "replay"
+                self.assertEqual(trainer._image_dagger_relabel({}, None), {"ok": True})
+
+    def test_paired_replay_compat_fails_before_relabel_if_eval_never_loaded_bundle(self):
+        trainer = self._compat_trainer()
+        trainer._first_condition_bundle_mode = None
+        before = {
+            view: value.copy() for view, value in trainer._id_anchors[0].items()
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "trainer.py"
+            source.write_text("# accepted trainer fixture\n", encoding="utf-8")
+            digest = metrics_adapter.sha256_bytes(source.read_bytes())
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "IMAGE_DAGGER_PAIRED_EVAL": "1",
+                        "IMAGE_DAGGER_FIRST_CONDITION_MODE": "replay",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    metrics_adapter.inspect,
+                    "getsourcefile",
+                    return_value=str(source),
+                ),
+                mock.patch.object(metrics_adapter, "PAIRED_REPLAY_TRAINER_SHA256", digest),
+            ):
+                metrics_adapter.install_replay_anchor_compat(trainer)
+                with self.assertRaisesRegex(metrics_adapter.AdapterError, "bundle mode"):
+                    trainer._image_dagger_relabel({}, None)
+        self.assertEqual(trainer.relabel_call_count, 0)
+        for view in trainer.vg_view_names:
+            np.testing.assert_array_equal(trainer._id_anchors[0][view], before[view])
+
+    def test_paired_replay_compat_preserves_anchor_when_original_raises(self):
+        trainer = self._compat_trainer(raise_after_commit=True)
+        before = {
+            view: value.copy() for view, value in trainer._id_anchors[0].items()
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "trainer.py"
+            source.write_text("# accepted trainer fixture\n", encoding="utf-8")
+            digest = metrics_adapter.sha256_bytes(source.read_bytes())
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "IMAGE_DAGGER_PAIRED_EVAL": "1",
+                        "IMAGE_DAGGER_FIRST_CONDITION_MODE": "replay",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(metrics_adapter.inspect, "getsourcefile", return_value=str(source)),
+                mock.patch.object(metrics_adapter, "PAIRED_REPLAY_TRAINER_SHA256", digest),
+            ):
+                metrics_adapter.install_replay_anchor_compat(trainer)
+                with self.assertRaisesRegex(RuntimeError, "renderer failed"):
+                    trainer._image_dagger_relabel({}, None)
+        for view in trainer.vg_view_names:
+            np.testing.assert_array_equal(trainer._id_anchors[0][view], before[view])
+
+    def test_paired_replay_compat_is_noop_outside_exact_evaluator_mode(self):
+        trainer = object()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                metrics_adapter.install_replay_anchor_compat(trainer),
+                {"enabled": False},
             )
 
     def test_adapter_fails_closed_on_source_drift_or_missing_metrics(self):

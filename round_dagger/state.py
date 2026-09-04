@@ -45,16 +45,23 @@ from round_dagger.production_data_lineage import (
 CAMPAIGN_SCHEMA = "fast_roborender.round_dagger.campaign.v1"
 BOUNDED_CAMPAIGN_SCHEMA = "fast_roborender.round_dagger.campaign.v2"
 PRODUCTION_CAMPAIGN_SCHEMA = "fast_roborender.round_dagger.campaign.v3"
-STATE_SCHEMA = "fast_roborender.round_dagger.coordinator_state.v2"
+# V3 separates immutable policy versions from macro-round indices.  This is
+# essential when a candidate fails evaluation: the next macro-round must
+# advance while the known-good active policy remains unchanged, and the
+# rejected policy version must never be reused.
+LEGACY_STATE_SCHEMA = "fast_roborender.round_dagger.coordinator_state.v2"
+STATE_SCHEMA = "fast_roborender.round_dagger.coordinator_state.v3"
 ROUND_CONTRACT_SCHEMA = "fast_roborender.round_dagger.round_contract.v2"
 PRODUCTION_ROUND_CONTRACT_SCHEMA = (
     "fast_roborender.round_dagger.round_contract.v3"
 )
 COLLECTION_SCHEMA = "fast_roborender.round_dagger.macro_round_collection.v1"
 BOOTSTRAP_SCHEMA = "fast_roborender.round_dagger.bootstrap_policy.v2"
-CANDIDATE_SCHEMA = "fast_roborender.round_dagger.policy_candidate.v2"
+LEGACY_CANDIDATE_SCHEMA = "fast_roborender.round_dagger.policy_candidate.v2"
+CANDIDATE_SCHEMA = "fast_roborender.round_dagger.policy_candidate.v3"
 EVALUATION_SCHEMA = "fast_roborender.round_dagger.policy_evaluation.v2"
 PROMOTION_SCHEMA = "fast_roborender.round_dagger.policy_promotion.v1"
+RESOLUTION_SCHEMA = "fast_roborender.round_dagger.round_resolution.v1"
 SHA_RE = re.compile(r"[0-9a-f]{64}")
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _EVALUATION_RECOVERY_ID_RE = re.compile(r"hardened-[0-9a-f]{20}")
@@ -89,6 +96,9 @@ _CANDIDATE_MANIFEST_KEYS = {
     "renderer_sha256",
     "optimizer_steps",
 }
+_CANDIDATE_V3_MANIFEST_KEYS = _CANDIDATE_MANIFEST_KEYS | {
+    "learner_acceptance_sha256"
+}
 _EVALUATION_MANIFEST_KEYS = {
     "schema",
     "campaign_id",
@@ -115,6 +125,30 @@ _PROMOTION_MANIFEST_KEYS = {
     "evaluation_sha256",
     "checkpoint_sha256",
     "policy_version",
+}
+_RESOLUTION_MANIFEST_KEYS = {
+    "schema",
+    "campaign_id",
+    "campaign_sha256",
+    "macro_round",
+    "decision",
+    "parent_policy_version",
+    "parent_checkpoint_sha256",
+    "candidate_manifest_sha256",
+    "candidate_policy_version",
+    "candidate_checkpoint_sha256",
+    "evaluation_sha256",
+    "selected_policy_version",
+    "selected_checkpoint_sha256",
+}
+_LAST_RESOLUTION_KEYS = {
+    "decision",
+    "macro_round",
+    "candidate_manifest_sha256",
+    "candidate_policy_version",
+    "evaluation_sha256",
+    "resolution_path",
+    "resolution_sha256",
 }
 
 
@@ -590,6 +624,10 @@ def initialize_campaign(
         "revision": 0,
         "phase": "READY",
         "next_macro_round": 0,
+        # Policy version numbers are monotonically allocated and are not
+        # synonymous with macro-rounds: a rejected candidate consumes a
+        # version but leaves the parent active for the following round.
+        "next_policy_version": 1,
         "open_macro_round": None,
         "last_collected_macro_round": -1,
         "last_ingested_macro_round": -1,
@@ -613,6 +651,7 @@ def initialize_campaign(
         "candidate_policy": None,
         "evaluation_sha256": None,
         "last_promotion_sha256": None,
+        "last_resolution": None,
     }
     _validate_state(state, campaign)
     with _state_lock(root):
@@ -683,6 +722,88 @@ def _validate_policy(
     return policy
 
 
+def _next_candidate_policy_version(state: Mapping[str, Any]) -> int:
+    """Return the one policy version reserved for an open learner result.
+
+    V2 campaigns coupled policy version to macro-round.  V3 keeps a separate,
+    durable allocator so a rejected candidate cannot collide with the next
+    candidate while its parent remains active.
+    """
+
+    if state.get("schema") == STATE_SCHEMA:
+        return _require_int(
+            state.get("next_policy_version"), "next_policy_version", minimum=1
+        )
+    active = state.get("active_policy")
+    if not isinstance(active, Mapping):
+        raise StateError("legacy coordinator active policy is malformed")
+    return _require_int(active.get("version"), "active_policy.version") + 1
+
+
+def _upgrade_state_for_write(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Upgrade an otherwise-valid V2 state only at a mutation boundary.
+
+    Reading remains backwards-compatible so a sealed legacy evaluator can
+    finish.  The first mutation by the newer coordinator atomically publishes
+    the V3 state with a deterministic policy-version allocator.
+    """
+
+    upgraded = dict(state)
+    if upgraded.get("schema") == STATE_SCHEMA:
+        return upgraded
+    if upgraded.get("schema") != LEGACY_STATE_SCHEMA:
+        raise StateError("cannot upgrade an unknown coordinator state schema")
+    candidate = upgraded.get("candidate_policy")
+    candidate_version = (
+        _require_int(candidate["version"], "candidate_policy.version")
+        if isinstance(candidate, Mapping)
+        else 0
+    )
+    active = upgraded.get("active_policy")
+    if not isinstance(active, Mapping):
+        raise StateError("legacy coordinator active policy is malformed")
+    active_version = _require_int(active.get("version"), "active_policy.version")
+    if upgraded.get("phase") in {"TRAINED", "EVALUATED"}:
+        inferred_next_policy_version = candidate_version
+    else:
+        inferred_next_policy_version = max(active_version, candidate_version) + 1
+    supplied_next_policy_version = upgraded.get("next_policy_version")
+    if supplied_next_policy_version is not None:
+        next_policy_version = _require_int(
+            supplied_next_policy_version, "next_policy_version", minimum=1
+        )
+    else:
+        next_policy_version = inferred_next_policy_version
+    upgraded["schema"] = STATE_SCHEMA
+    upgraded["next_policy_version"] = next_policy_version
+    # V2 has no canonical terminal-resolution artifact.  Preserve its
+    # promotion digest and establish new decision evidence on the next round.
+    upgraded.setdefault("last_resolution", None)
+    return upgraded
+
+
+def _validate_last_resolution(value: Any, *, next_round: int) -> dict[str, Any]:
+    resolution = _require_exact(value, _LAST_RESOLUTION_KEYS, "last_resolution")
+    if resolution["decision"] not in {"promoted", "rejected"}:
+        raise StateError("last_resolution decision is invalid")
+    expected_round = next_round - 1
+    if _require_int(resolution["macro_round"], "last_resolution.macro_round") != expected_round:
+        raise StateError("last_resolution macro_round is inconsistent")
+    _require_int(
+        resolution["candidate_policy_version"],
+        "last_resolution.candidate_policy_version",
+        minimum=1,
+    )
+    for key in (
+        "candidate_manifest_sha256",
+        "evaluation_sha256",
+        "resolution_sha256",
+    ):
+        _require_sha(resolution[key], f"last_resolution.{key}")
+    _safe_relative(resolution["resolution_path"], "last_resolution.resolution_path")
+    return resolution
+
+
 def _validate_state(
     document: Mapping[str, Any], campaign: Mapping[str, Any] | str
 ) -> dict[str, Any]:
@@ -695,7 +816,7 @@ def _validate_state(
         # complete immutable campaign document.
         campaign_sha256 = campaign
         macro_round_count = None
-    keys = {
+    legacy_keys = {
         "schema",
         "campaign_sha256",
         "revision",
@@ -713,8 +834,20 @@ def _validate_state(
         "evaluation_sha256",
         "last_promotion_sha256",
     }
-    state = _require_exact(document, keys, "coordinator state")
-    if state["schema"] != STATE_SCHEMA or state["campaign_sha256"] != campaign_sha256:
+    schema = document.get("schema") if isinstance(document, Mapping) else None
+    if schema == STATE_SCHEMA:
+        state = _require_exact(
+            document,
+            legacy_keys | {"next_policy_version", "last_resolution"},
+            "coordinator state",
+        )
+        is_v3 = True
+    elif schema == LEGACY_STATE_SCHEMA:
+        state = _require_exact(document, legacy_keys, "legacy coordinator state")
+        is_v3 = False
+    else:
+        raise StateError("coordinator state schema/campaign mismatch")
+    if state["campaign_sha256"] != campaign_sha256:
         raise StateError("coordinator state schema/campaign mismatch")
     _require_int(state["revision"], "state revision")
     if state["phase"] not in PHASES:
@@ -740,7 +873,25 @@ def _validate_state(
         if type(state[key]) is not int or state[key] < -1:
             raise StateError(f"{key} must be an integer >= -1")
     active = _validate_policy(state["active_policy"], "active_policy")
-    if active["version"] != next_round:
+    next_policy_version = _next_candidate_policy_version(state)
+    if is_v3:
+        if active["version"] >= next_policy_version:
+            raise StateError("active policy version must precede next_policy_version")
+        if state["last_resolution"] is not None:
+            resolution = _validate_last_resolution(
+                state["last_resolution"], next_round=next_round
+            )
+            if state["phase"] not in {"TRAINED", "EVALUATED"} and (
+                next_policy_version
+                != resolution["candidate_policy_version"] + 1
+            ):
+                raise StateError(
+                    "next_policy_version must follow the last resolved candidate"
+                )
+        elif next_round == 0:
+            # An untouched campaign cannot claim terminal decision evidence.
+            pass
+    elif active["version"] != next_round:
         raise StateError("active policy version must equal next_macro_round")
     for key in (
         "collection_manifest_sha256",
@@ -751,7 +902,14 @@ def _validate_state(
         if state[key] is not None:
             _require_sha(state[key], key)
     if state["candidate_policy"] is not None:
-        _validate_policy(state["candidate_policy"], "candidate_policy", candidate=True)
+        candidate = _validate_policy(
+            state["candidate_policy"], "candidate_policy", candidate=True
+        )
+        if is_v3 and state["phase"] in {"TRAINED", "EVALUATED"}:
+            if candidate["version"] != next_policy_version:
+                raise StateError(
+                    "open candidate policy version must equal next_policy_version"
+                )
 
     phase = state["phase"]
     if phase == "READY":
@@ -785,17 +943,87 @@ def _validate_state(
     for key, required in expected_evidence.items():
         if required != (state[key] is not None):
             raise StateError(f"{key} presence is inconsistent with coordinator phase")
-    if (next_round == 0) != (state["last_promotion_sha256"] is None):
+    if is_v3 and phase == "READY" and state["last_resolution"] is not None:
+        resolution = state["last_resolution"]
+        candidate = _validate_policy(
+            state["candidate_policy"], "candidate_policy", candidate=True
+        )
+        if (
+            candidate["macro_round"] != resolution["macro_round"]
+            or candidate["version"] != resolution["candidate_policy_version"]
+            or candidate["manifest_sha256"]
+            != resolution["candidate_manifest_sha256"]
+            or state["evaluation_sha256"] != resolution["evaluation_sha256"]
+        ):
+            raise StateError("retained terminal evidence does not match last_resolution")
+    if not is_v3 and (next_round == 0) != (state["last_promotion_sha256"] is None):
         raise StateError("last_promotion_sha256 is inconsistent with policy version")
+    if is_v3 and next_round == 0:
+        if state["last_promotion_sha256"] is not None or state["last_resolution"] is not None:
+            raise StateError("initial coordinator state cannot contain resolution evidence")
     return state
+
+
+def _verify_persisted_last_resolution(root: Path, state: Mapping[str, Any]) -> None:
+    """Deeply bind V3's terminal-decision pointer on every state reload."""
+
+    if state.get("schema") != STATE_SCHEMA or state.get("last_resolution") is None:
+        return
+    summary = _validate_last_resolution(
+        state["last_resolution"], next_round=state["next_macro_round"]
+    )
+    path, relative = _internal_path(
+        root, summary["resolution_path"], "last resolution manifest"
+    )
+    canonical = round_directory(root, summary["macro_round"]) / "resolution.json"
+    if path != canonical or relative != summary["resolution_path"]:
+        raise StateError("last resolution path is non-canonical")
+    if sha256_file(path) != summary["resolution_sha256"]:
+        raise StateError("last resolution SHA mismatch")
+    resolution = _require_exact(
+        load_strict_json(path), _RESOLUTION_MANIFEST_KEYS, "last resolution"
+    )
+    campaign = load_campaign(root)
+    expected_common = {
+        "schema": RESOLUTION_SCHEMA,
+        "campaign_id": campaign["campaign_id"],
+        "campaign_sha256": state["campaign_sha256"],
+        "macro_round": summary["macro_round"],
+        "decision": summary["decision"],
+        "candidate_manifest_sha256": summary["candidate_manifest_sha256"],
+        "candidate_policy_version": summary["candidate_policy_version"],
+        "evaluation_sha256": summary["evaluation_sha256"],
+        "selected_policy_version": state["active_policy"]["version"],
+        "selected_checkpoint_sha256": state["active_policy"]["checkpoint_sha256"],
+    }
+    if any(resolution.get(key) != value for key, value in expected_common.items()):
+        raise StateError("last resolution does not bind the current active policy")
+    if summary["decision"] == "promoted":
+        if (
+            resolution["selected_policy_version"]
+            != resolution["candidate_policy_version"]
+            or resolution["selected_checkpoint_sha256"]
+            != resolution["candidate_checkpoint_sha256"]
+        ):
+            raise StateError("promotion resolution selected the wrong checkpoint")
+    else:
+        if (
+            resolution["selected_policy_version"]
+            != resolution["parent_policy_version"]
+            or resolution["selected_checkpoint_sha256"]
+            != resolution["parent_checkpoint_sha256"]
+        ):
+            raise StateError("rejection resolution did not retain the parent checkpoint")
 
 
 def _load_state_unlocked(root: Path) -> dict[str, Any]:
     campaign = _validate_campaign(load_strict_json(root / "campaign.json"))
-    return _validate_state(
+    state = _validate_state(
         load_strict_json(root / "coordinator_state.json"),
         campaign,
     )
+    _verify_persisted_last_resolution(root, state)
+    return state
 
 
 def load_state(root: str | Path) -> dict[str, Any]:
@@ -812,7 +1040,7 @@ def _replace_state(
                 f"coordinator compare-and-swap failed: expected revision {expected_revision}, "
                 f"found {current['revision']}"
             )
-        updated = dict(state)
+        updated = _upgrade_state_for_write(state)
         updated["revision"] = expected_revision + 1
         campaign = _validate_campaign(load_strict_json(root / "campaign.json"))
         _validate_state(updated, campaign)
@@ -1437,12 +1665,26 @@ def transition(
         candidate = _validate_policy(
             candidate_policy, "candidate_policy", candidate=True
         )
-        manifest = _require_exact(
-            load_strict_json(artifact_path),
-            _CANDIDATE_MANIFEST_KEYS,
-            "candidate manifest",
-        )
-        if manifest["schema"] != CANDIDATE_SCHEMA:
+        manifest_document = load_strict_json(artifact_path)
+        if not isinstance(manifest_document, Mapping):
+            raise StateError("candidate manifest must be a mapping")
+        if manifest_document.get("schema") == CANDIDATE_SCHEMA:
+            manifest = _require_exact(
+                manifest_document,
+                _CANDIDATE_V3_MANIFEST_KEYS,
+                "candidate manifest",
+            )
+            _require_sha(
+                manifest["learner_acceptance_sha256"],
+                "learner_acceptance_sha256",
+            )
+        elif manifest_document.get("schema") == LEGACY_CANDIDATE_SCHEMA:
+            manifest = _require_exact(
+                manifest_document,
+                _CANDIDATE_MANIFEST_KEYS,
+                "candidate manifest",
+            )
+        else:
             raise StateError("training evidence is not a candidate manifest")
         if (
             canonical_json_sha256(manifest) != actual_sha
@@ -1453,7 +1695,7 @@ def transition(
             "campaign_id": load_campaign(root)["campaign_id"],
             "campaign_sha256": state["campaign_sha256"],
             "macro_round": macro_round,
-            "policy_version": state["active_policy"]["version"] + 1,
+            "policy_version": _next_candidate_policy_version(state),
             "checkpoint_path": candidate["checkpoint_path"],
             "checkpoint_sha256": candidate["checkpoint_sha256"],
             "runtime_policy_sha256": candidate["runtime_policy_sha256"],
@@ -1576,6 +1818,64 @@ def transition(
     return _replace_state(root, updated, state["revision"])
 
 
+def _load_terminal_resolution(
+    root: Path,
+    *,
+    state: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    macro_round: int,
+    decision: str,
+    resolution_manifest_path: str | Path,
+    resolution_manifest_sha256: str,
+    selected_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify one immutable promote/reject decision before state mutation."""
+
+    if decision not in {"promoted", "rejected"}:
+        raise StateError("terminal resolution decision is invalid")
+    path, relative = _internal_path(
+        root, resolution_manifest_path, "terminal resolution manifest"
+    )
+    canonical = round_directory(root, macro_round) / "resolution.json"
+    if path != canonical:
+        raise StateError("terminal resolution manifest path is non-canonical")
+    actual_sha = sha256_file(path)
+    if actual_sha != _require_sha(
+        resolution_manifest_sha256, "terminal resolution manifest SHA"
+    ):
+        raise StateError("terminal resolution manifest SHA mismatch")
+    resolution = _require_exact(
+        load_strict_json(path), _RESOLUTION_MANIFEST_KEYS, "terminal resolution"
+    )
+    campaign = load_campaign(root)
+    expected = {
+        "schema": RESOLUTION_SCHEMA,
+        "campaign_id": campaign["campaign_id"],
+        "campaign_sha256": state["campaign_sha256"],
+        "macro_round": macro_round,
+        "decision": decision,
+        "parent_policy_version": candidate["parent_policy_version"],
+        "parent_checkpoint_sha256": candidate["parent_checkpoint_sha256"],
+        "candidate_manifest_sha256": candidate["manifest_sha256"],
+        "candidate_policy_version": candidate["version"],
+        "candidate_checkpoint_sha256": candidate["checkpoint_sha256"],
+        "evaluation_sha256": state["evaluation_sha256"],
+        "selected_policy_version": selected_policy["version"],
+        "selected_checkpoint_sha256": selected_policy["checkpoint_sha256"],
+    }
+    if resolution != expected:
+        raise StateError("terminal resolution does not bind coordinator evidence")
+    return {
+        "decision": decision,
+        "macro_round": macro_round,
+        "candidate_manifest_sha256": candidate["manifest_sha256"],
+        "candidate_policy_version": candidate["version"],
+        "evaluation_sha256": state["evaluation_sha256"],
+        "resolution_path": relative,
+        "resolution_sha256": actual_sha,
+    }
+
+
 def complete_promotion(
     root: str | Path,
     *,
@@ -1583,6 +1883,8 @@ def complete_promotion(
     checkpoint_path: str,
     promotion_manifest_path: str | Path,
     promotion_manifest_sha256: str,
+    resolution_manifest_path: str | Path,
+    resolution_manifest_sha256: str,
 ) -> dict[str, Any]:
     """Atomically advance the active policy after passed evaluation evidence."""
 
@@ -1643,6 +1945,20 @@ def complete_promotion(
     }
     if promotion != expected_promotion:
         raise StateError("promotion manifest does not bind coordinator evidence")
+    selected = {
+        "version": candidate["version"],
+        "checkpoint_sha256": candidate["checkpoint_sha256"],
+    }
+    resolution_summary = _load_terminal_resolution(
+        root,
+        state=state,
+        candidate=candidate,
+        macro_round=macro_round,
+        decision="promoted",
+        resolution_manifest_path=resolution_manifest_path,
+        resolution_manifest_sha256=resolution_manifest_sha256,
+        selected_policy=selected,
+    )
     updated = dict(state)
     updated["active_policy"] = {
         "version": candidate["version"],
@@ -1659,9 +1975,57 @@ def complete_promotion(
     }
     updated["phase"] = "READY"
     updated["next_macro_round"] = macro_round + 1
+    updated["next_policy_version"] = candidate["version"] + 1
     updated["open_macro_round"] = None
     updated["last_promotion_sha256"] = actual_promotion_sha
+    updated["last_resolution"] = resolution_summary
     return _replace_state(root, updated, state["revision"])
+
+
+def complete_rejection(
+    root: str | Path,
+    *,
+    macro_round: int,
+    resolution_manifest_path: str | Path,
+    resolution_manifest_sha256: str,
+) -> dict[str, Any]:
+    """Resolve a failed evaluation by retaining the verified parent policy.
+
+    The rejected candidate remains immutable for diagnosis.  Its policy version
+    is consumed, while the next macro-round freezes the same trusted parent.
+    """
+
+    root = _campaign_root(root)
+    current = load_state(root)
+    macro_round = _require_int(macro_round, "macro_round")
+    if current["phase"] != "EVALUATED" or current["open_macro_round"] != macro_round:
+        raise StateError("policy rejection requires the open EVALUATED macro-round")
+    candidate = _validate_policy(
+        current["candidate_policy"], "candidate_policy", candidate=True
+    )
+    active = _validate_policy(current["active_policy"], "active_policy")
+    if (
+        active["version"] != candidate["parent_policy_version"]
+        or active["checkpoint_sha256"] != candidate["parent_checkpoint_sha256"]
+    ):
+        raise StateError("rejected candidate parent is no longer the active policy")
+    resolution_summary = _load_terminal_resolution(
+        root,
+        state=current,
+        candidate=candidate,
+        macro_round=macro_round,
+        decision="rejected",
+        resolution_manifest_path=resolution_manifest_path,
+        resolution_manifest_sha256=resolution_manifest_sha256,
+        selected_policy=active,
+    )
+    updated = dict(current)
+    updated["phase"] = "READY"
+    updated["next_macro_round"] = macro_round + 1
+    updated["next_policy_version"] = candidate["version"] + 1
+    updated["open_macro_round"] = None
+    updated["last_resolution"] = resolution_summary
+    return _replace_state(root, updated, current["revision"])
 
 
 __all__ = [
@@ -1672,10 +2036,13 @@ __all__ = [
     "ROUND_CONTRACT_SCHEMA",
     "PRODUCTION_ROUND_CONTRACT_SCHEMA",
     "STATE_SCHEMA",
+    "LEGACY_STATE_SCHEMA",
+    "RESOLUTION_SCHEMA",
     "StateError",
     "beta_for_macro_round",
     "beta_for_round",
     "complete_promotion",
+    "complete_rejection",
     "initialize_campaign",
     "load_campaign",
     "load_collection_manifest",

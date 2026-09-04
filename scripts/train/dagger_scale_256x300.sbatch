@@ -1,7 +1,7 @@
 #!/bin/bash
-# Distributed production DAgger: 256 global Isaac environments, 300 rollout steps.
+# Legacy packed OCI DAgger: 256 global Isaac environments, 300 rollout steps.
 # This remains the validated pure-BC DAgger objective (teacher action supervision),
-# not PPO reward optimization. Submit via scripts/scaling/submit_production.sh.
+# not PPO reward optimization. Submit explicitly via submit_oci_packed.sh.
 #SBATCH --partition=grizzly
 #SBATCH --account=general_cs_infra
 #SBATCH --job-name=rr_dagger_256x300
@@ -25,7 +25,7 @@ GR00T_ROOT=${GR00T_ROOT:-$ROOT/GR00T-VisualSim2Real}
 ANCHORS=${ANCHORS:-$STAGE_ROOT/assets/anchor_pool_2048}
 TEACHER_CKPT=${TEACHER_CKPT:-$STAGE_ROOT/assets/policies/expert_labeler/model_step_044500.pt}
 EXPECTED_TEACHER_CKPT_SHA256=${EXPECTED_TEACHER_CKPT_SHA256:-943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38}
-FLEET_DIR=${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_production.sh}
+FLEET_DIR=${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_oci_packed.sh}
 RUN_ID=${RUN_ID:?RUN_ID is required; use a sanitized launcher}
 [[ "$RUN_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || {
     echo "FATAL: RUN_ID must match [A-Za-z0-9_-]{1,128}" >&2

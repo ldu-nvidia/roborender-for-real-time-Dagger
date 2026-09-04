@@ -50,6 +50,38 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _STREAM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ATTEMPT_DIR_RE = re.compile(r"attempt_[A-Za-z0-9_.-]{1,160}\Z")
+# ``actor_pair_attempts`` was originally reserved exclusively for physical
+# Image3F stream attempts.  A previous recovery implementation accidentally
+# published a terminal-only W&B record there.  Keep the physical namespace
+# strict, but recognize that one well-defined legacy record shape so an
+# otherwise sealed historical cohort can be recovered without pretending its
+# terminal telemetry owns renderer streams.  New terminal-only records are
+# published under ``actor_pair_terminal_attempts`` by the shell supervisor.
+_LEGACY_TERMINAL_ATTEMPT_DIR_RE = re.compile(
+    r"(?:wandb_recovery|recovered_complete)_[A-Za-z0-9_.-]{1,160}\Z"
+)
+_ACTOR_PAIR_TERMINAL_SCHEMA = "fast_roborender.round_dagger.actor_pair_terminal.v1"
+_ACTOR_PAIR_TERMINAL_KEYS = {
+    "accepted_transitions",
+    "attempt_name",
+    "campaign_id",
+    "cohort_contract_sha256",
+    "cohort_index",
+    "cohort_sealed",
+    "committed_rank_transitions",
+    "delivery_pending",
+    "expected_transitions",
+    "failure_code",
+    "lifecycle_exit_code",
+    "macro_round",
+    "outcome",
+    "quality_exit_code",
+    "rank_exit_codes",
+    "rank_states",
+    "schema",
+    "wandb_exit_code",
+    "wandb_wrapper_exit_code",
+}
 _PLAN_KEYS = {
     "schema",
     "campaign_id",
@@ -754,6 +786,92 @@ def _reset_with_retry(
     )
 
 
+def _require_legacy_terminal_only_attempt(path: Path) -> None:
+    """Validate a terminal-only legacy record without treating it as a plan.
+
+    This is deliberately narrower than accepting an arbitrary non-plan
+    directory.  It exists solely to preserve the historic W&B/recovered-pair
+    evidence layout while ensuring that an unrecognized file, a stream plan,
+    or a malformed terminal remains fail-closed.
+    """
+
+    if _LEGACY_TERMINAL_ATTEMPT_DIR_RE.fullmatch(path.name) is None:
+        raise Image3FLifecycleError(f"unsafe actor-pair attempt directory: {path}")
+    entries = sorted(path.iterdir(), key=lambda entry: entry.name)
+    if len(entries) != 1 or entries[0].name != "actor_pair_terminal.json":
+        raise Image3FLifecycleError(
+            f"legacy terminal-only actor-pair attempt has unexpected contents: {path}"
+        )
+    terminal_path = entries[0]
+    if terminal_path.is_symlink() or not terminal_path.is_file():
+        raise Image3FLifecycleError("legacy terminal-only actor-pair terminal is unsafe")
+    try:
+        terminal = load_strict_json(terminal_path)
+    except Exception as exc:
+        raise Image3FLifecycleError(
+            "legacy terminal-only actor-pair terminal is not valid JSON"
+        ) from exc
+    if not isinstance(terminal, Mapping) or set(terminal) != _ACTOR_PAIR_TERMINAL_KEYS:
+        raise Image3FLifecycleError("legacy terminal-only actor-pair terminal fields are invalid")
+    if (
+        terminal.get("schema") != _ACTOR_PAIR_TERMINAL_SCHEMA
+        or terminal.get("attempt_name") != path.name
+        or terminal.get("failure_code") != "none"
+        or terminal.get("cohort_sealed") is not True
+        or terminal.get("rank_exit_codes") != {"0": 0, "1": 0}
+        or terminal.get("rank_states") != {"0": "complete", "1": "complete"}
+    ):
+        raise Image3FLifecycleError("legacy terminal-only actor-pair terminal is inconsistent")
+    if (
+        not isinstance(terminal.get("delivery_pending"), bool)
+        or not isinstance(terminal.get("campaign_id"), str)
+        or _TOKEN_RE.fullmatch(terminal["campaign_id"]) is None
+        or not isinstance(terminal.get("cohort_contract_sha256"), str)
+        or _SHA256_RE.fullmatch(terminal["cohort_contract_sha256"]) is None
+    ):
+        raise Image3FLifecycleError("legacy terminal-only actor-pair identity is invalid")
+    integer_fields = (
+        "macro_round",
+        "cohort_index",
+        "accepted_transitions",
+        "committed_rank_transitions",
+        "expected_transitions",
+        "lifecycle_exit_code",
+        "quality_exit_code",
+        "wandb_exit_code",
+        "wandb_wrapper_exit_code",
+    )
+    if any(
+        isinstance(terminal.get(field), bool)
+        or not isinstance(terminal.get(field), int)
+        or terminal[field] < 0
+        for field in integer_fields
+    ):
+        raise Image3FLifecycleError("legacy terminal-only actor-pair numeric fields are invalid")
+    if (
+        terminal["expected_transitions"] < 1
+        or terminal["accepted_transitions"] != terminal["expected_transitions"]
+        or terminal["committed_rank_transitions"] != terminal["expected_transitions"]
+        or any(
+            terminal[field] != 0
+            for field in (
+                "lifecycle_exit_code",
+                "quality_exit_code",
+                "wandb_exit_code",
+                "wandb_wrapper_exit_code",
+            )
+        )
+    ):
+        raise Image3FLifecycleError("legacy terminal-only actor-pair completion is invalid")
+    expected_outcome = (
+        "PENDING_WANDB_DELIVERY" if terminal["delivery_pending"] else "SUCCEEDED"
+    )
+    if terminal.get("outcome") != expected_outcome:
+        raise Image3FLifecycleError("legacy terminal-only actor-pair outcome is invalid")
+    if path.name.startswith("wandb_recovery_") and terminal["delivery_pending"] is not True:
+        raise Image3FLifecycleError("legacy W&B recovery terminal must be delivery-pending")
+
+
 def _discover_plans(
     train_dir: Path, *, allow_empty: bool = False
 ) -> list[tuple[Path, dict[str, Any]]]:
@@ -762,8 +880,11 @@ def _discover_plans(
         raise Image3FLifecycleError("actor_pair_attempts directory is unsafe or missing")
     result: list[tuple[Path, dict[str, Any]]] = []
     for attempt in sorted(attempts.iterdir(), key=lambda path: path.name):
-        if attempt.is_symlink() or not attempt.is_dir() or _ATTEMPT_DIR_RE.fullmatch(attempt.name) is None:
+        if attempt.is_symlink() or not attempt.is_dir():
             raise Image3FLifecycleError(f"unsafe actor-pair attempt directory: {attempt}")
+        if _ATTEMPT_DIR_RE.fullmatch(attempt.name) is None:
+            _require_legacy_terminal_only_attempt(attempt)
+            continue
         plan_path = attempt / "image3f_stream_plan.json"
         if plan_path.exists():
             result.append((plan_path, load_attempt_plan(plan_path)))

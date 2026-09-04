@@ -161,6 +161,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bundle", required=True, type=Path)
     parser.add_argument("--snapshot", required=True, type=Path)
     parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        help=(
+            "campaign/projection root used to resolve producer-absolute replay "
+            "paths after an RTX-to-H200 handoff"
+        ),
+    )
+    parser.add_argument(
         "--heldout-snapshot",
         type=Path,
         help="immutable purpose=eval replay snapshot pinned by the learner bundle",
@@ -198,6 +206,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--telemetry-jsonl", type=Path)
     parser.add_argument("--heldout-telemetry-jsonl", type=Path)
+    parser.add_argument("--training-quality-telemetry-jsonl", type=Path)
+    parser.add_argument(
+        "--dagger-wandb-dashboard",
+        action="store_true",
+        help=(
+            "publish the sampled-scene, training-quality, and OOD-validation "
+            "W&B namespaces"
+        ),
+    )
+    parser.add_argument(
+        "--scene-sample-manifest",
+        type=Path,
+        help="immutable sampled condition/render contact-sheet manifest",
+    )
+    parser.add_argument(
+        "--dagger-beta",
+        type=float,
+        help="scheduled expert-behavior probability bound by the replay contract",
+    )
     parser.add_argument("--wandb-project")
     parser.add_argument("--wandb-entity")
     parser.add_argument("--wandb-run-id")
@@ -274,6 +301,30 @@ def main(argv: list[str] | None = None) -> int:
         raise LearnerError(
             "--heldout-telemetry-jsonl requires held-out evaluation"
         )
+    if arguments.dagger_wandb_dashboard and (
+        not config.heldout_evaluation_enabled
+        or arguments.training_quality_telemetry_jsonl is None
+        or arguments.scene_sample_manifest is None
+        or arguments.dagger_beta is None
+        or arguments.wandb_project is None
+    ):
+        raise LearnerError(
+            "--dagger-wandb-dashboard requires held-out evaluation, W&B, "
+            "--training-quality-telemetry-jsonl, --scene-sample-manifest, "
+            "and --dagger-beta"
+        )
+    if (
+        not arguments.dagger_wandb_dashboard
+        and (
+            arguments.training_quality_telemetry_jsonl is not None
+            or arguments.scene_sample_manifest is not None
+            or arguments.dagger_beta is not None
+        )
+    ):
+        raise LearnerError(
+            "training-quality telemetry and scene samples require "
+            "--dagger-wandb-dashboard"
+        )
     if (
         arguments.validation_stop_at_step is not None
         and not arguments.no_publish_result
@@ -346,10 +397,23 @@ def main(argv: list[str] | None = None) -> int:
         "learner_config_sha256": config.sha256,
         "model_lineage_sha256": config.model_lineage_sha256,
     }
+    if arguments.dagger_wandb_dashboard:
+        wandb_config.update(
+            {
+                "dashboard_schema": "fast_roborender.dagger_wandb.v2",
+                "validation_distribution": (
+                    "motion_trajectory_ood_same_task_scene_renderer"
+                ),
+                "validation_is_closed_loop": False,
+                "validation_is_unseen_task_or_scene": False,
+                "scheduled_dagger_beta": arguments.dagger_beta,
+            }
+        )
     if arguments.heldout_snapshot is not None:
         heldout_identity = load_heldout_snapshot(
             arguments.heldout_snapshot,
             expected_file_sha256=config.heldout_snapshot_file_sha256,
+            artifact_root=arguments.artifact_root,
         )
         if heldout_identity["snapshot_sha256"] != config.heldout_snapshot_sha256:
             raise LearnerError("held-out replay snapshot semantic digest mismatch")
@@ -378,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         snapshot_identity = load_snapshot(
             arguments.snapshot,
             expected_file_sha256=arguments.expected_snapshot_file_sha256,
+            artifact_root=arguments.artifact_root,
         )
         if (
             snapshot_identity["campaign_id"] != config.campaign_id
@@ -434,6 +499,9 @@ def main(argv: list[str] | None = None) -> int:
         arguments.telemetry_jsonl,
         enabled=rank == 0,
         heldout_path=arguments.heldout_telemetry_jsonl,
+        training_quality_path=arguments.training_quality_telemetry_jsonl,
+        dagger_dashboard=arguments.dagger_wandb_dashboard,
+        scene_sample_manifest=arguments.scene_sample_manifest,
         wandb_project=arguments.wandb_project,
         wandb_entity=arguments.wandb_entity,
         wandb_run_id=arguments.wandb_run_id,
@@ -455,12 +523,14 @@ def main(argv: list[str] | None = None) -> int:
             resume_from=arguments.resume_from,
             expected_snapshot_file_sha256=arguments.expected_snapshot_file_sha256,
             heldout_snapshot_path=arguments.heldout_snapshot,
+            artifact_root=arguments.artifact_root,
             save_every=save_every,
             telemetry=telemetry,
             validation_stop_at_step=arguments.validation_stop_at_step,
             learner_identity_sha256=arguments.learner_identity_sha256,
             runtime_container_sha256=arguments.runtime_container_sha256,
             learner_contract_sha256=arguments.learner_contract_sha256,
+            dagger_beta=arguments.dagger_beta,
         )
         telemetry_exit_code = 0
     finally:

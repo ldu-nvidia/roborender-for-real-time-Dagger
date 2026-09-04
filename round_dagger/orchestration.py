@@ -1,7 +1,7 @@
 """Fail-closed production orchestration for one round-based DAgger macro-round.
 
 The actor, transfer, learner, and evaluator are deliberately external hooks:
-their deployment details differ between RTX and H100 clusters.  Hooks only
+their deployment details differ between RTX and the remote learner backend. Hooks only
 produce artifacts.  This module owns every coordinator transition and verifies
 the immutable artifact contract after each hook returns.
 
@@ -13,24 +13,34 @@ exactly 256 environments and 131,072 transitions per macro-round.
 from __future__ import annotations
 
 import ctypes
+import contextlib
 import fcntl
+import functools
 import hashlib
+import inspect
+import json
 import math
 import os
 import re
+import secrets
+import socket
 import stat
 import subprocess
 import sys
+import threading
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 from round_dagger import (
+    actor_host_access,
     artifacts,
     evaluation,
     handoff,
     image3f_lifecycle,
+    learner_acceptance,
     learner_identity,
     policy_bundle,
     promotion,
@@ -52,10 +62,16 @@ PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA = (
 BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA = (
     "fast_roborender.round_dagger.orchestration_config.v4"
 )
+RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA = (
+    "fast_roborender.round_dagger.orchestration_config.v5"
+)
 EVALUATOR_RESULT_SCHEMA = "fast_roborender.round_dagger.evaluator_result.v2"
 WANDB_PUBLIC_CONFIG_SCHEMA = "fast_roborender.round_dagger.wandb_public_config.v2"
 PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA = (
     "fast_roborender.round_dagger.wandb_public_config.v3"
+)
+WANDB_PUBLIC_CONFIG_RECOVERY_SCHEMA = (
+    "fast_roborender.round_dagger.wandb_public_config_recovery.v1"
 )
 
 COHORT_COUNT = 4
@@ -118,6 +134,7 @@ _SENSITIVE_ARGUMENT_RE = re.compile(
     r"(?:$|[=:])|(?:api[_-]?key|authorization|credential|password|secret|token)"
     r"\s*(?:=|:))"
 )
+_TRUSTED_HOST_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _LEARNER_RESULT_KEYS = {
     "schema",
     "campaign_id",
@@ -188,6 +205,338 @@ _PHASE_CODES = {
 
 class OrchestrationError(RuntimeError):
     """A macro-round configuration, hook, or postcondition failed closed."""
+
+
+class CampaignMutationLockError(RuntimeError):
+    """The campaign-wide mutator lease could not be acquired safely."""
+
+
+class CampaignMutationBusyError(CampaignMutationLockError):
+    """Another process or thread currently owns the campaign mutator lease."""
+
+
+_MUTATION_LOCK_SCHEMA = "fast_roborender.round_dagger.mutation_lease.v1"
+_MUTATION_LOCK_DIRECTORY = "operator"
+_MUTATION_LOCK_NAME = ".campaign_mutation.lock"
+_MUTATION_REGISTRY_GUARD = threading.RLock()
+
+
+@dataclass
+class _HeldCampaignMutationLease:
+    key: tuple[int, int]
+    root: Path
+    descriptor: int
+    directory_descriptor: int
+    owner_thread: int
+    owner_pid: int
+    depth: int
+    metadata: dict[str, Any]
+
+
+_HELD_MUTATION_LEASES: dict[tuple[int, int], _HeldCampaignMutationLease] = {}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    """Return Linux process start ticks for diagnostics, never lock authority."""
+
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        # The executable name in field two may contain spaces and parentheses;
+        # split only after its final closing parenthesis.  starttime is field 22,
+        # hence index 19 in the suffix beginning with field three.
+        suffix = raw[raw.rfind(")") + 2 :].split()
+        return int(suffix[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _boot_id() -> str | None:
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _write_lease_metadata(descriptor: int, document: Mapping[str, Any]) -> None:
+    payload = (
+        json.dumps(document, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    os.ftruncate(descriptor, 0)
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise CampaignMutationLockError("could not write mutation lease metadata")
+        offset += written
+    os.fsync(descriptor)
+
+
+def _read_lease_metadata(descriptor: int) -> dict[str, Any] | None:
+    try:
+        size = os.fstat(descriptor).st_size
+        if size <= 0 or size > 65_536:
+            return None
+        payload = os.pread(descriptor, size, 0)
+        value = json.loads(payload.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, Mapping) else None
+
+
+def _owner_summary(metadata: Mapping[str, Any] | None) -> str:
+    if metadata is None:
+        return "owner metadata unavailable"
+    fields = []
+    for key in ("operation", "hostname", "pid", "pid_start_ticks", "acquired_at"):
+        value = metadata.get(key)
+        if value is not None:
+            fields.append(f"{key}={value}")
+    return ", ".join(fields) if fields else "owner metadata unavailable"
+
+
+def _open_mutation_lock(
+    root: str | os.PathLike[str],
+) -> tuple[Path, int, int, tuple[int, int]]:
+    try:
+        # Validate the complete path chain, not only the final component later
+        # protected by O_NOFOLLOW.
+        campaign_root = state._campaign_root(root)  # noqa: SLF001
+    except (artifacts.ArtifactError, OSError, TypeError, ValueError) as exc:
+        raise CampaignMutationLockError(
+            "campaign root is missing, non-directory, or contains a symlink"
+        ) from exc
+    root_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        root_descriptor = os.open(campaign_root, root_flags)
+    except OSError as exc:
+        raise CampaignMutationLockError(
+            "campaign root is missing, non-directory, or a symlink"
+        ) from exc
+    operator_descriptor: int | None = None
+    lock_descriptor: int | None = None
+    try:
+        root_stat = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise CampaignMutationLockError("campaign root is not a directory")
+        try:
+            os.mkdir(_MUTATION_LOCK_DIRECTORY, 0o700, dir_fd=root_descriptor)
+            os.fsync(root_descriptor)
+        except FileExistsError:
+            pass
+        operator_descriptor = os.open(
+            _MUTATION_LOCK_DIRECTORY,
+            root_flags,
+            dir_fd=root_descriptor,
+        )
+        operator_stat = os.fstat(operator_descriptor)
+        if not stat.S_ISDIR(operator_stat.st_mode):
+            raise CampaignMutationLockError("campaign operator path is unsafe")
+        lock_descriptor = os.open(
+            _MUTATION_LOCK_NAME,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=operator_descriptor,
+        )
+        lock_stat = os.fstat(lock_descriptor)
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+            raise CampaignMutationLockError(
+                "campaign mutation lock is not a singly-linked regular file"
+            )
+        if lock_stat.st_uid != os.geteuid():
+            raise CampaignMutationLockError(
+                "campaign mutation lock is not owned by the current user"
+            )
+        return (
+            campaign_root,
+            operator_descriptor,
+            lock_descriptor,
+            (root_stat.st_dev, root_stat.st_ino),
+        )
+    except OSError as exc:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        if operator_descriptor is not None:
+            os.close(operator_descriptor)
+        raise CampaignMutationLockError(
+            "campaign mutation lock path is missing, unsafe, or a symlink"
+        ) from exc
+    except BaseException:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        if operator_descriptor is not None:
+            os.close(operator_descriptor)
+        raise
+    finally:
+        os.close(root_descriptor)
+
+
+def _release_mutation_lease(held: _HeldCampaignMutationLease) -> None:
+    with _MUTATION_REGISTRY_GUARD:
+        current = _HELD_MUTATION_LEASES.get(held.key)
+        if current is not held:
+            return
+        current.depth -= 1
+        if current.depth > 0:
+            return
+        _HELD_MUTATION_LEASES.pop(held.key, None)
+    try:
+        released = {
+            **held.metadata,
+            "state": "released",
+            "released_at": _utc_now(),
+        }
+        try:
+            _write_lease_metadata(held.descriptor, released)
+        except (OSError, CampaignMutationLockError):
+            # Closing the descriptor is the authoritative release.  Diagnostic
+            # metadata must never strand a kernel lease or mask a body error.
+            pass
+        try:
+            fcntl.flock(held.descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(held.descriptor)
+    finally:
+        os.close(held.directory_descriptor)
+
+
+@contextlib.contextmanager
+def campaign_mutation_lease(
+    root: str | os.PathLike[str], operation: str
+) -> Iterator[Mapping[str, Any]]:
+    """Acquire one nonblocking campaign-wide mutation lease.
+
+    Kernel ``flock`` ownership is the sole liveness authority, so an exited
+    process cannot leave a stale PID-based lock.  The JSON is durable diagnostic
+    provenance and includes both boot ID and process-start ticks to disambiguate
+    PID reuse.  Same-thread nesting is reentrant for the hardened recovery's
+    outer runner -> prepare/finalize call graph; another thread still fails
+    closed instead of overlapping side effects.
+    """
+
+    if (
+        not isinstance(operation, str)
+        or re.fullmatch(r"[a-z0-9_.-]{1,96}", operation) is None
+    ):
+        raise CampaignMutationLockError("mutation operation name is invalid")
+    campaign_root, directory_descriptor, descriptor, key = _open_mutation_lock(root)
+    pid = os.getpid()
+    thread_id = threading.get_ident()
+    held: _HeldCampaignMutationLease | None = None
+    with _MUTATION_REGISTRY_GUARD:
+        inherited = _HELD_MUTATION_LEASES.get(key)
+        if inherited is not None and inherited.owner_pid != pid:
+            # After fork, discard the child's duplicate descriptors before a
+            # fresh open/lock attempt.  The parent's open file description keeps
+            # its lease, while the child cannot mistake inherited metadata for
+            # reentrant ownership.
+            _HELD_MUTATION_LEASES.pop(key, None)
+            os.close(inherited.descriptor)
+            os.close(inherited.directory_descriptor)
+            inherited = None
+        if inherited is not None:
+            os.close(descriptor)
+            os.close(directory_descriptor)
+            if inherited.owner_thread != thread_id:
+                raise CampaignMutationBusyError(
+                    "campaign mutation lease is busy ("
+                    + _owner_summary(inherited.metadata)
+                    + ")"
+                )
+            inherited.depth += 1
+            held = inherited
+        else:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                owner = _read_lease_metadata(descriptor)
+                os.close(descriptor)
+                os.close(directory_descriptor)
+                raise CampaignMutationBusyError(
+                    "campaign mutation lease is busy ("
+                    + _owner_summary(owner)
+                    + ")"
+                ) from exc
+            try:
+                os.fchmod(descriptor, 0o600)
+                metadata = {
+                    "schema": _MUTATION_LOCK_SCHEMA,
+                    "state": "held",
+                    "lease_id": secrets.token_hex(16),
+                    "operation": operation,
+                    "hostname": socket.gethostname(),
+                    "pid": pid,
+                    "pid_start_ticks": _process_start_ticks(pid),
+                    "boot_id": _boot_id(),
+                    "thread_id": thread_id,
+                    "acquired_at": _utc_now(),
+                    "liveness_authority": "kernel_flock",
+                }
+                _write_lease_metadata(descriptor, metadata)
+            except BaseException:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+                    os.close(directory_descriptor)
+                raise
+            held = _HeldCampaignMutationLease(
+                key=key,
+                root=campaign_root,
+                descriptor=descriptor,
+                directory_descriptor=directory_descriptor,
+                owner_thread=thread_id,
+                owner_pid=pid,
+                depth=1,
+                metadata=metadata,
+            )
+            _HELD_MUTATION_LEASES[key] = held
+    try:
+        yield MappingProxyType(dict(held.metadata))
+    finally:
+        _release_mutation_lease(held)
+
+
+def campaign_mutation_guard(
+    *,
+    operation: str,
+    root_parameter: str,
+    error_type: type[Exception],
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorate a public mutating entrypoint with the shared campaign lease."""
+
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind(*args, **kwargs)
+            try:
+                with campaign_mutation_lease(
+                    bound.arguments[root_parameter], operation
+                ):
+                    return function(*args, **kwargs)
+            except CampaignMutationLockError as exc:
+                raise error_type(str(exc)) from exc
+
+        return guarded
+
+    return decorate
 
 
 def _exact_mapping(value: Any, keys: set[str], label: str) -> dict[str, Any]:
@@ -312,8 +661,9 @@ class MacroRoundConfig:
     sha256: str
     macro_round_count: int | None = None
     campaign_contract_sha256: str | None = None
-    learner_backend: str = LEARNER_BACKEND_OCI_NRT
+    learner_backend: str = LEARNER_BACKEND_LEPTON_JOB_V1
     learner_backend_contract_sha256: str | None = None
+    advance_after_rejected_evaluation: bool = False
 
     def __post_init__(self) -> None:
         for path, label in (
@@ -348,6 +698,10 @@ class MacroRoundConfig:
             _sha256(
                 self.learner_backend_contract_sha256,
                 "learner backend contract sha256",
+            )
+        if type(self.advance_after_rejected_evaluation) is not bool:
+            raise OrchestrationError(
+                "advance_after_rejected_evaluation must be boolean"
             )
         if not isinstance(self.hooks, Mapping) or set(self.hooks) != set(_HOOK_NAMES):
             raise OrchestrationError("hooks must contain exactly the six orchestration hooks")
@@ -400,6 +754,14 @@ class MacroRoundConfig:
                 "campaign_contract_sha256",
                 "learner_backend",
                 "learner_backend_contract_sha256",
+            }
+        elif schema == RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA:
+            keys = base_keys | {
+                "macro_round_count",
+                "campaign_contract_sha256",
+                "learner_backend",
+                "learner_backend_contract_sha256",
+                "advance_after_rejected_evaluation",
             }
         else:
             raise OrchestrationError("orchestration config schema mismatch")
@@ -454,12 +816,19 @@ class MacroRoundConfig:
                 in {
                     PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
                     BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                    RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
                 }
                 else None
             ),
             learner_backend=(
                 validate_learner_backend(document["learner_backend"])
-                if schema == BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
+                if schema
+                in {
+                    BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                    RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                }
+                # Pre-v4 files existed only for the named OCI compatibility
+                # path. Never reinterpret their absent backend as Lepton.
                 else LEARNER_BACKEND_OCI_NRT
             ),
             learner_backend_contract_sha256=(
@@ -467,8 +836,17 @@ class MacroRoundConfig:
                     document["learner_backend_contract_sha256"],
                     "learner_backend_contract_sha256",
                 )
-                if schema == BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
+                if schema
+                in {
+                    BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                    RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+                }
                 else None
+            ),
+            advance_after_rejected_evaluation=(
+                document["advance_after_rejected_evaluation"]
+                if schema == RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
+                else False
             ),
         )
 
@@ -527,7 +905,7 @@ def _verified_source_hook(
     The local RTX evaluation seal is also the coordinator hook seal.  This
     makes collection, learner submission, and evaluation use one verified
     source inventory instead of letting the first two execute mutable checkout
-    bytes.  The learner itself still independently verifies its remote OCI
+    bytes. The learner independently verifies the selected backend's remote
     source seal.
     """
 
@@ -709,6 +1087,204 @@ def _verified_evaluation_hook(
     return descriptor, argv
 
 
+def _actor_host_access_helper(environment: Mapping[str, str]) -> None:
+    """Run the narrow root helper from the coordinator source, never actor code."""
+
+    inventory_sha256 = environment.get(
+        "ROUND_DAGGER_LEARNER_SOURCE_INVENTORY_SHA256"
+    )
+    if not inventory_sha256 or _SHA256_RE.fullmatch(inventory_sha256) is None:
+        raise OrchestrationError(
+            "actor host-access recovery lacks coordinator source identity"
+        )
+    helper = (
+        _COORDINATOR_SOURCE_ROOT
+        / "scripts/round_dagger/run_actor_host_access_docker.sh"
+    )
+    try:
+        info = os.lstat(helper)
+    except OSError as exc:
+        raise OrchestrationError(
+            "actor host-access recovery helper is unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or not os.access(helper, os.X_OK)
+    ):
+        raise OrchestrationError("actor host-access recovery helper is unsafe")
+    helper_environment = dict(environment)
+    helper_environment.update(
+        ROUND_DAGGER_TRUSTED_COORDINATOR_HOST_ACCESS="1",
+        ROUND_DAGGER_COORDINATOR_SOURCE_ROOT=str(_COORDINATOR_SOURCE_ROOT),
+        ROUND_DAGGER_COORDINATOR_SOURCE_INVENTORY_SHA256=inventory_sha256,
+    )
+    try:
+        completed = subprocess.run(
+            [str(helper)],
+            cwd=_COORDINATOR_SOURCE_ROOT,
+            env=helper_environment,
+            check=False,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OrchestrationError(
+            "actor host-access recovery helper could not complete"
+        ) from exc
+    if completed.returncode != 0:
+        raise OrchestrationError(
+            "actor host-access recovery helper failed closed"
+        )
+
+
+def _repair_actor_host_access(environment: Mapping[str, str]) -> bool:
+    """Repair inaccessible legacy output and prove host access; return if repaired."""
+
+    raw_run_dir = environment.get("TRAIN_RUN_DIR")
+    if not raw_run_dir:
+        raise OrchestrationError("collect hook lacks actor run directory")
+    run_dir = Path(os.path.abspath(raw_run_dir))
+    try:
+        actor_host_access.verify_host_access(run_dir)
+        return False
+    except actor_host_access.ActorHostAccessError:
+        _actor_host_access_helper(environment)
+    try:
+        actor_host_access.verify_host_access(run_dir)
+    except actor_host_access.ActorHostAccessError as exc:
+        raise OrchestrationError(
+            "actor run remained inaccessible after ownership recovery"
+        ) from exc
+    return True
+
+
+def _prepare_actor_host_access(environment: Mapping[str, str]) -> None:
+    raw_run_dir = environment.get("TRAIN_RUN_DIR")
+    if not raw_run_dir:
+        raise OrchestrationError("collect hook lacks actor run directory")
+    run_dir = Path(os.path.abspath(raw_run_dir))
+    try:
+        actor_host_access.prepare_host_layout(run_dir)
+    except actor_host_access.ActorHostAccessError:
+        _actor_host_access_helper(environment)
+        try:
+            actor_host_access.verify_host_access(run_dir)
+        except actor_host_access.ActorHostAccessError as exc:
+            raise OrchestrationError(
+                "actor run is not host-accessible before collection"
+            ) from exc
+
+
+def _collect_cohort_is_sealed(environment: Mapping[str, str]) -> bool:
+    raw_cohort = environment.get("ROUND_DAGGER_COHORT_DIR")
+    if not raw_cohort:
+        raise OrchestrationError("collect hook lacks cohort directory")
+    try:
+        return bool(artifacts.verify_cohort(Path(raw_cohort))["sealed"])
+    except (artifacts.ArtifactError, OSError, ValueError):
+        return False
+
+
+def _run_collect_with_host_access(
+    invoke: Callable[[], subprocess.CompletedProcess[Any]],
+    environment: Mapping[str, str],
+) -> subprocess.CompletedProcess[Any]:
+    """Run legacy collection with one sealed-only ownership recovery retry.
+
+    The accepted actor/evaluation source remains unchanged.  A fresh cohort's
+    shared layout is created by the host before the legacy root container runs.
+    If that legacy hook seals the cohort but then fails its host-side telemetry
+    finalization, the coordinator normalizes only telemetry/W&B output and
+    invokes the same sealed hook one more time.  Its existing sealed branch
+    cannot launch rollout ranks, so cohort data are adopted without rerollout.
+    """
+
+    _prepare_actor_host_access(environment)
+    completed = invoke()
+    if completed.returncode == 0:
+        _repair_actor_host_access(environment)
+        return completed
+    if not _collect_cohort_is_sealed(environment):
+        return completed
+    if not _repair_actor_host_access(environment):
+        return completed
+    retried = invoke()
+    if retried.returncode == 0:
+        _repair_actor_host_access(environment)
+    return retried
+
+
+def _isolate_trusted_hook_python(
+    child_environment: dict[str, str],
+) -> None:
+    """Pin bare ``python3`` calls in trusted host hooks to the control venv.
+
+    The reviewed shell hooks still contain bare ``python3`` invocations.  They
+    must not resolve through an operator's PATH or user site-packages.  The
+    production contract already binds an absolute control-venv entry point;
+    require its sibling ``python3`` to resolve to the same interpreter and
+    publish a small deterministic host PATH.  Actor-container PATH is not
+    forwarded by the Docker executor, so this affects coordinator-side tools
+    only.
+    """
+
+    raw_control_python = child_environment.get("ROUND_DAGGER_CONTROL_PYTHON")
+    if not raw_control_python or not os.path.isabs(raw_control_python):
+        raise OrchestrationError(
+            "trusted hook requires an absolute control Python"
+        )
+    control_python = Path(raw_control_python)
+    sibling_python = control_python.parent / "python3"
+    virtual_environment = control_python.parent.parent
+    venv_configuration = virtual_environment / "pyvenv.cfg"
+    try:
+        control_target = control_python.resolve(strict=True)
+        sibling_target = sibling_python.resolve(strict=True)
+        control_info = control_target.stat()
+        sibling_info = sibling_target.stat()
+        venv_info = venv_configuration.lstat()
+    except OSError as exc:
+        raise OrchestrationError(
+            "trusted hook control Python is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(control_info.st_mode)
+        or not stat.S_ISREG(sibling_info.st_mode)
+        or stat.S_ISLNK(venv_info.st_mode)
+        or not stat.S_ISREG(venv_info.st_mode)
+        or control_python.parent.name != "bin"
+        or not os.access(control_python, os.X_OK)
+        or not os.access(sibling_python, os.X_OK)
+        or not os.path.samefile(control_target, sibling_target)
+    ):
+        raise OrchestrationError(
+            "trusted hook python3 does not match the control Python"
+        )
+    # Non-interactive bash reads BASH_ENV before it evaluates the verified
+    # memfd-backed hook.  Do not let an operator login shell inject commands
+    # ahead of the sealed source.  ENV is the corresponding POSIX-shell knob;
+    # the remaining entries can otherwise alter or hang short ``python3 -c``
+    # control probes used by the reviewed hooks.
+    for name in (
+        "BASH_ENV",
+        "ENV",
+        "PYTHONHOME",
+        "PYTHONBREAKPOINT",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+    ):
+        child_environment.pop(name, None)
+    child_environment.update(
+        {
+            "PATH": f"{control_python.parent}:{_TRUSTED_HOST_SYSTEM_PATH}",
+            "VIRTUAL_ENV": str(virtual_environment),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+
+
 class SubprocessHookRunner:
     """Run hooks without a shell and without echoing argv or environment."""
 
@@ -724,6 +1300,9 @@ class SubprocessHookRunner:
         child_environment.update(environment)
         verified_descriptor: int | None = None
         collect_sealed_teacher: Path | None = None
+        trusted_hook = name in _TRUSTED_HOOK_RELATIVES or name == "train"
+        if trusted_hook:
+            _isolate_trusted_hook_python(child_environment)
         if name == "collect":
             raw_source_root = child_environment.get(
                 "ROUND_DAGGER_EVALUATION_SOURCE_ROOT"
@@ -743,7 +1322,7 @@ class SubprocessHookRunner:
                 raise OrchestrationError(
                     "sealed teacher is outside the trusted actor source"
                 ) from exc
-        if name in _TRUSTED_HOOK_RELATIVES or name == "train":
+        if trusted_hook:
             (
                 verified_descriptor,
                 argv,
@@ -804,7 +1383,18 @@ class SubprocessHookRunner:
             }
             if verified_descriptor is not None:
                 options["pass_fds"] = (verified_descriptor,)
-            completed = subprocess.run(argv, **options)
+
+            def invoke() -> subprocess.CompletedProcess[Any]:
+                if verified_descriptor is not None:
+                    os.lseek(verified_descriptor, 0, os.SEEK_SET)
+                return subprocess.run(argv, **options)
+
+            completed = (
+                _run_collect_with_host_access(invoke, child_environment)
+                if name == "collect"
+                and child_environment.get("ROUND_DAGGER_CAMPAIGN_CONTRACT")
+                else invoke()
+            )
         except subprocess.TimeoutExpired as exc:
             raise OrchestrationError(f"{name} hook timed out") from exc
         except OSError as exc:
@@ -978,6 +1568,114 @@ def _validate_public_wandb_config(document: Mapping[str, Any]) -> None:
         raise OrchestrationError("public W&B beta must be finite and in [0,1]")
 
 
+def _canonical_public_config_bytes(
+    document: Mapping[str, Any], *, stable: bool
+) -> bytes:
+    """Canonical bytes for a validated public W&B config.
+
+    The stable projection excludes only the orchestration source digest.  Comparing
+    these bytes (rather than Python values) preserves JSON type distinctions such
+    as ``0`` versus ``0.0`` during a recovery decision.
+    """
+
+    values = dict(document["config"])
+    if stable:
+        del values["round_dagger/orchestration_config_sha256"]
+    return json.dumps(
+        {"schema": document["schema"], "config": values},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _recover_production_public_wandb_config(
+    *, path: Path, requested: Mapping[str, Any]
+) -> Path:
+    """Accept the one safe immutable-config drift allowed on a production retry."""
+
+    try:
+        before_sha = artifacts.sha256_file(path)
+        existing = artifacts.load_strict_json(path)
+        after_load_sha = artifacts.sha256_file(path)
+    except (artifacts.ArtifactError, OSError) as exc:
+        raise OrchestrationError(
+            "existing public W&B config is missing, corrupt, or unsafe"
+        ) from exc
+    if before_sha != after_load_sha:
+        raise OrchestrationError("existing public W&B config changed while loading")
+    if not isinstance(existing, Mapping):
+        raise OrchestrationError("existing public W&B config must be a mapping")
+
+    # Both documents must independently satisfy the complete production-v3
+    # allowlist before any recovery comparison is made.
+    _validate_public_wandb_config(existing)
+    _validate_public_wandb_config(requested)
+    if (
+        existing["schema"] != PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA
+        or requested["schema"] != PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA
+    ):
+        raise OrchestrationError(
+            "public W&B config recovery requires production v3 documents"
+        )
+
+    existing_bytes = _canonical_public_config_bytes(existing, stable=False)
+    requested_bytes = _canonical_public_config_bytes(requested, stable=False)
+    if hashlib.sha256(existing_bytes).hexdigest() != before_sha:
+        raise OrchestrationError(
+            "existing public W&B config is not a canonical immutable artifact"
+        )
+    existing_stable = _canonical_public_config_bytes(existing, stable=True)
+    requested_stable = _canonical_public_config_bytes(requested, stable=True)
+    if existing_stable != requested_stable:
+        raise OrchestrationError(
+            "public W&B config differs beyond orchestration_config_sha256"
+        )
+
+    old_orchestration_sha = existing["config"][
+        "round_dagger/orchestration_config_sha256"
+    ]
+    new_orchestration_sha = requested["config"][
+        "round_dagger/orchestration_config_sha256"
+    ]
+    if old_orchestration_sha == new_orchestration_sha:
+        # The immutable publisher reaches this function only after a byte
+        # conflict.  Equal source digests therefore indicate non-semantic byte
+        # drift or corruption, neither of which is recoverable.
+        raise OrchestrationError(
+            "public W&B config conflicts without orchestration config drift"
+        )
+
+    normalized_stable_sha = hashlib.sha256(existing_stable).hexdigest()
+    requested_sha = hashlib.sha256(requested_bytes).hexdigest()
+    recovery = {
+        "schema": WANDB_PUBLIC_CONFIG_RECOVERY_SCHEMA,
+        "old_public_config_sha256": before_sha,
+        "new_public_config_sha256": requested_sha,
+        "old_orchestration_config_sha256": old_orchestration_sha,
+        "new_orchestration_config_sha256": new_orchestration_sha,
+        "normalized_stable_config_sha256": normalized_stable_sha,
+    }
+    recovery_path = (
+        path.parent
+        / "WANDB_PUBLIC_CONFIG_RECOVERY"
+        / f"{new_orchestration_sha}.json"
+    )
+    try:
+        artifacts.publish_immutable_json(recovery_path, recovery)
+        final_sha = artifacts.sha256_file(path)
+    except (artifacts.ArtifactError, OSError) as exc:
+        raise OrchestrationError(
+            "cannot publish immutable public W&B config recovery provenance"
+        ) from exc
+    if final_sha != before_sha:
+        raise OrchestrationError(
+            "existing public W&B config changed during recovery publication"
+        )
+    return path
+
+
 class RoundTelemetry:
     """Deterministic scalar/config artifacts consumed by the W&B sidecar."""
 
@@ -988,7 +1686,16 @@ class RoundTelemetry:
     def publish_config(self, document: Mapping[str, Any]) -> Path:
         _validate_public_wandb_config(document)
         path = self.telemetry_dir / "WANDB_PUBLIC_CONFIG.json"
-        artifacts.publish_immutable_json(path, document)
+        try:
+            artifacts.publish_immutable_json(path, document)
+        except artifacts.ArtifactError:
+            # Production restarts may intentionally use a newly sealed
+            # orchestration source while continuing the same W&B run.  Keep the
+            # original public config immutable and record the sole permitted
+            # source-digest drift separately.  Every other conflict fails closed.
+            return _recover_production_public_wandb_config(
+                path=path, requested=document
+            )
         return path
 
     def record(self, *, step: int, metrics: Mapping[str, int | float]) -> Path:
@@ -1121,6 +1828,18 @@ class ProductionBackend:
         try:
             return wandb_delivery.verify_delivery(run_dir)
         except wandb_delivery.WandbDeliveryError as exc:
+            # Legacy actor containers may have completed and sealed their
+            # cohort before leaving telemetry owned by another runtime UID.
+            # That is a recoverable *access* boundary: return ``None`` so the
+            # orchestrator re-enters the idempotent collect hook, whose
+            # host-access wrapper normalizes only the actor run telemetry and
+            # then executes the sealed (no-rerollout) recovery branch.  If the
+            # host can already inspect the run, the evidence is genuinely
+            # malformed or contradictory and must continue to fail closed.
+            try:
+                actor_host_access.verify_host_access(run_dir)
+            except actor_host_access.ActorHostAccessError:
+                return None
             raise OrchestrationError(
                 f"actor cohort has invalid W&B delivery evidence: {exc}"
             ) from exc
@@ -1236,6 +1955,51 @@ class ProductionBackend:
             f"learner_result_round_{self.config.macro_round:06d}.json"
         )
 
+    def requires_learner_acceptance(self) -> bool:
+        """Whether this concrete backend crosses the audited Lepton boundary."""
+
+        return self.config.learner_backend == LEARNER_BACKEND_LEPTON_JOB_V1
+
+    def learner_acceptance_path(self) -> Path:
+        return learner_acceptance.acceptance_path(
+            self.root, self.config.macro_round
+        )
+
+    def load_learner_acceptance(
+        self, *, expected_environment: Mapping[str, str]
+    ) -> dict[str, Any]:
+        if not self.requires_learner_acceptance():
+            raise OrchestrationError(
+                "learner acceptance is defined only for the Lepton backend"
+            )
+        contract_raw = os.environ.get("ROUND_DAGGER_LEPTON_BACKEND_CONTRACT")
+        contract_sha = os.environ.get(
+            "ROUND_DAGGER_LEPTON_BACKEND_CONTRACT_SHA256"
+        )
+        if (
+            not contract_raw
+            or not Path(contract_raw).is_absolute()
+            or self.config.learner_backend_contract_sha256 is None
+            or contract_sha != self.config.learner_backend_contract_sha256
+        ):
+            raise OrchestrationError(
+                "Lepton acceptance backend-contract identity is unavailable"
+            )
+        try:
+            validation_environment = dict(os.environ)
+            validation_environment.update(expected_environment)
+            return learner_acceptance.validate_acceptance(
+                self.learner_acceptance_path(),
+                campaign_root=self.root,
+                macro_round=self.config.macro_round,
+                backend_contract_path=Path(os.path.abspath(contract_raw)),
+                expected_environment=validation_environment,
+            )
+        except learner_acceptance.LearnerAcceptanceError as exc:
+            raise OrchestrationError(
+                f"Lepton learner acceptance is invalid: {exc}"
+            ) from exc
+
     def load_learner_result(
         self,
         *,
@@ -1334,7 +2098,11 @@ class ProductionBackend:
         return environment
 
     def stage_candidate(
-        self, learner_result: Mapping[str, Any], snapshot: Mapping[str, Any]
+        self,
+        learner_result: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+        *,
+        learner_acceptance_sha256: str | None = None,
     ) -> dict[str, Any]:
         return promotion.stage_candidate(
             self.root,
@@ -1344,6 +2112,7 @@ class ProductionBackend:
             code_sha256=self.config.learner_code_sha256,
             learner_config_sha256=self.config.learner_config_sha256,
             optimizer_steps=learner_result["optimizer_steps"],
+            learner_acceptance_sha256=learner_acceptance_sha256,
         )
 
     def mark_trained(self, candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -1519,6 +2288,16 @@ class ProductionBackend:
             evaluation_manifest=evaluation["manifest_path"],
         )
 
+    def reject(
+        self, candidate: Mapping[str, Any], evaluation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return promotion.reject_candidate(
+            self.root,
+            macro_round=self.config.macro_round,
+            candidate_manifest=candidate["manifest_path"],
+            evaluation_manifest=evaluation["manifest_path"],
+        )
+
 
 def _cohort_environment(
     *,
@@ -1625,6 +2404,45 @@ def _validate_cohort_report(
         )
 
 
+def _ensure_scene_sample_manifest(
+    *,
+    actor_run_dir: Path,
+    round_dir: Path,
+    campaign_id: str,
+) -> Path:
+    """Package one immutable, bounded actor contact-sheet set for the learner.
+
+    Actor telemetry lives below the top-level ``actors`` tree, which is
+    deliberately excluded from the H200 campaign projection.  Copying only a
+    SHA-pinned sample set into the durable round directory gives the learner
+    its W&B scene panel without transferring the full rollout-media tree.
+    Publication is idempotent, so an INGESTED-phase restart can rebuild or
+    revalidate this handoff without touching replay or rerunning an actor.
+    """
+
+    try:
+        from scripts.round_dagger import build_scene_sample_manifest
+
+        destination = round_dir / "scene_samples"
+        expected = build_scene_sample_manifest.package_scene_samples(
+            actor_telemetry_dir=actor_run_dir / "telemetry",
+            destination=destination,
+            campaign_id=campaign_id,
+            actor_rank=0,
+            rollout_steps=STEPS_PER_ENVIRONMENT,
+        )
+        manifest_path = destination / build_scene_sample_manifest.MANIFEST_NAME
+        observed = artifacts.load_strict_json(manifest_path)
+    except Exception as exc:
+        raise OrchestrationError(
+            "cannot package the immutable actor scene samples required by the "
+            "learner dashboard"
+        ) from exc
+    if observed != expected:
+        raise OrchestrationError("actor scene sample manifest changed after publication")
+    return manifest_path
+
+
 class MacroRoundOrchestrator:
     """Run or resume one explicitly numbered production macro-round."""
 
@@ -1634,10 +2452,14 @@ class MacroRoundOrchestrator:
         *,
         backend: ProductionBackend | None = None,
         hook_runner: HookRunner | None = None,
+        stop_after_collected: bool = False,
     ):
+        if type(stop_after_collected) is not bool:
+            raise OrchestrationError("stop_after_collected must be a boolean")
         self.config = config
         self.backend = backend or ProductionBackend(config)
         self.hook_runner = hook_runner or SubprocessHookRunner()
+        self.stop_after_collected = stop_after_collected
 
     def _run_hook(self, name: str, environment: Mapping[str, str]) -> None:
         hook = self.config.hooks[name]
@@ -1663,7 +2485,7 @@ class MacroRoundOrchestrator:
         contract: Mapping[str, Any],
     ) -> dict[str, str]:
         checkpoint = self.config.campaign_root / contract["policy_checkpoint_path"]
-        return {
+        environment = {
             "ROUND_DAGGER_CAMPAIGN_ROOT": str(self.config.campaign_root),
             "ROUND_DAGGER_CAMPAIGN_ID": str(campaign["campaign_id"]),
             "ROUND_DAGGER_MACRO_ROUND": str(self.config.macro_round),
@@ -1727,7 +2549,20 @@ class MacroRoundOrchestrator:
             raise OrchestrationError(
                 "configured macro_round is stale or skips coordinator state"
             )
-        version = current["active_policy"]["version"]
+        active = current["active_policy"]
+        resolution = current.get("last_resolution")
+        if (
+            isinstance(resolution, Mapping)
+            and resolution.get("macro_round") == self.config.macro_round
+        ):
+            version = resolution.get("candidate_policy_version")
+            if type(version) is not int or version < 1:
+                raise OrchestrationError("completed round has invalid resolution version")
+        else:
+            # Legacy V2 campaigns recorded a successful promotion only; the
+            # active policy directory therefore remains the compatibility
+            # source for its candidate manifest.
+            version = active["version"]
         candidate_path = (
             self.config.campaign_root
             / "policies"
@@ -1741,9 +2576,23 @@ class MacroRoundOrchestrator:
             bind_state=False,
         )
         evaluation = self.backend.load_evaluation(candidate)
-        return self.backend.promote(candidate, evaluation)
+        if evaluation.get("passed") is True:
+            return self.backend.promote(candidate, evaluation)
+        if evaluation.get("passed") is False:
+            return self.backend.reject(candidate, evaluation)
+        raise OrchestrationError("completed round evaluation has an invalid passed flag")
 
     def run(self) -> dict[str, Any]:
+        try:
+            with campaign_mutation_lease(
+                self.config.campaign_root,
+                f"macro_round_{self.config.macro_round:06d}",
+            ):
+                return self._run_with_mutation_lease()
+        except CampaignMutationLockError as exc:
+            raise OrchestrationError(str(exc)) from exc
+
+    def _run_with_mutation_lease(self) -> dict[str, Any]:
         campaign = self.backend.load_campaign()
         validate_production_topology(campaign)
         if campaign.get("schema") == state.PRODUCTION_CAMPAIGN_SCHEMA:
@@ -1950,6 +2799,33 @@ class MacroRoundOrchestrator:
             )
 
         current = self.backend.load_state()
+        if self.stop_after_collected:
+            # Collection-only is an explicit terminal operation, not a failed
+            # partial macro round.  The aggregate must already be sealed and
+            # have the exact production topology before this return point; a
+            # later ordinary invocation resumes from COLLECTED and performs
+            # ingestion/training/evaluation without recollecting any cohort.
+            if current["phase"] != "COLLECTED":
+                raise OrchestrationError(
+                    "collection-only execution stopped in unexpected phase "
+                    f"{current['phase']}"
+                )
+            collection = self.backend.load_collection()
+            if collection.get("cohort_count") != COHORT_COUNT or collection.get(
+                "transition_count"
+            ) != TRANSITIONS_PER_MACRO_ROUND:
+                raise OrchestrationError(
+                    "collection-only execution requires an exact sealed 256x512 aggregate"
+                )
+            return {
+                "schema": "fast_roborender.round_dagger.collection_only_result.v1",
+                "status": "COLLECTED",
+                "macro_round": self.config.macro_round,
+                "collection_manifest_path": collection["manifest_path"],
+                "collection_manifest_sha256": collection["manifest_sha256"],
+                "cohort_count": collection["cohort_count"],
+                "transition_count": collection["transition_count"],
+            }
         if current["phase"] == "COLLECTED":
             collection = self.backend.load_collection()
             ingest_environment = {
@@ -2046,12 +2922,55 @@ class MacroRoundOrchestrator:
                 "ROUND_DAGGER_LEARNER_CONFIG_SHA256": self.config.learner_config_sha256,
                 "ROUND_DAGGER_LEARNER_MODEL_LINEAGE_SHA256": self.config.learner_model_lineage_sha256,
             }
-            if not self.backend.learner_result_path().exists():
+            if os.environ.get("ROUND_DAGGER_WANDB_PROJECT"):
+                actor_round = (
+                    self.config.actor_root
+                    / str(campaign["campaign_id"])
+                    / f"macro_round_{self.config.macro_round:06d}"
+                )
+                scene_sample_manifest = _ensure_scene_sample_manifest(
+                    actor_run_dir=actor_round / "cohort_00_run",
+                    round_dir=round_dir,
+                    campaign_id=str(campaign["campaign_id"]),
+                )
+                train_environment["ROUND_DAGGER_SCENE_SAMPLE_MANIFEST"] = str(
+                    scene_sample_manifest
+                )
+            requires_acceptance = bool(
+                getattr(
+                    self.backend,
+                    "requires_learner_acceptance",
+                    lambda: False,
+                )()
+            )
+            acceptance_sha256: str | None = None
+            if requires_acceptance:
+                acceptance_path = self.backend.learner_acceptance_path()
+                # A result alone is not a transaction commit.  Re-enter the
+                # idempotent bridge whenever its campaign-local acceptance
+                # receipt is absent, then deeply validate the receipt before
+                # any candidate bytes can be staged.
+                if not os.path.lexists(acceptance_path):
+                    self._run_hook("train", train_environment)
+                self.backend.load_learner_acceptance(
+                    expected_environment=train_environment
+                )
+                acceptance_sha256 = artifacts.sha256_file(acceptance_path)
+            elif not self.backend.learner_result_path().exists():
+                # Generic/local and legacy OCI backends retain their existing
+                # result-gated compatibility contract.
                 self._run_hook("train", train_environment)
             learner_result = self.backend.load_learner_result(
                 campaign=campaign, snapshot=snapshot
             )
-            candidate = self.backend.stage_candidate(learner_result, snapshot)
+            if acceptance_sha256 is None:
+                candidate = self.backend.stage_candidate(learner_result, snapshot)
+            else:
+                candidate = self.backend.stage_candidate(
+                    learner_result,
+                    snapshot,
+                    learner_acceptance_sha256=acceptance_sha256,
+                )
             self.backend.mark_trained(candidate)
             telemetry.record(
                 step=self.config.macro_round * 100 + 30,
@@ -2105,41 +3024,81 @@ class MacroRoundOrchestrator:
             )
         candidate = self.backend.load_candidate()
         evaluation = self.backend.load_evaluation(candidate)
-        if evaluation.get("passed") is not True:
-            # Never invoke an external promotion hook for a rejected candidate.
-            # The immutable EVALUATED state remains available for diagnosis,
-            # while both external side effects and active-policy mutation are
-            # blocked fail closed.
-            raise OrchestrationError(
-                "candidate failed paired evaluation; promotion hook was not invoked"
-            )
-        promote_environment = {
-            **base_environment,
-            "ROUND_DAGGER_CANDIDATE_MANIFEST": str(
-                self.config.campaign_root / candidate["manifest_path"]
-            ),
-            "ROUND_DAGGER_EVALUATION_MANIFEST": str(
-                self.config.campaign_root / evaluation["manifest_path"]
-            ),
-            "ROUND_DAGGER_EVALUATION_SHA256": str(evaluation["evidence_sha256"]),
-        }
-        self._run_hook("promote", promote_environment)
-        result = self.backend.promote(candidate, evaluation)
+        passed = evaluation.get("passed")
+        if type(passed) is not bool:
+            raise OrchestrationError("candidate evaluation passed flag is invalid")
+        parent = dict(current["active_policy"])
+        if passed:
+            promote_environment = {
+                **base_environment,
+                "ROUND_DAGGER_CANDIDATE_MANIFEST": str(
+                    self.config.campaign_root / candidate["manifest_path"]
+                ),
+                "ROUND_DAGGER_EVALUATION_MANIFEST": str(
+                    self.config.campaign_root / evaluation["manifest_path"]
+                ),
+                "ROUND_DAGGER_EVALUATION_SHA256": str(
+                    evaluation["evidence_sha256"]
+                ),
+            }
+            self._run_hook("promote", promote_environment)
+            result = self.backend.promote(candidate, evaluation)
+            expected_active = {
+                "version": candidate["policy_version"],
+                "checkpoint_sha256": candidate["checkpoint_sha256"],
+            }
+            decision = "promoted"
+        else:
+            # No external promotion hook is allowed for a rejected candidate.
+            # Legacy configurations remain fail-closed at EVALUATED.  The
+            # unattended production schema must opt in explicitly before it
+            # can publish a rejection receipt and advance with the parent.
+            if not self.config.advance_after_rejected_evaluation:
+                raise OrchestrationError(
+                    "candidate failed paired evaluation; promotion hook was not invoked"
+                )
+            # The coordinator publishes a terminal rejection receipt and
+            # deterministically advances with the exact verified parent.
+            result = self.backend.reject(candidate, evaluation)
+            expected_active = {
+                "version": parent["version"],
+                "checkpoint_sha256": parent["checkpoint_sha256"],
+            }
+            decision = "rejected"
         final_state = self.backend.load_state()
         if (
             final_state.get("phase") != "READY"
             or final_state.get("next_macro_round") != self.config.macro_round + 1
             or final_state.get("active_policy", {}).get("version")
-            != candidate["policy_version"]
+            != expected_active["version"]
+            or final_state.get("active_policy", {}).get("checkpoint_sha256")
+            != expected_active["checkpoint_sha256"]
         ):
-            raise OrchestrationError("promotion did not atomically advance active policy")
+            raise OrchestrationError("terminal resolution did not atomically advance")
+        resolution = final_state.get("last_resolution")
+        if self.config.advance_after_rejected_evaluation:
+            if not isinstance(resolution, Mapping):
+                raise OrchestrationError("terminal resolution lacks an immutable receipt")
+            if (
+                resolution.get("decision") != decision
+                or resolution.get("candidate_manifest_sha256")
+                != candidate["manifest_sha256"]
+                or resolution.get("evaluation_sha256")
+                != evaluation["evidence_sha256"]
+            ):
+                raise OrchestrationError(
+                    "terminal resolution receipt does not match evidence"
+                )
         telemetry.record(
             step=self.config.macro_round * 100 + 50,
             metrics={
                 "round/macro_round": self.config.macro_round,
                 "round/phase_code": _PHASE_CODES["READY"],
-                "round/evaluation_passed": 1,
-                "round/policy_version": int(candidate["policy_version"]),
+                "round/evaluation_passed": int(passed),
+                "round/candidate_promoted": int(passed),
+                "round/candidate_rejected": int(not passed),
+                "round/policy_version": int(expected_active["version"]),
+                "round/candidate_policy_version": int(candidate["policy_version"]),
                 "round/cohorts_complete": COHORT_COUNT,
                 "round/logical_environments_complete": TARGET_ENVIRONMENTS,
                 "round/transitions_complete": TRANSITIONS_PER_MACRO_ROUND,
@@ -2153,12 +3112,14 @@ __all__ = [
     "BOUNDED_ORCHESTRATION_CONFIG_SCHEMA",
     "PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA",
     "BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA",
+    "RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA",
     "LEARNER_BACKEND_OCI_NRT",
     "LEARNER_BACKEND_LEPTON_JOB_V1",
     "LEARNER_BACKENDS",
     "EVALUATOR_RESULT_SCHEMA",
     "WANDB_PUBLIC_CONFIG_SCHEMA",
     "PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA",
+    "WANDB_PUBLIC_CONFIG_RECOVERY_SCHEMA",
     "COHORT_COUNT",
     "ENVIRONMENTS_PER_COHORT",
     "TARGET_ENVIRONMENTS",
@@ -2169,6 +3130,10 @@ __all__ = [
     "TRANSITIONS_PER_CAMPAIGN",
     "EXPECTED_ACTOR_RANKS",
     "OrchestrationError",
+    "CampaignMutationLockError",
+    "CampaignMutationBusyError",
+    "campaign_mutation_lease",
+    "campaign_mutation_guard",
     "HookSpec",
     "MacroRoundConfig",
     "validate_learner_backend",

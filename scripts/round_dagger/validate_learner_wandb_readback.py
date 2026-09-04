@@ -34,10 +34,15 @@ HELDOUT_TELEMETRY_SCHEMA = (
     "fast_roborender.round_dagger.learner_heldout_telemetry.v1"
 )
 QUALITY_KEYS = (
+    "quality/eval_frontier",
     "quality/heldout_action_mse",
     "quality/heldout_action_mae",
     "quality/heldout_action_rmse",
     "quality/heldout_action_cosine",
+    "quality/heldout_action_absolute_error_p90",
+    "quality/heldout_action_l2_p90",
+    "quality/heldout_action_mse_delta_from_step0",
+    "quality/heldout_action_mse_relative_improvement_from_step0",
     "quality/heldout_transitions",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -192,10 +197,21 @@ def validate(
     for row in heldout:
         step = int(row["optimizer_step"])
         expected = {
+            "quality/eval_frontier": row.get("eval_frontier"),
             "quality/heldout_action_mse": row.get("action_mse"),
             "quality/heldout_action_mae": row.get("action_mae"),
             "quality/heldout_action_rmse": row.get("action_rmse"),
             "quality/heldout_action_cosine": row.get("action_cosine"),
+            "quality/heldout_action_absolute_error_p90": row.get(
+                "action_absolute_error_p90"
+            ),
+            "quality/heldout_action_l2_p90": row.get("action_l2_p90"),
+            "quality/heldout_action_mse_delta_from_step0": row.get(
+                "action_mse_delta_from_step0"
+            ),
+            "quality/heldout_action_mse_relative_improvement_from_step0": row.get(
+                "action_mse_relative_improvement_from_step0"
+            ),
             "quality/heldout_transitions": row.get("heldout_transitions_global"),
         }
         for key, raw in expected.items():

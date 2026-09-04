@@ -35,7 +35,7 @@ done
 [[ -x $DOCKER && ! -L $DOCKER ]] || fatal "Docker executable is unsafe"
 [[ -x $CONTROL_PYTHON ]] || fatal "control Python is unavailable"
 [[ $(stat -c %a -- "$NETRC") == 600 ]] || fatal "W&B netrc mode must be 0600"
-[[ $ENTITY == nvidia && $PROJECT == roborender-round-dagger ]] || \
+[[ $ENTITY == nvidia && $PROJECT == lepton-dagger-production-1 ]] || \
     fatal "W&B baseline destination differs from production"
 
 GR00T_ROOT="$ROOT/GR00T-VisualSim2Real"

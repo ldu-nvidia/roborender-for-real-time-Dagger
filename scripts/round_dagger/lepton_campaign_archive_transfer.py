@@ -148,6 +148,13 @@ def _publish_bytes(path: Path, payload: bytes, *, mode: int = 0o444) -> str:
                 expected,
             ):
                 raise CampaignArchiveError("competing artifact publication differs")
+        directory = os.open(
+            destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         return "published"
     finally:
         temporary.unlink(missing_ok=True)
@@ -169,6 +176,13 @@ def _publish_temporary(path: Path, temporary: Path, expected: tuple[int, str]) -
     except FileExistsError:
         if destination.is_symlink() or _regular_identity(destination) != expected:
             raise CampaignArchiveError("competing archive publication differs")
+    directory = os.open(
+        destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
     return "published"
 
 
@@ -665,9 +679,28 @@ def _extract_archive(
                     record = records[member.name]
                     if written != record["size"] or digest.hexdigest() != record["sha256"]:
                         raise CampaignArchiveError("extracted file differs from its inventory")
-                    os.chmod(target, 0o644)
+                    # Returned learner artifacts are immutable evidence.  Make
+                    # the inode read-only before the extraction tree can be
+                    # atomically published at its final path.
+                    os.fchmod(descriptor, 0o444)
+                    os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
+            # Persist all directory entries before the stage is renamed into
+            # the canonical destination.  File fsync alone does not make the
+            # containing directory entries crash durable.
+            for directory in sorted(
+                (Path(root) for root, _dirs, _files in os.walk(stage)),
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                directory_fd = os.open(
+                    directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             os.chmod(stage, 0o755)
     except (OSError, tarfile.TarError, EOFError) as exc:
         raise CampaignArchiveError("cannot safely extract campaign archive") from exc
@@ -809,6 +842,8 @@ def upload_publish(arguments: argparse.Namespace) -> dict[str, Any]:
             )
         command = shlex.join(
             [
+                "env",
+                "PYTHONDONTWRITEBYTECODE=1",
                 remote_python,
                 remote_tool,
                 "extract-publish",

@@ -54,7 +54,17 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
             "evaluation-source-inventory"
         )
         self.root = _campaign(self.tmp)
-        _to_ingested(self.root)
+        replay_snapshot, replay_snapshot_path = _to_ingested(self.root)
+        # Recovery uses the production-canonical snapshot location.  Preserve
+        # the exact bytes already bound by coordinator state so the fixture
+        # represents the real file-vs-semantic dual identity.
+        canonical_snapshot = (
+            self.root / "replay/snapshots/through_macro_round_000000.json"
+        )
+        canonical_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(replay_snapshot_path, canonical_snapshot)
+        canonical_snapshot.chmod(0o444)
+        self.replay_snapshot = replay_snapshot
         self.candidate = _stage_and_bind(self.root, self.tmp)
         self.state = load_state(self.root)
         self.campaign = load_campaign(self.root)
@@ -140,7 +150,6 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
         result = learner / "learner_result_round_000000.json"
         publish_immutable_json(result, {"fixture": "recovered learner"})
         snapshot = self.root / "replay/snapshots/through_macro_round_000000.json"
-        publish_immutable_json(snapshot, {"fixture": "replay snapshot"})
         receipt = {
             "schema": evaluation_recovery.LEARNER_RECOVERY_RECEIPT_SCHEMA,
             "status": "TRAINED",
@@ -150,7 +159,9 @@ class HardenedEvaluationRecoveryTest(unittest.TestCase):
             "ingested_revision": current["revision"] - 1,
             "trained_revision": current["revision"],
             "replay_snapshot_file_sha256": sha256_file(snapshot),
-            "replay_snapshot_sha256": current["replay_snapshot_sha256"],
+            # Production snapshots carry a semantic identity separate from
+            # their immutable file digest.
+            "replay_snapshot_sha256": self.replay_snapshot["snapshot_sha256"],
             "sealed_source_inventory_sha256": _sha("sealed-source"),
             "learner_config_sha256": _sha("learner-config"),
             "learner_result_path": result.relative_to(self.root).as_posix(),

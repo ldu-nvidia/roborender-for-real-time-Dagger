@@ -13,7 +13,7 @@ as later macro-rounds complete::
     python scripts/round_dagger/evaluation_wandb_bridge.py \
       --campaign-root /mnt/data2/.../campaign \
       --state-dir /mnt/data2/.../evaluation-wandb \
-      --project roborender-round-dagger --entity nvidia \
+      --project lepton-dagger-production-1 --entity nvidia \
       --expected-email ldu@nvidia.com --authorization-scope team \
       --poll-seconds 60
 
@@ -649,6 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dir=str(wandb_dir),
                 config=bridge.wandb_config,
                 tags=("round-dagger", "evaluation", "read-only-bridge"),
+                settings=wandb.Settings(x_disable_stats=True),
             )
             run.define_metric("eval/macro_round")
             run.define_metric("eval/*", step_metric="eval/macro_round")

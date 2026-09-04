@@ -314,6 +314,7 @@ class EvaluationWandbBridgeTest(unittest.TestCase):
         self.assertEqual(document["schema"], bridge.READY_SCHEMA)
         self.assertEqual(document["process_id"], os.getpid())
         self.assertEqual(document["wandb_run_id"], wandb.init.call_args.kwargs["id"])
+        wandb.Settings.assert_called_once_with(x_disable_stats=True)
         self.assertEqual(run.finished, [0])
 
     def test_ready_marker_must_be_direct_child_of_external_state(self) -> None:

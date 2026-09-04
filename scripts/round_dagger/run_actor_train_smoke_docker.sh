@@ -107,6 +107,31 @@ done
 }
 CONTAINER="rdt-rtx-train-smoke-v1-m0-c${COHORT_INDEX}-r0"
 
+# A real Isaac/GR00T actor can fail after the container has initialized but
+# before it has published a single shard.  `--rm` is appropriate here (the
+# cohort itself is the durable artifact), but it used to discard the only
+# useful stderr for that class of failure.  Keep an append-free, attempt
+# specific host log outside the immutable cohort tree so the next diagnosis is
+# based on the actual runtime error rather than an incomplete Hydra log.
+PLAN_DIR=$(cd "$(dirname "$PLAN")" && pwd -P)
+LAUNCH_LOG_DIR="$PLAN_DIR/launcher_logs"
+[[ ! -L $LAUNCH_LOG_DIR ]] || {
+    echo "train-smoke launcher log directory may not be a symlink" >&2
+    exit 2
+}
+mkdir -p "$LAUNCH_LOG_DIR"
+[[ -d $LAUNCH_LOG_DIR && ! -L $LAUNCH_LOG_DIR ]] || {
+    echo "cannot create safe train-smoke launcher log directory" >&2
+    exit 2
+}
+ATTEMPT_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
+ATTEMPT_LOG="$LAUNCH_LOG_DIR/cohort_${COHORT_INDEX}_${ATTEMPT_ID}.log"
+(umask 077; : >"$ATTEMPT_LOG")
+[[ -f $ATTEMPT_LOG && ! -L $ATTEMPT_LOG ]] || {
+    echo "cannot create safe train-smoke launcher log" >&2
+    exit 2
+}
+
 # This whitelist deliberately excludes W&B credentials: actor-side W&B is
 # disabled by the frozen validation primitive, and the later learner/W&B gate
 # has its own bounded credential path.
@@ -115,9 +140,11 @@ ENV_NAMES=(
     IMAGE3F_ENDPOINT_MANIFEST ROUND_DAGGER_BETA
     ROUND_DAGGER_BETA_SHA256 ROUND_DAGGER_CAMPAIGN_ID
     ROUND_DAGGER_COHORT_DIR ROUND_DAGGER_COHORT_INDEX
+    ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST
     ROUND_DAGGER_CONFIG_SHA256 ROUND_DAGGER_ENVS_PER_SHARD
     ROUND_DAGGER_EXPECTED_RENDERERS ROUND_DAGGER_GLOBAL_ENV_OFFSET
     ROUND_DAGGER_MACRO_ROUND ROUND_DAGGER_MIN_ANCHORS
+    ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256
     ROUND_DAGGER_POLICY_CHECKPOINT ROUND_DAGGER_POLICY_MANIFEST
     ROUND_DAGGER_POLICY_SHA256 ROUND_DAGGER_POLICY_SPEC
     ROUND_DAGGER_RENDERER_SHA256 ROUND_DAGGER_ROLLOUT_ID
@@ -155,7 +182,8 @@ ENV_ARGS+=(
     --env "ROUND_DAGGER_RUNTIME_AB_EVIDENCE="
 )
 
-exec "$DOCKER" run --rm \
+set +e
+"$DOCKER" run --rm \
     --name "$CONTAINER" \
     --gpus "\"device=$GPU\"" \
     --ipc=private \
@@ -165,4 +193,14 @@ exec "$DOCKER" run --rm \
     "${MOUNTS[@]}" \
     "${ENV_ARGS[@]}" \
     "$IMAGE" \
-    /usr/bin/env bash "$RANK_SCRIPT"
+    /usr/bin/env bash "$RANK_SCRIPT" >"$ATTEMPT_LOG" 2>&1
+STATUS=$?
+set -e
+chmod a-w "$ATTEMPT_LOG"
+if ((STATUS != 0)); then
+    echo "ACTOR_TRAIN_SMOKE_FAILED cohort=$COHORT_INDEX exit=$STATUS log=$ATTEMPT_LOG" >&2
+    tail -n 120 "$ATTEMPT_LOG" >&2
+    exit "$STATUS"
+fi
+echo "ACTOR_TRAIN_SMOKE_CONTAINER_OK cohort=$COHORT_INDEX log=$ATTEMPT_LOG"
+exit 0

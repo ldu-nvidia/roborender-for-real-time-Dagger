@@ -91,6 +91,11 @@ class LeptonCampaignArchiveTransferTest(unittest.TestCase):
                 (destination / "replay/nested/payload.bin").read_bytes(),
                 b"payload" * 31,
             )
+            self.assertEqual(
+                (destination / "replay/nested/payload.bin").stat().st_mode
+                & 0o777,
+                0o444,
+            )
             self.assertEqual((destination / "replay").stat().st_mode & 0o777, 0o755)
 
             second = campaign.extract_publish(
@@ -195,6 +200,10 @@ class LeptonCampaignArchiveTransferTest(unittest.TestCase):
                 expected_manifest_sha256=manifest_sha,
             )
             changed = destination / "campaign.json"
+            # Published extraction trees intentionally contain read-only
+            # evidence.  Simulate external tampering explicitly before
+            # asserting that adoption still detects the changed bytes.
+            changed.chmod(0o644)
             changed.write_text("changed\n", encoding="utf-8")
 
             with self.assertRaisesRegex(campaign.CampaignArchiveError, "conflicts"):
@@ -367,6 +376,7 @@ class LeptonCampaignArchiveTransferTest(unittest.TestCase):
             self.assertNotIn("--delete", json.dumps(engine.calls))
             self.assertIn("extract-publish", shell.scripts[0][0])
             self.assertIn(manifest_sha, shell.scripts[0][0])
+            self.assertIn("PYTHONDONTWRITEBYTECODE=1", shell.scripts[0][0])
 
     def test_remote_bundle_paths_are_content_addressed_and_confined(self) -> None:
         digest = "a" * 64

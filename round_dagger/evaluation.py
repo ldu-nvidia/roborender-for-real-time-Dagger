@@ -1038,10 +1038,20 @@ def _renderer_delta(
         old_requests = _integer(old_metrics.get("requests"), "before renderer requests")
         new_requests = _integer(new_metrics.get("requests"), "after renderer requests")
         for name in ("errors", "replays"):
-            if _integer(old_metrics.get(name), f"before renderer {name}") != 0:
-                raise EvaluationError(f"renderer fleet has nonzero {name}")
-            if _integer(new_metrics.get(name), f"after renderer {name}") != 0:
-                raise EvaluationError(f"renderer fleet has nonzero {name}")
+            before_count = _integer(
+                old_metrics.get(name), f"before renderer {name}"
+            )
+            after_count = _integer(
+                new_metrics.get(name), f"after renderer {name}"
+            )
+            if after_count < before_count:
+                raise EvaluationError(f"renderer {name} counter moved backwards")
+            # These are process-lifetime counters.  A prior unrelated error
+            # must not invalidate an otherwise healthy fixed-seed evaluation;
+            # only an error/replay *during this exact evaluation window* is a
+            # failure.  The immutable before/after snapshots attest the delta.
+            if after_count != before_count:
+                raise EvaluationError(f"renderer fleet accrued {name} during evaluation")
         if new_requests < old_requests:
             raise EvaluationError("renderer request counter moved backwards")
         requests += new_requests - old_requests

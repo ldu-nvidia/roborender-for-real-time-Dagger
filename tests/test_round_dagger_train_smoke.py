@@ -55,6 +55,14 @@ class TrainSmokePlanTest(unittest.TestCase):
         )
         self.teacher = self.root / "teacher.pt"
         self.teacher.write_bytes(b"teacher")
+        self.motion_split = self.root / "motion_split.json"
+        publish_immutable_json(
+            self.motion_split,
+            {
+                "schema": "roborender.motion_split.v1",
+                "counts": {"collection": 1, "eval": 1, "total": 2},
+            },
+        )
 
         self.fleet = self.root / "fleet"
         endpoints = self.fleet / "endpoints"
@@ -108,6 +116,7 @@ class TrainSmokePlanTest(unittest.TestCase):
             teacher_checkpoint=self.teacher,
             renderer_sha256=RENDERER_SHA,
             anchors=self.anchors,
+            collection_motion_split_manifest=self.motion_split,
             repository_root=ROOT,
             gr00t_root=self.gr00t,
             actor_image="actor:test",
@@ -161,6 +170,14 @@ class TrainSmokePlanTest(unittest.TestCase):
         self.assertEqual(
             environment["IMAGE3F_ENDPOINT_MANIFEST"],
             str(self.output / "cohort_03/renderer_endpoint_manifest.txt"),
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST"],
+            str(self.motion_split),
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"],
+            sha256_file(self.motion_split),
         )
         for forbidden in ("RANK", "WORLD_SIZE", "ROUND_DAGGER_ACTOR_RANK"):
             self.assertNotIn(forbidden, environment)
@@ -247,9 +264,14 @@ class TrainSmokeDockerLauncherTest(TrainSmokePlanTest):
         self.assertIn(str(ROOT / "scripts/round_dagger/run_actor_validation.sh"), argv)
         self.assertNotIn("WANDB_API_KEY", argv)
         self.assertNotIn("ROUND_DAGGER_ACTOR_RANK", argv)
+        self.assertIn("ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST", argv)
+        self.assertIn("ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256", argv)
         self.assertIn("ROUND_DAGGER_RUNTIME_ADAPTER_MODE=legacy", argv)
         self.assertIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK=", argv)
         self.assertNotIn("metadata-only-v1", argv)
+        launcher_logs = sorted((self.output / "launcher_logs").glob("*.log"))
+        self.assertEqual(len(launcher_logs), 1)
+        self.assertEqual(launcher_logs[0].stat().st_mode & 0o222, 0)
         runtime_args = [
             value
             for value in argv

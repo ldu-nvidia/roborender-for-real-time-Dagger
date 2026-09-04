@@ -1,10 +1,12 @@
 # Round-based DAgger RTX renderer fleet
 
 `scripts/server/local_image3f_fleet.py` owns the local Image3F processes used
-by staged RTX validation and round-based actor collection. It launches exactly
+by staged RTX validation and canonical round-based actor collection. It launches
+exactly
 one `image3f_server.py` process for each explicit GPU token and remains in the
-foreground as the process supervisor. Cluster-scale Slurm runs still use
-`scripts/server/image3f_server_array.sbatch`.
+foreground as the process supervisor. The Slurm-array topology in
+`scripts/server/image3f_server_array.sbatch` is retained only for legacy cluster
+compatibility.
 
 ## Lifecycle contract
 
@@ -41,7 +43,8 @@ The local fleet binds and advertises `127.0.0.1` by default. Each accepted
 connection has a 180-second read timeout, and each renderer permits at most
 256 concurrent connections. Controlled deployments may override these with
 `IMAGE3F_CLIENT_SOCKET_TIMEOUT_S` and `IMAGE3F_MAX_CONNECTIONS` within the
-server's validated ranges. The remote standalone and Slurm-array topologies
+server's validated ranges. The remote standalone and legacy Slurm-array
+topologies
 explicitly opt into `0.0.0.0` and advertise their node hostname; they must run
 only on an isolated network until authenticated transport is supplied.
 

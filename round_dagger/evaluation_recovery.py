@@ -34,7 +34,7 @@ from round_dagger.artifacts import (
     sha256_file,
 )
 
-PLAN_SCHEMA = "fast_roborender.round_dagger.hardened_evaluation_recovery.v2"
+PLAN_SCHEMA = "fast_roborender.round_dagger.hardened_evaluation_recovery.v3"
 INVENTORY_SCHEMA = (
     "fast_roborender.round_dagger.legacy_evaluation_inventory.v1"
 )
@@ -81,6 +81,8 @@ _PLAN_KEYS = {
     "anchor_count",
     "anchor_index",
     "anchor_inventory_sha256",
+    "production_runtime_contract_path",
+    "production_runtime_contract_sha256",
     "recovery_id",
     "recovery_root",
     "evaluator_contract_path",
@@ -341,6 +343,11 @@ def _parse_octal_mode(value: Any, label: str) -> int:
     return int(value, 8)
 
 
+@orchestration.campaign_mutation_guard(
+    operation="evaluation_recovery_attest_hold",
+    root_parameter="root",
+    error_type=EvaluationRecoveryError,
+)
 def attest_promotion_hold(
     root: str | Path,
     *,
@@ -607,7 +614,11 @@ def _load_learner_recovery_receipt(
         )
     if (
         current["phase"] != "READY"
-        and receipt["replay_snapshot_sha256"]
+        # Coordinator/candidate state deliberately binds the immutable replay
+        # snapshot *file* digest.  The recovery receipt carries that digest and
+        # the snapshot's separate semantic digest; comparing the semantic
+        # value here rejects every valid production receipt.
+        and receipt["replay_snapshot_file_sha256"]
         != current["replay_snapshot_sha256"]
     ):
         raise EvaluationRecoveryError("replay snapshot differs from learner recovery")
@@ -641,6 +652,11 @@ def _load_learner_recovery_receipt(
     return receipt
 
 
+@orchestration.campaign_mutation_guard(
+    operation="evaluation_recovery_prepare",
+    root_parameter="root",
+    error_type=EvaluationRecoveryError,
+)
 def prepare_recovery(
     root: str | Path,
     *,
@@ -660,11 +676,14 @@ def prepare_recovery(
     anchor_count: int,
     anchor_index: int,
     anchor_inventory_sha256: str,
+    production_runtime_contract_path: str | Path | None = None,
+    production_runtime_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Inventory the legacy result and publish an isolated hardened contract."""
 
     root = _root(root)
     current = state.load_state(root)
+    campaign = state.load_campaign(root)
     if current["phase"] != "TRAINED" or current.get("candidate_policy") is None:
         raise EvaluationRecoveryError(
             "hardened recovery preparation requires one open TRAINED candidate"
@@ -768,6 +787,43 @@ def prepare_recovery(
     scenario_path, _ = external_inputs[0]
     threshold_path, _ = external_inputs[1]
     config_path, _ = external_inputs[2]
+    production = campaign.get("schema") == state.PRODUCTION_CAMPAIGN_SCHEMA
+    runtime_contract_path: Path | None = None
+    runtime_contract_sha: str | None = None
+    if production:
+        if (
+            production_runtime_contract_path is None
+            or production_runtime_contract_sha256 is None
+        ):
+            raise EvaluationRecoveryError(
+                "production recovery requires a verified runtime contract"
+            )
+        runtime_contract_path = Path(
+            os.path.abspath(Path(production_runtime_contract_path).expanduser())
+        )
+        if (
+            not runtime_contract_path.is_absolute()
+            or runtime_contract_path.is_symlink()
+            or not runtime_contract_path.is_file()
+        ):
+            raise EvaluationRecoveryError(
+                "production runtime contract is missing or unsafe"
+            )
+        runtime_contract_sha = _sha(
+            production_runtime_contract_sha256,
+            "production runtime contract SHA-256",
+        )
+        if sha256_file(runtime_contract_path) != runtime_contract_sha:
+            raise EvaluationRecoveryError(
+                "production runtime contract SHA-256 mismatch"
+            )
+    elif (
+        production_runtime_contract_path is not None
+        or production_runtime_contract_sha256 is not None
+    ):
+        raise EvaluationRecoveryError(
+            "non-production recovery cannot select a production runtime contract"
+        )
     scenario_cases = evaluation._validate_cases(load_strict_json(scenario_path))
     thresholds = evaluation._validate_thresholds(load_strict_json(threshold_path))
     if type(expected_renderer_count) is not int or expected_renderer_count < 1:
@@ -793,6 +849,12 @@ def prepare_recovery(
             "scenario_cases_sha256": sha256_file(scenario_path),
             "thresholds_sha256": sha256_file(threshold_path),
             "evaluation_config_sha256": sha256_file(config_path),
+            "production_runtime_contract_path": (
+                str(runtime_contract_path)
+                if runtime_contract_path is not None
+                else None
+            ),
+            "production_runtime_contract_sha256": runtime_contract_sha,
             "renderer_runtime_sha256": _sha(
                 renderer_runtime_sha256, "renderer runtime SHA"
             ),
@@ -832,12 +894,14 @@ def prepare_recovery(
         anchor_count=anchor_count,
         anchor_index=anchor_index,
         anchor_inventory_sha256=anchor_inventory_sha,
+        production_runtime_contract_path=runtime_contract_path,
+        production_runtime_contract_sha256=runtime_contract_sha,
         output=recovery_root / "contract.json",
         thresholds=thresholds,
     )
     plan = {
         "schema": PLAN_SCHEMA,
-        "campaign_id": state.load_campaign(root)["campaign_id"],
+        "campaign_id": campaign["campaign_id"],
         "campaign_sha256": current["campaign_sha256"],
         "macro_round": macro_round,
         "candidate_manifest_path": candidate["manifest_path"],
@@ -869,6 +933,12 @@ def prepare_recovery(
         "anchor_count": anchor_count,
         "anchor_index": anchor_index,
         "anchor_inventory_sha256": anchor_inventory_sha,
+        "production_runtime_contract_path": (
+            str(runtime_contract_path)
+            if runtime_contract_path is not None
+            else None
+        ),
+        "production_runtime_contract_sha256": runtime_contract_sha,
         "recovery_id": recovery_id,
         "recovery_root": _relative(root, recovery_root, "recovery root"),
         "evaluator_contract_path": hardened_contract["contract_path"],
@@ -918,6 +988,35 @@ def _load_plan(
         raise EvaluationRecoveryError("recovery root differs from plan path")
     if relative != plan_path.relative_to(root).as_posix():
         raise EvaluationRecoveryError("recovery plan relative path is ambiguous")
+    campaign = state.load_campaign(root)
+    runtime_path_raw = plan["production_runtime_contract_path"]
+    runtime_sha_raw = plan["production_runtime_contract_sha256"]
+    if campaign.get("schema") == state.PRODUCTION_CAMPAIGN_SCHEMA:
+        if not isinstance(runtime_path_raw, str):
+            raise EvaluationRecoveryError(
+                "production recovery plan is missing its runtime contract"
+            )
+        runtime_path = Path(runtime_path_raw)
+        if (
+            not runtime_path.is_absolute()
+            or os.path.abspath(runtime_path_raw) != runtime_path_raw
+            or runtime_path.is_symlink()
+            or not runtime_path.is_file()
+        ):
+            raise EvaluationRecoveryError(
+                "production recovery runtime contract is missing or unsafe"
+            )
+        runtime_sha = _sha(
+            runtime_sha_raw, "production recovery runtime contract SHA-256"
+        )
+        if sha256_file(runtime_path) != runtime_sha:
+            raise EvaluationRecoveryError(
+                "production recovery runtime contract changed"
+            )
+    elif runtime_path_raw is not None or runtime_sha_raw is not None:
+        raise EvaluationRecoveryError(
+            "non-production recovery plan selected a production runtime contract"
+        )
     return plan, plan_path
 
 
@@ -1058,6 +1157,11 @@ def _verify_plan_evidence(
     return current
 
 
+@orchestration.campaign_mutation_guard(
+    operation="evaluation_recovery_finalize",
+    root_parameter="root",
+    error_type=EvaluationRecoveryError,
+)
 def finalize_recovery(
     root: str | Path,
     *,
@@ -1218,6 +1322,11 @@ def finalize_recovery(
     }
 
 
+@orchestration.campaign_mutation_guard(
+    operation="evaluation_recovery_run",
+    root_parameter="root",
+    error_type=EvaluationRecoveryError,
+)
 def run_trusted_recovery(
     root: str | Path,
     *,
@@ -1237,6 +1346,8 @@ def run_trusted_recovery(
     anchor_count: int,
     anchor_index: int,
     anchor_inventory_sha256: str,
+    production_runtime_contract_path: str | Path | None = None,
+    production_runtime_contract_sha256: str | None = None,
     environment: Mapping[str, str] | None = None,
     hook_timeout_seconds: int = RECOVERY_EVALUATION_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
@@ -1302,6 +1413,10 @@ def run_trusted_recovery(
             anchor_count=anchor_count,
             anchor_index=anchor_index,
             anchor_inventory_sha256=anchor_inventory_sha256,
+            production_runtime_contract_path=production_runtime_contract_path,
+            production_runtime_contract_sha256=(
+                production_runtime_contract_sha256
+            ),
         )
 
         current = state.load_state(campaign_root)
@@ -1485,6 +1600,12 @@ def run_recovery_from_environment(
         anchor_inventory_sha256=_required_environment(
             values, "ROUND_DAGGER_ANCHOR_INVENTORY_SHA256"
         ),
+        production_runtime_contract_path=_required_environment(
+            values, "ROUND_DAGGER_CAMPAIGN_CONTRACT"
+        ),
+        production_runtime_contract_sha256=_required_environment(
+            values, "ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256"
+        ),
         environment=values,
     )
 
@@ -1518,6 +1639,8 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--anchor-count", type=int, required=True)
     prepare.add_argument("--anchor-index", type=int, required=True)
     prepare.add_argument("--anchor-inventory-sha256", required=True)
+    prepare.add_argument("--production-runtime-contract")
+    prepare.add_argument("--production-runtime-contract-sha256")
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--root", required=True)
     finalize.add_argument("--plan", required=True)
@@ -1562,6 +1685,12 @@ def main(argv: list[str] | None = None) -> int:
                 anchor_count=args.anchor_count,
                 anchor_index=args.anchor_index,
                 anchor_inventory_sha256=args.anchor_inventory_sha256,
+                production_runtime_contract_path=(
+                    args.production_runtime_contract
+                ),
+                production_runtime_contract_sha256=(
+                    args.production_runtime_contract_sha256
+                ),
             )
         elif args.command == "finalize":
             result = finalize_recovery(

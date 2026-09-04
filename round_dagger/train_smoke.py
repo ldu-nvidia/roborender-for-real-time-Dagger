@@ -29,7 +29,7 @@ from .artifacts import (
 )
 
 
-PLAN_SCHEMA = "fast_roborender.round_dagger.actor_train_smoke_plan.v1"
+PLAN_SCHEMA = "fast_roborender.round_dagger.actor_train_smoke_plan.v2"
 CONFIG_SCHEMA = "fast_roborender.round_dagger.actor_train_smoke_config.v1"
 BETA_SCHEMA = "fast_roborender.round_dagger.beta.v1"
 CAMPAIGN_ID = "rtx-train-smoke-v1"
@@ -57,6 +57,8 @@ _PLAN_KEYS = {
     "beta_path",
     "beta_sha256",
     "campaign_id",
+    "collection_motion_split_manifest",
+    "collection_motion_split_manifest_sha256",
     "cohorts",
     "config_path",
     "config_sha256",
@@ -255,6 +257,39 @@ def _validate_fleet_evidence(
             raise TrainSmokeError("renderer readiness does not prove protocol version 3")
 
 
+def _validate_collection_motion_split(path: Path) -> None:
+    """Require an explicit collection/evaluation split before actor invocation.
+
+    GR00T verifies the full motion-directory inventory at runtime.  The smoke
+    planner also binds a real role-split document, preventing a bounded actor
+    test from silently falling back to an ambient reset-data default.
+    """
+
+    try:
+        document = load_strict_json(path)
+    except ArtifactError as exc:
+        raise TrainSmokeError("collection motion split is not valid JSON") from exc
+    if (
+        not isinstance(document, Mapping)
+        or document.get("schema") != "roborender.motion_split.v1"
+    ):
+        raise TrainSmokeError("collection motion split schema mismatch")
+    counts = document.get("counts")
+    if not isinstance(counts, Mapping):
+        raise TrainSmokeError("collection motion split counts are missing")
+    collection = counts.get("collection")
+    heldout = counts.get("eval")
+    if (
+        isinstance(collection, bool)
+        or isinstance(heldout, bool)
+        or not isinstance(collection, int)
+        or not isinstance(heldout, int)
+        or collection <= 0
+        or heldout <= 0
+    ):
+        raise TrainSmokeError("collection motion split has invalid role counts")
+
+
 def prepare_train_smoke(
     root: str | Path,
     *,
@@ -263,6 +298,7 @@ def prepare_train_smoke(
     teacher_checkpoint: str | Path,
     renderer_sha256: str,
     anchors: str | Path,
+    collection_motion_split_manifest: str | Path,
     repository_root: str | Path,
     gr00t_root: str | Path,
     actor_image: str,
@@ -281,6 +317,10 @@ def prepare_train_smoke(
     descriptors = _canonical_endpoint_descriptors(endpoint_manifest_path)
     checkpoint = _absolute_regular(policy_checkpoint, "policy checkpoint")
     teacher = _absolute_regular(teacher_checkpoint, "teacher checkpoint")
+    collection_motion_split = _absolute_regular(
+        collection_motion_split_manifest, "collection motion split manifest"
+    )
+    _validate_collection_motion_split(collection_motion_split)
     anchors_path = _absolute_directory(anchors, "anchor pool")
     repository = _absolute_directory(repository_root, "repository root")
     gr00t = _absolute_directory(gr00t_root, "GR00T root")
@@ -387,6 +427,10 @@ def prepare_train_smoke(
         "beta_path": str(beta_path),
         "beta_sha256": beta_sha,
         "campaign_id": CAMPAIGN_ID,
+        "collection_motion_split_manifest": str(collection_motion_split),
+        "collection_motion_split_manifest_sha256": sha256_file(
+            collection_motion_split
+        ),
         "cohorts": cohorts,
         "config_path": str(config_path),
         "config_sha256": config_sha,
@@ -438,10 +482,18 @@ def validate_train_smoke(path: str | Path) -> dict[str, Any]:
     plan_path, plan = _plan(path)
     checkpoint = _absolute_regular(plan["policy_checkpoint"], "policy checkpoint")
     teacher = _absolute_regular(plan["teacher_checkpoint"], "teacher checkpoint")
+    collection_motion_split = _absolute_regular(
+        plan["collection_motion_split_manifest"], "collection motion split manifest"
+    )
+    _validate_collection_motion_split(collection_motion_split)
     if sha256_file(checkpoint) != plan.get("policy_sha256"):
         raise TrainSmokeError("policy checkpoint changed after plan publication")
     if sha256_file(teacher) != plan.get("teacher_sha256"):
         raise TrainSmokeError("teacher checkpoint changed after plan publication")
+    if sha256_file(collection_motion_split) != plan.get(
+        "collection_motion_split_manifest_sha256"
+    ):
+        raise TrainSmokeError("collection motion split changed after plan publication")
     spec, policy_manifest, runtime_sha = _load_bootstrap_identity(checkpoint)
     if str(spec) != plan.get("policy_spec") or str(policy_manifest) != plan.get("policy_manifest"):
         raise TrainSmokeError("bootstrap policy bundle paths changed")
@@ -621,12 +673,18 @@ def train_smoke_environment(path: str | Path, cohort_index: int) -> dict[str, st
         "ROUND_DAGGER_CAMPAIGN_ID": CAMPAIGN_ID,
         "ROUND_DAGGER_COHORT_DIR": cohort["cohort_dir"],
         "ROUND_DAGGER_COHORT_INDEX": str(cohort_index),
+        "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": plan[
+            "collection_motion_split_manifest"
+        ],
         "ROUND_DAGGER_CONFIG_SHA256": plan["config_sha256"],
         "ROUND_DAGGER_ENVS_PER_SHARD": "1",
         "ROUND_DAGGER_EXPECTED_RENDERERS": "1",
         "ROUND_DAGGER_GLOBAL_ENV_OFFSET": str(cohort_index),
         "ROUND_DAGGER_MACRO_ROUND": "0",
         "ROUND_DAGGER_MIN_ANCHORS": "2048",
+        "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": plan[
+            "collection_motion_split_manifest_sha256"
+        ],
         "ROUND_DAGGER_POLICY_CHECKPOINT": plan["policy_checkpoint"],
         "ROUND_DAGGER_POLICY_MANIFEST": plan["policy_manifest"],
         "ROUND_DAGGER_POLICY_SHA256": plan["policy_sha256"],
@@ -659,6 +717,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--teacher-checkpoint", required=True, type=Path)
     prepare.add_argument("--renderer-sha256", required=True)
     prepare.add_argument("--anchors", required=True, type=Path)
+    prepare.add_argument("--collection-motion-split-manifest", required=True, type=Path)
     prepare.add_argument("--repository-root", required=True, type=Path)
     prepare.add_argument("--gr00t-root", required=True, type=Path)
     prepare.add_argument("--actor-image", required=True)
@@ -686,6 +745,7 @@ def main(argv: list[str] | None = None) -> int:
             teacher_checkpoint=arguments.teacher_checkpoint,
             renderer_sha256=arguments.renderer_sha256,
             anchors=arguments.anchors,
+            collection_motion_split_manifest=arguments.collection_motion_split_manifest,
             repository_root=arguments.repository_root,
             gr00t_root=arguments.gr00t_root,
             actor_image=arguments.actor_image,

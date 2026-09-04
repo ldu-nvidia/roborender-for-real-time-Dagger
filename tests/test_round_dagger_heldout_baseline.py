@@ -252,7 +252,7 @@ class HeldoutBaselineTest(unittest.TestCase):
                     heldout_snapshot_sha256=result["heldout_snapshot_sha256"],
                 ),
                 "entity": "nvidia",
-                "project": "roborender-round-dagger",
+                "project": "lepton-dagger-production-1",
                 "optimizer_step": 0,
             }
             artifacts.publish_immutable_json(

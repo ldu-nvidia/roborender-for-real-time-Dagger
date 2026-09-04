@@ -108,6 +108,124 @@ def _safe_artifact_file(root: Path, relative: PurePosixPath, label: str) -> Path
     return resolved
 
 
+def _real_artifact_root(
+    value: str | os.PathLike[str], *, snapshot_path: Path
+) -> Path:
+    """Return a canonical campaign projection root without following symlinks.
+
+    Replay snapshot bytes deliberately bind the producer-side absolute manifest
+    names.  A learner projection may live at a different absolute root, so the
+    loader accepts an explicit root only when the snapshot itself is inside
+    that root and every path component is a real directory.  This keeps path
+    relocation separate from content identity: cohort, shard and payload
+    digests remain the authority.
+    """
+
+    supplied = Path(os.path.abspath(Path(value).expanduser()))
+    if supplied.is_symlink() or not supplied.is_dir():
+        raise ReplayError("replay artifact root must be a real directory")
+    current = Path(supplied.anchor)
+    for component in supplied.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ReplayError("replay artifact root contains a symbolic link")
+    root = supplied.resolve(strict=True)
+    try:
+        snapshot_path.relative_to(root)
+    except ValueError as exc:
+        raise ReplayError("replay snapshot lies outside its artifact root") from exc
+    return root
+
+
+def _relocated_manifest_index(
+    root: Path, *, basenames: Iterable[str]
+) -> dict[tuple[str, str], list[Path]]:
+    """Index candidate cohort manifests in one walk of a large projection."""
+
+    wanted = set(basenames)
+    if not wanted or any(
+        not isinstance(name, str) or Path(name).name != name for name in wanted
+    ):
+        raise ReplayError("relocated cohort manifest basenames are malformed")
+    index: dict[tuple[str, str], list[Path]] = {}
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        safe_directories: list[str] = []
+        for name in sorted(dirnames):
+            child = base / name
+            if child.is_symlink():
+                raise ReplayError("replay artifact root contains a symbolic link")
+            safe_directories.append(name)
+        dirnames[:] = safe_directories
+        for basename in sorted(wanted & set(filenames)):
+            candidate = base / basename
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ReplayError("relocated cohort manifest is unsafe")
+            relative = PurePosixPath(candidate.relative_to(root).as_posix())
+            resolved = _safe_artifact_file(
+                root, relative, "relocated cohort manifest"
+            )
+            digest = _sha256_file(resolved)
+            index.setdefault((basename, digest), []).append(resolved)
+    return index
+
+
+def _resolve_snapshot_cohort_manifest(
+    value: Any,
+    *,
+    manifest_sha256: str,
+    artifact_root: Path | None,
+    relocation_index: Mapping[tuple[str, str], list[Path]] | None,
+    label: str,
+) -> Path:
+    """Resolve one snapshot manifest locally while retaining its byte identity.
+
+    Without ``artifact_root`` this is the historical strict absolute-path
+    behavior.  With a projection root, an embedded producer path is used only
+    when it is inside that root.  Otherwise exactly one manifest with the
+    pinned digest must exist below the projection.  Ambiguous copies fail
+    closed rather than selecting by traversal order.
+    """
+
+    if not isinstance(value, str) or not value:
+        raise ReplayError(f"{label} must be a non-empty absolute path")
+    embedded = Path(value)
+    if not embedded.is_absolute() or os.path.abspath(value) != value:
+        raise ReplayError(f"{label} must be canonical and absolute")
+    if artifact_root is None:
+        if embedded.is_symlink() or not embedded.is_file():
+            raise ReplayError(f"{label} is unsafe")
+        return embedded.resolve(strict=True)
+
+    try:
+        relative = embedded.relative_to(artifact_root)
+    except ValueError:
+        relative = None
+    if relative is not None:
+        try:
+            local = _safe_artifact_file(
+                artifact_root,
+                PurePosixPath(relative.as_posix()),
+                label,
+            )
+        except ReplayError:
+            local = None
+        if local is not None and _sha256_file(local) == manifest_sha256:
+            return local
+
+    index = relocation_index
+    if index is None:
+        index = _relocated_manifest_index(
+            artifact_root, basenames={embedded.name}
+        )
+    matches = list(index.get((embedded.name, manifest_sha256), ()))
+    if not matches:
+        raise ReplayError(f"{label} is absent from the replay artifact root")
+    if len(matches) != 1:
+        raise ReplayError(f"{label} digest is ambiguous in the replay artifact root")
+    return matches[0]
+
+
 def _publish_immutable_json(path: Path, document: Mapping[str, Any]) -> str:
     """Call the artifact layer's create-only JSON publisher.
 
@@ -843,7 +961,10 @@ def build_heldout_snapshot(
 
 
 def load_heldout_snapshot(
-    path: str | os.PathLike[str], *, expected_file_sha256: str | None = None
+    path: str | os.PathLike[str],
+    *,
+    expected_file_sha256: str | None = None,
+    artifact_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Load and recursively revalidate an immutable held-out eval snapshot."""
 
@@ -852,6 +973,11 @@ def load_heldout_snapshot(
         raise ReplayError(
             "held-out replay snapshot must be a regular non-symlink file"
         )
+    resolved_artifact_root = (
+        None
+        if artifact_root is None
+        else _real_artifact_root(artifact_root, snapshot_path=snapshot_path)
+    )
     actual_file_sha256 = _sha256_file(snapshot_path)
     if expected_file_sha256 is not None and _sha256(
         expected_file_sha256, "expected held-out snapshot file SHA-256"
@@ -911,6 +1037,19 @@ def load_heldout_snapshot(
         document["cohort_count"], "held-out snapshot cohort_count", minimum=1
     ) != len(raw_cohorts):
         raise ReplayError("held-out replay snapshot cohort count mismatch")
+    relocation_index = (
+        None
+        if resolved_artifact_root is None
+        else _relocated_manifest_index(
+            resolved_artifact_root,
+            basenames={
+                Path(str(raw["cohort_manifest_path"])).name
+                for raw in raw_cohorts
+                if isinstance(raw, Mapping)
+                and isinstance(raw.get("cohort_manifest_path"), str)
+            },
+        )
+    )
 
     resolved_shards: list[dict[str, Any]] = []
     normalized_cohorts: list[dict[str, Any]] = []
@@ -930,15 +1069,21 @@ def load_heldout_snapshot(
         }
         if not isinstance(raw, Mapping) or set(raw) != expected_cohort_fields:
             raise ReplayError("held-out snapshot cohort is malformed")
-        manifest_path = Path(str(raw["cohort_manifest_path"]))
-        if not manifest_path.is_absolute():
-            raise ReplayError("held-out cohort manifest path must be absolute")
+        manifest_path = _resolve_snapshot_cohort_manifest(
+            raw["cohort_manifest_path"],
+            manifest_sha256=_sha256(
+                raw["manifest_sha256"],
+                "held-out snapshot cohort manifest digest",
+            ),
+            artifact_root=resolved_artifact_root,
+            relocation_index=relocation_index,
+            label="held-out cohort manifest path",
+        )
         record = _cohort_record(manifest_path)
         expected_record = {
             "logical_id": raw["logical_id"],
             "macro_round": raw["macro_round"],
             "cohort_index": raw["cohort_index"],
-            "cohort_manifest_path": str(manifest_path),
             "manifest_sha256": raw["manifest_sha256"],
             "transition_count": raw["transition_count"],
         }
@@ -963,7 +1108,9 @@ def load_heldout_snapshot(
             raise ReplayError("held-out snapshot has duplicate cohort manifest")
         logical_ids.add(record["logical_id"])
         cohort_digests.add(record["manifest_sha256"])
-        normalized_cohorts.append(dict(raw))
+        normalized = dict(raw)
+        normalized["cohort_manifest_path"] = str(manifest_path)
+        normalized_cohorts.append(normalized)
         total += record["transition_count"]
         for shard in record["shards"]:
             if shard["manifest_sha256"] in shard_manifest_digests:
@@ -1009,6 +1156,7 @@ def load_heldout_snapshot(
     ) != total:
         raise ReplayError("held-out snapshot transition count mismatch")
     result = dict(document)
+    result["cohorts"] = normalized_cohorts
     result["path"] = str(snapshot_path)
     result["file_sha256"] = actual_file_sha256
     result["resolved_shards"] = resolved_shards
@@ -1016,7 +1164,10 @@ def load_heldout_snapshot(
 
 
 def load_snapshot(
-    path: str | os.PathLike[str], *, expected_file_sha256: str | None = None
+    path: str | os.PathLike[str],
+    *,
+    expected_file_sha256: str | None = None,
+    artifact_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Load a frozen replay snapshot and revalidate every referenced artifact.
 
@@ -1028,6 +1179,11 @@ def load_snapshot(
     snapshot_path = Path(os.path.abspath(Path(path).expanduser()))
     if snapshot_path.is_symlink() or not snapshot_path.is_file():
         raise ReplayError("replay snapshot must be a regular non-symlink file")
+    resolved_artifact_root = (
+        None
+        if artifact_root is None
+        else _real_artifact_root(artifact_root, snapshot_path=snapshot_path)
+    )
     actual_file_sha256 = _sha256_file(snapshot_path)
     if expected_file_sha256 is not None and _sha256(
         expected_file_sha256, "expected_file_sha256"
@@ -1084,12 +1240,26 @@ def load_snapshot(
         raw_cohorts
     ):
         raise ReplayError("replay snapshot cohort count mismatch")
+    relocation_index = (
+        None
+        if resolved_artifact_root is None
+        else _relocated_manifest_index(
+            resolved_artifact_root,
+            basenames={
+                Path(str(raw["cohort_manifest_path"])).name
+                for raw in raw_cohorts
+                if isinstance(raw, Mapping)
+                and isinstance(raw.get("cohort_manifest_path"), str)
+            },
+        )
+    )
     expected_pairs = [
         (macro_round, cohort_index)
         for macro_round in range(through_round + 1)
         for cohort_index in range(expected_cohorts)
     ]
     actual_pairs: list[tuple[int, int]] = []
+    resolved_cohorts: list[dict[str, Any]] = []
     logical_ids: set[str] = set()
     cohort_digests: set[str] = set()
     shard_digests: set[str] = set()
@@ -1141,15 +1311,19 @@ def load_snapshot(
         if manifest_sha in cohort_digests:
             raise ReplayError("snapshot contains a duplicate cohort manifest digest")
         cohort_digests.add(manifest_sha)
-        cohort_manifest = Path(str(raw_cohort["cohort_manifest_path"]))
-        if not cohort_manifest.is_absolute():
-            raise ReplayError("snapshot cohort manifest path must be absolute")
-        if cohort_manifest.is_symlink() or not cohort_manifest.is_file():
-            raise ReplayError("snapshot cohort manifest path is unsafe")
-        cohort_manifest = cohort_manifest.resolve(strict=True)
+        cohort_manifest = _resolve_snapshot_cohort_manifest(
+            raw_cohort["cohort_manifest_path"],
+            manifest_sha256=manifest_sha,
+            artifact_root=resolved_artifact_root,
+            relocation_index=relocation_index,
+            label="snapshot cohort manifest path",
+        )
         if _sha256_file(cohort_manifest) != manifest_sha:
             raise ReplayError("snapshot cohort manifest digest mismatch at load")
         cohort_root = cohort_manifest.parent
+        resolved_cohort = dict(raw_cohort)
+        resolved_cohort["cohort_manifest_path"] = str(cohort_manifest)
+        resolved_cohorts.append(resolved_cohort)
         stored_seed, stored_fingerprints = _stored_seed_provenance(
             str(cohort_manifest), manifest_sha
         )
@@ -1299,6 +1473,7 @@ def load_snapshot(
     if document["counts_by_round_cohort"] != by_round_cohort:
         raise ReplayError("snapshot counts_by_round_cohort mismatch")
     result = dict(document)
+    result["cohorts"] = resolved_cohorts
     result["path"] = str(snapshot_path)
     result["file_sha256"] = actual_file_sha256
     result["resolved_shards"] = resolved_shards

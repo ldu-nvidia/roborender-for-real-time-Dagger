@@ -14,6 +14,7 @@ NumPy.  It does not import Isaac, Torch, GR00T, or the learner stack.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import stat
 import tempfile
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
@@ -309,6 +311,13 @@ def load_strict_json(path: str | os.PathLike[str]) -> Any:
     try:
         with _open_regular_read(target) as handle:
             raw = handle.read()
+        return _load_strict_json_bytes(raw, target)
+    except ArtifactError:
+        raise
+
+
+def _load_strict_json_bytes(raw: bytes, label: Path) -> Any:
+    try:
         document = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=_strict_object,
@@ -317,9 +326,56 @@ def load_strict_json(path: str | os.PathLike[str]) -> Any:
     except ArtifactError:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ArtifactError(f"invalid JSON artifact {target}: {exc}") from exc
-    _validate_json_value(document, str(target))
+        raise ArtifactError(f"invalid JSON artifact {label}: {exc}") from exc
+    _validate_json_value(document, str(label))
     return document
+
+
+@contextmanager
+def _cohort_contract_lock(cohort_dir: Path, *, exclusive: bool):
+    """Lock the cohort's immutable contract inode for one boundary operation.
+
+    No mutable lock file is introduced into the artifact tree.  Publishers
+    hold a shared lock for the complete payload-plus-sidecar transaction;
+    sealers and cohort verifiers hold an exclusive lock while taking an exact
+    directory snapshot.
+    """
+
+    root = _absolute(cohort_dir)
+    contract_path = root / CONTRACT_FILENAME
+    handle = _open_regular_read(contract_path)
+    operation = "exclusive" if exclusive else "shared"
+    try:
+        try:
+            fcntl.flock(
+                handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            )
+        except OSError as exc:
+            raise ArtifactError(
+                f"cannot acquire {operation} cohort contract lock: {exc}"
+            ) from exc
+
+        # Prove that the pathname still names the inode we locked.  The
+        # contract is create-only and mode 0444, so this also makes the lock
+        # identity stable across every normal retry.
+        locked = os.fstat(handle.fileno())
+        try:
+            current = os.stat(contract_path, follow_symlinks=False)
+        except OSError as exc:
+            raise ArtifactError(
+                f"cannot revalidate locked cohort contract inode: {exc}"
+            ) from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (locked.st_dev, locked.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ArtifactError("cohort contract inode changed while acquiring lock")
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -665,6 +721,21 @@ def _load_contract(cohort_dir: Path) -> tuple[dict[str, Any], str]:
     contract_path = cohort_dir / CONTRACT_FILENAME
     contract = _validate_contract(load_strict_json(contract_path))
     return contract, sha256_file(contract_path)
+
+
+def _load_locked_contract(
+    handle: BinaryIO, cohort_dir: Path
+) -> tuple[dict[str, Any], str]:
+    """Read the exact contract bytes from an already-locked inode."""
+
+    contract_path = _absolute(cohort_dir) / CONTRACT_FILENAME
+    try:
+        handle.seek(0)
+        raw = handle.read()
+    except OSError as exc:
+        raise ArtifactError(f"cannot read locked cohort contract: {exc}") from exc
+    contract = _validate_contract(_load_strict_json_bytes(raw, contract_path))
+    return contract, hashlib.sha256(raw).hexdigest()
 
 
 def _global_env_vector(array: np.ndarray, steps: int, envs: int) -> np.ndarray:
@@ -1082,12 +1153,9 @@ def publish_rollout_shard(
 
     root = _absolute(cohort_dir)
     _check_path_chain(root)
-    contract, contract_sha = _load_contract(root)
     rank = _require_int(rank, "rank")
     rollout_id = _require_int(rollout_id, "rollout_id")
     part_index = _require_int(part_index, "part_index")
-    if rank not in contract["expected_ranks"]:
-        raise ArtifactError("rank is not listed in the cohort contract")
     supplied = {
         "campaign_id": campaign_id,
         "macro_round": macro_round,
@@ -1100,61 +1168,72 @@ def publish_rollout_shard(
         "beta_sha256": beta_sha256,
         "config_sha256": config_sha256,
     }
-    _require_exact_provenance(contract, supplied)
-    validated = _validate_arrays(arrays, contract)
-
     shard_id = _shard_id(rank, rollout_id, part_index)
-    shard_dir = _ensure_directory(root / SHARD_DIRECTORY)
-    payload_path = shard_dir / f"{shard_id}.npz"
-    sidecar_path = shard_dir / f"{shard_id}.json"
-    if (root / SEAL_FILENAME).exists() and not sidecar_path.exists():
-        raise ArtifactError("cannot add a new shard after the cohort is sealed")
+    with _cohort_contract_lock(root, exclusive=False) as contract_handle:
+        contract, contract_sha = _load_locked_contract(contract_handle, root)
+        if rank not in contract["expected_ranks"]:
+            raise ArtifactError("rank is not listed in the cohort contract")
+        _require_exact_provenance(contract, supplied)
+        validated = _validate_arrays(arrays, contract)
 
-    temporary = _write_npz_temporary(payload_path, validated["arrays"])
-    try:
-        payload_sha = _publish_temp_create_only(temporary, payload_path)
-    finally:
+        shard_dir = _ensure_directory(root / SHARD_DIRECTORY)
+        payload_path = shard_dir / f"{shard_id}.npz"
+        sidecar_path = shard_dir / f"{shard_id}.json"
+
+        # This check is intentionally inside the shared transaction lock.
+        # Once a sealer obtains the exclusive lock and publishes seal.json, no
+        # publisher can introduce either half of a new shard.  A fully
+        # published identical shard remains retryable and is reverified below.
+        if (root / SEAL_FILENAME).exists() and not (
+            payload_path.exists() and sidecar_path.exists()
+        ):
+            raise ArtifactError("cannot add a new shard after the cohort is sealed")
+
+        temporary = _write_npz_temporary(payload_path, validated["arrays"])
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    payload_size = os.stat(payload_path, follow_symlinks=False).st_size
-    manifest = {
-        "schema": (
-            PRODUCTION_SHARD_SCHEMA
-            if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA
-            else SHARD_SCHEMA
-        ),
-        "shard_id": shard_id,
-        **supplied,
-        "rank": rank,
-        "rollout_id": rollout_id,
-        "part_index": part_index,
-        "cohort_contract_sha256": contract_sha,
-        "transition_count": validated["transition_count"],
-        "num_steps": validated["num_steps"],
-        "num_envs": validated["num_envs"],
-        "global_env_ids": validated["global_env_ids"],
-        "view_contract": contract["view_contract"],
-        "action_contract": contract["action_contract"],
-        "arrays": _array_metadata(validated["arrays"]),
-        "payload": {
-            "path": payload_path.name,
-            "sha256": payload_sha,
-            "size_bytes": payload_size,
-        },
-    }
-    if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA:
-        manifest[_DATA_LINEAGE_SHA_FIELD] = contract[_DATA_LINEAGE_SHA_FIELD]
-        manifest[_MOTION_ASSIGNMENT_SHA_FIELD] = contract[
-            _MOTION_ASSIGNMENT_SHA_FIELD
-        ]
-        manifest[_RANK_MOTION_ASSIGNMENT_FIELD] = rank_assignment(
-            contract[_MOTION_ASSIGNMENT_FIELD], rank
-        )
-    _validate_shard_manifest(manifest)
-    publish_immutable_json(sidecar_path, manifest)
-    return verify_rollout_shard(sidecar_path)
+            payload_sha = _publish_temp_create_only(temporary, payload_path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        payload_size = os.stat(payload_path, follow_symlinks=False).st_size
+        manifest = {
+            "schema": (
+                PRODUCTION_SHARD_SCHEMA
+                if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA
+                else SHARD_SCHEMA
+            ),
+            "shard_id": shard_id,
+            **supplied,
+            "rank": rank,
+            "rollout_id": rollout_id,
+            "part_index": part_index,
+            "cohort_contract_sha256": contract_sha,
+            "transition_count": validated["transition_count"],
+            "num_steps": validated["num_steps"],
+            "num_envs": validated["num_envs"],
+            "global_env_ids": validated["global_env_ids"],
+            "view_contract": contract["view_contract"],
+            "action_contract": contract["action_contract"],
+            "arrays": _array_metadata(validated["arrays"]),
+            "payload": {
+                "path": payload_path.name,
+                "sha256": payload_sha,
+                "size_bytes": payload_size,
+            },
+        }
+        if contract["schema"] == PRODUCTION_COHORT_CONTRACT_SCHEMA:
+            manifest[_DATA_LINEAGE_SHA_FIELD] = contract[_DATA_LINEAGE_SHA_FIELD]
+            manifest[_MOTION_ASSIGNMENT_SHA_FIELD] = contract[
+                _MOTION_ASSIGNMENT_SHA_FIELD
+            ]
+            manifest[_RANK_MOTION_ASSIGNMENT_FIELD] = rank_assignment(
+                contract[_MOTION_ASSIGNMENT_FIELD], rank
+            )
+        _validate_shard_manifest(manifest)
+        publish_immutable_json(sidecar_path, manifest)
+        return verify_rollout_shard(sidecar_path)
 
 
 def _validate_array_metadata(value: Any) -> dict[str, dict[str, Any]]:
@@ -1398,6 +1477,41 @@ def discover_rollout_shards(cohort_dir: str | os.PathLike[str]) -> list[Path]:
     return sorted(paths, key=lambda item: item.name)
 
 
+def _exact_shard_directory_entries(cohort_dir: Path) -> dict[str, Path]:
+    """Return the exact regular-file inventory accepted by seal/verify."""
+
+    shard_dir = _absolute(cohort_dir) / SHARD_DIRECTORY
+    _check_path_chain(shard_dir)
+    try:
+        directory_info = os.lstat(shard_dir)
+    except OSError as exc:
+        raise ArtifactError(f"cannot inspect shard directory {shard_dir}: {exc}") from exc
+    if not stat.S_ISDIR(directory_info.st_mode):
+        raise ArtifactError(f"missing shard directory: {shard_dir}")
+
+    entries: dict[str, Path] = {}
+    try:
+        iterator = list(os.scandir(shard_dir))
+    except OSError as exc:
+        raise ArtifactError(f"cannot enumerate shard directory {shard_dir}: {exc}") from exc
+    for entry in iterator:
+        path = shard_dir / entry.name
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ArtifactError(f"cannot inspect shard directory entry {path}: {exc}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise ArtifactError(
+                f"shards directory contains a non-regular entry: {entry.name}"
+            )
+        if entry.name.startswith(".") or Path(entry.name).suffix not in {".json", ".npz"}:
+            raise ArtifactError(
+                f"shards directory contains an unrecognized entry: {entry.name}"
+            )
+        entries[entry.name] = path
+    return entries
+
+
 def _cohort_logical_id(contract: Mapping[str, Any]) -> str:
     return (
         f"{contract['campaign_id']}:r{contract['macro_round']:09d}:"
@@ -1417,7 +1531,11 @@ def _validate_and_summarize_shards(
     set[tuple[int, int, int]],
     dict[str, str],
 ]:
-    sidecars = discover_rollout_shards(cohort_dir)
+    inventory = _exact_shard_directory_entries(cohort_dir)
+    sidecars = sorted(
+        (path for name, path in inventory.items() if name.endswith(".json")),
+        key=lambda item: item.name,
+    )
     if not sidecars:
         raise ArtifactError("cannot seal an empty cohort")
     identities: set[tuple[int, int, int]] = set()
@@ -1464,6 +1582,19 @@ def _validate_and_summarize_shards(
         if shard_visitor is not None:
             arrays = report.pop("_arrays")
             shard_visitor(public_reports[-1], arrays)
+
+    referenced_names = {
+        Path(report[field]).name
+        for report in public_reports
+        for field in ("manifest_path", "payload_path")
+    }
+    actual_names = set(inventory)
+    if actual_names != referenced_names:
+        raise ArtifactError(
+            "shards directory inventory is not exact: "
+            f"unreferenced={sorted(actual_names - referenced_names)} "
+            f"missing={sorted(referenced_names - actual_names)}"
+        )
 
     if sorted(ranks) != contract["expected_ranks"]:
         raise ArtifactError(
@@ -1662,18 +1793,19 @@ def seal_cohort(cohort_dir: str | os.PathLike[str]) -> dict[str, Any]:
 
     root = _absolute(cohort_dir)
     _assert_tree_has_no_symlinks(root)
-    if (root / SEAL_FILENAME).exists():
-        return verify_cohort(root)
-    contract, contract_sha = _load_contract(root)
-    reports, _, trajectory_fingerprints = _validate_and_summarize_shards(
-        root, contract, contract_sha
-    )
-    seal = _build_seal(
-        contract, contract_sha, reports, trajectory_fingerprints
-    )
-    _validate_seal(seal)
-    publish_immutable_json(root / SEAL_FILENAME, seal)
-    return verify_cohort(root)
+    with _cohort_contract_lock(root, exclusive=True) as contract_handle:
+        contract, contract_sha = _load_locked_contract(contract_handle, root)
+        if (root / SEAL_FILENAME).exists():
+            return _verify_cohort_locked(root, contract, contract_sha)
+        reports, _, trajectory_fingerprints = _validate_and_summarize_shards(
+            root, contract, contract_sha
+        )
+        seal = _build_seal(
+            contract, contract_sha, reports, trajectory_fingerprints
+        )
+        _validate_seal(seal)
+        publish_immutable_json(root / SEAL_FILENAME, seal)
+        return _verify_cohort_locked(root, contract, contract_sha)
 
 
 def _cohort_directory(path: str | os.PathLike[str]) -> Path:
@@ -1694,9 +1826,28 @@ def _verify_cohort(
 ) -> dict[str, Any]:
     root = _cohort_directory(path)
     _assert_tree_has_no_symlinks(root)
+    with _cohort_contract_lock(root, exclusive=True) as contract_handle:
+        contract, contract_sha = _load_locked_contract(contract_handle, root)
+        return _verify_cohort_locked(
+            root,
+            contract,
+            contract_sha,
+            shard_visitor=shard_visitor,
+        )
+
+
+def _verify_cohort_locked(
+    root: Path,
+    contract: Mapping[str, Any],
+    contract_sha: str,
+    *,
+    shard_visitor: Callable[[Mapping[str, Any], Mapping[str, np.ndarray]], None]
+    | None = None,
+) -> dict[str, Any]:
+    """Verify a cohort while its contract inode is exclusively locked."""
+
     seal_path = root / SEAL_FILENAME
     seal = _validate_seal(load_strict_json(seal_path))
-    contract, contract_sha = _load_contract(root)
     if seal["contract_sha256"] != contract_sha:
         raise ArtifactError("cohort seal references a different contract")
     reports, _, trajectory_fingerprints = _validate_and_summarize_shards(

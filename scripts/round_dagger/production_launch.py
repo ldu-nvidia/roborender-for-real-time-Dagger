@@ -6,7 +6,7 @@ This program is the non-mutating preflight used by
 campaign, change coordinator state, or submit a job.  A successful result
 means that the checked-in invariant profile, the campaign-owned learner
 contract, the durable campaign, the strict per-round orchestration config,
-every local static input, and the sealed OCI-NRT source snapshot all agree
+every local static input, and the selected backend's sealed source snapshot all agree
 byte-for-byte.
 """
 
@@ -70,6 +70,9 @@ CAMPAIGN_CONTRACT_SCHEMA = (
     "fast_roborender.round_dagger.production_campaign_contract.v2"
 )
 LEARNER_CONTRACT_SCHEMA = (
+    "fast_roborender.round_dagger.production_learner_contract.v2"
+)
+LEGACY_OCI_LEARNER_CONTRACT_SCHEMA = (
     "fast_roborender.round_dagger.production_learner_contract.v1"
 )
 LEARNER_BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
@@ -154,12 +157,13 @@ LEARNER_CONTRACT_KEYS = {
     "schema",
     "allocation",
     "optimization",
-    "cluster",
-    "container",
     "handoff",
     "wandb",
     "source",
 }
+LEGACY_OCI_LEARNER_CONTRACT_KEYS = (
+    LEARNER_CONTRACT_KEYS | {"cluster", "container"}
+)
 
 
 class ProductionLaunchError(RuntimeError):
@@ -848,6 +852,10 @@ def load_campaign_contract(path: Path) -> dict[str, Any]:
             "expected_email": "ldu@nvidia.com",
             "entity": "nvidia",
             "authorization_scope": "team",
+            # This profile is immutable camera/data/topology lineage accepted
+            # by the RTX evaluator seal.  The live telemetry destination is a
+            # deployment concern and comes from the campaign-owned learner
+            # contract in build_environment().
             "project": "roborender-round-dagger",
             "python": "/opt/round-dagger-rtx/bin/python",
             "netrc": str(WANDB_NETRC),
@@ -974,27 +982,82 @@ def materialize_campaign_contract(
     return materialized, runtime_contract, lineage
 
 
+def learner_contract_backend(contract: Mapping[str, Any]) -> str | None:
+    """Return a legacy contract's bound backend, or ``None`` when portable.
+
+    Version 2 contains only optimizer, world-size, evaluation, telemetry, and
+    source-integrity policy.  Scheduling and runtime identity belong to the
+    separately hashed backend contract.  Version 1 is retained only for an
+    explicitly selected OCI compatibility launch.
+    """
+
+    schema = contract.get("schema")
+    if schema == LEARNER_CONTRACT_SCHEMA:
+        return None
+    if schema == LEGACY_OCI_LEARNER_CONTRACT_SCHEMA:
+        return LEARNER_BACKEND_OCI_NRT
+    raise ProductionLaunchError("learner contract schema is not supported")
+
+
 def load_learner_contract(path: Path) -> dict[str, Any]:
-    contract = _load_contract(
-        path,
-        LEARNER_CONTRACT_SCHEMA,
-        LEARNER_CONTRACT_KEYS,
-        "learner contract",
-        optional_keys={"heldout_evaluation"},
-    )
-    _require_equal(
-        _exact(
-            contract["allocation"],
-            {"nodes", "gpus_per_node", "gpu_architecture", "batch_size_per_rank", "global_batch_size"},
-            "learner allocation",
-        ),
-        {
+    target = _regular(path, "learner contract")
+    try:
+        raw = artifacts.load_strict_json(target)
+    except Exception as exc:
+        raise ProductionLaunchError("cannot load strict learner contract") from exc
+    if not isinstance(raw, Mapping):
+        raise ProductionLaunchError("learner contract must be a mapping")
+    schema = raw.get("schema")
+    if schema == LEARNER_CONTRACT_SCHEMA:
+        contract = _load_contract(
+            target,
+            LEARNER_CONTRACT_SCHEMA,
+            LEARNER_CONTRACT_KEYS,
+            "learner contract",
+            optional_keys={"heldout_evaluation"},
+        )
+        allocation_keys = {
+            "world_size",
+            "batch_size_per_rank",
+            "global_batch_size",
+        }
+        expected_allocation = {
+            "world_size": 8,
+            "batch_size_per_rank": 8,
+            "global_batch_size": 64,
+        }
+    elif schema == LEGACY_OCI_LEARNER_CONTRACT_SCHEMA:
+        contract = _load_contract(
+            target,
+            LEGACY_OCI_LEARNER_CONTRACT_SCHEMA,
+            LEGACY_OCI_LEARNER_CONTRACT_KEYS,
+            "legacy OCI learner contract",
+            optional_keys={"heldout_evaluation"},
+        )
+        allocation_keys = {
+            "nodes",
+            "gpus_per_node",
+            "gpu_architecture",
+            "batch_size_per_rank",
+            "global_batch_size",
+        }
+        expected_allocation = {
             "nodes": 1,
             "gpus_per_node": 8,
             "gpu_architecture": "H100-SM90",
             "batch_size_per_rank": 8,
             "global_batch_size": 64,
-        },
+        }
+    else:
+        raise ProductionLaunchError("learner contract schema is not supported")
+    backend = learner_contract_backend(contract)
+    _require_equal(
+        _exact(
+            contract["allocation"],
+            allocation_keys,
+            "learner allocation",
+        ),
+        expected_allocation,
         "learner allocation",
     )
     optimization = _exact(
@@ -1014,45 +1077,87 @@ def load_learner_contract(path: Path) -> dict[str, Any]:
         },
         "learner optimization",
     )
-    cluster = _exact(
-        contract["cluster"],
-        {"host", "account", "partition", "qos", "slurm_bin", "stage_root", "wandb_netrc"},
-        "learner cluster",
+    if backend == LEARNER_BACKEND_OCI_NRT:
+        cluster = _exact(
+            contract["cluster"],
+            {
+                "host",
+                "account",
+                "partition",
+                "qos",
+                "slurm_bin",
+                "stage_root",
+                "wandb_netrc",
+            },
+            "legacy OCI learner cluster",
+        )
+        _require_equal(cluster["host"], "oci-nrt", "legacy OCI learner host")
+        _require_equal(
+            cluster["account"],
+            "general_cs_infra__ngcsre",
+            "legacy OCI learner account",
+        )
+        _require_equal(
+            cluster["partition"],
+            "batch_singlenode",
+            "legacy OCI learner partition",
+        )
+        _require_equal(cluster["qos"], "normal", "legacy OCI learner QOS")
+        for key in ("slurm_bin", "stage_root", "wandb_netrc"):
+            _absolute(cluster[key], f"legacy OCI cluster {key}")
+        _require_equal(
+            cluster["slurm_bin"],
+            "/cm/shared/apps/slurm/current/bin",
+            "legacy OCI Slurm binary root",
+        )
+        _require_equal(
+            cluster["stage_root"], str(OCI_STAGE_ROOT), "legacy OCI stage root"
+        )
+        _require_equal(
+            cluster["wandb_netrc"],
+            "/home/ldu/.netrc",
+            "legacy OCI W&B netrc path",
+        )
+        container = _exact(
+            contract["container"],
+            {"path", "sha256", "python"},
+            "legacy OCI learner container",
+        )
+        _absolute(container["path"], "legacy OCI learner container")
+        _absolute(container["python"], "legacy OCI learner container Python")
+        _require_equal(
+            container["path"],
+            str(
+                OCI_STAGE_ROOT
+                / "containers/roborender-isaac-gr00t-x86_64-sm90-isaac5.1.sqsh"
+            ),
+            "legacy OCI learner container path",
+        )
+        _require_equal(
+            container["python"],
+            "/opt/viral-h100/bin/python",
+            "legacy OCI learner container Python",
+        )
+        _require_equal(
+            container["sha256"],
+            "f3391b76a66182618f9e71b67e89b0af2d758ffe16afdb164760fcbb4860ebe6",
+            "legacy OCI learner container identity",
+        )
+    handoff_keys = (
+        {"local_root", "poll_seconds", "maximum_attempts"}
+        if backend == LEARNER_BACKEND_OCI_NRT
+        else {"local_root"}
     )
-    _require_equal(cluster["host"], "oci-nrt", "learner host")
-    _require_equal(cluster["account"], "general_cs_infra__ngcsre", "learner account")
-    _require_equal(cluster["partition"], "batch_singlenode", "learner partition")
-    _require_equal(cluster["qos"], "normal", "learner QOS")
-    for key in ("slurm_bin", "stage_root", "wandb_netrc"):
-        _absolute(cluster[key], f"cluster {key}")
-    _require_equal(cluster["slurm_bin"], "/cm/shared/apps/slurm/current/bin", "Slurm binary root")
-    _require_equal(cluster["stage_root"], str(OCI_STAGE_ROOT), "OCI stage root")
-    _require_equal(cluster["wandb_netrc"], "/home/ldu/.netrc", "remote W&B netrc path")
-    container = _exact(contract["container"], {"path", "sha256", "python"}, "learner container")
-    _absolute(container["path"], "learner container")
-    _absolute(container["python"], "learner container Python")
-    _require_equal(
-        container["path"],
-        str(OCI_STAGE_ROOT / "containers/roborender-isaac-gr00t-x86_64-sm90-isaac5.1.sqsh"),
-        "learner container path",
-    )
-    _require_equal(container["python"], "/opt/viral-h100/bin/python", "learner container Python")
-    _require_equal(
-        container["sha256"],
-        "f3391b76a66182618f9e71b67e89b0af2d758ffe16afdb164760fcbb4860ebe6",
-        "learner container identity",
-    )
-    handoff = _exact(
-        contract["handoff"], {"local_root", "poll_seconds", "maximum_attempts"}, "learner handoff"
-    )
+    handoff = _exact(contract["handoff"], handoff_keys, "learner handoff")
     _absolute(handoff["local_root"], "learner handoff root")
     _require_equal(
         handoff["local_root"],
         "/mnt/data2/ldu/roborender_round_dagger_handoff",
         "learner handoff root",
     )
-    _require_equal(handoff["poll_seconds"], 30, "learner poll interval")
-    _require_equal(handoff["maximum_attempts"], 3, "learner maximum attempts")
+    if backend == LEARNER_BACKEND_OCI_NRT:
+        _require_equal(handoff["poll_seconds"], 30, "learner poll interval")
+        _require_equal(handoff["maximum_attempts"], 3, "learner maximum attempts")
     _require_equal(
         _exact(
             contract["wandb"],
@@ -1064,7 +1169,7 @@ def load_learner_contract(path: Path) -> dict[str, Any]:
             "expected_email": "ldu@nvidia.com",
             "entity": "nvidia",
             "authorization_scope": "team",
-            "project": "roborender-round-dagger",
+            "project": "lepton-dagger-production-1",
         },
         "learner W&B identity",
     )
@@ -1130,6 +1235,7 @@ def load_campaign_owned_learner_contract(
     *,
     campaign_root: Path,
     expected_sha256: str,
+    expected_backend: str,
 ) -> tuple[dict[str, Any], str]:
     """Load the one immutable learner contract owned by a campaign.
 
@@ -1165,6 +1271,20 @@ def load_campaign_owned_learner_contract(
     if observed_sha != expected_sha:
         raise ProductionLaunchError("learner contract SHA-256 mismatch")
     contract = load_learner_contract(target)
+    observed_backend = learner_contract_backend(contract)
+    if expected_backend == LEARNER_BACKEND_LEPTON_JOB_V1:
+        if observed_backend is not None:
+            raise ProductionLaunchError(
+                "Lepton requires the portable v2 campaign learner contract"
+            )
+    elif expected_backend == LEARNER_BACKEND_OCI_NRT:
+        _require_equal(
+            observed_backend,
+            LEARNER_BACKEND_OCI_NRT,
+            "campaign learner contract/backend",
+        )
+    else:
+        raise ProductionLaunchError("unknown learner backend")
     if artifacts.sha256_file(target) != expected_sha:
         raise ProductionLaunchError(
             "campaign-owned learner contract changed while it was validated"
@@ -1385,6 +1505,72 @@ def _verify_camera_acceptance_source_bindings(
         )
 
 
+def _verified_source_identity(
+    report: Mapping[str, Any], label: str
+) -> dict[str, str]:
+    """Return the code identity from one inventory-bound source attestation.
+
+    Roots and whole-snapshot inventories may legitimately differ between the
+    RTX and Lepton filesystems (for example, because Git metadata is packaged
+    differently).  The attested source trees and revisions may not: those are
+    the executable code identity that a production launch must keep in lock
+    step across both platforms.
+    """
+
+    revisions: dict[str, str] = {}
+    for key, description in (
+        ("fast_roborender_revision", "fast_roborender revision"),
+        ("gr00t_revision", "GR00T revision"),
+    ):
+        value = report.get(key)
+        if not isinstance(value, str) or REVISION_RE.fullmatch(value) is None:
+            raise ProductionLaunchError(
+                f"{label} source {description} is malformed"
+            )
+        revisions[key] = value
+    revisions["fast_roborender_source_tree_sha256"] = _require_sha(
+        report.get("fast_roborender_source_tree_sha256"),
+        f"{label} fast_roborender source tree",
+    )
+    revisions["gr00t_source_tree_sha256"] = _require_sha(
+        report.get("gr00t_source_tree_sha256"),
+        f"{label} GR00T source tree",
+    )
+    return revisions
+
+
+def _verify_execution_source_parity(
+    *,
+    learner_source_report: Mapping[str, Any],
+    rtx_execution_source_report: Mapping[str, Any],
+) -> dict[str, str]:
+    """Require the RTX hook source and learner source to be the same code.
+
+    This gate exists specifically before any trusted hook dispatch.  Comparing
+    only the nested GR00T tree is insufficient: it previously allowed an old
+    RTX outer repository to execute collection while a newer outer repository
+    was selected for the H200 learner.
+    """
+
+    learner = _verified_source_identity(learner_source_report, "learner")
+    rtx = _verified_source_identity(rtx_execution_source_report, "RTX execution")
+    for key, description in (
+        ("fast_roborender_revision", "fast_roborender revision"),
+        (
+            "fast_roborender_source_tree_sha256",
+            "fast_roborender source tree",
+        ),
+        ("gr00t_revision", "GR00T revision"),
+        ("gr00t_source_tree_sha256", "GR00T source tree"),
+    ):
+        _require_equal(
+            rtx[key],
+            learner[key],
+            f"RTX execution/learner {description}",
+        )
+    return rtx
+
+
 def _verify_remote_source(
     root: str,
     inventory_sha256: str,
@@ -1480,6 +1666,8 @@ def _verify_lepton_remote_source(
             ),
             shlex.join(
                 [
+                    "env",
+                    "PYTHONDONTWRITEBYTECODE=1",
                     str(backend_contract.python),
                     str(backend_contract.source_verifier),
                     "--root",
@@ -1539,7 +1727,7 @@ def _verify_local_evaluation_seal(
 ) -> dict[str, Any]:
     """Bind the RTX evaluator to an independently versioned local source seal.
 
-    The learner may have completed from an older OCI snapshot.  Evaluation has
+    The learner may have completed from an independently sealed remote snapshot. Evaluation has
     its own explicit inventory identity so a later hardening commit can execute
     without rewriting learner lineage.  No caller may supply the teacher or
     evaluator path independently from this verified root.
@@ -1686,6 +1874,123 @@ def _verify_local_evaluation_seal(
         "sealed_teacher_checkpoint": str(sealed_teacher),
         "sealed_teacher_sha256": teacher["checkpoint_sha256"],
     }
+
+
+def _verify_historical_capture_source(
+    *,
+    campaign_contract: Mapping[str, Any],
+    runtime_contract: Mapping[str, Any],
+    rtx_execution_source_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify immutable capture provenance without freezing hook execution.
+
+    A release-eligible capture remains bound to the source seal that produced
+    it.  Later control-plane hardening may execute from a newer seal, but only
+    after both seals independently prove the same teacher, split, held-out
+    plan, thresholds, campaign invariants, and nested GR00T implementation.
+    The historical paths in the immutable runtime contract are evidence; they
+    are deliberately not rewritten to the current execution root.
+    """
+
+    capture = runtime_contract.get("live_capture")
+    provenance = runtime_contract.get("capture_provenance")
+    if not isinstance(capture, Mapping) or not isinstance(provenance, Mapping):
+        raise ProductionLaunchError(
+            "production runtime contract lacks historical capture provenance"
+        )
+    split = campaign_contract["motion_split"]
+    split_root = _source_binding_root(
+        capture.get("split_manifest_path"),
+        Path(split["manifest_relative_path"]),
+        "historical capture motion split path",
+    )
+    plan_root = _source_binding_root(
+        capture.get("heldout_plan_path"),
+        Path(split["heldout_plan_relative_path"]),
+        "historical capture held-out plan path",
+    )
+    _require_equal(
+        plan_root,
+        split_root,
+        "historical capture split/plan source root",
+    )
+    actor_inventory = _require_sha(
+        provenance.get("actor_source_inventory_sha256"),
+        "historical capture actor source inventory",
+    )
+    evaluation_inventory = _require_sha(
+        provenance.get("evaluation_source_inventory_sha256"),
+        "historical capture evaluation source inventory",
+    )
+    _require_equal(
+        actor_inventory,
+        evaluation_inventory,
+        "historical capture actor/evaluation source inventory",
+    )
+
+    execution_root = Path(str(rtx_execution_source_report.get("root")))
+    execution_inventory = rtx_execution_source_report.get("inventory_sha256")
+    if split_root == execution_root:
+        _require_equal(
+            evaluation_inventory,
+            execution_inventory,
+            "historical/current capture source inventory",
+        )
+        historical_report = dict(rtx_execution_source_report)
+    else:
+        # This performs the same recursive inventory/attestation verification
+        # and byte-identity gates as the current execution seal.  Consequently
+        # the source-owned capture/evaluation assets are proven equal through
+        # their immutable campaign hashes without requiring the outer control
+        # code revision to remain frozen forever.
+        historical_report = _verify_local_evaluation_seal(
+            split_root,
+            evaluation_inventory,
+            campaign_contract=campaign_contract,
+        )
+
+    historical_identity = _verified_source_identity(
+        historical_report, "historical capture"
+    )
+    provenance_expected = {
+        "fast_roborender_revision": historical_identity[
+            "fast_roborender_revision"
+        ],
+        "gr00t_revision": historical_identity["gr00t_revision"],
+        "gr00t_source_tree_sha256": historical_identity[
+            "gr00t_source_tree_sha256"
+        ],
+        "actor_source_inventory_sha256": historical_report.get(
+            "inventory_sha256"
+        ),
+        "evaluation_source_inventory_sha256": historical_report.get(
+            "inventory_sha256"
+        ),
+    }
+    mismatches = [
+        key
+        for key, expected in provenance_expected.items()
+        if provenance.get(key) != expected
+    ]
+    if mismatches:
+        raise ProductionLaunchError(
+            "historical capture provenance differs from its sealed source: "
+            f"{mismatches}"
+        )
+
+    current_identity = _verified_source_identity(
+        rtx_execution_source_report, "RTX execution"
+    )
+    for key, description in (
+        ("gr00t_revision", "GR00T revision"),
+        ("gr00t_source_tree_sha256", "GR00T source tree"),
+    ):
+        _require_equal(
+            current_identity[key],
+            historical_identity[key],
+            f"current execution/historical capture {description}",
+        )
+    return historical_report
 
 
 def _run_git(
@@ -1869,7 +2174,7 @@ def derive_learner_bundle_sha256(
     code_sha256: str,
     learner_contract: Mapping[str, Any],
 ) -> str:
-    """Derive the exact H100 ``LearnerBundleConfig`` digest without Torch.
+    """Derive the exact backend-neutral ``LearnerBundleConfig`` digest without Torch.
 
     ``prepare_gr00t_learner_bundle.prepare_bundle`` imports the GPU learner
     module and therefore Torch.  Production preflight intentionally runs in a
@@ -2019,7 +2324,7 @@ def _validate_orchestration_and_campaign(
     learner_contract: Mapping[str, Any],
     learner_deployment_contract_sha256: str,
     source_inventory_sha256: str,
-    evaluation_source_inventory_sha256: str,
+    durable_campaign_code_sha256: str,
     evaluation_source_root: Path,
 ) -> tuple[MacroRoundConfig, dict[str, Any], dict[str, Any], str]:
     _regular(orchestration_path, "orchestration config")
@@ -2032,6 +2337,10 @@ def _validate_orchestration_and_campaign(
     if configuration.macro_round_count != PRODUCTION_MACRO_ROUND_COUNT:
         raise ProductionLaunchError(
             "production orchestration config must bind exactly five macro-rounds"
+        )
+    if configuration.advance_after_rejected_evaluation is not True:
+        raise ProductionLaunchError(
+            "production orchestration must explicitly advance after an attested rejected evaluation"
         )
     if not 0 <= configuration.macro_round < PRODUCTION_MACRO_ROUND_COUNT:
         raise ProductionLaunchError(
@@ -2154,10 +2463,10 @@ def _validate_orchestration_and_campaign(
         # independently pinned by the orchestration config and per-round
         # learner bundle, so backend-only learner revisions must not rewrite
         # an already initialized campaign manifest.
-        "code_sha256": evaluation_source_inventory_sha256,
+        "code_sha256": durable_campaign_code_sha256,
         # This is the immutable bootstrap/deployment contract identity.  It is
         # deliberately distinct from the per-round LearnerBundleConfig digest
-        # consumed by the H100 learner.
+        # consumed by the remote learner.
         "policy_config_sha256": learner_deployment_contract_sha256,
         "beta_schedule": campaign_contract["beta_schedule"],
         "data_lineage": campaign_contract["data_lineage"],
@@ -2223,17 +2532,42 @@ def build_environment(
     evaluation_source_inventory_sha256: str,
     sealed_teacher_checkpoint: str,
     learner_contract_sha256: str,
+    learner_backend: str,
 ) -> dict[str, str]:
+    bound_backend = learner_contract_backend(learner_contract)
+    if learner_backend == LEARNER_BACKEND_LEPTON_JOB_V1:
+        if bound_backend is not None:
+            raise ProductionLaunchError(
+                "Lepton environment requires the portable v2 learner contract"
+            )
+    elif learner_backend == LEARNER_BACKEND_OCI_NRT:
+        if bound_backend != LEARNER_BACKEND_OCI_NRT:
+            raise ProductionLaunchError(
+                "OCI environment requires the explicit legacy OCI learner contract"
+            )
+    else:
+        raise ProductionLaunchError("unknown learner backend")
     artifact = campaign_contract["artifacts"]
     observation = campaign_contract["observation_contract"]
     runtime = campaign_contract["actor_runtime"]
     telemetry = campaign_contract["telemetry"]
-    wandb = campaign_contract["wandb"]
+    actor_wandb = campaign_contract["wandb"]
+    deployment_wandb = learner_contract["wandb"]
+    for key in ("expected_email", "entity", "authorization_scope"):
+        _require_equal(
+            deployment_wandb[key],
+            actor_wandb[key],
+            f"learner/actor W&B {key}",
+        )
+    _require_equal(deployment_wandb["mode"], "online", "learner W&B mode")
+    _require_equal(
+        deployment_wandb["project"],
+        "lepton-dagger-production-1",
+        "learner W&B deployment project",
+    )
     evaluation = campaign_contract["evaluation"]
     split = campaign_contract["motion_split"]
     production_runtime = campaign_contract["production_runtime_contract"]
-    cluster = learner_contract["cluster"]
-    container = learner_contract["container"]
     handoff = learner_contract["handoff"]
     optimization = learner_contract["optimization"]
     environment = {
@@ -2327,13 +2661,15 @@ def build_environment(
         "IMAGE_DAGGER_TELEMETRY_CLIP_EVERY": str(telemetry["clip_every_steps"]),
         "IMAGE_DAGGER_TELEMETRY_CLIP_FRAMES": str(telemetry["clip_frames"]),
         "IMAGE_DAGGER_TELEMETRY_CLIP_FPS": str(telemetry["clip_fps"]),
-        "ROUND_DAGGER_WANDB_ENABLED": "1" if wandb["enabled"] else "0",
-        "ROUND_DAGGER_WANDB_PYTHON": wandb["python"],
-        "ROUND_DAGGER_WANDB_ENTITY": wandb["entity"],
-        "ROUND_DAGGER_WANDB_PROJECT": wandb["project"],
-        "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": wandb["expected_email"],
-        "ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE": wandb["authorization_scope"],
-        "ROUND_DAGGER_WANDB_NETRC": wandb["netrc"],
+        "ROUND_DAGGER_WANDB_ENABLED": "1" if actor_wandb["enabled"] else "0",
+        "ROUND_DAGGER_WANDB_PYTHON": actor_wandb["python"],
+        "ROUND_DAGGER_WANDB_ENTITY": deployment_wandb["entity"],
+        "ROUND_DAGGER_WANDB_PROJECT": deployment_wandb["project"],
+        "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": deployment_wandb["expected_email"],
+        "ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE": deployment_wandb[
+            "authorization_scope"
+        ],
+        "ROUND_DAGGER_WANDB_NETRC": actor_wandb["netrc"],
         "ROUND_DAGGER_EVALUATION_CONFIG": evaluation["hydra_config_path"],
         "ROUND_DAGGER_EVALUATION_SCENARIOS": str(
             Path(evaluation["scenario_contract"])
@@ -2346,23 +2682,10 @@ def build_environment(
         "ROUND_DAGGER_EVALUATION_ENDPOINT_DIR": artifact["endpoint_manifest"]["endpoint_directory"],
         "ROUND_DAGGER_CONTROL_PYTHON": "/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python",
         "ROUND_DAGGER_PYTHON": "/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python",
-        "ROUND_DAGGER_REMOTE_HOST": cluster["host"],
-        "ROUND_DAGGER_REMOTE_ACCOUNT": cluster["account"],
-        "ROUND_DAGGER_REMOTE_PARTITION": cluster["partition"],
-        "ROUND_DAGGER_REMOTE_QOS": cluster["qos"],
-        "ROUND_DAGGER_REMOTE_STAGE_ROOT": cluster["stage_root"],
-        "ROUND_DAGGER_REMOTE_SLURM_BIN": cluster["slurm_bin"],
-        "ROUND_DAGGER_REMOTE_WANDB_NETRC": cluster["wandb_netrc"],
-        "ROUND_DAGGER_REMOTE_SOURCE_ROOT": sealed_source_root,
-        "ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256": sealed_source_inventory_sha256,
-        "ROUND_DAGGER_REMOTE_CONTAINER": container["path"],
-        "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": container["sha256"],
         "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": _require_sha(
             learner_contract_sha256, "learner deployment contract SHA-256"
         ),
         "ROUND_DAGGER_REMOTE_HANDOFF_ROOT": handoff["local_root"],
-        "ROUND_DAGGER_REMOTE_POLL_SECONDS": str(handoff["poll_seconds"]),
-        "ROUND_DAGGER_REMOTE_MAX_ATTEMPTS": str(handoff["maximum_attempts"]),
         "ROUND_DAGGER_LEARNER_BATCH_SIZE": str(learner_contract["allocation"]["batch_size_per_rank"]),
         "ROUND_DAGGER_LEARNER_MAX_STEPS": str(optimization["optimizer_steps"]),
         "ROUND_DAGGER_LEARNER_SAVE_EVERY": str(optimization["save_every_steps"]),
@@ -2371,6 +2694,30 @@ def build_environment(
         "ROUND_DAGGER_LEARNER_SEED": str(optimization["seed"]),
         "ROUND_DAGGER_LEARNER_PARTITION_SEED": str(optimization["partition_seed"]),
     }
+    if learner_backend == LEARNER_BACKEND_OCI_NRT:
+        cluster = learner_contract["cluster"]
+        container = learner_contract["container"]
+        environment.update(
+            {
+                "ROUND_DAGGER_REMOTE_HOST": cluster["host"],
+                "ROUND_DAGGER_REMOTE_ACCOUNT": cluster["account"],
+                "ROUND_DAGGER_REMOTE_PARTITION": cluster["partition"],
+                "ROUND_DAGGER_REMOTE_QOS": cluster["qos"],
+                "ROUND_DAGGER_REMOTE_STAGE_ROOT": cluster["stage_root"],
+                "ROUND_DAGGER_REMOTE_SLURM_BIN": cluster["slurm_bin"],
+                "ROUND_DAGGER_REMOTE_WANDB_NETRC": cluster["wandb_netrc"],
+                "ROUND_DAGGER_REMOTE_SOURCE_ROOT": sealed_source_root,
+                "ROUND_DAGGER_REMOTE_SOURCE_INVENTORY_SHA256": (
+                    sealed_source_inventory_sha256
+                ),
+                "ROUND_DAGGER_REMOTE_CONTAINER": container["path"],
+                "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": container["sha256"],
+                "ROUND_DAGGER_REMOTE_POLL_SECONDS": str(handoff["poll_seconds"]),
+                "ROUND_DAGGER_REMOTE_MAX_ATTEMPTS": str(
+                    handoff["maximum_attempts"]
+                ),
+            }
+        )
     heldout = learner_contract.get("heldout_evaluation")
     if heldout is not None:
         environment.update(
@@ -2399,7 +2746,7 @@ def validate_launch(
     campaign_contract_sha256: str,
     learner_contract_path: Path,
     learner_contract_sha256: str,
-    learner_backend: str = LEARNER_BACKEND_OCI_NRT,
+    learner_backend: str = LEARNER_BACKEND_LEPTON_JOB_V1,
     learner_backend_contract_path: Path | None = None,
     learner_backend_contract_sha256: str | None = None,
     lepton_remote_backend_contract: str | None = None,
@@ -2460,6 +2807,7 @@ def validate_launch(
             learner_contract_path,
             campaign_root=preliminary_configuration.campaign_root,
             expected_sha256=learner_contract_sha256,
+            expected_backend=learner_backend,
         )
     )
     lepton_backend_contract = None
@@ -2587,21 +2935,19 @@ def validate_launch(
         evaluation_sealed_source_inventory_sha256,
         campaign_contract=campaign_contract,
     )
-    capture = runtime_contract["live_capture"]
-    expected_capture_sources = {
-        "split_manifest_path": str(
-            Path(local_seal_report["root"])
-            / campaign_contract["motion_split"]["manifest_relative_path"]
-        ),
-        "heldout_plan_path": str(
-            Path(local_seal_report["root"])
-            / campaign_contract["motion_split"]["heldout_plan_relative_path"]
-        ),
-    }
-    if any(capture[key] != value for key, value in expected_capture_sources.items()):
-        raise ProductionLaunchError(
-            "live capture split/plan are not derived from the sealed evaluation source"
-        )
+    # Current trusted execution must be one cross-platform code identity.  The
+    # immutable historical capture is checked separately below so hardening
+    # the outer control plane cannot silently split RTX collection from H200
+    # training and also does not require rewriting prior capture evidence.
+    _verify_execution_source_parity(
+        learner_source_report=source_report,
+        rtx_execution_source_report=local_seal_report,
+    )
+    historical_capture_report = _verify_historical_capture_source(
+        campaign_contract=campaign_contract,
+        runtime_contract=runtime_contract,
+        rtx_execution_source_report=local_seal_report,
+    )
     _verify_camera_acceptance_source_bindings(
         campaign_contract,
         learner_source_report=source_report,
@@ -2609,23 +2955,21 @@ def validate_launch(
     )
     capture_provenance = runtime_contract["capture_provenance"]
     provenance_expected = {
-        # Capture provenance belongs to the independently sealed RTX
-        # actor/evaluator source, not to the learner deployment.  Control-plane
-        # and learner-backend hardening may legitimately advance the remote
-        # learner revision without invalidating already accepted camera and
-        # held-out capture evidence.  The nested GR00T tree remains required
-        # to match both seals by _verify_camera_acceptance_source_bindings.
-        "fast_roborender_revision": local_seal_report.get(
+        # Capture provenance belongs to the historical source that produced
+        # the accepted evidence.  It need not equal the current RTX/H200 outer
+        # control revision, but that historical seal remains recursively
+        # verified above and its nested renderer tree must remain unchanged.
+        "fast_roborender_revision": historical_capture_report.get(
             "fast_roborender_revision"
         ),
-        "gr00t_revision": source_report.get("gr00t_revision"),
+        "gr00t_revision": historical_capture_report.get("gr00t_revision"),
         "actor_source_inventory_sha256": (
-            evaluation_sealed_source_inventory_sha256
+            historical_capture_report.get("inventory_sha256")
         ),
         "evaluation_source_inventory_sha256": (
-            evaluation_sealed_source_inventory_sha256
+            historical_capture_report.get("inventory_sha256")
         ),
-        "gr00t_source_tree_sha256": source_report.get(
+        "gr00t_source_tree_sha256": historical_capture_report.get(
             "gr00t_source_tree_sha256"
         ),
         "camera_acceptance_sha256": campaign_contract["artifacts"][
@@ -2665,7 +3009,10 @@ def validate_launch(
         learner_contract,
         learner_deployment_contract_sha,
         sealed_source_inventory_sha256,
-        evaluation_sealed_source_inventory_sha256,
+        _require_sha(
+            historical_capture_report.get("inventory_sha256"),
+            "historical capture source inventory",
+        ),
         Path(local_seal_report["root"]),
     )
     _require_equal(
@@ -2689,6 +3036,7 @@ def validate_launch(
             "sealed_teacher_checkpoint"
         ],
         learner_contract_sha256=learner_deployment_contract_sha,
+        learner_backend=configuration.learner_backend,
     )
     environment["ROUND_DAGGER_LAUNCH_ORCHESTRATION_SHA256"] = orchestration_sha
     environment["ROUND_DAGGER_LEARNER_BACKEND"] = configuration.learner_backend
@@ -2763,7 +3111,7 @@ def validate_launch(
     if artifacts.sha256_file(orchestration_config) != orchestration_sha:
         raise ProductionLaunchError("orchestration config changed during preflight")
     # Actor collection still uses the live RTX checkout, whereas learner code
-    # uses the sealed OCI snapshot and evaluation uses its independent local
+    # uses the selected backend's sealed snapshot and evaluation uses its independent local
     # seal.  Preserve the actor/learner compatibility check immediately before
     # handing control to the orchestrator.
     local_source = _verify_local_source_checkout(source_report)
@@ -2811,6 +3159,12 @@ def validate_launch(
         "evaluation_source_revision": local_seal_report.get(
             "fast_roborender_revision"
         ),
+        "historical_capture_source_revision": historical_capture_report.get(
+            "fast_roborender_revision"
+        ),
+        "historical_capture_source_inventory_sha256": (
+            historical_capture_report.get("inventory_sha256")
+        ),
         "local_source": local_source,
         "learner_deployment_contract_sha256": learner_deployment_contract_sha,
         "learner_backend": configuration.learner_backend,
@@ -2834,7 +3188,7 @@ def validate_launch(
             if configuration.learner_backend == LEARNER_BACKEND_OCI_NRT
             else "1 Lepton reserved node / 8 H200 / batch 8 per rank / 1200 optimizer steps"
         ),
-        "wandb": "ldu@nvidia.com -> nvidia/roborender-round-dagger",
+        "wandb": "ldu@nvidia.com -> nvidia/lepton-dagger-production-1",
         "hooks": {
             name: None if hook is None else {"argv": list(hook.argv), "timeout_seconds": hook.timeout_seconds}
             for name, hook in configuration.hooks.items()
@@ -2873,7 +3227,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--learner-backend",
         choices=(LEARNER_BACKEND_OCI_NRT, LEARNER_BACKEND_LEPTON_JOB_V1),
-        default=LEARNER_BACKEND_OCI_NRT,
+        default=LEARNER_BACKEND_LEPTON_JOB_V1,
     )
     parser.add_argument("--learner-backend-contract", type=Path, required=True)
     parser.add_argument("--learner-backend-contract-sha256", required=True)

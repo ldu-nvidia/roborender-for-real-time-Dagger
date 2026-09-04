@@ -40,10 +40,18 @@ class FakeRun:
     def quality(step: int, mse: float):
         return {
             "optimizer_step": step,
+            "quality/eval_frontier": step,
             "quality/heldout_action_mse": mse,
             "quality/heldout_action_mae": mse + 0.1,
             "quality/heldout_action_rmse": mse + 0.2,
             "quality/heldout_action_cosine": 0.5 - step / 10,
+            "quality/heldout_action_absolute_error_p90": mse + 0.3,
+            "quality/heldout_action_l2_p90": mse + 0.4,
+            "quality/heldout_action_mse_delta_from_step0": mse - 5.0,
+            "quality/heldout_action_mse_relative_improvement_from_step0": (
+                5.0 - mse
+            )
+            / 5.0,
             "quality/heldout_transitions": 256,
         }
 
@@ -82,10 +90,18 @@ class LearnerWandbReadbackTest(unittest.TestCase):
                     {
                         "schema": readback.HELDOUT_TELEMETRY_SCHEMA,
                         "optimizer_step": step,
+                        "eval_frontier": step,
                         "action_mse": mse,
                         "action_mae": mse + 0.1,
                         "action_rmse": mse + 0.2,
                         "action_cosine": 0.5 - step / 10,
+                        "action_absolute_error_p90": mse + 0.3,
+                        "action_l2_p90": mse + 0.4,
+                        "action_mse_delta_from_step0": mse - 5.0,
+                        "action_mse_relative_improvement_from_step0": (
+                            5.0 - mse
+                        )
+                        / 5.0,
                         "heldout_transitions_global": 256,
                     },
                     sort_keys=True,

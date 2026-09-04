@@ -25,6 +25,12 @@ image3f_queue*/
 *_endpoint*.txt
 diag_*/
 runtime/
+runs/
+outputs/
+artifacts/
+checkpoints/
+replay_cache/
+.round_dagger/
 
 # ---- logs ----
 *.log
@@ -41,6 +47,23 @@ __pycache__/
 venv/
 *.egg-info/
 .ipynb_checkpoints/
+
+# ---- local credentials and deployment identity ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.kubeconfig
+.kube/
+.netrc
+credentials/
+secrets/
+service-account*.json
+*_credentials.json
+*_secrets.json
 
 # ---- editor / os ----
 .vscode/

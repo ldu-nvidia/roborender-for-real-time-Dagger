@@ -9,6 +9,10 @@ one environment per learner rank through the normal artifact/replay APIs.
 ``fixture_manifest.json`` is published last and is the only completion marker.
 It binds the complete source cohort, every selected source shard, the slicing
 policy, the derived cohort, and the replay snapshot by SHA-256.
+
+Held-out replay keeps the historical exact-count behavior.  The sole bounded
+exception derives 32 cases from the verified fixed-256 source: it takes the
+four lowest global environment IDs from each of exactly eight source shards.
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ DEFAULT_ENVIRONMENTS_PER_SOURCE_RANK = 4
 DEFAULT_STEPS = 4
 DEFAULT_HELDOUT_CASES = 256
 EXPECTED_HELDOUT_SOURCE_SHARDS = 8
+DOWNSAMPLE_SOURCE_HELDOUT_CASES = 256
+DOWNSAMPLE_TARGET_HELDOUT_CASES = 32
+DOWNSAMPLE_CASES_PER_SOURCE_SHARD = 4
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _DIGEST_FIELDS = (
     "policy_sha256",
@@ -146,6 +153,61 @@ def _slice_one_environment(
     return sliced
 
 
+def _slice_environment_subset(
+    arrays: Mapping[str, np.ndarray],
+    *,
+    source_num_steps: int,
+    source_num_envs: int,
+    selected_global_env_ids: Sequence[int],
+) -> dict[str, np.ndarray]:
+    """Select named environments from every verified array's environment axis."""
+
+    raw_ids = arrays.get("global_env_ids")
+    if not isinstance(raw_ids, np.ndarray):
+        raise FixtureError("verified source global_env_ids array is missing")
+    if tuple(raw_ids.shape) == (source_num_envs,):
+        env_vector = raw_ids
+    elif tuple(raw_ids.shape) == (source_num_steps, source_num_envs):
+        if not np.all(raw_ids == raw_ids[0:1]):
+            raise FixtureError("verified source global_env_ids changed over time")
+        env_vector = raw_ids[0]
+    else:
+        raise FixtureError("verified source global_env_ids shape changed")
+
+    index_by_env_id = {
+        int(raw_env_id): index
+        for index, raw_env_id in enumerate(env_vector.tolist())
+    }
+    if len(index_by_env_id) != source_num_envs:
+        raise FixtureError("verified source global_env_ids are not unique")
+    selected = [int(item) for item in selected_global_env_ids]
+    if not selected or len(selected) != len(set(selected)):
+        raise FixtureError("selected held-out environments are empty or duplicated")
+    missing = sorted(set(selected) - set(index_by_env_id))
+    if missing:
+        raise FixtureError(
+            f"selected held-out environments are absent from source shard: {missing}"
+        )
+    indices = [index_by_env_id[env_id] for env_id in selected]
+
+    sliced: dict[str, np.ndarray] = {}
+    for key, array in arrays.items():
+        if key == "global_env_ids" and tuple(array.shape) == (source_num_envs,):
+            value = np.take(array, indices, axis=0)
+        elif array.ndim >= 2 and tuple(array.shape[:2]) == (
+            source_num_steps,
+            source_num_envs,
+        ):
+            value = np.take(array, indices, axis=1)
+        else:
+            raise FixtureError(
+                f"verified held-out source array {key!r} has an unsupported "
+                f"leading shape {tuple(array.shape)}"
+            )
+        sliced[key] = np.ascontiguousarray(value)
+    return sliced
+
+
 def _extract_verified_arrays(
     source_cohort: Path,
     selection: Sequence[Mapping[str, int]],
@@ -239,6 +301,7 @@ def _derive_fixed_heldout(
     expected_action_contract: Mapping[str, Any],
     expected_digests: Mapping[str, str],
     training_payload_sha256s: set[str],
+    allow_source_eval_schedule_rebinding: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Recursively verify and republish eight fixed-eval shards as one cohort."""
 
@@ -252,10 +315,16 @@ def _derive_fixed_heldout(
         source_snapshot_path,
         expected_file_sha256=source_snapshot_file_sha256,
     )
-    if source_snapshot["transition_count"] != expected_cases:
+    source_transition_count = int(source_snapshot["transition_count"])
+    downsample = source_transition_count != expected_cases
+    if downsample and (
+        source_transition_count != DOWNSAMPLE_SOURCE_HELDOUT_CASES
+        or expected_cases != DOWNSAMPLE_TARGET_HELDOUT_CASES
+    ):
         raise FixtureError(
             "source held-out transition count differs from the fixed-case contract: "
-            f"actual={source_snapshot['transition_count']} expected={expected_cases}"
+            f"actual={source_transition_count} expected={expected_cases}; only "
+            "deterministic 32-from-256 downsampling is supported"
         )
     if source_snapshot["campaign_id"] != expected_source_campaign_id:
         raise FixtureError("source held-out snapshot belongs to another campaign")
@@ -272,8 +341,10 @@ def _derive_fixed_heldout(
     captures: list[dict[str, Any]] = []
     source_cohort_records: list[dict[str, Any]] = []
     source_payload_sha256s: set[str] = set()
-    all_eval_env_ids: set[int] = set()
-    total_transitions = 0
+    all_source_eval_env_ids: set[int] = set()
+    all_selected_eval_env_ids: set[int] = set()
+    total_source_transitions = 0
+    total_selected_transitions = 0
     for learner_rank, snapshot_cohort in enumerate(source_snapshot["cohorts"]):
         source_manifest = Path(snapshot_cohort["cohort_manifest_path"])
         visited: list[tuple[dict[str, Any], dict[str, np.ndarray]]] = []
@@ -300,37 +371,76 @@ def _derive_fixed_heldout(
             )
         if source_report["cohort_sha256"] != snapshot_cohort["manifest_sha256"]:
             raise FixtureError("held-out snapshot/cohort digest binding changed")
+        core_digest_fields = (
+            "policy_sha256",
+            "runtime_policy_sha256",
+            "teacher_sha256",
+            "renderer_sha256",
+        )
+        source_schedule_differs = any(
+            source_report[field] != expected_digests[field]
+            for field in ("beta_sha256", "config_sha256")
+        )
         if (
             source_report["view_contract"] != dict(expected_view_contract)
             or source_report["action_contract"] != dict(expected_action_contract)
             or any(
                 source_report[field] != expected_digests[field]
-                for field in _DIGEST_FIELDS
+                for field in core_digest_fields
             )
         ):
             raise FixtureError(
                 "held-out source model/view/action lineage differs from training"
             )
+        if source_schedule_differs and not allow_source_eval_schedule_rebinding:
+            raise FixtureError(
+                "held-out source beta/config lineage differs from training; "
+                "explicit eval schedule rebinding is required"
+            )
         source_shard, arrays = visited[0]
         shard_envs = {int(item) for item in source_shard["global_env_ids"]}
-        if int(source_shard["transition_count"]) != len(shard_envs):
+        source_shard_transitions = int(source_shard["transition_count"])
+        if source_shard_transitions != len(shard_envs):
             raise FixtureError(
                 "each fixed held-out environment must contribute exactly one case"
             )
-        if all_eval_env_ids & shard_envs:
+        if all_source_eval_env_ids & shard_envs:
             raise FixtureError("held-out source shards reuse logical environment IDs")
-        all_eval_env_ids.update(shard_envs)
+        all_source_eval_env_ids.update(shard_envs)
         source_payload_sha = str(source_shard["payload_sha256"])
         if source_payload_sha in source_payload_sha256s:
             raise FixtureError("held-out source shards reuse a payload digest")
         source_payload_sha256s.add(source_payload_sha)
-        total_transitions += int(source_shard["transition_count"])
+        if downsample:
+            selected_env_ids = sorted(shard_envs)[
+                :DOWNSAMPLE_CASES_PER_SOURCE_SHARD
+            ]
+            if len(selected_env_ids) != DOWNSAMPLE_CASES_PER_SOURCE_SHARD:
+                raise FixtureError(
+                    "each 256-case held-out source shard must provide at least "
+                    f"{DOWNSAMPLE_CASES_PER_SOURCE_SHARD} environments"
+                )
+            arrays = _slice_environment_subset(
+                arrays,
+                source_num_steps=1,
+                source_num_envs=source_shard_transitions,
+                selected_global_env_ids=selected_env_ids,
+            )
+            selection_policy = "lowest_global_env_id_per_source_shard"
+        else:
+            selected_env_ids = sorted(shard_envs)
+            selection_policy = "all_verified_cases"
+        if all_selected_eval_env_ids & set(selected_env_ids):
+            raise FixtureError("selected held-out environments are duplicated")
+        all_selected_eval_env_ids.update(selected_env_ids)
+        total_source_transitions += source_shard_transitions
+        total_selected_transitions += len(selected_env_ids)
         captures.append(
             {
                 "learner_rank": learner_rank,
                 "arrays": arrays,
-                "global_env_ids": sorted(shard_envs),
-                "transition_count": int(source_shard["transition_count"]),
+                "global_env_ids": selected_env_ids,
+                "transition_count": len(selected_env_ids),
             }
         )
         source_cohort_records.append(
@@ -341,14 +451,24 @@ def _derive_fixed_heldout(
                 "cohort_sha256": source_report["cohort_sha256"],
                 "contract_sha256": source_report["contract_sha256"],
                 "transition_count": source_report["transition_count"],
+                "source_transition_count": source_shard_transitions,
+                "selected_transition_count": len(selected_env_ids),
+                "selection_policy": selection_policy,
                 "source_shard_id": source_shard["shard_id"],
                 "source_manifest_sha256": source_shard["manifest_sha256"],
                 "source_payload_sha256": source_payload_sha,
+                "source_beta_sha256": source_report["beta_sha256"],
+                "source_config_sha256": source_report["config_sha256"],
                 "global_env_ids": sorted(shard_envs),
+                "selected_global_env_ids": selected_env_ids,
             }
         )
 
-    if total_transitions != expected_cases or len(captures) != 8:
+    if (
+        total_source_transitions != source_transition_count
+        or total_selected_transitions != expected_cases
+        or len(captures) != EXPECTED_HELDOUT_SOURCE_SHARDS
+    ):
         raise FixtureError("recursively verified held-out coverage is not exact")
 
     heldout_cohort = output / "heldout_cohort"
@@ -359,7 +479,7 @@ def _derive_fixed_heldout(
         cohort_index=1,
         purpose="eval",
         expected_ranks=list(range(len(captures))),
-        expected_global_env_ids=sorted(all_eval_env_ids),
+        expected_global_env_ids=sorted(all_selected_eval_env_ids),
         expected_transitions=expected_cases,
         view_contract=expected_view_contract,
         action_contract=expected_action_contract,
@@ -409,9 +529,35 @@ def _derive_fixed_heldout(
         "snapshot_sha256": source_snapshot["snapshot_sha256"],
         "campaign_id": source_snapshot["campaign_id"],
         "transition_count": source_snapshot["transition_count"],
+        "selected_transition_count": total_selected_transitions,
         "cohort_count": source_snapshot["cohort_count"],
         "source_shard_count": len(captures),
         "full_recursive_verification": True,
+        "source_eval_schedule_rebinding": {
+            "authorized": allow_source_eval_schedule_rebinding,
+            "rebound_fields": ["beta_sha256", "config_sha256"],
+            "source": {
+                field: source_cohort_records[0][f"source_{field}"]
+                for field in ("beta_sha256", "config_sha256")
+            },
+            "destination": {
+                field: expected_digests[field]
+                for field in ("beta_sha256", "config_sha256")
+            },
+        },
+        "selection": {
+            "policy": (
+                "lowest_global_env_id_per_source_shard"
+                if downsample
+                else "all_verified_cases"
+            ),
+            "source_transition_count": source_transition_count,
+            "selected_transition_count": total_selected_transitions,
+            "source_shard_count": len(captures),
+            "selected_cases_per_source_shard": (
+                DOWNSAMPLE_CASES_PER_SOURCE_SHARD if downsample else None
+            ),
+        },
         "cohorts": source_cohort_records,
     }
     derived_record = {
@@ -442,6 +588,8 @@ def build_fixture(
     environments_per_source_rank: int = DEFAULT_ENVIRONMENTS_PER_SOURCE_RANK,
     steps: int = DEFAULT_STEPS,
     source_heldout_snapshot: str | os.PathLike[str] | None = None,
+    expected_source_heldout_campaign_id: str | None = None,
+    allow_source_eval_schedule_rebinding: bool = False,
     expected_heldout_cases: int = DEFAULT_HELDOUT_CASES,
 ) -> dict[str, Any]:
     """Build and seal one real-data cohort plus a one-round replay snapshot."""
@@ -531,16 +679,24 @@ def build_fixture(
     source_heldout_record: dict[str, Any] | None = None
     derived_heldout_record: dict[str, Any] | None = None
     if source_heldout_snapshot is not None:
+        source_heldout_campaign_id = (
+            source_report["campaign_id"]
+            if expected_source_heldout_campaign_id is None
+            else _campaign_token(expected_source_heldout_campaign_id)
+        )
         source_heldout_record, derived_heldout_record = _derive_fixed_heldout(
             source_snapshot_path=_absolute(source_heldout_snapshot),
             output=output,
             campaign_id=campaign_id,
             expected_cases=expected_heldout_cases,
-            expected_source_campaign_id=source_report["campaign_id"],
+            expected_source_campaign_id=source_heldout_campaign_id,
             expected_view_contract=source_report["view_contract"],
             expected_action_contract=source_report["action_contract"],
             expected_digests=source_digests,
             training_payload_sha256s=training_payload_sha256s,
+            allow_source_eval_schedule_rebinding=(
+                allow_source_eval_schedule_rebinding
+            ),
         )
 
     manifest: dict[str, Any] = {
@@ -641,6 +797,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--source-heldout-snapshot", type=Path)
     parser.add_argument(
+        "--expected-source-heldout-campaign-id",
+        help=(
+            "explicit source campaign pinned by a reused fixed held-out pool; "
+            "defaults to the training source campaign"
+        ),
+    )
+    parser.add_argument(
+        "--allow-source-eval-schedule-rebinding",
+        action="store_true",
+        help=(
+            "allow only beta/config lineage to be rebound when republishing a "
+            "fixed eval pool; policy/runtime/teacher/renderer must still match"
+        ),
+    )
+    parser.add_argument(
         "--expected-heldout-cases", type=int, default=DEFAULT_HELDOUT_CASES
     )
     return parser
@@ -656,6 +827,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         environments_per_source_rank=args.environments_per_source_rank,
         steps=args.steps,
         source_heldout_snapshot=args.source_heldout_snapshot,
+        expected_source_heldout_campaign_id=(
+            args.expected_source_heldout_campaign_id
+        ),
+        allow_source_eval_schedule_rebinding=(
+            args.allow_source_eval_schedule_rebinding
+        ),
         expected_heldout_cases=args.expected_heldout_cases,
     )
     print(

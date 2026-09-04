@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -130,6 +131,12 @@ class ActorValidationDryRunTest(unittest.TestCase):
         self.fake_accelerate = self._executable("accelerate")
         self.teacher = self.root / "teacher.pt"
         self.teacher.write_bytes(b"independent-expert")
+        self.motion_split = self.root / "collection-motion-split.json"
+        self.motion_split.write_text(
+            '{"schema":"roborender.motion_split.v1","test":true}\n',
+            encoding="utf-8",
+        )
+        self.motion_split_sha = _sha256(self.motion_split)
         self.anchors = self.root / "anchors"
         self.anchors.mkdir()
         (self.anchors / "anchor_00000.npz").write_bytes(b"unit-test-anchor")
@@ -262,6 +269,17 @@ class ActorValidationDryRunTest(unittest.TestCase):
                 "ROUND_DAGGER_PURPOSE": "train",
             }
         )
+        if purpose == "train":
+            environment.update(
+                {
+                    "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": str(
+                        self.motion_split
+                    ),
+                    "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": (
+                        self.motion_split_sha
+                    ),
+                }
+            )
         if train_ack:
             environment["ROUND_DAGGER_VALIDATION_TRAIN_ACK"] = "bounded-train-replay"
         if actor_rank is not None:
@@ -291,6 +309,11 @@ class ActorValidationDryRunTest(unittest.TestCase):
         self.assertIn("algo.config.num_steps_per_env=2", result.stdout)
         self.assertIn("seed=0", result.stdout)
         self.assertIn("++algo.config.videogen.seed=42", result.stdout)
+        self.assertIn("actor_training_entrypoint.py", result.stdout)
+        self.assertIn(
+            'export EXPECTED_TRAIN_CHECKPOINT_SHA256="$ROUND_DAGGER_POLICY_SHA256"',
+            SCRIPT.read_text(encoding="utf-8"),
+        )
         self.assertIn(
             'export IMAGE3F_LOCAL_ENVS="$ENVS_PER_RANK"',
             SCRIPT.read_text(encoding="utf-8"),
@@ -364,6 +387,213 @@ class ActorValidationDryRunTest(unittest.TestCase):
         )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertIn("purpose=train", accepted.stdout)
+        self.assertFalse(self.marker.exists())
+
+    def test_train_binds_collection_split_rank_offsets_and_rank_telemetry(self) -> None:
+        environment = self._environment(
+            ranks=2,
+            actor_rank=0,
+            envs_per_rank=3,
+            purpose="train",
+            train_ack=True,
+        )
+        rank_zero = self._run(environment)
+        self.assertEqual(rank_zero.returncode, 0, rank_zero.stderr)
+        self.assertIn(
+            "++env.config.reset_from_dataset.motion_split_manifest="
+            f"{self.motion_split}",
+            rank_zero.stdout,
+        )
+        self.assertIn(
+            "++env.config.reset_from_dataset.motion_split_manifest_sha256="
+            f"{self.motion_split_sha}",
+            rank_zero.stdout,
+        )
+        for override in (
+            "++env.config.reset_from_dataset.motion_split_role=collection",
+            "++env.config.reset_from_dataset.motion_split_verify_content=true",
+            "++env.config.reset_from_dataset.motion_split_offset=0",
+            "++env.config.reset_from_dataset.motion_split_limit=null",
+            "++env.config.reset_from_dataset.motion_assignment_offset=0",
+        ):
+            self.assertIn(override, rank_zero.stdout)
+        self.assertIn(
+            f"telemetry_dir={environment['TRAIN_RUN_DIR']}/ranks/rank_0000/telemetry",
+            rank_zero.stdout,
+        )
+
+        environment["ROUND_DAGGER_VALIDATION_ACTOR_RANK"] = "1"
+        rank_one = self._run(environment)
+        self.assertEqual(rank_one.returncode, 0, rank_one.stderr)
+        self.assertIn(
+            "++env.config.reset_from_dataset.motion_assignment_offset=3",
+            rank_one.stdout,
+        )
+        self.assertIn(
+            f"telemetry_dir={environment['TRAIN_RUN_DIR']}/ranks/rank_0001/telemetry",
+            rank_one.stdout,
+        )
+        self.assertFalse(self.marker.exists())
+
+    def test_isolated_actor_uses_one_rank_local_run_root_for_real_telemetry(self) -> None:
+        """Exercise the actual telemetry constructor under a fake actor trainer."""
+
+        self.fake_python.write_text(
+            f"""#!{sys.executable}
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, {str(ROOT)!r})
+sys.path.insert(0, {str(ROOT / 'GR00T-VisualSim2Real')!r})
+
+from gr00t.rl.utils.dagger_telemetry import DaggerTelemetry
+from round_dagger.artifacts import load_strict_json, publish_rollout_shard
+
+rank = int(os.environ["ROUND_DAGGER_ACTOR_RANK"])
+world_size = int(os.environ["ROUND_DAGGER_ACTOR_WORLD_SIZE"])
+base = Path(os.environ["TEST_BASE_TRAIN_RUN_DIR"]).resolve()
+run_dir = Path(os.environ["TRAIN_RUN_DIR"]).resolve()
+telemetry_dir = Path(os.environ["ROBORENDER_TELEMETRY_DIR"]).resolve()
+expected_run_dir = base / "ranks" / f"rank_{{rank:04d}}"
+if run_dir != expected_run_dir:
+    raise SystemExit(f"rank-local TRAIN_RUN_DIR mismatch: {{run_dir}} != {{expected_run_dir}}")
+if telemetry_dir != run_dir / "telemetry":
+    raise SystemExit("rank-local telemetry is not TRAIN_RUN_DIR/telemetry")
+telemetry = DaggerTelemetry.from_environment(rank=0)
+if telemetry is None or telemetry.run_dir != run_dir or telemetry.root != telemetry_dir:
+    raise SystemExit("DaggerTelemetry did not bind the rank-local run root")
+
+cohort = Path(os.environ["ROUND_DAGGER_COHORT_DIR"])
+contract = load_strict_json(cohort / "contract.json")
+steps = int(contract["expected_steps_per_env"])
+per_rank = len(contract["expected_global_env_ids"]) // world_size
+ids = contract["expected_global_env_ids"][rank * per_rank : (rank + 1) * per_rank]
+envs = len(ids)
+actions = np.zeros((steps, envs, 26), dtype=np.float32)
+arrays = {{
+    "policy_rgb": np.zeros((steps, envs, 324, 192, 3), dtype=np.uint8),
+    "expert_actions": np.ones_like(actions),
+    "student_actions": actions,
+    "behavior_actions": actions.copy(),
+    "expert_mask": np.zeros((steps, envs), dtype=np.bool_),
+    "dones": np.zeros((steps, envs), dtype=np.bool_),
+    "observation_is_raytraced": np.zeros((steps, envs), dtype=np.bool_),
+    "global_env_ids": np.asarray(ids, dtype=np.int64),
+    "episode_ids": np.zeros((steps, envs), dtype=np.int64),
+    "episode_steps": np.broadcast_to(
+        np.arange(steps, dtype=np.int64)[:, None], (steps, envs)
+    ).copy(),
+    "obs__actor_obs": np.zeros((steps, envs, 3), dtype=np.float32),
+}}
+digests = {{
+    key: contract[key]
+    for key in (
+        "policy_sha256",
+        "runtime_policy_sha256",
+        "teacher_sha256",
+        "renderer_sha256",
+        "beta_sha256",
+        "config_sha256",
+    )
+}}
+publish_rollout_shard(
+    cohort,
+    rank=rank,
+    rollout_id=0,
+    part_index=0,
+    arrays=arrays,
+    campaign_id=contract["campaign_id"],
+    macro_round=contract["macro_round"],
+    cohort_index=contract["cohort_index"],
+    purpose=contract["purpose"],
+    **digests,
+)
+""",
+            encoding="utf-8",
+        )
+        self.fake_python.chmod(0o755)
+        environment = self._environment(
+            ranks=2,
+            actor_rank=1,
+            envs_per_rank=1,
+            steps=2,
+            dry_run=False,
+        )
+        environment["TEST_BASE_TRAIN_RUN_DIR"] = environment["TRAIN_RUN_DIR"]
+        result = self._run(environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rank_run_dir = (
+            Path(environment["TRAIN_RUN_DIR"]) / "ranks" / "rank_0001"
+        )
+        self.assertTrue((rank_run_dir / "telemetry/video_capability.json").is_file())
+        self.assertFalse((Path(environment["TRAIN_RUN_DIR"]) / "telemetry").exists())
+        self.assertIn("ROUND_ACTOR_VALIDATION_RANK_OK rank=1", result.stdout)
+
+    def test_train_collection_split_identity_is_required_and_verified(self) -> None:
+        for missing in (
+            "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST",
+            "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256",
+        ):
+            with self.subTest(missing=missing):
+                environment = self._environment(purpose="train", train_ack=True)
+                environment.pop(missing)
+                result = self._run(environment)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    f"missing required train environment: {missing}", result.stderr
+                )
+                self.assertFalse(self.marker.exists())
+
+        invalid = self._environment(purpose="train", train_ack=True)
+        invalid["ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"] = "NOT-A-SHA"
+        result = self._run(invalid)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be lowercase hexadecimal", result.stderr)
+        self.assertFalse(self.marker.exists())
+
+        mismatch = self._environment(purpose="train", train_ack=True)
+        mismatch["ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"] = "0" * 64
+        result = self._run(mismatch)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("SHA-256 mismatch", result.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_train_collection_split_path_is_fail_closed(self) -> None:
+        relative = self._environment(purpose="train", train_ack=True)
+        relative["ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST"] = (
+            self.motion_split.name
+        )
+        result = self._run(relative)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("path must be absolute", result.stderr)
+        self.assertFalse(self.marker.exists())
+
+        link = self.root / "collection-motion-split-link.json"
+        link.symlink_to(self.motion_split)
+        symlink = self._environment(purpose="train", train_ack=True)
+        symlink["ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST"] = str(link)
+        result = self._run(symlink)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsafe or missing", result.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_eval_does_not_bind_collection_split_and_keeps_base_telemetry(self) -> None:
+        environment = self._environment(purpose="eval")
+        environment.update(
+            {
+                "ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST": "relative.json",
+                "ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256": "invalid",
+            }
+        )
+        result = self._run(environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("reset_from_dataset.motion_split_", result.stdout)
+        self.assertIn(
+            f"telemetry_dir={environment['TRAIN_RUN_DIR']}/telemetry", result.stdout
+        )
         self.assertFalse(self.marker.exists())
 
     def test_shadow_and_validation_evidence_require_immutable_ab_plan(self) -> None:

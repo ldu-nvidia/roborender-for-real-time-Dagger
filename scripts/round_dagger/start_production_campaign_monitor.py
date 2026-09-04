@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -24,6 +26,10 @@ from scripts.round_dagger import start_student_quality_wandb_bridge as quality_s
 
 
 MONITOR = ROOT / "scripts/round_dagger/monitor_production_campaign.py"
+MONITOR_PID_SCHEMA = "fast_roborender.round_dagger.monitor_process.v2"
+MONITOR_READY_SCHEMA = (
+    "fast_roborender.round_dagger.production_monitor_ready.v1"
+)
 _SENSITIVE_RE = re.compile(
     r"(?i)(api[_-]?key|password|secret|access[_-]?token|identity[_-]?token)"
 )
@@ -46,13 +52,10 @@ def _process_start_ticks(pid: int) -> int | None:
         return None
 
 
-def _atomic_pidfile(path: Path, pid: int, start_ticks: int) -> None:
+def _atomic_pidfile(path: Path, document: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (
-        json.dumps(
-            {"schema": "fast_roborender.round_dagger.monitor_process.v1", "pid": pid, "start_ticks": start_ticks},
-            sort_keys=True,
-        )
+        json.dumps(document, sort_keys=True)
         + "\n"
     ).encode("utf-8")
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -80,6 +83,11 @@ def _existing_monitor(pidfile: Path) -> tuple[int, int] | None:
         raise StarterError("monitor pidfile is unsafe")
     try:
         document = json.loads(pidfile.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or document.get("schema") not in {
+            "fast_roborender.round_dagger.monitor_process.v1",
+            MONITOR_PID_SCHEMA,
+        }:
+            raise ValueError
         pid = document["pid"]
         ticks = document["start_ticks"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -87,6 +95,93 @@ def _existing_monitor(pidfile: Path) -> tuple[int, int] | None:
     if type(pid) is int and type(ticks) is int and _process_start_ticks(pid) == ticks:
         return pid, ticks
     return None
+
+
+def _single_argument(arguments: list[str], name: str) -> str:
+    values = [
+        arguments[index + 1]
+        for index, value in enumerate(arguments[:-1])
+        if value == name
+    ]
+    if len(values) != 1 or not values[0]:
+        raise StarterError(f"monitor requires exactly one {name}")
+    if not Path(values[0]).is_absolute():
+        raise StarterError(f"monitor {name} must be absolute")
+    return values[0]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_ready_marker(
+    path: Path,
+    *,
+    child_pid: int,
+    campaign_root: str,
+    output_root: str,
+    driver_status: str,
+    learner_backend: str,
+) -> dict[str, object] | None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise StarterError("monitor readiness marker is unsafe")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StarterError("monitor readiness marker is invalid") from exc
+    expected = {
+        "schema": MONITOR_READY_SCHEMA,
+        "process_id": child_pid,
+        "campaign_root": campaign_root,
+        "output_root": output_root,
+        "driver_status": driver_status,
+        "learner_backend": learner_backend,
+    }
+    if not isinstance(document, dict) or any(
+        document.get(key) != value for key, value in expected.items()
+    ):
+        raise StarterError("monitor readiness marker does not match child")
+    report_path = document.get("report_path")
+    report_sha = document.get("report_sha256")
+    ready_ns = document.get("ready_unix_ns")
+    if (
+        report_path != str(Path(output_root) / "latest.json")
+        or not isinstance(report_sha, str)
+        or len(report_sha) != 64
+        or type(ready_ns) is not int
+    ):
+        raise StarterError("monitor readiness marker binding is malformed")
+    report_file = Path(report_path)
+    try:
+        if _sha256_file(report_file) != report_sha:
+            raise StarterError("monitor readiness report changed")
+        report = json.loads(report_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StarterError("monitor readiness report is invalid") from exc
+    progress = report.get("progress_health") if isinstance(report, dict) else None
+    learner = report.get("learner_control_plane") if isinstance(report, dict) else None
+    wandb = report.get("wandb_remote") if isinstance(report, dict) else None
+    if not (
+        isinstance(progress, dict)
+        and progress.get("production_observability_healthy") is True
+        and progress.get("required_processes_healthy") is True
+        and isinstance(learner, dict)
+        and learner.get("backend") == learner_backend
+        and learner.get("healthy") is True
+        and isinstance(wandb, dict)
+        and wandb.get("reachable") is True
+        and wandb.get("authorized") is True
+    ):
+        raise StarterError("monitor first report is not production healthy")
+    return document
 
 
 def _terminate_child(child: subprocess.Popen[bytes]) -> None:
@@ -122,20 +217,44 @@ def start_monitor(
     pidfile: Path,
     logfile: Path,
     monitor_arguments: list[str],
+    ready_timeout_seconds: float = 180.0,
 ) -> dict[str, object]:
     if _existing_monitor(pidfile) is not None:
         raise StarterError("a monitor recorded by this pidfile is already running")
-    try:
-        info = os.lstat(python)
-    except FileNotFoundError as exc:
-        raise StarterError(f"monitor Python is missing: {python}") from exc
-    if not stat.S_ISREG(info.st_mode) or not os.access(python, os.X_OK):
-        raise StarterError("monitor Python must be an executable regular file")
+    quality_starter._executable_entrypoint(python, "monitor Python")
+    if not math.isfinite(ready_timeout_seconds) or ready_timeout_seconds <= 0:
+        raise StarterError("monitor readiness timeout must be positive")
     forbidden = {"--once", "--test-max-polls", "--test-poll-interval-seconds"}
     if forbidden.intersection(monitor_arguments):
         raise StarterError("durable monitor cannot use bounded/test polling flags")
     if any(_SENSITIVE_RE.search(argument) for argument in monitor_arguments):
         raise StarterError("monitor argv appears to contain a credential")
+    campaign_root = _single_argument(monitor_arguments, "--campaign-root")
+    output_root = _single_argument(monitor_arguments, "--output-root")
+    driver_status = _single_argument(monitor_arguments, "--expected-driver-status")
+    learner_backend_values = [
+        monitor_arguments[index + 1]
+        for index, value in enumerate(monitor_arguments[:-1])
+        if value == "--learner-backend"
+    ]
+    if len(learner_backend_values) != 1 or learner_backend_values[0] not in {
+        "oci_nrt",
+        "lepton_job_v1",
+    }:
+        raise StarterError("monitor requires exactly one supported learner backend")
+    learner_backend = learner_backend_values[0]
+    ready_marker = Path(output_root) / "MONITOR_READY.json"
+    if ready_marker.exists() or ready_marker.is_symlink():
+        if not stat.S_ISREG(os.lstat(ready_marker).st_mode):
+            raise StarterError("monitor readiness marker is unsafe")
+        ready_marker.unlink()
+    if "--ready-marker" in monitor_arguments:
+        raise StarterError("monitor readiness marker is owned by the starter")
+    command_arguments = [
+        *monitor_arguments,
+        "--ready-marker",
+        str(ready_marker),
+    ]
     logfile.parent.mkdir(parents=True, exist_ok=True)
     try:
         log_info = os.lstat(logfile)
@@ -153,7 +272,7 @@ def start_monitor(
     )
     try:
         child = subprocess.Popen(
-            [str(python), str(MONITOR), *monitor_arguments],
+            [str(python), str(MONITOR), *command_arguments],
             stdin=subprocess.DEVNULL,
             stdout=log_descriptor,
             stderr=subprocess.STDOUT,
@@ -163,20 +282,44 @@ def start_monitor(
     finally:
         os.close(log_descriptor)
     try:
-        # Detect immediate argument/configuration failures without keeping the
-        # starter attached to the long-lived observer.
-        try:
-            return_code = child.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            return_code = None
-        if return_code is not None:
-            raise StarterError(
-                f"monitor exited during startup with status {return_code}"
+        deadline = time.monotonic() + ready_timeout_seconds
+        ready_document: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            return_code = child.poll()
+            if return_code is not None:
+                raise StarterError(
+                    f"monitor exited during startup with status {return_code}"
+                )
+            ready_document = _read_ready_marker(
+                ready_marker,
+                child_pid=child.pid,
+                campaign_root=campaign_root,
+                output_root=output_root,
+                driver_status=driver_status,
+                learner_backend=learner_backend,
             )
+            if ready_document is not None:
+                break
+            time.sleep(0.1)
+        if ready_document is None:
+            raise StarterError("monitor first healthy report timed out")
         start_ticks = _process_start_ticks(child.pid)
         if start_ticks is None:
             raise StarterError("cannot bind detached monitor process identity")
-        _atomic_pidfile(pidfile, child.pid, start_ticks)
+        _atomic_pidfile(
+            pidfile,
+            {
+                "schema": MONITOR_PID_SCHEMA,
+                "pid": child.pid,
+                "start_ticks": start_ticks,
+                "entrypoint": str(MONITOR),
+                "campaign_root": campaign_root,
+                "output_root": output_root,
+                "driver_status": driver_status,
+                "learner_backend": learner_backend,
+                "ready_marker": str(ready_marker),
+            },
+        )
         return {
             "status": "STARTED",
             "pid": child.pid,
@@ -184,6 +327,12 @@ def start_monitor(
             "pidfile": str(pidfile),
             "logfile": str(logfile),
             "monitor": str(MONITOR),
+            "campaign_root": campaign_root,
+            "output_root": output_root,
+            "driver_status": driver_status,
+            "learner_backend": learner_backend,
+            "ready_marker": str(ready_marker),
+            "ready": True,
             "interval_seconds": 1800,
             "read_only": True,
         }
@@ -192,16 +341,33 @@ def start_monitor(
         raise
 
 
-def _stop_bound_process(report: dict[str, object]) -> None:
-    """Roll back only the exact child created by this startup transaction."""
+def _stop_bound_process(
+    report: dict[str, object], *, graceful_timeout_seconds: float = 15.0
+) -> None:
+    """Gracefully drain only the exact child created by this transaction."""
 
     pid = report.get("pid")
     ticks = report.get("start_ticks")
     if type(pid) is int and type(ticks) is int and _process_start_ticks(pid) == ticks:
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGINT)
         except ProcessLookupError:
-            pass
+            return
+        deadline = time.monotonic() + graceful_timeout_seconds
+        while time.monotonic() < deadline:
+            if _process_start_ticks(pid) != ticks:
+                return
+            time.sleep(0.1)
+        if _process_start_ticks(pid) == ticks:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if _process_start_ticks(pid) != ticks:
+                    return
+                time.sleep(0.1)
 
 
 def start_production_observers(
@@ -230,6 +396,7 @@ def start_production_observers(
     evaluation_pidfile: Path,
     evaluation_logfile: Path,
     evaluation_ready_timeout_seconds: float,
+    monitor_ready_timeout_seconds: float = 180.0,
 ) -> dict[str, object]:
     """Start both required W&B bridges, await readiness, then their monitor."""
 
@@ -269,6 +436,21 @@ def start_production_observers(
         _stop_bound_process(quality)
         raise
     monitored_arguments = list(monitor_arguments)
+    expected_driver_pair = (
+        "--expected-driver-status",
+        str(quality_driver_status),
+    )
+    existing_driver_values = [
+        monitored_arguments[index + 1]
+        for index, value in enumerate(monitored_arguments[:-1])
+        if value == "--expected-driver-status"
+    ]
+    if existing_driver_values and existing_driver_values != [str(quality_driver_status)]:
+        _stop_bound_process(evaluation)
+        _stop_bound_process(quality)
+        raise StarterError("monitor driver status differs from both bridges")
+    if not existing_driver_values:
+        monitored_arguments.extend(expected_driver_pair)
     for required_pidfile in (quality_pidfile, evaluation_pidfile):
         pair = ("--required-process-pidfile", str(required_pidfile))
         if not any(
@@ -282,6 +464,7 @@ def start_production_observers(
             pidfile=pidfile,
             logfile=logfile,
             monitor_arguments=monitored_arguments,
+            ready_timeout_seconds=monitor_ready_timeout_seconds,
         )
     except BaseException:
         _stop_bound_process(evaluation)
@@ -327,6 +510,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluation-ready-timeout-seconds", type=float, default=45.0
     )
+    parser.add_argument("--monitor-ready-timeout-seconds", type=float, default=180.0)
     parser.add_argument("monitor_arguments", nargs=argparse.REMAINDER)
     return parser
 
@@ -381,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
             evaluation_ready_timeout_seconds=(
                 arguments.evaluation_ready_timeout_seconds
             ),
+            monitor_ready_timeout_seconds=arguments.monitor_ready_timeout_seconds,
         )
     except StarterError as exc:
         print(f"monitor starter failed: {exc}", file=sys.stderr)

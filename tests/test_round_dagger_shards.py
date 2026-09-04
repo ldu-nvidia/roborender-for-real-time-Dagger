@@ -1,6 +1,8 @@
+import fcntl
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -406,6 +408,184 @@ class RolloutArrayValidationTest(ArtifactTestCase):
 
 
 class CohortIntegrityTest(ArtifactTestCase):
+    def test_seal_waits_for_complete_payload_sidecar_publication(self):
+        self.create(ranks=(0,), envs=(0,), transitions=3)
+        sidecar_entered = threading.Event()
+        allow_sidecar = threading.Event()
+        sealer_started = threading.Event()
+        publisher_errors = []
+        sealer_errors = []
+        actual_publish = artifacts.publish_immutable_json
+        target = "rank-0000_rollout-00000007_part-0000.json"
+
+        def block_shard_sidecar(path, document):
+            if Path(path).name == target:
+                sidecar_entered.set()
+                if not allow_sidecar.wait(timeout=5):
+                    raise RuntimeError("test timed out waiting to publish sidecar")
+            return actual_publish(path, document)
+
+        def publish():
+            try:
+                self.publish(0, 0, (0,))
+            except BaseException as exc:  # surfaced in the asserting thread
+                publisher_errors.append(exc)
+
+        sealed = []
+
+        def seal():
+            try:
+                sealer_started.set()
+                sealed.append(artifacts.seal_cohort(self.cohort))
+            except BaseException as exc:  # surfaced in the asserting thread
+                sealer_errors.append(exc)
+
+        with mock.patch.object(
+            artifacts, "publish_immutable_json", side_effect=block_shard_sidecar
+        ):
+            publisher = threading.Thread(target=publish)
+            publisher.start()
+            self.assertTrue(sidecar_entered.wait(timeout=5))
+
+            sealer = threading.Thread(target=seal)
+            sealer.start()
+            self.assertTrue(sealer_started.wait(timeout=5))
+            self.assertTrue(sealer.is_alive())
+            self.assertFalse((self.cohort / artifacts.SEAL_FILENAME).exists())
+
+            allow_sidecar.set()
+            publisher.join(timeout=5)
+            sealer.join(timeout=5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(sealer.is_alive())
+        self.assertEqual(publisher_errors, [])
+        self.assertEqual(sealer_errors, [])
+        self.assertEqual(len(sealed), 1)
+        self.assertEqual(sealed[0], artifacts.verify_cohort(self.cohort))
+
+    def test_publisher_waiting_across_seal_rechecks_and_rejects_new_shard(self):
+        self.create(ranks=(0,), envs=(0,), transitions=3)
+        self.publish(0, 0, (0,))
+        seal_document = artifacts.seal_cohort(self.cohort)
+        seal_document.pop("cohort_sha256")
+        seal_document.pop("manifest_path")
+        seal_path = self.cohort / artifacts.SEAL_FILENAME
+        seal_path.unlink()
+
+        publisher_started = threading.Event()
+        publisher_errors = []
+
+        def publish_new_shard():
+            publisher_started.set()
+            try:
+                self.publish(0, 1, (0,), rollout_id=8)
+            except BaseException as exc:  # surfaced in the asserting thread
+                publisher_errors.append(exc)
+
+        contract_handle = (self.cohort / artifacts.CONTRACT_FILENAME).open("rb")
+        try:
+            fcntl.flock(contract_handle.fileno(), fcntl.LOCK_EX)
+            publisher = threading.Thread(target=publish_new_shard)
+            publisher.start()
+            self.assertTrue(publisher_started.wait(timeout=5))
+            artifacts.publish_immutable_json(seal_path, seal_document)
+        finally:
+            fcntl.flock(contract_handle.fileno(), fcntl.LOCK_UN)
+            contract_handle.close()
+
+        publisher.join(timeout=5)
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(len(publisher_errors), 1)
+        self.assertIsInstance(publisher_errors[0], artifacts.ArtifactError)
+        self.assertIn("after the cohort is sealed", str(publisher_errors[0]))
+        self.assertFalse(
+            (
+                self.cohort
+                / artifacts.SHARD_DIRECTORY
+                / "rank-0000_rollout-00000008_part-0001.npz"
+            ).exists()
+        )
+        self.assertEqual(artifacts.verify_cohort(self.cohort)["sealed"], True)
+
+    def test_seal_rejects_orphan_payload(self):
+        self.create(ranks=(0,), envs=(0,), transitions=3)
+        self.publish(0, 0, (0,))
+        (self.cohort / artifacts.SHARD_DIRECTORY / "orphan.npz").write_bytes(
+            b"unreferenced"
+        )
+        with self.assertRaisesRegex(
+            artifacts.ArtifactError, "inventory is not exact.*orphan.npz"
+        ):
+            artifacts.seal_cohort(self.cohort)
+
+    def test_seal_rejects_orphan_json_hidden_staging_and_special_entries(self):
+        cases = (
+            ("orphan.json", b"{}", "schema mismatch"),
+            (".payload.staging", b"partial", "unrecognized entry"),
+            ("unexpected.txt", b"operator data", "unrecognized entry"),
+        )
+        for index, (name, content, pattern) in enumerate(cases):
+            with self.subTest(name=name):
+                cohort = self.root / f"cohort-{index}"
+                artifacts.create_cohort(
+                    cohort,
+                    expected_ranks=(0,),
+                    expected_global_env_ids=(0,),
+                    expected_transitions=3,
+                    view_contract=VIEW_CONTRACT,
+                    action_contract=ACTION_CONTRACT,
+                    **IDENTITY,
+                    **SHA,
+                )
+                artifacts.publish_rollout_shard(
+                    cohort,
+                    rank=0,
+                    rollout_id=7,
+                    part_index=0,
+                    arrays=rollout_arrays((0,)),
+                    **IDENTITY,
+                    **SHA,
+                )
+                (cohort / artifacts.SHARD_DIRECTORY / name).write_bytes(content)
+                with self.assertRaisesRegex(artifacts.ArtifactError, pattern):
+                    artifacts.seal_cohort(cohort)
+
+        special = self.root / "cohort-special"
+        artifacts.create_cohort(
+            special,
+            expected_ranks=(0,),
+            expected_global_env_ids=(0,),
+            expected_transitions=3,
+            view_contract=VIEW_CONTRACT,
+            action_contract=ACTION_CONTRACT,
+            **IDENTITY,
+            **SHA,
+        )
+        artifacts.publish_rollout_shard(
+            special,
+            rank=0,
+            rollout_id=7,
+            part_index=0,
+            arrays=rollout_arrays((0,)),
+            **IDENTITY,
+            **SHA,
+        )
+        (special / artifacts.SHARD_DIRECTORY / "unexpected.json").mkdir()
+        with self.assertRaisesRegex(artifacts.ArtifactError, "non-regular entry"):
+            artifacts.seal_cohort(special)
+
+    def test_verify_rejects_file_added_after_seal(self):
+        self.create(ranks=(0,), envs=(0,), transitions=3)
+        self.publish(0, 0, (0,))
+        artifacts.seal_cohort(self.cohort)
+        extra = self.cohort / artifacts.SHARD_DIRECTORY / "orphan.npz"
+        extra.write_bytes(b"post-seal contamination")
+        with self.assertRaisesRegex(
+            artifacts.ArtifactError, "inventory is not exact.*orphan.npz"
+        ):
+            artifacts.verify_cohort(self.cohort)
+
     def test_seal_requires_exact_rank_environment_and_transition_coverage(self):
         self.create()
         self.publish(0, 0, (0, 1))

@@ -1,8 +1,10 @@
 # Lepton campaign archive transport
 
-The reserved H200 Dev Pod is not reachable from the RTX workstation over
-direct SSH.  Campaign handoff therefore uses the authenticated Lepton Web
-terminal transport.  The transport sends one deterministic `tar+gzip` archive
+The reserved-node control Deployment `leo-cosmos-h200-dev` is not reachable
+from the RTX workstation over direct SSH. It is the authenticated transfer and
+lifecycle gateway; the learner itself runs as a private Lepton Job on the same
+one-node/eight-H200 reservation. Campaign handoff therefore uses the Lepton Web
+terminal transport. The transport sends one deterministic `tar+gzip` archive
 instead of issuing a remote command for every replay file.
 
 The implementation is

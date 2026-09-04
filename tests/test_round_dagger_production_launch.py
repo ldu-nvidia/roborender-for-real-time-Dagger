@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -27,6 +28,9 @@ from tests.policy_bundle_helpers import publish_policy_bundle
 ROOT = Path(__file__).resolve().parents[1]
 CAMPAIGN_CONTRACT = ROOT / "configs/round_dagger/production_campaign_256x512.json"
 LEARNER_CONTRACT = ROOT / "configs/round_dagger/production_learner_8xh100_1200.json"
+PORTABLE_LEARNER_CONTRACT = (
+    ROOT / "configs/round_dagger/production_learner_8rank_1200.json"
+)
 SOURCE_SHA = "a" * 64
 RUNTIME_SHA = "b" * 64
 EVALUATION_CONFIG_SHA = (
@@ -67,7 +71,10 @@ class ProductionLaunchTests(unittest.TestCase):
         }
 
     def _materialize_campaign_learner_contract(
-        self, campaign_root: Path
+        self,
+        campaign_root: Path,
+        *,
+        base_contract: Path = LEARNER_CONTRACT,
     ) -> Path:
         """Create a self-contained heldout-bound learner contract fixture."""
 
@@ -111,7 +118,7 @@ class ProductionLaunchTests(unittest.TestCase):
         heldout_path = campaign_root / "heldout_snapshot.json"
         heldout = replay.build_heldout_snapshot([cohort], output=heldout_path)
 
-        contract = artifacts.load_strict_json(LEARNER_CONTRACT)
+        contract = artifacts.load_strict_json(base_contract)
         contract["heldout_evaluation"] = {
             "snapshot_path": str(heldout_path),
             "snapshot_file_sha256": heldout["file_sha256"],
@@ -336,6 +343,7 @@ class ProductionLaunchTests(unittest.TestCase):
         campaign_code_sha: str = SOURCE_SHA,
         learner_config_sha: str | None = None,
         evaluation_source_root: Path = ROOT,
+        learner_contract_base: Path = LEARNER_CONTRACT,
     ) -> tuple[Path, Path]:
         campaign_contract, _, _, runtime_contract_sha = (
             self._materialized_campaign_fixture(
@@ -344,7 +352,8 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         root = self.base / "campaign"
         campaign_learner_contract = self._materialize_campaign_learner_contract(
-            root
+            root,
+            base_contract=learner_contract_base,
         )
         self.campaign_learner_contract = campaign_learner_contract
         learner_deployment_sha = artifacts.sha256_file(
@@ -421,7 +430,7 @@ class ProductionLaunchTests(unittest.TestCase):
             "promote": None,
         }
         orchestration = {
-            "schema": "fast_roborender.round_dagger.orchestration_config.v3",
+            "schema": "fast_roborender.round_dagger.orchestration_config.v5",
             "campaign_root": str(root),
             "actor_root": str(root / "actors"),
             "macro_round": 0,
@@ -432,6 +441,9 @@ class ProductionLaunchTests(unittest.TestCase):
             "learner_config_sha256": learner_config_sha or derived_bundle_sha,
             "learner_model_lineage_sha256": active["checkpoint_sha256"],
             "evaluator_config_sha256": EVALUATION_CONFIG_SHA,
+            "learner_backend": "oci_nrt",
+            "learner_backend_contract_sha256": learner_deployment_sha,
+            "advance_after_rejected_evaluation": True,
             "hooks": hooks,
         }
         config_path = self.base / "macro-round-000000.json"
@@ -486,9 +498,12 @@ class ProductionLaunchTests(unittest.TestCase):
             "gr00t_revision": nested_revision,
         }
 
-    def test_checked_in_contracts_pin_exact_production_topology_and_learner(self) -> None:
+    def test_checked_in_contracts_pin_canonical_lepton_training_and_legacy_oci(self) -> None:
         campaign = production_launch.load_campaign_contract(CAMPAIGN_CONTRACT)
         learner = production_launch.load_learner_contract(LEARNER_CONTRACT)
+        portable = production_launch.load_learner_contract(
+            PORTABLE_LEARNER_CONTRACT
+        )
         self.assertEqual(campaign["topology"]["transitions_per_macro_round"], 131072)
         self.assertEqual(
             campaign["schema"],
@@ -563,6 +578,21 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertEqual(learner["cluster"]["account"], "general_cs_infra__ngcsre")
         self.assertEqual(learner["cluster"]["partition"], "batch_singlenode")
         self.assertEqual(learner["cluster"]["qos"], "normal")
+        self.assertEqual(
+            portable["schema"],
+            "fast_roborender.round_dagger.production_learner_contract.v2",
+        )
+        self.assertEqual(portable["allocation"]["world_size"], 8)
+        self.assertNotIn("cluster", portable)
+        self.assertNotIn("container", portable)
+        self.assertIsNone(production_launch.learner_contract_backend(portable))
+        self.assertEqual(
+            production_launch.learner_contract_backend(learner), "oci_nrt"
+        )
+        self.assertEqual(
+            production_launch._parser().get_default("learner_backend"),
+            "lepton_job_v1",
+        )
 
     def test_campaign_owned_learner_contract_is_canonical_immutable_and_hashed(
         self,
@@ -576,11 +606,22 @@ class ProductionLaunchTests(unittest.TestCase):
             contract_path,
             campaign_root=campaign_root,
             expected_sha256=expected_sha,
+            expected_backend="oci_nrt",
         )
         self.assertEqual(observed_sha, expected_sha)
         self.assertEqual(
             loaded, production_launch.load_learner_contract(contract_path)
         )
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "portable v2",
+        ):
+            production_launch.load_campaign_owned_learner_contract(
+                contract_path,
+                campaign_root=campaign_root,
+                expected_sha256=expected_sha,
+                expected_backend="lepton_job_v1",
+            )
 
         alternate = campaign_root / "alternate.json"
         alternate.write_bytes(contract_path.read_bytes())
@@ -592,6 +633,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 alternate,
                 campaign_root=campaign_root,
                 expected_sha256=expected_sha,
+                expected_backend="oci_nrt",
             )
 
         contract_path.chmod(0o400)
@@ -602,6 +644,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 contract_path,
                 campaign_root=campaign_root,
                 expected_sha256=expected_sha,
+                expected_backend="oci_nrt",
             )
         contract_path.chmod(0o444)
         with self.assertRaisesRegex(
@@ -611,6 +654,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 contract_path,
                 campaign_root=campaign_root,
                 expected_sha256="f" * 64,
+                expected_backend="oci_nrt",
             )
 
         unbound_root = self.base / "unbound-contract-campaign"
@@ -627,6 +671,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 unbound_path,
                 campaign_root=unbound_root,
                 expected_sha256=artifacts.sha256_file(unbound_path),
+                expected_backend="oci_nrt",
             )
 
     def test_source_owned_paths_rebind_to_the_executing_repository(self) -> None:
@@ -757,6 +802,129 @@ class ProductionLaunchTests(unittest.TestCase):
                         evaluation_source_report=report,
                     )
 
+    def test_execution_source_parity_allows_platform_inventory_difference(self) -> None:
+        identity = {
+            "fast_roborender_revision": "1" * 40,
+            "fast_roborender_source_tree_sha256": "2" * 64,
+            "gr00t_revision": "3" * 40,
+            "gr00t_source_tree_sha256": "4" * 64,
+        }
+        learner = {
+            **identity,
+            "root": "/workspace/projects/roborender/src/fast_roborender",
+            "inventory_sha256": "5" * 64,
+        }
+        rtx = {
+            **identity,
+            "root": "/mnt/data2/ldu/snapshots/fast_roborender",
+            "inventory_sha256": "6" * 64,
+        }
+        self.assertEqual(
+            production_launch._verify_execution_source_parity(
+                learner_source_report=learner,
+                rtx_execution_source_report=rtx,
+            ),
+            identity,
+        )
+
+    def test_execution_source_parity_rejects_old12b9_vs_30310ce(self) -> None:
+        learner = {
+            "fast_roborender_revision": (
+                "30310cef287a0fb1b5bf748aef7ff09bdebfba4e"
+            ),
+            "fast_roborender_source_tree_sha256": (
+                "30d5bb22ba4ec97237165098c41c78d84c71a97df8dddc4355afd3b3cc58d638"
+            ),
+            "gr00t_revision": "9dd746d7fe86cbc09f20546695ab46bec609a3ea",
+            "gr00t_source_tree_sha256": (
+                "57de89b06a2edc531a02ca81076e760ec8a4027f5483120a3a8046f9ef1df335"
+            ),
+        }
+        old_rtx = {
+            "fast_roborender_revision": (
+                "12b9c6022aba15bbe5f0e73816362968dbac6111"
+            ),
+            "fast_roborender_source_tree_sha256": (
+                "f228f98006a96fa3aeebb53a3a43d2e8ac7a7483fd48edbab78ad619002c00e9"
+            ),
+            "gr00t_revision": learner["gr00t_revision"],
+            "gr00t_source_tree_sha256": learner[
+                "gr00t_source_tree_sha256"
+            ],
+        }
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "RTX execution/learner fast_roborender revision mismatch",
+        ):
+            production_launch._verify_execution_source_parity(
+                learner_source_report=learner,
+                rtx_execution_source_report=old_rtx,
+            )
+
+    def test_historical_capture_source_can_precede_current_execution_source(
+        self,
+    ) -> None:
+        historical_root = Path("/mnt/data2/ldu/history/fast_roborender")
+        split_relative = Path("GR00T-VisualSim2Real/data/split.json")
+        plan_relative = Path("configs/heldout.json")
+        old_revision = "12b9c6022aba15bbe5f0e73816362968dbac6111"
+        old_inventory = "5" * 64
+        nested_revision = "9dd746d7fe86cbc09f20546695ab46bec609a3ea"
+        nested_tree = "7" * 64
+        historical_report = {
+            "root": str(historical_root),
+            "inventory_sha256": old_inventory,
+            "fast_roborender_revision": old_revision,
+            "fast_roborender_source_tree_sha256": "8" * 64,
+            "gr00t_revision": nested_revision,
+            "gr00t_source_tree_sha256": nested_tree,
+        }
+        current_report = {
+            "root": "/mnt/data2/ldu/current/fast_roborender",
+            "inventory_sha256": "9" * 64,
+            "fast_roborender_revision": (
+                "30310cef287a0fb1b5bf748aef7ff09bdebfba4e"
+            ),
+            "fast_roborender_source_tree_sha256": "a" * 64,
+            "gr00t_revision": nested_revision,
+            "gr00t_source_tree_sha256": nested_tree,
+        }
+        campaign = {
+            "motion_split": {
+                "manifest_relative_path": split_relative.as_posix(),
+                "heldout_plan_relative_path": plan_relative.as_posix(),
+            }
+        }
+        runtime = {
+            "live_capture": {
+                "split_manifest_path": str(historical_root / split_relative),
+                "heldout_plan_path": str(historical_root / plan_relative),
+            },
+            "capture_provenance": {
+                "actor_source_inventory_sha256": old_inventory,
+                "evaluation_source_inventory_sha256": old_inventory,
+                "fast_roborender_revision": old_revision,
+                "gr00t_revision": nested_revision,
+                "gr00t_source_tree_sha256": nested_tree,
+            },
+        }
+        with mock.patch.object(
+            production_launch,
+            "_verify_local_evaluation_seal",
+            return_value=historical_report,
+        ) as verify_historical:
+            observed = production_launch._verify_historical_capture_source(
+                campaign_contract=campaign,
+                runtime_contract=runtime,
+                rtx_execution_source_report=current_report,
+            )
+        verify_historical.assert_called_once_with(
+            historical_root,
+            old_inventory,
+            campaign_contract=campaign,
+        )
+        self.assertEqual(observed, historical_report)
+
     def test_build_environment_forces_legacy_runtime_adapter(self) -> None:
         # Read the checked-in documents directly so this unit gate remains
         # runnable from a clean isolated worktree whose absolute path differs
@@ -772,12 +940,23 @@ class ProductionLaunchTests(unittest.TestCase):
             evaluation_source_inventory_sha256="b" * 64,
             sealed_teacher_checkpoint="/local/sealed/evaluation/teacher.pt",
             learner_contract_sha256="c" * 64,
+            learner_backend="oci_nrt",
         )
         self.assertEqual(
             environment["ROUND_DAGGER_RUNTIME_ADAPTER_MODE"], "legacy"
         )
         self.assertEqual(
             environment["IMAGE_DAGGER_EXPECT_ANCHOR_SOURCE"], "simulator_rgb"
+        )
+        self.assertEqual(
+            campaign["wandb"]["project"], "roborender-round-dagger"
+        )
+        self.assertEqual(
+            learner["wandb"]["project"], "lepton-dagger-production-1"
+        )
+        self.assertEqual(
+            environment["ROUND_DAGGER_WANDB_PROJECT"],
+            "lepton-dagger-production-1",
         )
         self.assertEqual(
             environment["ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"],
@@ -806,8 +985,30 @@ class ProductionLaunchTests(unittest.TestCase):
             ["ROUND_DAGGER_RUNTIME_ADAPTER_MODE"],
         )
 
+    def test_build_environment_rejects_unreviewed_wandb_deployment_routing(self) -> None:
+        campaign, _, _, _ = self._materialized_campaign_fixture()
+        learner = json.loads(LEARNER_CONTRACT.read_text(encoding="utf-8"))
+        learner["wandb"]["project"] = "unreviewed-project"
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "learner W&B deployment project",
+        ):
+            production_launch.build_environment(
+                campaign,
+                learner,
+                sealed_source_root="/remote/sealed/source",
+                sealed_source_inventory_sha256="a" * 64,
+                evaluation_source_root="/local/sealed/evaluation",
+                evaluation_source_inventory_sha256="b" * 64,
+                sealed_teacher_checkpoint="/local/sealed/evaluation/teacher.pt",
+                learner_contract_sha256="c" * 64,
+                learner_backend="oci_nrt",
+            )
+
     def test_lepton_request_identity_uses_backend_image_not_oci_container(self) -> None:
-        root, orchestration = self._campaign_and_orchestration()
+        root, orchestration = self._campaign_and_orchestration(
+            learner_contract_base=PORTABLE_LEARNER_CONTRACT
+        )
         campaign, _, _, _ = self._materialized_campaign_fixture()
         learner = production_launch.load_learner_contract(
             self.campaign_learner_contract
@@ -823,12 +1024,16 @@ class ProductionLaunchTests(unittest.TestCase):
             learner_contract_sha256=artifacts.sha256_file(
                 self.campaign_learner_contract
             ),
+            learner_backend="lepton_job_v1",
         )
         active = load_state(root)["active_policy"]
         checkpoint = root / active["checkpoint_path"]
         replay_snapshot = root / "replay/snapshot_round_000000.json"
         replay_snapshot.parent.mkdir(parents=True, exist_ok=True)
         replay_snapshot.write_text("{}\n", encoding="utf-8")
+        scene_manifest = root / "scene_samples/manifest.json"
+        scene_manifest.parent.mkdir(parents=True, exist_ok=True)
+        scene_manifest.write_text("{}\n", encoding="utf-8")
         output = root / "learner/macro_round_000000"
         environment.update(
             {
@@ -863,6 +1068,11 @@ class ProductionLaunchTests(unittest.TestCase):
                 "ROUND_DAGGER_LEARNER_CONTRACT": str(
                     self.campaign_learner_contract
                 ),
+                "ROUND_DAGGER_BETA": "0.5",
+                "ROUND_DAGGER_BETA_SHA256": artifacts.canonical_json_sha256(
+                    {"beta": 0.5}
+                ),
+                "ROUND_DAGGER_SCENE_SAMPLE_MANIFEST": str(scene_manifest),
             }
         )
         contract = lepton_job.load_contract(
@@ -910,7 +1120,10 @@ class ProductionLaunchTests(unittest.TestCase):
             source_environment=environment,
         )
         self.assertEqual(request.identity_sha256, identity)
-        self.assertNotEqual(contract.image_digest, learner["container"]["sha256"])
+        self.assertNotIn("cluster", learner)
+        self.assertNotIn("container", learner)
+        self.assertNotIn("ROUND_DAGGER_REMOTE_HOST", environment)
+        self.assertNotIn("ROUND_DAGGER_REMOTE_SLURM_BIN", environment)
         self.assertEqual(
             request.environment["ROUND_DAGGER_LEARNER_IDENTITY_SHA256"],
             identity,
@@ -936,9 +1149,8 @@ class ProductionLaunchTests(unittest.TestCase):
             "status": "PASS",
             "root": "/lustre/fs1/portfolios/general/projects/general_cs_infra__ngcsre/users/ldu/roborender_h100_build/src_snapshots/fast_roborender_source",
             "inventory_sha256": SOURCE_SHA,
-            # The learner may advance independently from the already sealed
-            # RTX capture/evaluation source.
-            "fast_roborender_revision": "9" * 40,
+            "fast_roborender_revision": "1" * 40,
+            "fast_roborender_source_tree_sha256": "8" * 64,
             "gr00t_revision": "2" * 40,
             "gr00t_source_tree_sha256": "4" * 64,
         }
@@ -961,7 +1173,11 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         local_seal_report = {
             "root": str(local_sealed_root),
+            "inventory_sha256": evaluation_inventory_sha,
             "fast_roborender_revision": "1" * 40,
+            "fast_roborender_source_tree_sha256": "8" * 64,
+            "gr00t_revision": "2" * 40,
+            "gr00t_source_tree_sha256": "4" * 64,
             "sealed_teacher_checkpoint": str(sealed_teacher),
             "sealed_teacher_sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38",
         }
@@ -1002,6 +1218,7 @@ class ProductionLaunchTests(unittest.TestCase):
                 learner_contract_sha256=artifacts.sha256_file(
                     self.campaign_learner_contract
                 ),
+                learner_backend="oci_nrt",
                 sealed_source_root=source_report["root"],
                 sealed_source_inventory_sha256=SOURCE_SHA,
                 evaluation_sealed_source_root=local_sealed_root,
@@ -1076,10 +1293,15 @@ class ProductionLaunchTests(unittest.TestCase):
         )
         self.assertNotIn("ROUND_DAGGER_RUNTIME_ADAPTER_SHADOW_ACK", environment)
         self.assertEqual(
-            environment["ROUND_DAGGER_FAST_ROBORENDER_REVISION"], "9" * 40
+            environment["ROUND_DAGGER_FAST_ROBORENDER_REVISION"], "1" * 40
         )
-        self.assertEqual(plan["learner_source_revision"], "9" * 40)
+        self.assertEqual(plan["learner_source_revision"], "1" * 40)
         self.assertEqual(plan["evaluation_source_revision"], "1" * 40)
+        self.assertEqual(plan["historical_capture_source_revision"], "1" * 40)
+        self.assertEqual(
+            plan["historical_capture_source_inventory_sha256"],
+            evaluation_inventory_sha,
+        )
         self.assertEqual(environment["ROUND_DAGGER_GR00T_REVISION"], "2" * 40)
         self.assertEqual(
             environment["ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256"], "4" * 64
@@ -1173,7 +1395,7 @@ class ProductionLaunchTests(unittest.TestCase):
         document = artifacts.load_strict_json(orchestration)
         document.update(
             {
-                "schema": "fast_roborender.round_dagger.orchestration_config.v4",
+                "schema": "fast_roborender.round_dagger.orchestration_config.v5",
                 "learner_backend": "lepton_job_v1",
                 "learner_backend_contract_sha256": "f" * 64,
             }
@@ -1240,6 +1462,9 @@ class ProductionLaunchTests(unittest.TestCase):
         document["schema"] = "fast_roborender.round_dagger.orchestration_config.v1"
         document.pop("macro_round_count")
         document.pop("campaign_contract_sha256")
+        document.pop("learner_backend")
+        document.pop("learner_backend_contract_sha256")
+        document.pop("advance_after_rejected_evaluation")
         legacy = self.base / "legacy-unbounded-orchestration.json"
         legacy.write_text(
             json.dumps(document, indent=2, sort_keys=True) + "\n",
@@ -1255,6 +1480,34 @@ class ProductionLaunchTests(unittest.TestCase):
                 production_launch.load_campaign_contract(CAMPAIGN_CONTRACT),
                 production_launch.load_learner_contract(LEARNER_CONTRACT),
                 artifacts.sha256_file(LEARNER_CONTRACT),
+                SOURCE_SHA,
+                SOURCE_SHA,
+                ROOT,
+            )
+
+    def test_production_rejects_v4_without_rejection_transition_policy(self) -> None:
+        _, orchestration = self._campaign_and_orchestration()
+        document = artifacts.load_strict_json(orchestration)
+        document["schema"] = "fast_roborender.round_dagger.orchestration_config.v4"
+        document.pop("advance_after_rejected_evaluation")
+        orchestration.chmod(0o644)
+        orchestration.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        orchestration.chmod(0o444)
+        materialized, _, _, _ = self._materialized_campaign_fixture()
+        with self.assertRaisesRegex(
+            production_launch.ProductionLaunchError,
+            "explicitly advance after an attested rejected evaluation",
+        ):
+            production_launch._validate_orchestration_and_campaign(
+                orchestration,
+                materialized,
+                production_launch.load_learner_contract(
+                    self.campaign_learner_contract
+                ),
+                artifacts.sha256_file(self.campaign_learner_contract),
                 SOURCE_SHA,
                 SOURCE_SHA,
                 ROOT,
@@ -1608,6 +1861,13 @@ class ProductionLaunchTests(unittest.TestCase):
         self.assertIn("learner contract mode must be exactly 0444", script)
         self.assertIn("learner contract SHA-256 mismatch", script)
         self.assertIn("unset WANDB_API_KEY", script)
+        self.assertIn(
+            'BASELINE_SCRIPT="$ROOT/scripts/round_dagger/run_policy_v0_baseline_docker.sh"',
+            script,
+        )
+        self.assertNotIn(
+            'BASELINE_SCRIPT="$EVALUATION_SEALED_SOURCE_ROOT/', script
+        )
         self.assertIn('exec "$PYTHON" "$ORCHESTRATOR"', script)
         self.assertIn('PYTHON_REAL=$(realpath -e -- "$PYTHON")', script)
         self.assertNotIn("PYTHON=$PYTHON_REAL", script)
@@ -1616,6 +1876,52 @@ class ProductionLaunchTests(unittest.TestCase):
             text = contract.read_text()
             self.assertNotIn("wandb_v1_", text)
             self.assertNotIn("WANDB_API_KEY", text)
+            expected_project = (
+                "roborender-round-dagger"
+                if contract == CAMPAIGN_CONTRACT
+                else "lepton-dagger-production-1"
+            )
+            self.assertIn(f'"project": "{expected_project}"', text)
+
+    def test_lepton_source_verifier_disables_remote_bytecode_writes(self) -> None:
+        root = "/workspace/projects/roborender/src/fast_roborender"
+        inventory_sha256 = "a" * 64
+        backend_contract = SimpleNamespace(
+            source_root=Path(root),
+            source_inventory_sha256=inventory_sha256,
+            sha256="b" * 64,
+            python=Path("/workspace/projects/roborender/envs/h200/bin/python"),
+            source_verifier=Path(
+                "/workspace/projects/roborender/src/fast_roborender/"
+                "scripts/round_dagger/verify_source.py"
+            ),
+            document={"orchestration": {"control_deployment": "control"}},
+        )
+        report = {
+            "schema": production_launch.SEALED_REPORT_SCHEMA,
+            "status": "PASS",
+            "root": root,
+            "inventory_sha256": inventory_sha256,
+            "fast_roborender_revision": "1" * 40,
+            "gr00t_revision": "2" * 40,
+        }
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps(report))
+        with mock.patch.object(
+            production_launch.subprocess, "run", return_value=completed
+        ) as run:
+            observed = production_launch._verify_lepton_remote_source(
+                root,
+                inventory_sha256,
+                backend_contract=backend_contract,
+                remote_backend_contract=(
+                    "/workspace/projects/roborender/manifests/backend.json"
+                ),
+                control_exec_program=Path("/mnt/data1/ldu/lepton_pod_exec.py"),
+                sdk_python=Path("/mnt/data2/ldu/roborender_lepton_control/env/bin/python"),
+            )
+        self.assertEqual(observed, report)
+        remote_command = run.call_args.args[0][-1]
+        self.assertIn("env PYTHONDONTWRITEBYTECODE=1", remote_command)
 
 
 if __name__ == "__main__":

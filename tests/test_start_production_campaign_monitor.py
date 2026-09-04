@@ -23,19 +23,30 @@ class StartProductionCampaignMonitorTests(unittest.TestCase):
         self.python = self.base / "python"
         self.python.write_text("#!/bin/sh\n", encoding="utf-8")
         self.python.chmod(0o500)
+        self.output = self.base / "output"
+        self.output.mkdir()
+
+    def _monitor_arguments(self) -> list[str]:
+        return [
+            "--campaign-root", str(self.base / "campaign"),
+            "--output-root", str(self.output),
+            "--expected-driver-status", str(self.base / "driver.json"),
+            "--learner-backend", "oci_nrt",
+        ]
 
     def test_detaches_and_records_bound_process_identity(self) -> None:
         child = mock.Mock(pid=321)
-        child.wait.side_effect = __import__("subprocess").TimeoutExpired("monitor", 0.5)
+        child.poll.return_value = None
         with (
             mock.patch.object(starter.subprocess, "Popen", return_value=child) as popen,
             mock.patch.object(starter, "_process_start_ticks", return_value=987),
+            mock.patch.object(starter, "_read_ready_marker", return_value={}),
         ):
             report = starter.start_monitor(
                 python=self.python,
                 pidfile=self.base / "monitor.pid.json",
                 logfile=self.base / "monitor.log",
-                monitor_arguments=["--campaign-root", "/campaign"],
+                monitor_arguments=self._monitor_arguments(),
             )
         self.assertEqual(report["pid"], 321)
         self.assertTrue(report["read_only"])
@@ -62,35 +73,29 @@ class StartProductionCampaignMonitorTests(unittest.TestCase):
 
     def test_identity_binding_failure_reaps_detached_monitor(self) -> None:
         child = mock.Mock(pid=321)
-        child.wait.side_effect = [
-            __import__("subprocess").TimeoutExpired("monitor", 0.5),
-            0,
-        ]
         child.poll.return_value = None
         with (
             mock.patch.object(starter.subprocess, "Popen", return_value=child),
             mock.patch.object(starter, "_process_start_ticks", return_value=None),
+            mock.patch.object(starter, "_read_ready_marker", return_value={}),
         ):
             with self.assertRaisesRegex(starter.StarterError, "cannot bind"):
                 starter.start_monitor(
                     python=self.python,
                     pidfile=self.base / "monitor.pid.json",
                     logfile=self.base / "monitor.log",
-                    monitor_arguments=["--campaign-root", "/campaign"],
+                    monitor_arguments=self._monitor_arguments(),
                 )
         child.terminate.assert_called_once()
         child.wait.assert_called()
 
     def test_pidfile_publication_failure_reaps_detached_monitor(self) -> None:
         child = mock.Mock(pid=321)
-        child.wait.side_effect = [
-            __import__("subprocess").TimeoutExpired("monitor", 0.5),
-            0,
-        ]
         child.poll.return_value = None
         with (
             mock.patch.object(starter.subprocess, "Popen", return_value=child),
             mock.patch.object(starter, "_process_start_ticks", return_value=987),
+            mock.patch.object(starter, "_read_ready_marker", return_value={}),
             mock.patch.object(starter, "_atomic_pidfile", side_effect=OSError("disk")),
         ):
             with self.assertRaises(OSError):
@@ -98,7 +103,7 @@ class StartProductionCampaignMonitorTests(unittest.TestCase):
                     python=self.python,
                     pidfile=self.base / "monitor.pid.json",
                     logfile=self.base / "monitor.log",
-                    monitor_arguments=["--campaign-root", "/campaign"],
+                    monitor_arguments=self._monitor_arguments(),
                 )
         child.terminate.assert_called_once()
         child.wait.assert_called()
@@ -261,11 +266,13 @@ class StartProductionCampaignMonitorTests(unittest.TestCase):
     def test_rollback_signals_only_the_exact_pid_start_tick_identity(self) -> None:
         report = {"pid": 400, "start_ticks": 500}
         with (
-            mock.patch.object(starter, "_process_start_ticks", return_value=500),
+            mock.patch.object(
+                starter, "_process_start_ticks", side_effect=[500, None]
+            ),
             mock.patch.object(starter.os, "kill") as kill,
         ):
             starter._stop_bound_process(report)
-        kill.assert_called_once_with(400, starter.signal.SIGTERM)
+        kill.assert_called_once_with(400, starter.signal.SIGINT)
 
         with (
             mock.patch.object(starter, "_process_start_ticks", return_value=501),

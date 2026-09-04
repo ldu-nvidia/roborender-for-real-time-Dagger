@@ -12,6 +12,7 @@ from unittest import mock
 from round_dagger.checkpoint_compat import (
     CheckpointCompatibilityError,
     load_hash_pinned_policy_state_dict,
+    load_hash_pinned_restart_document,
     load_restricted_restart_document,
 )
 
@@ -171,6 +172,36 @@ class HashPinnedCheckpointCompatibilityTest(unittest.TestCase):
         for name, value in state.items():
             torch.testing.assert_close(loaded[name], value, rtol=0, atol=0)
         self.assertEqual(checkpoint.read_bytes(), original)
+
+    def test_hash_pinned_restart_document_retains_actor_provenance(self):
+        """RTX warm-start needs controller provenance, not just model weights."""
+
+        checkpoint = self.root / "candidate_with_controller.pt"
+        state = {"weight": torch.arange(4, dtype=torch.float32)}
+        controller_sha = {"walk": "a" * 64, "stand": "b" * 64}
+        torch.save(
+            {
+                "schema": "fast_roborender.round_dagger.learner_checkpoint.v3",
+                "policy_state_dict": state,
+                "homie_controller_sha256": controller_sha,
+                "rng_states": [{"numpy": np.random.get_state()}],
+            },
+            checkpoint,
+        )
+        expected = self._sha256(checkpoint)
+        loaded = load_hash_pinned_restart_document(
+            checkpoint,
+            expected_sha256=expected,
+        )
+        self.assertEqual(loaded["homie_controller_sha256"], controller_sha)
+        torch.testing.assert_close(
+            loaded["policy_state_dict"]["weight"], state["weight"]
+        )
+        with self.assertRaisesRegex(CheckpointCompatibilityError, "SHA-256 mismatch"):
+            load_hash_pinned_restart_document(
+                checkpoint,
+                expected_sha256="0" * 64,
+            )
 
     def test_hash_mismatch_and_symlink_fail_before_deserialization(self):
         checkpoint = self.root / "policy.pt"

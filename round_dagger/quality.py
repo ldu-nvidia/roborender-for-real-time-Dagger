@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ import numpy as np
 from .artifacts import (
     ArtifactError,
     canonical_json_sha256,
+    load_strict_json,
     publish_immutable_json,
     sha256_file,
     visit_verified_cohort_shards,
@@ -31,6 +33,9 @@ from .artifacts import (
 
 
 QUALITY_SCHEMA = "fast_roborender.round_dagger.student_quality.v1"
+QUALITY_RECOVERY_SCHEMA = (
+    "fast_roborender.round_dagger.student_quality_recovery.v1"
+)
 LEARNED_ACTION_DIMENSIONS = 11
 LINEAGE_FIELDS = (
     "campaign_id",
@@ -52,9 +57,121 @@ SHA256_FIELDS = {
     "config_sha256",
 }
 
+# Cohort 00 of the first production run was finalized before trusted host
+# hooks pinned their Python/NumPy runtime.  NumPy 2.3 and the subsequently
+# pinned NumPy 2.0 use different pairwise-reduction trees for these two means;
+# on that exact cohort each result differs by one binary64 ULP.  No other
+# quality field is reduction-runtime compatible: accepting even a one-ULP
+# difference elsewhere would hide corruption or semantic drift.
+_LEGACY_REDUCTION_COMPATIBLE_METRICS = frozenset(
+    {
+        "student_quality/action_cosine_similarity_mean",
+        "student_quality/action_l2_mean",
+    }
+)
+
 
 class StudentQualityError(RuntimeError):
     """A cohort cannot support trustworthy student-quality telemetry."""
+
+
+def _load_optional_regular_json(path: Path) -> dict[str, Any] | None:
+    """Load an existing immutable document without following a symlink."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise StudentQualityError(
+            f"cannot inspect existing quality artifact {path}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise StudentQualityError(
+            f"existing quality artifact is not a regular file: {path}"
+        )
+    if info.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+        raise StudentQualityError(
+            f"existing quality artifact is not immutable: {path}"
+        )
+    try:
+        value = load_strict_json(path)
+    except (ArtifactError, OSError) as exc:
+        raise StudentQualityError(
+            f"existing quality artifact is invalid: {path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise StudentQualityError(
+            f"existing quality artifact is not an object: {path}"
+        )
+    if sha256_file(path) != canonical_json_sha256(value):
+        raise StudentQualityError(
+            f"existing quality artifact is not canonical JSON: {path}"
+        )
+    return value
+
+
+def _verify_legacy_reduction_compatibility(
+    existing: Mapping[str, Any], recomputed: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Require exact identity except two explicitly known one-ULP means.
+
+    This is intentionally narrower than an epsilon comparison.  It preserves
+    a pre-runtime-pin immutable quality artifact while still rejecting schema,
+    lineage, shard, count, ordering, type, and metric drift.
+    """
+
+    accepted: list[dict[str, Any]] = []
+
+    def compare(left: Any, right: Any, path: tuple[str | int, ...]) -> None:
+        if type(left) is not type(right):
+            raise StudentQualityError(
+                "existing quality artifact type mismatch at "
+                + "/".join(map(str, path))
+            )
+        if isinstance(left, Mapping):
+            if set(left) != set(right):
+                raise StudentQualityError(
+                    "existing quality artifact key mismatch at "
+                    + "/".join(map(str, path))
+                )
+            for key in sorted(left):
+                compare(left[key], right[key], (*path, key))
+            return
+        if isinstance(left, list):
+            if len(left) != len(right):
+                raise StudentQualityError(
+                    "existing quality artifact length mismatch at "
+                    + "/".join(map(str, path))
+                )
+            for index, (left_item, right_item) in enumerate(zip(left, right)):
+                compare(left_item, right_item, (*path, index))
+            return
+        if left == right:
+            return
+        metric = path[1] if len(path) == 2 and path[0] == "metrics" else None
+        if (
+            metric not in _LEGACY_REDUCTION_COMPATIBLE_METRICS
+            or type(left) is not float
+            or not math.isfinite(left)
+            or not math.isfinite(right)
+            or math.nextafter(left, right) != right
+        ):
+            raise StudentQualityError(
+                "existing quality artifact semantic mismatch at "
+                + "/".join(map(str, path))
+            )
+        accepted.append(
+            {
+                "json_path": f"metrics/{metric}",
+                "existing_float_hex": left.hex(),
+                "recomputed_float_hex": right.hex(),
+                "ulp_distance": 1,
+            }
+        )
+
+    compare(existing, recomputed, ())
+    return accepted
 
 
 def _expected_lineage(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -456,12 +573,50 @@ def publish_student_quality(
         )
     )
     try:
-        publish_immutable_json(artifact_path, document)
+        existing_document = _load_optional_regular_json(artifact_path)
+        publication_document = document
+        if existing_document is None:
+            publish_immutable_json(artifact_path, document)
+        else:
+            accepted_differences = _verify_legacy_reduction_compatibility(
+                existing_document, document
+            )
+            publication_document = existing_document
+            if accepted_differences:
+                existing_sha256 = sha256_file(artifact_path)
+                recomputed_sha256 = canonical_json_sha256(document)
+                recovery_path = (
+                    run_root
+                    / "quality"
+                    / "recovery"
+                    / (
+                        f"existing_{existing_sha256}_"
+                        f"recomputed_{recomputed_sha256}.json"
+                    )
+                )
+                publish_immutable_json(
+                    recovery_path,
+                    {
+                        "schema": QUALITY_RECOVERY_SCHEMA,
+                        "status": "verified_legacy_reduction_adoption",
+                        "reason": "numpy_pairwise_reduction_one_ulp",
+                        "existing_artifact_sha256": existing_sha256,
+                        "recomputed_artifact_sha256": recomputed_sha256,
+                        "cohort_sha256": publication_document["lineage"][
+                            "cohort_sha256"
+                        ],
+                        "lineage": publication_document["lineage"],
+                        "accepted_differences": accepted_differences,
+                    },
+                )
         publish_immutable_json(
             scalar_path,
-            {"step": document["wandb_step"], "metrics": document["metrics"]},
+            {
+                "step": publication_document["wandb_step"],
+                "metrics": publication_document["metrics"],
+            },
         )
-    except ArtifactError as exc:
+    except (ArtifactError, KeyError, TypeError) as exc:
         raise StudentQualityError(f"quality publication failed: {exc}") from exc
     return {
         "schema": "fast_roborender.round_dagger.student_quality_publication.v1",
@@ -469,8 +624,8 @@ def publish_student_quality(
         "artifact_sha256": sha256_file(artifact_path),
         "scalar_path": str(scalar_path),
         "scalar_sha256": sha256_file(scalar_path),
-        "wandb_step": document["wandb_step"],
-        "metrics": document["metrics"],
+        "wandb_step": publication_document["wandb_step"],
+        "metrics": publication_document["metrics"],
     }
 
 
@@ -529,6 +684,7 @@ __all__ = [
     "LEARNED_ACTION_DIMENSIONS",
     "LINEAGE_FIELDS",
     "QUALITY_SCHEMA",
+    "QUALITY_RECOVERY_SCHEMA",
     "StudentQualityError",
     "publish_student_quality",
     "summarize_sealed_cohort",

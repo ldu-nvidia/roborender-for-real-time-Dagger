@@ -32,13 +32,23 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="strict orchestration_config.v1 JSON; credentials belong in the environment",
     )
+    parser.add_argument(
+        "--stop-after-collected",
+        action="store_true",
+        help=(
+            "seal and mark the four 64x512 cohorts, then stop before replay "
+            "ingestion, learner training, or policy evaluation"
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     config = MacroRoundConfig.load(arguments.config)
-    result = MacroRoundOrchestrator(config).run()
+    result = MacroRoundOrchestrator(
+        config, stop_after_collected=arguments.stop_after_collected
+    ).run()
     print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     return 0
 

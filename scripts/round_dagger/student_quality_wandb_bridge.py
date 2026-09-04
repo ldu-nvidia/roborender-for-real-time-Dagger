@@ -653,7 +653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 entity=arguments.entity,
                 id=run_id,
                 name=(
-                    f"{campaign['campaign_id']}-{campaign_sha[:8]}-student-quality"
+                    f"{campaign['campaign_id']}-{campaign_sha[:8]}-rollout-quality"
                 ),
                 resume="must" if remote_initialized else "allow",
                 dir=str(wandb_dir),
@@ -663,7 +663,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "round_dagger/quality_scope": "sealed-rollout-action-agreement",
                     "round_dagger/telemetry_read_only": True,
                 },
-                tags=("round-dagger", "student-quality", "read-only-bridge"),
+                tags=("round-dagger", "rollout-quality", "read-only-bridge"),
+                settings=wandb.Settings(x_disable_stats=True),
             )
             run.define_metric("campaign/status_event")
             run.define_metric("campaign/*", step_metric="campaign/status_event")
@@ -776,6 +777,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                 }
                 _atomic_json(state_path, state)
+    except KeyboardInterrupt:
+        print("STUDENT_QUALITY_WANDB_BRIDGE_STOPPED", flush=True)
+        if run is not None:
+            try:
+                run.finish(exit_code=0)
+            except Exception:
+                return 2
+        return 0
     except WandbPreflightError:
         print("student quality bridge failed: W&B identity/preflight rejected", file=sys.stderr)
         if run is not None:

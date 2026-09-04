@@ -21,6 +21,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
+# This tool runs from the sealed source tree and imports ``round_dagger``
+# below.  Never let that import create ``__pycache__`` in the immutable tree:
+# a cache directory is both an unexpected mutable artifact and causes the
+# independent source verifier to reject an otherwise valid seal.  Set this
+# before importing any repository module so callers do not need to remember a
+# process-environment flag.
+sys.dont_write_bytecode = True
+
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:

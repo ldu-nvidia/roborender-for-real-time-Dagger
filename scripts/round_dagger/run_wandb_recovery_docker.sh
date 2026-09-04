@@ -116,13 +116,19 @@ ENV_ARGS=(
 [[ -z ${ROUND_DAGGER_WANDB_GROUP:-} ]] || ENV_ARGS+=(--env ROUND_DAGGER_WANDB_GROUP)
 
 # W&B upload and local receipt verification need network and CPU only.  No GPU
-# device is exposed to this recovery container.
+# device is exposed to this recovery container.  The pinned Isaac image keeps
+# /isaac-sim mode-0750, so its entrypoint and venv cannot run as the host UID.
+# Use root solely to enter that immutable runtime, with all capabilities dropped
+# except DAC_OVERRIDE for read/search access to its protected directories.  The
+# coordinator's narrow host-access helper normalizes only telemetry/W&B output
+# after this container exits; source and cohort inputs are never writable here.
 exec "$DOCKER" run --rm \
     --name "$CONTAINER" \
-    --user "$(id -u):$(id -g)" \
+    --user 0:0 \
     --read-only \
     --tmpfs /tmp:rw,nosuid,nodev,size=256m \
     --cap-drop=ALL \
+    --cap-add=DAC_OVERRIDE \
     --security-opt=no-new-privileges \
     --ipc=private \
     --network=host \

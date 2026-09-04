@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from round_dagger import state as state_module
 from round_dagger.artifacts import (
     ArtifactError,
     canonical_json_sha256,
@@ -25,16 +26,19 @@ from round_dagger.policy_bundle import (
     validate_policy_bundle_identity,
 )
 from round_dagger.state import (
+    RESOLUTION_SCHEMA,
     _campaign_root,
     _check_path_chain,
     _internal_path,
     _safe_relative,
     complete_promotion,
+    complete_rejection,
     load_campaign,
     load_state,
 )
 
-CANDIDATE_SCHEMA = "fast_roborender.round_dagger.policy_candidate.v2"
+LEGACY_CANDIDATE_SCHEMA = "fast_roborender.round_dagger.policy_candidate.v2"
+CANDIDATE_SCHEMA = "fast_roborender.round_dagger.policy_candidate.v3"
 EVALUATION_SCHEMA = "fast_roborender.round_dagger.policy_evaluation.v2"
 PROMOTION_SCHEMA = "fast_roborender.round_dagger.policy_promotion.v1"
 BOOTSTRAP_SCHEMA = "fast_roborender.round_dagger.bootstrap_policy.v2"
@@ -195,6 +199,7 @@ _CANDIDATE_KEYS = {
     "renderer_sha256",
     "optimizer_steps",
 }
+_CANDIDATE_V3_KEYS = _CANDIDATE_KEYS | {"learner_acceptance_sha256"}
 
 
 def _sidecar_paths(checkpoint: Path) -> tuple[Path, Path]:
@@ -308,6 +313,21 @@ _PROMOTION_KEYS = {
     "checkpoint_sha256",
     "policy_version",
 }
+_RESOLUTION_KEYS = {
+    "schema",
+    "campaign_id",
+    "campaign_sha256",
+    "macro_round",
+    "decision",
+    "parent_policy_version",
+    "parent_checkpoint_sha256",
+    "candidate_manifest_sha256",
+    "candidate_policy_version",
+    "candidate_checkpoint_sha256",
+    "evaluation_sha256",
+    "selected_policy_version",
+    "selected_checkpoint_sha256",
+}
 
 
 def _policy_paths(root: Path, version: int) -> tuple[Path, str, Path, str]:
@@ -371,8 +391,20 @@ def _validate_candidate(
     campaign: Mapping[str, Any] | None = None,
     expected_macro_round: int | None = None,
 ) -> dict[str, Any]:
-    candidate = _require_exact(document, _CANDIDATE_KEYS, "candidate manifest")
-    if candidate["schema"] != CANDIDATE_SCHEMA:
+    if not isinstance(document, Mapping):
+        raise PromotionError("candidate manifest must be a mapping")
+    schema = document.get("schema")
+    if schema == CANDIDATE_SCHEMA:
+        candidate = _require_exact(
+            document, _CANDIDATE_V3_KEYS, "candidate manifest"
+        )
+        _require_sha256(
+            candidate["learner_acceptance_sha256"],
+            "candidate learner_acceptance_sha256",
+        )
+    elif schema == LEGACY_CANDIDATE_SCHEMA:
+        candidate = _require_exact(document, _CANDIDATE_KEYS, "candidate manifest")
+    else:
         raise PromotionError("candidate manifest schema mismatch")
     _require_int(candidate["macro_round"], "candidate macro_round")
     version = _require_int(
@@ -458,7 +490,7 @@ def _validate_candidate(
         active = state["active_policy"]
         expected_state = {
             "macro_round": state["open_macro_round"],
-            "policy_version": active["version"] + 1,
+            "policy_version": state_module._next_candidate_policy_version(state),
             "parent_policy_version": active["version"],
             "parent_checkpoint_sha256": active["checkpoint_sha256"],
             "replay_snapshot_sha256": state["replay_snapshot_sha256"],
@@ -505,6 +537,7 @@ def stage_candidate(
     code_sha256: str,
     learner_config_sha256: str,
     optimizer_steps: int,
+    learner_acceptance_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Stage and verify the H100 learner result without changing active policy."""
 
@@ -519,14 +552,18 @@ def stage_candidate(
         raise PromotionError(
             "candidate replay snapshot does not match coordinator state"
         )
-    version = int(state["active_policy"]["version"]) + 1
+    version = state_module._next_candidate_policy_version(state)
     checkpoint_path, relative, manifest_path, _ = _policy_paths(root, version)
     bundle = _stage_policy_bundle(
         source_checkpoint=Path(checkpoint_source),
         destination_checkpoint=checkpoint_path,
     )
     manifest = {
-        "schema": CANDIDATE_SCHEMA,
+        "schema": (
+            CANDIDATE_SCHEMA
+            if learner_acceptance_sha256 is not None
+            else LEGACY_CANDIDATE_SCHEMA
+        ),
         "campaign_id": campaign["campaign_id"],
         "campaign_sha256": canonical_json_sha256(campaign),
         "macro_round": macro_round,
@@ -550,6 +587,10 @@ def stage_candidate(
         "renderer_sha256": campaign["renderer_sha256"],
         "optimizer_steps": _require_int(optimizer_steps, "optimizer_steps", minimum=1),
     }
+    if learner_acceptance_sha256 is not None:
+        manifest["learner_acceptance_sha256"] = _require_sha256(
+            learner_acceptance_sha256, "learner_acceptance_sha256"
+        )
     _validate_candidate(
         root, manifest, state=state, campaign=campaign, expected_macro_round=macro_round
     )
@@ -741,6 +782,88 @@ def load_evaluation_manifest(
     }
 
 
+def _resolution_path(root: Path, macro_round: int) -> Path:
+    return root / "rounds" / f"macro_round_{macro_round:06d}" / "resolution.json"
+
+
+def _publish_resolution(
+    root: Path,
+    *,
+    candidate: Mapping[str, Any],
+    evaluation: Mapping[str, Any],
+    selected_policy: Mapping[str, Any],
+    decision: str,
+) -> dict[str, Any]:
+    """Publish the immutable terminal decision before its coordinator CAS."""
+
+    if decision not in {"promoted", "rejected"}:
+        raise PromotionError("terminal resolution decision is invalid")
+    campaign = load_campaign(root)
+    document = {
+        "schema": RESOLUTION_SCHEMA,
+        "campaign_id": campaign["campaign_id"],
+        "campaign_sha256": candidate["campaign_sha256"],
+        "macro_round": candidate["macro_round"],
+        "decision": decision,
+        "parent_policy_version": candidate["parent_policy_version"],
+        "parent_checkpoint_sha256": candidate["parent_checkpoint_sha256"],
+        "candidate_manifest_sha256": candidate["manifest_sha256"],
+        "candidate_policy_version": candidate["policy_version"],
+        "candidate_checkpoint_sha256": candidate["checkpoint_sha256"],
+        "evaluation_sha256": evaluation["evidence_sha256"],
+        "selected_policy_version": selected_policy["version"],
+        "selected_checkpoint_sha256": selected_policy["checkpoint_sha256"],
+    }
+    _require_exact(document, _RESOLUTION_KEYS, "terminal resolution")
+    path = _resolution_path(root, candidate["macro_round"])
+    digest = publish_immutable_json(path, document)
+    return {
+        **document,
+        "manifest_path": path.relative_to(root).as_posix(),
+        "resolution_sha256": digest,
+    }
+
+
+def _load_resolution(
+    root: Path,
+    *,
+    candidate: Mapping[str, Any],
+    evaluation: Mapping[str, Any],
+    decision: str,
+    selected_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reopen and verify a terminal decision for idempotent retries."""
+
+    path = _resolution_path(root, candidate["macro_round"])
+    if not path.is_file() or path.is_symlink():
+        raise PromotionError("terminal resolution evidence is missing or unsafe")
+    document = _require_exact(
+        load_strict_json(path), _RESOLUTION_KEYS, "terminal resolution"
+    )
+    expected = {
+        "schema": RESOLUTION_SCHEMA,
+        "campaign_id": candidate["campaign_id"],
+        "campaign_sha256": candidate["campaign_sha256"],
+        "macro_round": candidate["macro_round"],
+        "decision": decision,
+        "parent_policy_version": candidate["parent_policy_version"],
+        "parent_checkpoint_sha256": candidate["parent_checkpoint_sha256"],
+        "candidate_manifest_sha256": candidate["manifest_sha256"],
+        "candidate_policy_version": candidate["policy_version"],
+        "candidate_checkpoint_sha256": candidate["checkpoint_sha256"],
+        "evaluation_sha256": evaluation["evidence_sha256"],
+        "selected_policy_version": selected_policy["version"],
+        "selected_checkpoint_sha256": selected_policy["checkpoint_sha256"],
+    }
+    if document != expected:
+        raise PromotionError("terminal resolution evidence does not match state")
+    return {
+        **document,
+        "manifest_path": path.relative_to(root).as_posix(),
+        "resolution_sha256": sha256_file(path),
+    }
+
+
 def promote_candidate(
     root: str | Path,
     *,
@@ -805,11 +928,24 @@ def promote_candidate(
             or sha256_file(promotion_path) != state["last_promotion_sha256"]
         ):
             raise PromotionError("promotion retry evidence does not match active state")
-        return {
+        result = {
             **promotion,
             "manifest_path": promotion_path.relative_to(root).as_posix(),
             "promotion_sha256": sha256_file(promotion_path),
         }
+        # A V2 campaign may have completed a valid promotion before terminal
+        # resolution receipts existed.  Its historical retry remains valid;
+        # V3 decisions are deep-checked on every load.
+        if state.get("last_resolution") is None:
+            return result
+        resolution = _load_resolution(
+            root,
+            candidate=candidate,
+            evaluation=evaluation,
+            decision="promoted",
+            selected_policy=active,
+        )
+        return {**result, "resolution_sha256": resolution["resolution_sha256"]}
 
     if state["phase"] != "EVALUATED" or state["open_macro_round"] != macro_round:
         raise PromotionError("promotion requires the open EVALUATED macro-round")
@@ -828,18 +964,107 @@ def promote_candidate(
     ):
         raise PromotionError("coordinator candidate does not match learner handoff")
     promotion_sha = publish_immutable_json(promotion_path, promotion)
+    resolution = _publish_resolution(
+        root,
+        candidate=candidate,
+        evaluation=evaluation,
+        selected_policy={
+            "version": candidate["policy_version"],
+            "checkpoint_sha256": candidate["checkpoint_sha256"],
+        },
+        decision="promoted",
+    )
     complete_promotion(
         root,
         macro_round=macro_round,
         checkpoint_path=candidate["checkpoint_path"],
         promotion_manifest_path=promotion_path,
         promotion_manifest_sha256=promotion_sha,
+        resolution_manifest_path=resolution["manifest_path"],
+        resolution_manifest_sha256=resolution["resolution_sha256"],
     )
     return {
         **promotion,
         "manifest_path": promotion_path.relative_to(root).as_posix(),
         "promotion_sha256": promotion_sha,
+        "resolution_sha256": resolution["resolution_sha256"],
     }
+
+
+def reject_candidate(
+    root: str | Path,
+    *,
+    macro_round: int,
+    candidate_manifest: str | Path,
+    evaluation_manifest: str | Path,
+) -> dict[str, Any]:
+    """Resolve a failed candidate without mutating the active parent policy."""
+
+    root = _campaign_root(root)
+    current = load_state(root)
+    macro_round = _require_int(macro_round, "macro_round")
+    candidate = load_candidate_manifest(
+        root,
+        candidate_manifest,
+        expected_macro_round=macro_round,
+        bind_state=current["phase"] != "READY",
+    )
+    evaluation = load_evaluation_manifest(root, evaluation_manifest, candidate=candidate)
+    if evaluation["passed"] is not False:
+        raise PromotionError("only a failed evaluation may reject a candidate")
+
+    active = current["active_policy"]
+    if current["phase"] == "READY":
+        resolution_state = current.get("last_resolution")
+        if (
+            not isinstance(resolution_state, Mapping)
+            or resolution_state.get("decision") != "rejected"
+            or resolution_state.get("macro_round") != macro_round
+            or resolution_state.get("candidate_manifest_sha256")
+            != candidate["manifest_sha256"]
+            or active["version"] != candidate["parent_policy_version"]
+            or active["checkpoint_sha256"] != candidate["parent_checkpoint_sha256"]
+        ):
+            raise PromotionError("READY retry does not bind a retained parent decision")
+        resolution = _load_resolution(
+            root,
+            candidate=candidate,
+            evaluation=evaluation,
+            decision="rejected",
+            selected_policy=active,
+        )
+        return {**resolution, "retained": True}
+
+    if current["phase"] != "EVALUATED" or current["open_macro_round"] != macro_round:
+        raise PromotionError("rejection requires the open EVALUATED macro-round")
+    if (
+        active["version"] != candidate["parent_policy_version"]
+        or active["checkpoint_sha256"] != candidate["parent_checkpoint_sha256"]
+    ):
+        raise PromotionError("candidate parent is no longer the active policy")
+    if current["evaluation_sha256"] != evaluation["evidence_sha256"]:
+        raise PromotionError("coordinator evaluation digest does not match evidence")
+    staged = current.get("candidate_policy")
+    if (
+        not isinstance(staged, Mapping)
+        or staged.get("manifest_sha256") != candidate["manifest_sha256"]
+        or staged.get("checkpoint_sha256") != candidate["checkpoint_sha256"]
+    ):
+        raise PromotionError("coordinator candidate does not match rejected learner handoff")
+    resolution = _publish_resolution(
+        root,
+        candidate=candidate,
+        evaluation=evaluation,
+        selected_policy=active,
+        decision="rejected",
+    )
+    complete_rejection(
+        root,
+        macro_round=macro_round,
+        resolution_manifest_path=resolution["manifest_path"],
+        resolution_manifest_sha256=resolution["resolution_sha256"],
+    )
+    return {**resolution, "retained": True}
 
 
 def load_active_policy(root: str | Path) -> dict[str, Any]:
@@ -906,11 +1131,13 @@ __all__ = [
     "CANDIDATE_SCHEMA",
     "EVALUATION_SCHEMA",
     "PROMOTION_SCHEMA",
+    "RESOLUTION_SCHEMA",
     "PromotionError",
     "load_active_policy",
     "load_candidate_manifest",
     "load_evaluation_manifest",
     "promote_candidate",
+    "reject_candidate",
     "stage_bootstrap_policy",
     "stage_candidate",
     "write_evaluation",

@@ -28,10 +28,17 @@ if torch is not None:
         JsonlTelemetry,
         LearnerBundleConfig,
         LearnerError,
+        MappingPolicyAdapter,
         ORDERED_ALLGATHER_GRADIENT_REDUCTION,
         SINGLE_PROCESS_GRADIENT_REDUCTION,
+        TRAINING_CONTEXT_TELEMETRY_SCHEMA,
+        TRAINING_QUALITY_PROBE_BUDGET,
+        TRAINING_QUALITY_TELEMETRY_SCHEMA,
+        TrainingQualityProbe,
         _ordered_allgather_gradient_hook,
+        build_training_quality_probe,
         configure_deterministic_runtime,
+        evaluate_heldout_actions,
         load_heldout_partition,
         load_replay_partition,
         partition_shards,
@@ -498,6 +505,143 @@ class ReplayInputContractTest(LearnerFixture):
             [19, 18, 18],
         )
 
+    @staticmethod
+    def _probe_snapshot(*, through_round: int, rows_per_shard: int = 1024):
+        shards = [
+            {
+                "logical_id": f"campaign:r{macro_round:09d}:c{rank:04d}:train",
+                "shard_id": f"rank-{rank:04d}_part-0000",
+                "macro_round": macro_round,
+                "cohort_index": rank,
+                "transition_count": rows_per_shard,
+            }
+            for macro_round in range(through_round + 1)
+            for rank in range(8)
+        ]
+        return {
+            "campaign_id": "probe-campaign",
+            "through_macro_round": through_round,
+            "file_sha256": "a" * 64,
+            "snapshot_sha256": "b" * 64,
+            "transition_count": sum(
+                shard["transition_count"] for shard in shards
+            ),
+            "resolved_shards": shards,
+        }
+
+    def test_training_quality_probe_is_fixed_bounded_and_lineage_bound(self):
+        snapshot = self._probe_snapshot(through_round=4)
+        first = build_training_quality_probe(
+            snapshot, world_size=8, partition_seed=23
+        )
+        repeated = build_training_quality_probe(
+            {**snapshot, "resolved_shards": list(reversed(snapshot["resolved_shards"]))},
+            world_size=8,
+            partition_seed=23,
+        )
+        summary = first.summary()
+        self.assertEqual(summary, repeated.summary())
+        self.assertEqual(first.indices_by_rank, repeated.indices_by_rank)
+        self.assertEqual(
+            summary["transitions_global"], TRAINING_QUALITY_PROBE_BUDGET
+        )
+        self.assertEqual(summary["current_round_transitions_global"], 128)
+        self.assertEqual(summary["historical_transitions_global"], 128)
+        self.assertTrue(all(count > 0 for count in summary["transitions_per_rank"]))
+        self.assertEqual(
+            sum(summary["transitions_per_rank"]),
+            sum(len(indices) for indices in first.indices_by_rank),
+        )
+
+        changed_lineage = build_training_quality_probe(
+            {**snapshot, "file_sha256": "c" * 64},
+            world_size=8,
+            partition_seed=23,
+        )
+        self.assertNotEqual(
+            summary["selection_sha256"],
+            changed_lineage.summary()["selection_sha256"],
+        )
+        tampered = first.summary()
+        tampered["transitions_per_rank"][0] += 1
+        with self.assertRaisesRegex(LearnerError, "coverage|counts"):
+            TrainingQualityProbe(
+                summary_document=tampered,
+                indices_by_rank=first.indices_by_rank,
+            )
+        overlapping = [list(indices) for indices in first.indices_by_rank]
+        overlapping[0][1] = overlapping[0][0]
+        with self.assertRaisesRegex(LearnerError, "duplicate"):
+            TrainingQualityProbe(
+                summary_document=summary,
+                indices_by_rank=tuple(tuple(indices) for indices in overlapping),
+            )
+
+    def test_round_zero_training_quality_probe_is_all_current(self):
+        probe = build_training_quality_probe(
+            self._probe_snapshot(through_round=0),
+            world_size=8,
+            partition_seed=23,
+        )
+        summary = probe.summary()
+        self.assertEqual(summary["transitions_global"], 256)
+        self.assertEqual(summary["current_round_transitions_global"], 256)
+        self.assertEqual(summary["historical_transitions_global"], 0)
+
+    def test_training_quality_forward_count_is_independent_of_replay_growth(self):
+        class CountingPolicy(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+                self.examples = 0
+
+            def forward(self, observations):
+                self.calls += 1
+                self.examples += int(observations["feature"].shape[0])
+                return {"actions": observations["feature"]}
+
+        class SyntheticPartition:
+            def __init__(self, population):
+                self.rank = 0
+                self.world_size = 1
+                self.transition_count = population
+                self.transition_counts_by_rank = (population,)
+                self.global_transition_count = population
+                self.config = types.SimpleNamespace(
+                    batch_size=8,
+                    train_action_slice=None,
+                    campaign_id="probe-campaign",
+                    macro_round=0,
+                )
+                self.snapshot = {
+                    "snapshot_sha256": "b" * 64,
+                    "file_sha256": "a" * 64,
+                }
+
+            @staticmethod
+            def batch(indices, *, device):
+                values = torch.as_tensor(indices, dtype=torch.float32, device=device)
+                values = values.unsqueeze(-1).remainder(17).div(17)
+                return {"feature": values}, torch.zeros_like(values)
+
+        observed = []
+        for population in (1_024, 1_000_000):
+            model = CountingPolicy()
+            record = evaluate_heldout_actions(
+                model,
+                partition=SyntheticPartition(population),
+                adapter=MappingPolicyAdapter(),
+                device="cpu",
+                optimizer_step=0,
+                indices=tuple(range(TRAINING_QUALITY_PROBE_BUDGET)),
+                transition_counts_by_rank=[TRAINING_QUALITY_PROBE_BUDGET],
+                include_per_action_p90=True,
+            )
+            observed.append((model.calls, model.examples))
+            self.assertEqual(record["heldout_transitions_global"], 256)
+            self.assertIn("0", record["per_action_absolute_error_p90"])
+        self.assertEqual(observed, [(32, 256), (32, 256)])
+
     def test_partition_rejects_missing_or_invalid_transition_count(self):
         base = {
             "logical_id": "campaign:r000000000:c0000:train",
@@ -815,6 +959,7 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         )
         fake_wandb = types.SimpleNamespace(
             init=mock.Mock(return_value=fake_run),
+            Settings=mock.Mock(return_value=object()),
         )
         with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
             first = JsonlTelemetry(
@@ -835,6 +980,9 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
 
         self.assertEqual(fake_wandb.init.call_args_list[0].kwargs["resume"], "allow")
         self.assertEqual(fake_wandb.init.call_args_list[1].kwargs["resume"], "must")
+        fake_wandb.Settings.assert_has_calls(
+            [mock.call(x_disable_stats=True), mock.call(x_disable_stats=True)]
+        )
         self.assertEqual(
             [call.kwargs["exit_code"] for call in fake_run.finish.call_args_list],
             [0, 0],
@@ -851,7 +999,10 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         fake_run = types.SimpleNamespace(
             log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
         )
-        fake_wandb = types.SimpleNamespace(init=mock.Mock(return_value=fake_run))
+        fake_wandb = types.SimpleNamespace(
+            init=mock.Mock(return_value=fake_run),
+            Settings=mock.Mock(return_value=object()),
+        )
         with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
             telemetry = JsonlTelemetry(
                 None,
@@ -938,8 +1089,22 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             self.assertEqual(record["learned_action_indices"], [0])
             self.assertEqual(set(record["per_action"]), {"0"})
             self.assertEqual(record["heldout_transitions_global"], 16)
+            self.assertEqual(record["eval_frontier"], record["optimizer_step"])
             self.assertAlmostEqual(record["action_rmse"] ** 2, record["action_mse"])
+            self.assertGreaterEqual(record["action_absolute_error_p90"], 0.0)
+            self.assertGreaterEqual(record["action_l2_p90"], 0.0)
             self.assertTrue(np.isfinite(record["action_cosine"]))
+            self.assertAlmostEqual(
+                record["action_mse_delta_from_step0"],
+                record["action_mse"] - quality_records[0]["action_mse"],
+            )
+            self.assertAlmostEqual(
+                record["action_mse_relative_improvement_from_step0"],
+                (
+                    quality_records[0]["action_mse"] - record["action_mse"]
+                )
+                / quality_records[0]["action_mse"],
+            )
         resumed_telemetry = JsonlTelemetry(
             None, heldout_path=heldout_path, enabled=True
         )
@@ -983,6 +1148,7 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         )
         fake_wandb = types.SimpleNamespace(
             init=mock.Mock(return_value=fake_run),
+            Settings=mock.Mock(return_value=object()),
         )
         with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
             telemetry = JsonlTelemetry(
@@ -1017,6 +1183,18 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         initial_quality = fake_run.log.call_args_list[0].args[0]
         final_combined = fake_run.log.call_args_list[2].args[0]
         self.assertIn("quality/heldout_action_mse", initial_quality)
+        self.assertIn("quality/heldout_action_absolute_error_p90", initial_quality)
+        self.assertIn("quality/heldout_action_l2_p90", initial_quality)
+        self.assertEqual(initial_quality["quality/eval_frontier"], 0)
+        self.assertEqual(
+            initial_quality["quality/heldout_action_mse_delta_from_step0"], 0.0
+        )
+        self.assertEqual(
+            initial_quality[
+                "quality/heldout_action_mse_relative_improvement_from_step0"
+            ],
+            0.0,
+        )
         self.assertEqual(initial_quality["optimizer_step"], 0)
         self.assertIn("loss", final_combined)
         self.assertIn("quality/heldout_action_mse", final_combined)
@@ -1024,6 +1202,192 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         fake_run.define_metric.assert_any_call(
             "quality/*", step_metric="optimizer_step"
         )
+
+    def test_dagger_dashboard_separates_scene_training_and_ood_validation(self):
+        scene_dir = self.root / "dashboard-scene" / "scene_samples"
+        scene_dir.mkdir(parents=True)
+        scene_image = scene_dir / "step_000000000_conditions_generated.png"
+        scene_image.write_bytes(b"test-scene")
+        scene_image.chmod(0o444)
+        scene_core = {
+            "schema": "fast_roborender.round_dagger.scene_samples.v1",
+            "campaign_id": "learner-test",
+            "actor_rank": 0,
+            "rollout_steps": 2,
+            "view_labels": ["head_color", "hand_left", "hand_right"],
+            "row_labels": ["depth", "mask", "client_anchor", "generated"],
+            "sampling_policy": {"name": "test"},
+            "source": {"candidate_count": 1},
+            "sampled_rollout_steps": [0],
+            "samples": [
+                {
+                    "path": scene_image.name,
+                    "rollout_step": 0,
+                    "sha256": artifacts.sha256_file(scene_image),
+                    "size_bytes": scene_image.stat().st_size,
+                    "width": 1252,
+                    "height": 1046,
+                }
+            ],
+        }
+        scene_manifest = {
+            **scene_core,
+            "sample_set_sha256": artifacts.canonical_json_sha256(scene_core),
+        }
+        manifest_path = scene_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(scene_manifest), encoding="utf-8")
+        manifest_path.chmod(0o444)
+        fake_run = types.SimpleNamespace(
+            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
+        )
+        fake_wandb = types.SimpleNamespace(
+            init=mock.Mock(return_value=fake_run),
+            Settings=mock.Mock(return_value=object()),
+            Image=mock.Mock(
+                side_effect=lambda path, caption: {"path": path, "caption": caption}
+            ),
+        )
+        training_quality_path = self.root / "dashboard" / "training_quality.jsonl"
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            telemetry = JsonlTelemetry(
+                self.root / "dashboard" / "training.jsonl",
+                heldout_path=self.root / "dashboard" / "validation_ood.jsonl",
+                training_quality_path=training_quality_path,
+                dagger_dashboard=True,
+                scene_sample_manifest=manifest_path,
+                enabled=True,
+                wandb_project="dashboard-project",
+                wandb_run_id="dashboard-run",
+            )
+            try:
+                train_from_replay(
+                    TinyPolicy(),
+                    snapshot_path=self.snapshot_path,
+                    config=_config(
+                        heldout_snapshot=self.heldout_snapshot,
+                        heldout_eval_interval=2,
+                    ),
+                    heldout_snapshot_path=self.heldout_snapshot_path,
+                    output_dir=self.root / "dashboard" / "run",
+                    max_steps=2,
+                    save_every=2,
+                    telemetry=telemetry,
+                    dagger_beta=0.5,
+                )
+            finally:
+                telemetry.close()
+        rows = [call.args[0] for call in fake_run.log.call_args_list]
+        self.assertEqual([row["optimizer_step"] for row in rows], [0, 1, 2])
+        self.assertIn("1_scene_samples/conditions_and_rendered", rows[0])
+        self.assertIn("2_training_quality/action_mse", rows[0])
+        self.assertIn("2_training_quality/expert_intervention_rate", rows[0])
+        self.assertIn("3_validation_ood/action_mse", rows[0])
+        self.assertIn("3_validation_ood/action_0/mse", rows[0])
+        self.assertIn("3_validation_ood/action_0/cosine", rows[0])
+        self.assertIn("2_training_quality/optimization_loss", rows[1])
+        self.assertIn("2_training_quality/gradient_l2_norm", rows[1])
+        self.assertNotIn("3_validation_ood/action_mse", rows[1])
+        self.assertIn("2_training_quality/action_mse", rows[2])
+        self.assertIn("3_validation_ood/action_mse", rows[2])
+        quality_rows = [
+            json.loads(line) for line in training_quality_path.read_text().splitlines()
+        ]
+        self.assertEqual(
+            [row["optimizer_step"] for row in quality_rows], [0, 2]
+        )
+        self.assertTrue(
+            all(
+                row["schema"]
+                == TRAINING_QUALITY_TELEMETRY_SCHEMA
+                for row in quality_rows
+            )
+        )
+        self.assertTrue(
+            all(row["training_probe_transitions_global"] == 16 for row in quality_rows)
+        )
+        self.assertTrue(
+            all(row["training_replay_transitions_global"] == 16 for row in quality_rows)
+        )
+        self.assertEqual(
+            len({row["training_probe_selection_sha256"] for row in quality_rows}),
+            1,
+        )
+        training_context_path = training_quality_path.with_name(
+            "training_context.json"
+        )
+        training_context = json.loads(training_context_path.read_text())
+        self.assertEqual(
+            training_context["schema"], TRAINING_CONTEXT_TELEMETRY_SCHEMA
+        )
+        self.assertEqual(training_context["campaign_id"], "learner-test")
+        self.assertEqual(training_context["macro_round"], 0)
+        self.assertEqual(
+            training_context["training_probe_selection_sha256"],
+            quality_rows[0]["training_probe_selection_sha256"],
+        )
+        self.assertEqual(
+            training_context["metrics"]["expert_label_coverage"], 1.0
+        )
+        self.assertEqual(
+            training_context["metrics"]["scheduled_beta"], 0.5
+        )
+        fake_run.define_metric.assert_any_call(
+            "2_training_quality/*", step_metric="optimizer_step"
+        )
+        fake_run.define_metric.assert_any_call(
+            "3_validation_ood/*", step_metric="optimizer_step"
+        )
+
+    def test_training_context_local_artifact_is_restart_idempotent(self):
+        quality_path = self.root / "context-resume" / "training_quality.jsonl"
+        record = {
+            "schema": TRAINING_CONTEXT_TELEMETRY_SCHEMA,
+            "campaign_id": "learner-test",
+            "macro_round": 0,
+            "learner_config_sha256": "a" * 64,
+            "model_lineage_sha256": "b" * 64,
+            "replay_snapshot_file_sha256": "c" * 64,
+            "replay_snapshot_sha256": "d" * 64,
+            "training_probe_selection_sha256": "e" * 64,
+            "metrics": {
+                "parent_rollout_action_mse": 0.1,
+                "parent_rollout_action_mae": 0.2,
+                "parent_rollout_action_rmse": 0.3,
+                "parent_rollout_action_cosine": 0.4,
+                "parent_rollout_action_l2_p90": 0.5,
+                "expert_intervention_rate": 0.6,
+                "behavior_expert_match_rate": 0.7,
+                "expert_label_coverage": 1.0,
+                "replay_transitions": 128,
+                "replay_environments": 8,
+                "done_rate": 0.1,
+                "scheduled_beta": 0.5,
+            },
+        }
+        first = JsonlTelemetry(
+            None,
+            training_quality_path=quality_path,
+            dagger_dashboard=True,
+            enabled=True,
+        )
+        first.persist_training_context(record)
+        context_path = quality_path.with_name("training_context.json")
+        durable = context_path.read_bytes()
+
+        resumed = JsonlTelemetry(
+            None,
+            training_quality_path=quality_path,
+            dagger_dashboard=True,
+            enabled=True,
+        )
+        resumed.persist_training_context(record)
+        self.assertEqual(context_path.read_bytes(), durable)
+        changed = copy.deepcopy(record)
+        changed["metrics"]["scheduled_beta"] = 0.4
+        with self.assertRaisesRegex(
+            LearnerError, "training-context telemetry changed across restart"
+        ):
+            resumed.persist_training_context(changed)
 
     def test_resume_relogs_due_heldout_frontier_without_duplicate_jsonl(self):
         heldout_path = self.root / "quality-resume" / "heldout.jsonl"
@@ -1059,7 +1423,10 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         fake_run = types.SimpleNamespace(
             log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
         )
-        fake_wandb = types.SimpleNamespace(init=mock.Mock(return_value=fake_run))
+        fake_wandb = types.SimpleNamespace(
+            init=mock.Mock(return_value=fake_run),
+            Settings=mock.Mock(return_value=object()),
+        )
         with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
             resumed_telemetry = JsonlTelemetry(
                 None,

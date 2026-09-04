@@ -45,6 +45,10 @@ class EvaluationInputVerificationTest(unittest.TestCase):
                     "linear.bias": torch.tensor([0.25, -0.5, 1.0]),
                 },
                 "value_state_dict": {"value.weight": torch.ones(1, 3)},
+                "homie_controller_sha256": {
+                    "walk": "a" * 64,
+                    "stand": "b" * 64,
+                },
                 "env_state_dict": {"forbidden": "simulator state"},
                 "optimizer_state_dict": {"step": 9},
             },
@@ -89,6 +93,11 @@ class EvaluationInputVerificationTest(unittest.TestCase):
 
     def test_exact_first_stage_passes(self) -> None:
         self.assertEqual(self._verify()["status"], "PASS")
+        staged = torch.load(self.staged, map_location="cpu", weights_only=True)
+        self.assertEqual(
+            staged["homie_controller_sha256"],
+            {"walk": "a" * 64, "stand": "b" * 64},
+        )
 
     def test_exact_resume_reuse_passes(self) -> None:
         first = self._verify()

@@ -128,6 +128,44 @@ done
 [[ $ROUND_DAGGER_LEARNER_SEED =~ ^[0-9]+$ ]] || fatal "invalid learner seed"
 [[ $ROUND_DAGGER_LEARNER_PARTITION_SEED =~ ^[0-9]+$ ]] || \
     fatal "invalid partition seed"
+DASHBOARD_ENABLED=0
+if [[ -n ${ROUND_DAGGER_WANDB_PROJECT:-} ]]; then
+    DASHBOARD_ENABLED=1
+    for name in ROUND_DAGGER_WANDB_ENTITY ROUND_DAGGER_WANDB_EXPECTED_EMAIL \
+                ROUND_DAGGER_BETA ROUND_DAGGER_BETA_SHA256 \
+                ROUND_DAGGER_SCENE_SAMPLE_MANIFEST; do
+        [[ -n ${!name:-} ]] || fatal "W&B dashboard requires environment: $name"
+    done
+    ((HELDOUT_ENABLED)) || fatal "W&B dashboard requires held-out evaluation"
+    [[ $ROUND_DAGGER_BETA_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+        fatal "ROUND_DAGGER_BETA_SHA256 is not a lowercase SHA-256"
+    [[ $ROUND_DAGGER_SCENE_SAMPLE_MANIFEST == /* && \
+       -f $ROUND_DAGGER_SCENE_SAMPLE_MANIFEST && \
+       ! -L $ROUND_DAGGER_SCENE_SAMPLE_MANIFEST ]] || \
+        fatal "scene sample manifest is missing or unsafe"
+    [[ $(basename -- "$ROUND_DAGGER_SCENE_SAMPLE_MANIFEST") == manifest.json && \
+       $(basename -- "$(dirname -- "$ROUND_DAGGER_SCENE_SAMPLE_MANIFEST")") == scene_samples ]] || \
+        fatal "scene sample manifest path is non-canonical"
+    "$H100_PYTHON" - "$ROUND_DAGGER_BETA" "$ROUND_DAGGER_BETA_SHA256" <<'PY'
+import hashlib
+import json
+import sys
+
+raw, expected_sha256 = sys.argv[1:]
+try:
+    beta = float(raw)
+except ValueError as exc:
+    raise SystemExit("scheduled DAgger beta is not numeric") from exc
+if repr(beta) != raw or not 0.0 <= beta <= 1.0:
+    raise SystemExit("scheduled DAgger beta is not canonical or outside [0,1]")
+payload = json.dumps(
+    {"beta": beta}, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    allow_nan=False,
+).encode("utf-8")
+if hashlib.sha256(payload).hexdigest() != expected_sha256:
+    raise SystemExit("scheduled DAgger beta digest mismatch")
+PY
+fi
 
 # These are redundant with the coordinator topology gate, but retaining them
 # here prevents a manually invoked learner hook from training on a different
@@ -176,6 +214,7 @@ fi
 PREPARE=(
     "$H100_PYTHON" "$ROOT/scripts/round_dagger/prepare_gr00t_learner_bundle.py"
     --base-policy-spec "$ROUND_DAGGER_BASE_POLICY_SPEC"
+    --artifact-root "$ROUND_DAGGER_CAMPAIGN_ROOT"
     --parent-checkpoint "$ROUND_DAGGER_POLICY_CHECKPOINT"
     --expected-parent-checkpoint-sha256 "$ROUND_DAGGER_POLICY_SHA256"
     --runtime-policy-sha256 "$ROUND_DAGGER_RUNTIME_POLICY_SHA256"
@@ -216,6 +255,8 @@ targets = (
     "restart.pt",
     "telemetry.jsonl",
     "heldout_telemetry.jsonl",
+    "training_quality_telemetry.jsonl",
+    "training_context.json",
     f"learner_bundle_round_{round_padded}.json",
     f"candidate_round_{round_padded}.pt",
     f"candidate_round_{round_padded}.pt.policy_spec.json",
@@ -254,6 +295,7 @@ RESUME_PATH=$("$H100_PYTHON" - \
     "$ROUND_DAGGER_LEARNER_IDENTITY_SHA256" \
     "$ROUND_DAGGER_REMOTE_CONTAINER_SHA256" \
     "$ROUND_DAGGER_LEARNER_CONTRACT_SHA256" \
+    "$ROUND_DAGGER_CAMPAIGN_ROOT" \
     "${ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT:-}" \
     "${ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256:-}" \
     "${ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256:-}" \
@@ -278,6 +320,7 @@ from round_dagger.replay import load_heldout_snapshot, load_snapshot
     world_size, max_steps, restart_path, parent_policy_sha,
     runtime_policy_sha, partition_seed, base_policy_spec_path,
     learner_identity_sha, runtime_container_sha, learner_contract_sha,
+    artifact_root,
     heldout_path, heldout_file_sha, heldout_semantic_sha, heldout_interval,
 ) = sys.argv[1:]
 dry_run = dry_run == "1"
@@ -306,7 +349,11 @@ policy_spec = (
 )
 replay_action_dim = policy_spec["output_contract"]["replay_action_dim"]
 
-snapshot = load_snapshot(snapshot_path, expected_file_sha256=snapshot_file_sha)
+snapshot = load_snapshot(
+    snapshot_path,
+    expected_file_sha256=snapshot_file_sha,
+    artifact_root=artifact_root,
+)
 if snapshot["snapshot_sha256"] != snapshot_semantic_sha:
     raise SystemExit("replay snapshot semantic digest mismatch")
 if snapshot["campaign_id"] != campaign_id:
@@ -383,7 +430,9 @@ if heldout_enabled:
     if heldout_interval != "100":
         raise SystemExit("production held-out evaluation interval must be exactly 100")
     heldout = load_heldout_snapshot(
-        heldout_path, expected_file_sha256=heldout_file_sha
+        heldout_path,
+        expected_file_sha256=heldout_file_sha,
+        artifact_root=artifact_root,
     )
     if heldout["snapshot_sha256"] != heldout_semantic_sha:
         raise SystemExit("held-out replay snapshot semantic digest mismatch")
@@ -492,6 +541,7 @@ COMMAND=(
     "$ROOT/scripts/round_dagger/train_learner.py"
     --bundle "$BUNDLE"
     --snapshot "$ROUND_DAGGER_REPLAY_SNAPSHOT"
+    --artifact-root "$ROUND_DAGGER_CAMPAIGN_ROOT"
     --output-dir "$ROUND_DAGGER_LEARNER_OUTPUT_DIR"
     --model-factory round_dagger.gr00t_policy:create_vision_actor_obj_pred
     --adapter-factory round_dagger.gr00t_policy:vision_actor_obj_pred_adapter_factory
@@ -508,6 +558,15 @@ COMMAND=(
     --device cuda
     --telemetry-jsonl "$ROUND_DAGGER_LEARNER_OUTPUT_DIR/telemetry.jsonl"
 )
+if ((DASHBOARD_ENABLED)); then
+    COMMAND+=(
+        --training-quality-telemetry-jsonl \
+            "$ROUND_DAGGER_LEARNER_OUTPUT_DIR/training_quality_telemetry.jsonl"
+        --dagger-wandb-dashboard
+        --scene-sample-manifest "$ROUND_DAGGER_SCENE_SAMPLE_MANIFEST"
+        --dagger-beta "$ROUND_DAGGER_BETA"
+    )
+fi
 if ((HELDOUT_ENABLED)); then
     COMMAND+=(
         --heldout-snapshot "$ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT"
@@ -678,14 +737,18 @@ if ((HELDOUT_ENABLED)); then
 fi
 "$H100_PYTHON" "$ROOT/scripts/round_dagger/learner_completion_attestation.py" publish \
     --attestation "$COMPLETION_ATTESTATION" \
-    --result "$ROUND_DAGGER_LEARNER_RESULT" \
+    --result "$(basename "$ROUND_DAGGER_LEARNER_RESULT")" \
     --output-dir "$ROUND_DAGGER_LEARNER_OUTPUT_DIR" \
     --bundle "$(basename "$BUNDLE")" --restart restart.pt \
     --telemetry telemetry.jsonl \
+    --training-quality-telemetry training_quality_telemetry.jsonl \
+    --training-context training_context.json \
     "${HELDOUT_ATTESTATION_ARGS[@]}" \
     --parent-checkpoint "$ROUND_DAGGER_POLICY_CHECKPOINT" \
     --parent-sha256 "$ROUND_DAGGER_POLICY_SHA256" \
     --snapshot "$ROUND_DAGGER_REPLAY_SNAPSHOT" \
+    --artifact-root "$ROUND_DAGGER_CAMPAIGN_ROOT" \
+    --world-size "$WORLD_SIZE" \
     --snapshot-file-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_FILE_SHA256" \
     --snapshot-sha256 "$ROUND_DAGGER_REPLAY_SNAPSHOT_SHA256" \
     --campaign-id "$ROUND_DAGGER_CAMPAIGN_ID" \

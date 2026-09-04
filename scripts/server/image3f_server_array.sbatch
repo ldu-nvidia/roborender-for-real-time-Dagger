@@ -1,5 +1,5 @@
 #!/bin/bash
-# Production Image3F fleet element. Submit through scripts/scaling/submit_production.sh
+# Legacy OCI Image3F fleet element. Submit through submit_oci_packed.sh.
 # so every array task receives a unique endpoint and queue directory.
 #SBATCH --job-name=i3f_scale
 #SBATCH --partition=backfill_block1
@@ -19,7 +19,7 @@ if [ "${ROBORENDER_CONTAINERIZED:-0}" != 1 ]; then
     exec bash "$ROOT/scripts/setup/reexec_in_oci_container.sh" \
         "$ROOT/scripts/server/image3f_server_array.sbatch"
 fi
-RUN_DIR=${RUN_DIR:-${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_production.sh}}
+RUN_DIR=${RUN_DIR:-${FLEET_DIR:?FLEET_DIR is required; use scripts/scaling/submit_oci_packed.sh}}
 TASK_ID=${SLURM_ARRAY_TASK_ID:?this script must run as a Slurm array}
 INDEX=$(printf '%03d' "$TASK_ID")
 

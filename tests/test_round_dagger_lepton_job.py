@@ -24,6 +24,17 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "configs/round_dagger/production_learner_1x8h200_lepton.json"
 
 
+def _canonical_beta_sha256(beta: float) -> str:
+    payload = json.dumps(
+        {"beta": beta},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
 def _environment(identity: str, campaign: str, macro_round: int) -> dict[str, str]:
     campaign_root = f"/workspace/projects/roborender/campaigns/{campaign}"
     output = f"{campaign_root}/rounds/macro_round_{macro_round:06d}/learner_output"
@@ -62,11 +73,16 @@ def _environment(identity: str, campaign: str, macro_round: int) -> dict[str, st
         "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256": sha("8"),
         "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256": sha("9"),
         "ROUND_DAGGER_HELDOUT_EVAL_INTERVAL": "100",
-        "ROUND_DAGGER_WANDB_PROJECT": "roborender-round-dagger",
+        "ROUND_DAGGER_WANDB_PROJECT": "lepton-dagger-production-1",
         "ROUND_DAGGER_WANDB_ENTITY": "nvidia",
         "ROUND_DAGGER_WANDB_RUN_ID": f"rrd-m{macro_round:06d}-id{identity}",
         "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": "ldu@nvidia.com",
         "ROUND_DAGGER_WANDB_AUTHORIZATION_SCOPE": "team",
+        "ROUND_DAGGER_BETA": "0.5",
+        "ROUND_DAGGER_BETA_SHA256": _canonical_beta_sha256(0.5),
+        "ROUND_DAGGER_SCENE_SAMPLE_MANIFEST": (
+            f"{campaign_root}/scene_samples/manifest.json"
+        ),
     }
 
 
@@ -334,6 +350,11 @@ class LeptonJobBackendTest(unittest.TestCase):
             environment[key] = str(local / relative)
         environment["ROUND_DAGGER_LEARNER_OUTPUT_DIR"] = str(local / "old-output")
         environment["ROUND_DAGGER_LEARNER_RESULT"] = str(local / "old-result.json")
+        environment["ROUND_DAGGER_BETA"] = "0.75"
+        environment["ROUND_DAGGER_BETA_SHA256"] = _canonical_beta_sha256(0.75)
+        environment["ROUND_DAGGER_SCENE_SAMPLE_MANIFEST"] = str(
+            local / "scene_samples/manifest.json"
+        )
         # Ambient credentials and unrelated variables are deliberately ignored.
         environment["WANDB_API_KEY"] = "wandb_v1_must_not_be_projected"
         environment["UNRELATED"] = "not-projected"
@@ -359,6 +380,75 @@ class LeptonJobBackendTest(unittest.TestCase):
                 "/workspace/projects/roborender/campaigns/materialized/"
             )
         )
+        self.assertEqual(request.environment["ROUND_DAGGER_BETA"], "0.75")
+        self.assertEqual(
+            request.environment["ROUND_DAGGER_BETA_SHA256"],
+            _canonical_beta_sha256(0.75),
+        )
+        self.assertEqual(
+            request.environment["ROUND_DAGGER_SCENE_SAMPLE_MANIFEST"],
+            "/workspace/projects/roborender/campaigns/materialized/"
+            "scene_samples/manifest.json",
+        )
+
+    def test_request_requires_semantically_bound_dashboard_contract(self):
+        for index, missing in enumerate(
+            (
+                "ROUND_DAGGER_BETA",
+                "ROUND_DAGGER_BETA_SHA256",
+                "ROUND_DAGGER_SCENE_SAMPLE_MANIFEST",
+            )
+        ):
+            document = json.loads(self.request_path.read_text())
+            document["environment"].pop(missing)
+            partial = self.root / f"partial-dashboard-{index}.json"
+            partial.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                lepton_job.LeptonJobError,
+                rf"dashboard contract is incomplete: missing=.*{missing}",
+            ):
+                lepton_job.load_request(partial, contract=self.contract)
+
+        document = json.loads(self.request_path.read_text())
+        for name in lepton_job._DASHBOARD_ENV:
+            document["environment"].pop(name)
+        absent = self.root / "absent-dashboard.json"
+        absent.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(
+            lepton_job.LeptonJobError, "dashboard contract is incomplete"
+        ):
+            lepton_job.load_request(absent, contract=self.contract)
+
+        document = json.loads(self.request_path.read_text())
+        document["environment"]["ROUND_DAGGER_BETA_SHA256"] = "a" * 64
+        wrong_digest = self.root / "wrong-beta-digest.json"
+        wrong_digest.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(lepton_job.LeptonJobError, "does not bind"):
+            lepton_job.load_request(wrong_digest, contract=self.contract)
+
+        document = json.loads(self.request_path.read_text())
+        document["environment"]["ROUND_DAGGER_BETA"] = "nan"
+        nonfinite = self.root / "nonfinite-beta.json"
+        nonfinite.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(lepton_job.LeptonJobError, "finite"):
+            lepton_job.load_request(nonfinite, contract=self.contract)
+
+        document = json.loads(self.request_path.read_text())
+        document["environment"]["ROUND_DAGGER_BETA"] = "0.50"
+        noncanonical = self.root / "noncanonical-beta.json"
+        noncanonical.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(lepton_job.LeptonJobError, "non-canonical"):
+            lepton_job.load_request(noncanonical, contract=self.contract)
+
+        document = json.loads(self.request_path.read_text())
+        document["environment"]["ROUND_DAGGER_SCENE_SAMPLE_MANIFEST"] = (
+            document["environment"]["ROUND_DAGGER_CAMPAIGN_ROOT"]
+            + "/scene_samples/not-the-manifest.json"
+        )
+        noncanonical_scene = self.root / "noncanonical-scene.json"
+        noncanonical_scene.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(lepton_job.LeptonJobError, "scene.*non-canonical"):
+            lepton_job.load_request(noncanonical_scene, contract=self.contract)
 
     def test_exact_job_is_adopted_and_multiple_active_attempts_fail_closed(self):
         first = _job(self.request, self.contract, 1, "Running")
@@ -905,6 +995,19 @@ class LeptonJobBackendTest(unittest.TestCase):
             "ROUND_DAGGER_LEARNER_RESULT": str(result),
         }
         request = replace(self.request, paths=paths, environment=environment)
+        bundle_paths = lepton_job.learner_output_bundle_paths(contract, request)
+        bundle_root = Path(bundle_paths["root"])
+        bundle_root.mkdir(parents=True)
+        orphan_archive = bundle_root / f".learner_output.tar.gz.{'a' * 32}.incoming"
+        orphan_inventory = (
+            bundle_root / ".learner_output.inventory.json.abc123_4.incoming"
+        )
+        orphan_manifest = (
+            bundle_root / ".learner_output.manifest.json.def567_8.incoming"
+        )
+        orphan_archive.write_bytes(b"partial-archive")
+        orphan_inventory.write_bytes(b"partial-inventory")
+        orphan_manifest.write_bytes(b"partial-manifest")
         events: list[str] = []
 
         def runner(argv, **kwargs):
@@ -941,12 +1044,14 @@ class LeptonJobBackendTest(unittest.TestCase):
             )
         self.assertEqual(events, ["train", "pack"])
         self.assertEqual(execution["publication"], "published")
+        self.assertFalse(orphan_archive.exists())
+        self.assertFalse(orphan_inventory.exists())
+        self.assertFalse(orphan_manifest.exists())
         document = json.loads(marker.read_text())
         self.assertEqual(
             document["schema"],
             "fast_roborender.round_dagger.remote_learner_success.v4",
         )
-        bundle_paths = lepton_job.learner_output_bundle_paths(contract, request)
         self.assertEqual(
             document["learner_output_manifest_path"],
             str(bundle_paths["manifest"]),
@@ -993,6 +1098,41 @@ class LeptonJobBackendTest(unittest.TestCase):
             adopted["success_marker_sha256"],
             execution["success_marker_sha256"],
         )
+
+    def test_learner_output_pack_temp_pruning_prevalidates_every_candidate(self):
+        root = self.root / "pack-temp-prevalidation"
+        root.mkdir()
+        paths = {
+            "root": root,
+            "archive": root / "learner_output.tar.gz",
+            "inventory": root / "learner_output.inventory.json",
+            "manifest": root / "learner_output.manifest.json",
+        }
+        safe = root / f".learner_output.tar.gz.{'1' * 32}.incoming"
+        safe.write_bytes(b"safe-but-stale")
+        unsafe = root / ".learner_output.inventory.json.abc123_4.incoming"
+        unsafe.symlink_to(self.root)
+        with self.assertRaisesRegex(
+            lepton_job.LeptonJobError, "no-follow regular"
+        ):
+            lepton_job._prune_learner_output_pack_temporaries(paths)
+        self.assertTrue(safe.is_file())
+        self.assertTrue(os.path.lexists(unsafe))
+
+    def test_learner_output_pack_temp_pruning_rejects_malformed_name(self):
+        root = self.root / "pack-temp-malformed"
+        root.mkdir()
+        paths = {
+            "root": root,
+            "archive": root / "learner_output.tar.gz",
+            "inventory": root / "learner_output.inventory.json",
+            "manifest": root / "learner_output.manifest.json",
+        }
+        malformed = root / ".learner_output.manifest.json.not-a-name.incoming"
+        malformed.write_bytes(b"ambiguous")
+        with self.assertRaisesRegex(lepton_job.LeptonJobError, "malformed"):
+            lepton_job._prune_learner_output_pack_temporaries(paths)
+        self.assertTrue(malformed.is_file())
 
     def test_in_job_executor_never_publishes_success_when_bundle_pack_fails(self):
         project = self.root / "remote-project-pack-failure"

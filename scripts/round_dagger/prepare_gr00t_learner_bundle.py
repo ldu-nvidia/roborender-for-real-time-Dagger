@@ -94,6 +94,7 @@ def prepare_bundle(
     partition_seed: int,
     heldout_snapshot: Path | None = None,
     heldout_eval_interval: int | None = None,
+    artifact_root: Path | None = None,
 ) -> LearnerBundleConfig:
     """Derive a canonical bundle without writing it."""
 
@@ -144,7 +145,9 @@ def prepare_bundle(
     if heldout_snapshot is not None:
         heldout_path = _absolute_file(heldout_snapshot, "held-out replay snapshot")
         try:
-            heldout_identity = load_heldout_snapshot(heldout_path)
+            heldout_identity = load_heldout_snapshot(
+                heldout_path, artifact_root=artifact_root
+            )
         except Exception as exc:
             raise BundlePreparationError(
                 f"held-out replay snapshot validation failed: {exc}"
@@ -214,6 +217,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--partition-seed", required=True, type=int)
     parser.add_argument("--heldout-snapshot", type=Path)
     parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        help="campaign/projection root for relocated held-out replay artifacts",
+    )
+    parser.add_argument(
         "--heldout-eval-interval",
         type=int,
         help="evaluation cadence in optimizer steps (production target: 100)",
@@ -247,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         partition_seed=arguments.partition_seed,
         heldout_snapshot=arguments.heldout_snapshot,
         heldout_eval_interval=arguments.heldout_eval_interval,
+        artifact_root=arguments.artifact_root,
     )
     expected = arguments.expected_bundle_sha256
     if expected is not None and bundle.sha256 != _sha256(

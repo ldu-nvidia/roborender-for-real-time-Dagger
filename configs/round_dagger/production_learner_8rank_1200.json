@@ -1,0 +1,31 @@
+{
+  "schema": "fast_roborender.round_dagger.production_learner_contract.v2",
+  "allocation": {
+    "world_size": 8,
+    "batch_size_per_rank": 8,
+    "global_batch_size": 64
+  },
+  "optimization": {
+    "optimizer_steps": 1200,
+    "save_every_steps": 5,
+    "learning_rate": 2.5e-5,
+    "weight_decay": 0.01,
+    "seed": 17,
+    "partition_seed": 23
+  },
+  "handoff": {
+    "local_root": "/mnt/data2/ldu/roborender_round_dagger_handoff"
+  },
+  "wandb": {
+    "mode": "online",
+    "expected_email": "ldu@nvidia.com",
+    "entity": "nvidia",
+    "authorization_scope": "team",
+    "project": "lepton-dagger-production-1"
+  },
+  "source": {
+    "must_be_sealed": true,
+    "inventory_schema": "fast_roborender.hsg_source_inventory.v1",
+    "attestation_schema": "fast_roborender.hsg_source_snapshot_attestation.v2"
+  }
+}

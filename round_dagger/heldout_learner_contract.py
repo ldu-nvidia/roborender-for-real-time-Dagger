@@ -1,4 +1,4 @@
-"""Materialize an exact production learner contract for fixed held-out eval.
+"""Materialize an exact backend-neutral learner contract for fixed held-out eval.
 
 The checked-in learner contract intentionally remains unbound while the live
 8x32 expert capture is incomplete.  This module is the only publication path

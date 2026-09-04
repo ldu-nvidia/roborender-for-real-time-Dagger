@@ -28,7 +28,8 @@ from typing import Any
 
 from round_dagger import artifacts, state
 from round_dagger.orchestration import (
-    BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+    RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
+    LEARNER_BACKEND_LEPTON_JOB_V1,
     LEARNER_BACKEND_OCI_NRT,
     MacroRoundConfig,
     trusted_train_hook_relative,
@@ -44,7 +45,7 @@ COLLECTION_FAILURE_SCHEMA = (
 COLLECTION_ATTEMPT_SCHEMA = (
     "fast_roborender.round_dagger.collection_launcher_attempt.v1"
 )
-ORCHESTRATION_SCHEMA = BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
+ORCHESTRATION_SCHEMA = RESILIENT_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA
 PRODUCTION_MACRO_ROUNDS = 5
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _SENSITIVE_RE = re.compile(
@@ -321,7 +322,7 @@ class DriverInputs:
     launcher: Path
     launcher_sha256: str
     control_root: Path
-    learner_backend: str = LEARNER_BACKEND_OCI_NRT
+    learner_backend: str = LEARNER_BACKEND_LEPTON_JOB_V1
     lepton_backend_contract: Path | None = None
     lepton_backend_contract_sha256: str | None = None
     lepton_remote_backend_contract: str | None = None
@@ -444,10 +445,24 @@ class DriverInputs:
             learner_contract = production_launch.load_learner_contract(
                 self.learner_contract
             )
+            learner_contract_backend = production_launch.learner_contract_backend(
+                learner_contract
+            )
             campaign = state.load_campaign(self.campaign_root)
         except Exception as exc:
             raise ProductionDriverError(f"cannot validate immutable inputs: {exc}") from exc
         _reject_secrets(learner_contract, "learner contract")
+        if (
+            self.learner_backend == LEARNER_BACKEND_LEPTON_JOB_V1
+            and learner_contract_backend is not None
+        ) or (
+            self.learner_backend == LEARNER_BACKEND_OCI_NRT
+            and learner_contract_backend != LEARNER_BACKEND_OCI_NRT
+        ):
+            raise ProductionDriverError(
+                "campaign learner contract backend differs from the selected "
+                "learner backend"
+            )
         if campaign.get("policy_config_sha256") != self.learner_contract_sha256:
             raise ProductionDriverError(
                 "durable campaign policy_config_sha256 differs from the "
@@ -693,6 +708,7 @@ def _orchestration_document(
         raise ProductionDriverError("learner backend contract identity is missing")
     document = {
         "schema": ORCHESTRATION_SCHEMA,
+        "advance_after_rejected_evaluation": True,
         "learner_backend": inputs.learner_backend,
         "learner_backend_contract_sha256": backend_contract_sha256,
         "campaign_root": str(inputs.campaign_root),
@@ -820,7 +836,15 @@ def materialize_orchestration_config(
     return config_path, config_sha, binding_path
 
 
-def _launcher_argv(inputs: DriverInputs, config_path: Path, *, dry_run: bool) -> list[str]:
+def _launcher_argv(
+    inputs: DriverInputs,
+    config_path: Path,
+    *,
+    dry_run: bool,
+    stop_after_collected: bool = False,
+) -> list[str]:
+    if type(stop_after_collected) is not bool:
+        raise ProductionDriverError("stop_after_collected must be a boolean")
     argv = [
         str(inputs.launcher),
         "--orchestration-config",
@@ -872,11 +896,98 @@ def _launcher_argv(inputs: DriverInputs, config_path: Path, *, dry_run: bool) ->
         )
     if dry_run:
         argv.append("--dry-run")
+    if stop_after_collected:
+        argv.append("--stop-after-collected")
     if any(_SENSITIVE_RE.search(item) for item in argv):
         raise ProductionDriverError(
             "launcher argv unexpectedly contains a credential-shaped value"
         )
     return argv
+
+
+def _collection_only_receipt(
+    *,
+    campaign_root: Path,
+    campaign: Mapping[str, Any],
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the only successful terminal state for collection-only mode.
+
+    A collection-only invocation deliberately does *not* advance the campaign
+    to ``READY``: it stops at the durable, immutable ``COLLECTED`` boundary so
+    the normal driver can later ingest/train/evaluate the exact same rollout.
+    Treating that boundary as an ordinary successful round resolution would
+    either falsely report a failure or risk continuing into H200 work that the
+    operator explicitly deferred.
+    """
+
+    allowed_before_phases = {"READY", "COLLECTING", "COLLECTED"}
+    if before.get("phase") not in allowed_before_phases:
+        raise ProductionDriverError(
+            "collection-only mode may start only from READY, COLLECTING, or "
+            "COLLECTED"
+        )
+    macro_round = before.get("next_macro_round")
+    if type(macro_round) is not int:
+        raise ProductionDriverError("collection-only before-state macro round is invalid")
+    if (
+        after.get("phase") != "COLLECTED"
+        or after.get("next_macro_round") != macro_round
+        or after.get("open_macro_round") != macro_round
+        or after.get("last_collected_macro_round") != macro_round
+    ):
+        raise ProductionDriverError(
+            "collection-only launcher did not finish at the expected durable "
+            "COLLECTED boundary"
+        )
+    if after.get("active_policy") != before.get("active_policy"):
+        raise ProductionDriverError(
+            "collection-only launcher unexpectedly changed the active policy"
+        )
+    if after.get("candidate_policy") != before.get("candidate_policy"):
+        raise ProductionDriverError(
+            "collection-only launcher unexpectedly changed the candidate policy"
+        )
+
+    collection_path = state.round_directory(campaign_root, macro_round) / "collection.json"
+    try:
+        collection = state.load_collection_manifest(
+            campaign_root,
+            collection_path,
+            expected_macro_round=macro_round,
+        )
+    except Exception as exc:
+        raise ProductionDriverError(
+            "collection-only launcher did not leave a valid immutable collection"
+        ) from exc
+    expected_cohorts = campaign.get("cohort_count")
+    expected_transitions = (
+        campaign.get("target_environments") * campaign.get("steps_per_environment")
+        if type(campaign.get("target_environments")) is int
+        and type(campaign.get("steps_per_environment")) is int
+        else None
+    )
+    if (
+        collection.get("cohort_count") != expected_cohorts
+        or collection.get("transition_count") != expected_transitions
+    ):
+        raise ProductionDriverError(
+            "collection-only launcher did not seal the exact campaign topology"
+        )
+    active = after.get("active_policy")
+    if not isinstance(active, Mapping) or collection.get("runtime_policy_sha256") != active.get(
+        "runtime_policy_sha256"
+    ):
+        raise ProductionDriverError(
+            "collection-only aggregate is not bound to the active policy runtime"
+        )
+    return {
+        "collection_manifest_path": collection["manifest_path"],
+        "collection_manifest_sha256": collection["manifest_sha256"],
+        "cohort_count": collection["cohort_count"],
+        "transition_count": collection["transition_count"],
+    }
 
 
 def _status_document(
@@ -1643,7 +1754,7 @@ def _reconcile_unmatched_attempt(
     return config_path, config_sha, binding_path, recovery
 
 
-def _round_was_promoted(
+def _round_was_resolved(
     before: Mapping[str, Any], after: Mapping[str, Any]
 ) -> bool:
     before_policy = before.get("active_policy")
@@ -1656,7 +1767,7 @@ def _round_was_promoted(
     after_version = (
         after_policy.get("version") if isinstance(after_policy, Mapping) else None
     )
-    return bool(
+    advanced = bool(
         isinstance(before_policy, Mapping)
         and isinstance(after_policy, Mapping)
         and type(before_round) is int
@@ -1666,8 +1777,47 @@ def _round_was_promoted(
         and after.get("phase") == "READY"
         and after.get("open_macro_round") is None
         and after_round == before_round + 1
-        and after_version == before_version + 1
     )
+    if not advanced:
+        return False
+    resolution = after.get("last_resolution")
+    if resolution is None:
+        # Compatibility for a V2/V4 campaign completed before terminal
+        # resolution receipts were introduced.
+        return after_version == before_version + 1
+    if not isinstance(resolution, Mapping):
+        return False
+    decision = resolution.get("decision")
+    if (
+        resolution.get("macro_round") != before_round
+        or not isinstance(resolution.get("candidate_policy_version"), int)
+        or not isinstance(resolution.get("candidate_manifest_sha256"), str)
+        or not isinstance(resolution.get("evaluation_sha256"), str)
+    ):
+        return False
+    candidate = after.get("candidate_policy")
+    if (
+        not isinstance(candidate, Mapping)
+        or candidate.get("version") != resolution["candidate_policy_version"]
+        or candidate.get("manifest_sha256")
+        != resolution["candidate_manifest_sha256"]
+    ):
+        return False
+    if decision == "promoted":
+        return bool(
+            after_version == resolution["candidate_policy_version"]
+            and after_policy.get("checkpoint_sha256")
+            == candidate.get("checkpoint_sha256")
+        )
+    if decision == "rejected":
+        return dict(after_policy) == dict(before_policy)
+    return False
+
+
+# Kept as a private compatibility spelling for older diagnostics.  New driver
+# paths intentionally accept either a promoted candidate or an attested parent
+# retention as the successful terminal state of one macro-round.
+_round_was_promoted = _round_was_resolved
 
 
 def _invoke_launcher(
@@ -1752,9 +1902,18 @@ def run_driver(
     inputs: DriverInputs,
     *,
     dry_run: bool = False,
+    stop_after_collected: bool = False,
     launcher_runner: Callable[..., int] = _invoke_launcher,
 ) -> dict[str, Any]:
-    """Run/resume rounds 0..4, or validate only the current round in dry-run."""
+    """Run/resume production rounds, or seal only the current collection.
+
+    ``stop_after_collected`` is intentionally narrow: it may finish the
+    currently open macro-round only at its immutable collection boundary.  It
+    never trains, evaluates, promotes, or advances to another macro-round.
+    """
+
+    if type(stop_after_collected) is not bool:
+        raise ProductionDriverError("stop_after_collected must be a boolean")
 
     runtime_contract, _learner_contract, _campaign = inputs.validate()
     status_path = inputs.control_root / "driver_status.json"
@@ -1766,6 +1925,10 @@ def run_driver(
         while True:
             campaign, coordinator = _snapshot(inputs.campaign_root)
             if coordinator["next_macro_round"] == PRODUCTION_MACRO_ROUNDS:
+                if stop_after_collected:
+                    raise ProductionDriverError(
+                        "collection-only mode cannot run after all macro-rounds complete"
+                    )
                 result = _status_document(
                     inputs=inputs,
                     coordinator=coordinator,
@@ -1774,6 +1937,34 @@ def run_driver(
                 )
                 _atomic_json(status_path, result)
                 return result
+
+            if stop_after_collected and coordinator["phase"] == "COLLECTED":
+                receipt = _collection_only_receipt(
+                    campaign_root=inputs.campaign_root,
+                    campaign=campaign,
+                    before=coordinator,
+                    after=coordinator,
+                )
+                completed = _status_document(
+                    inputs=inputs,
+                    coordinator=coordinator,
+                    driver_state="COLLECTION_ONLY_COMPLETE",
+                    detail=(
+                        "the exact immutable collection is already sealed; "
+                        "no learner, evaluation, or promotion hook was launched"
+                    ),
+                )
+                completed.update(receipt)
+                _atomic_json(status_path, completed)
+                return completed
+            if stop_after_collected and coordinator["phase"] not in {
+                "READY",
+                "COLLECTING",
+            }:
+                raise ProductionDriverError(
+                    "collection-only mode refuses a macro-round that has already "
+                    "advanced beyond collection"
+                )
 
             collection_failures = _load_collection_failures(
                 inputs=inputs,
@@ -1929,7 +2120,12 @@ def run_driver(
                     ),
                 )
 
-            argv = _launcher_argv(inputs, config_path, dry_run=dry_run)
+            argv = _launcher_argv(
+                inputs,
+                config_path,
+                dry_run=dry_run,
+                stop_after_collected=stop_after_collected,
+            )
             return_code = launcher_runner(
                 argv,
                 log_path=log_path,
@@ -2034,15 +2230,47 @@ def run_driver(
                 validated = _status_document(
                     inputs=inputs,
                     coordinator=after,
-                    driver_state="DRY_RUN_VALIDATED",
+                    driver_state=(
+                        "COLLECTION_ONLY_DRY_RUN_VALIDATED"
+                        if stop_after_collected
+                        else "DRY_RUN_VALIDATED"
+                    ),
                     config_path=config_path,
                     config_sha256=config_sha,
                     binding_path=binding_path,
-                    detail="current durable round passed launcher preflight without submission",
+                    detail=(
+                        "current durable collection passed launcher preflight "
+                        "without submission"
+                        if stop_after_collected
+                        else "current durable round passed launcher preflight "
+                        "without submission"
+                    ),
                 )
                 _atomic_json(status_path, validated)
                 return validated
-            if not _round_was_promoted(coordinator, after):
+            if stop_after_collected:
+                receipt = _collection_only_receipt(
+                    campaign_root=inputs.campaign_root,
+                    campaign=campaign,
+                    before=coordinator,
+                    after=after,
+                )
+                completed = _status_document(
+                    inputs=inputs,
+                    coordinator=after,
+                    driver_state="COLLECTION_ONLY_COMPLETE",
+                    config_path=config_path,
+                    config_sha256=config_sha,
+                    binding_path=binding_path,
+                    detail=(
+                        "the exact four-cohort collection is sealed; no learner, "
+                        "evaluation, or promotion hook was launched"
+                    ),
+                )
+                completed.update(receipt)
+                _atomic_json(status_path, completed)
+                return completed
+            if not _round_was_resolved(coordinator, after):
                 failed = _status_document(
                     inputs=inputs,
                     coordinator=after,
@@ -2050,7 +2278,7 @@ def run_driver(
                     config_path=config_path,
                     config_sha256=config_sha,
                     binding_path=binding_path,
-                    detail="launcher returned success without exactly one durable promotion",
+                    detail="launcher returned success without exactly one durable terminal resolution",
                 )
                 _atomic_json(status_path, failed)
                 raise ProductionDriverError(
@@ -2077,7 +2305,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--learner-backend",
         choices=("oci_nrt", "lepton_job_v1"),
-        default="oci_nrt",
+        default="lepton_job_v1",
     )
     parser.add_argument("--lepton-backend-contract", type=Path)
     parser.add_argument("--lepton-backend-contract-sha256")
@@ -2088,6 +2316,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--collection-retry-limit", type=int, default=2)
     parser.add_argument(
         "--collection-retry-backoff-seconds", type=float, default=30.0
+    )
+    parser.add_argument(
+        "--stop-after-collected",
+        action="store_true",
+        help=(
+            "seal the current round's four cohorts and stop before learner "
+            "ingestion, training, evaluation, or promotion"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -2148,7 +2384,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.collection_retry_backoff_seconds
             ),
         )
-        result = run_driver(inputs, dry_run=arguments.dry_run)
+        result = run_driver(
+            inputs,
+            dry_run=arguments.dry_run,
+            stop_after_collected=arguments.stop_after_collected,
+        )
     except ProductionDriverError as exc:
         print(f"production five-round driver failed: {exc}", file=os.sys.stderr)
         return 2

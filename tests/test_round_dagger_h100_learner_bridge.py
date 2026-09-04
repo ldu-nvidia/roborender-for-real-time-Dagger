@@ -462,6 +462,112 @@ class ImmutableLearnerBundleTest(unittest.TestCase):
         self.assertEqual(captured["max_steps"], 11)
         self.assertEqual(captured["validation_stop_at_step"], 5)
 
+    def test_dashboard_entrypoint_forwards_lineage_verified_dagger_beta(self):
+        snapshot_path, snapshot = _production_snapshot(
+            self.root,
+            parent_sha=self.kwargs["expected_parent_checkpoint_sha256"],
+            runtime_sha=self.kwargs["runtime_policy_sha256"],
+        )
+        heldout_path, _heldout = _heldout_snapshot(
+            self.root,
+            parent_sha=self.kwargs["expected_parent_checkpoint_sha256"],
+            runtime_sha=self.kwargs["runtime_policy_sha256"],
+        )
+        bundle = self.preparer.prepare_bundle(
+            **self.kwargs,
+            heldout_snapshot=heldout_path,
+            heldout_eval_interval=100,
+            artifact_root=self.root,
+        )
+        bundle_path = self.root / "dashboard-learner-bundle.json"
+        artifacts.publish_immutable_json(bundle_path, bundle.to_mapping())
+        runtime_container_sha256 = "6" * 64
+        learner_contract_sha256 = "5" * 64
+        identity_sha256 = learner_identity_sha256(
+            campaign_id=bundle.campaign_id,
+            macro_round=bundle.macro_round,
+            learner_code_sha256=bundle.code_sha256,
+            learner_config_sha256=bundle.sha256,
+            replay_snapshot_file_sha256=snapshot["file_sha256"],
+            replay_snapshot_sha256=snapshot["snapshot_sha256"],
+            parent_checkpoint_sha256=bundle.model_lineage_sha256,
+            parent_runtime_policy_sha256=bundle.to_mapping()["model_config"][
+                "runtime_policy_sha256"
+            ],
+            runtime_container_sha256=runtime_container_sha256,
+            learner_contract_sha256=learner_contract_sha256,
+        )
+        arguments = [
+            "--bundle",
+            str(bundle_path),
+            "--snapshot",
+            str(snapshot_path),
+            "--heldout-snapshot",
+            str(heldout_path),
+            "--heldout-eval-interval",
+            "100",
+            "--output-dir",
+            str(self.root / "dashboard-output"),
+            "--model-factory",
+            "unused:factory",
+            "--initial-checkpoint",
+            str(self.kwargs["parent_checkpoint"]),
+            "--expected-snapshot-file-sha256",
+            snapshot["file_sha256"],
+            "--learner-identity-sha256",
+            identity_sha256,
+            "--runtime-container-sha256",
+            runtime_container_sha256,
+            "--learner-contract-sha256",
+            learner_contract_sha256,
+            "--telemetry-jsonl",
+            str(self.root / "telemetry.jsonl"),
+            "--heldout-telemetry-jsonl",
+            str(self.root / "heldout.jsonl"),
+            "--training-quality-telemetry-jsonl",
+            str(self.root / "training-quality.jsonl"),
+            "--dagger-wandb-dashboard",
+            "--scene-sample-manifest",
+            str(self.root / "scene-samples.json"),
+            "--dagger-beta",
+            "0.5",
+            "--wandb-project",
+            "dashboard-test",
+            "--wandb-run-id",
+            learner_wandb_run_id(
+                campaign_id=bundle.campaign_id,
+                macro_round=bundle.macro_round,
+                learner_identity_sha256=identity_sha256,
+            ),
+            "--no-publish-result",
+        ]
+        captured = {}
+
+        def train_stub(_model, **kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(
+                completed_steps=11,
+                target_steps=11,
+                validation_stopped=False,
+                restart_checkpoint=str(self.root / "restart.pt"),
+                replay_snapshot_sha256=snapshot["snapshot_sha256"],
+            )
+
+        trainer = _load_train_entrypoint()
+        telemetry = types.SimpleNamespace(close=lambda *, exit_code=0: None)
+        with (
+            mock.patch.object(
+                trainer,
+                "_symbol",
+                return_value=lambda _mapping: torch.nn.Linear(1, 1),
+            ),
+            mock.patch.object(trainer, "_load_initial_checkpoint"),
+            mock.patch.object(trainer, "train_from_replay", side_effect=train_stub),
+            mock.patch.object(trainer, "JsonlTelemetry", return_value=telemetry),
+        ):
+            self.assertEqual(trainer.main(arguments), 0)
+        self.assertEqual(captured["dagger_beta"], 0.5)
+
     def test_train_entrypoint_requires_the_bundle_pinned_initial_checkpoint(self):
         bundle = self.preparer.prepare_bundle(**self.kwargs)
         bundle_path = self.root / "learner_bundle.json"
@@ -562,15 +668,27 @@ class H100LauncherDryRunTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.preparer = _load_preparer()
         self.kwargs = _bundle_kwargs(self.root)
-        self.bundle = self.preparer.prepare_bundle(**self.kwargs)
         self.snapshot_path, self.snapshot = _production_snapshot(
             self.root,
             parent_sha=self.kwargs["expected_parent_checkpoint_sha256"],
             runtime_sha=self.kwargs["runtime_policy_sha256"],
         )
+        self.heldout_path, self.heldout = _heldout_snapshot(
+            self.root,
+            parent_sha=self.kwargs["expected_parent_checkpoint_sha256"],
+            runtime_sha=self.kwargs["runtime_policy_sha256"],
+        )
+        self.bundle = self.preparer.prepare_bundle(
+            **self.kwargs,
+            heldout_snapshot=self.heldout_path,
+            heldout_eval_interval=100,
+        )
         self.output = self.root / "learner"
         self.gr00t_root = self.root / "GR00T-VisualSim2Real"
         self.gr00t_root.mkdir()
+        self.scene_sample_manifest = self.root / "scene_samples/manifest.json"
+        self.scene_sample_manifest.parent.mkdir()
+        artifacts.publish_immutable_json(self.scene_sample_manifest, {})
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -652,8 +770,24 @@ class H100LauncherDryRunTest(unittest.TestCase):
             "ROUND_DAGGER_ENVIRONMENTS_PER_COHORT": "64",
             "ROUND_DAGGER_STEPS_PER_ENVIRONMENT": "512",
             "ROUND_DAGGER_TRANSITIONS_PER_MACRO_ROUND": "131072",
+            "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT": str(self.heldout_path),
+            "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_FILE_SHA256": self.heldout[
+                "file_sha256"
+            ],
+            "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256": self.heldout[
+                "snapshot_sha256"
+            ],
+            "ROUND_DAGGER_HELDOUT_EVAL_INTERVAL": "100",
+            "ROUND_DAGGER_BETA": "1.0",
+            "ROUND_DAGGER_BETA_SHA256": artifacts.canonical_json_sha256(
+                {"beta": 1.0}
+            ),
+            "ROUND_DAGGER_SCENE_SAMPLE_MANIFEST": str(
+                self.scene_sample_manifest
+            ),
             "ROUND_DAGGER_WANDB_PROJECT": "bridge-test",
             "ROUND_DAGGER_WANDB_ENTITY": "entity-test",
+            "ROUND_DAGGER_WANDB_EXPECTED_EMAIL": "ldu@nvidia.com",
             "WANDB_API_KEY": "must-never-appear-in-launch-output",
         }
         return self._bind_identity(environment)
@@ -684,9 +818,31 @@ class H100LauncherDryRunTest(unittest.TestCase):
             completed.stdout,
         )
         self.assertIn("--device cuda", completed.stdout)
+        self.assertIn(f"--artifact-root {self.root}", completed.stdout)
+        self.assertIn("--training-quality-telemetry-jsonl", completed.stdout)
+        self.assertIn("--dagger-wandb-dashboard", completed.stdout)
+        self.assertIn("--scene-sample-manifest", completed.stdout)
+        self.assertIn(str(self.scene_sample_manifest), completed.stdout)
+        self.assertIn("--dagger-beta 1.0", completed.stdout)
         self.assertIn("cuda_determinism=:4096:8", completed.stdout)
         self.assertNotIn("must-never-appear", completed.stdout + completed.stderr)
         self.assertFalse(self.output.exists())
+
+    def test_dashboard_rejects_missing_scene_manifest_and_beta_drift(self):
+        missing = self._environment()
+        missing.pop("ROUND_DAGGER_SCENE_SAMPLE_MANIFEST")
+        completed = self._launch(missing)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "W&B dashboard requires environment: ROUND_DAGGER_SCENE_SAMPLE_MANIFEST",
+            completed.stderr,
+        )
+
+        drifted = self._environment()
+        drifted["ROUND_DAGGER_BETA"] = "0.5"
+        completed = self._launch(drifted)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("scheduled DAgger beta digest mismatch", completed.stderr)
 
     def test_conflicting_cublas_determinism_contract_is_rejected(self):
         environment = self._environment()
@@ -708,6 +864,7 @@ class H100LauncherDryRunTest(unittest.TestCase):
             **self.kwargs,
             heldout_snapshot=heldout_path,
             heldout_eval_interval=100,
+            artifact_root=self.root,
         )
         environment = self._environment()
         environment.update(
@@ -732,7 +889,7 @@ class H100LauncherDryRunTest(unittest.TestCase):
         self.assertIn("heldout_eval=1 cadence=100", completed.stdout)
 
         incomplete = self._environment()
-        incomplete["ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT"] = str(heldout_path)
+        incomplete.pop("ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256")
         rejected = self._launch(incomplete)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("supplied all-or-none", rejected.stderr)
@@ -805,6 +962,8 @@ class H100LauncherDryRunTest(unittest.TestCase):
                 self.kwargs,
                 base_policy_spec=changed_spec_path,
                 runtime_policy_sha256=changed_runtime,
+                heldout_snapshot=self.heldout_path,
+                heldout_eval_interval=100,
             )
         )
         environment["ROUND_DAGGER_LEARNER_CONFIG_SHA256"] = changed.sha256

@@ -1,7 +1,12 @@
 #!/bin/bash
-# Compatibility name: submit one cluster-max four-hour stage of the 256-env campaign.
-# A continuous eight-hour allocation requires long-run QoS not currently granted.
+# Legacy OCI compatibility entry point for the superseded packed 256-env campaign.
+# The canonical production route is scripts/scaling/submit_production.sh.
 set -Eeuo pipefail
+
+[[ ${ROUND_DAGGER_ENABLE_LEGACY_OCI_COMPAT:-0} == 1 ]] || {
+    echo "FATAL: this is a legacy OCI launcher; set ROUND_DAGGER_ENABLE_LEGACY_OCI_COMPAT=1 for an explicit compatibility run" >&2
+    exit 2
+}
 
 SCRIPT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}

@@ -14,6 +14,7 @@ import numpy as np
 from round_dagger import artifacts
 from round_dagger.quality import (
     QUALITY_SCHEMA,
+    QUALITY_RECOVERY_SCHEMA,
     StudentQualityError,
     publish_student_quality,
     summarize_sealed_cohort,
@@ -115,6 +116,20 @@ class StudentQualityTest(unittest.TestCase):
         )
         artifacts.seal_cohort(self.cohort)
 
+    @staticmethod
+    def _replace_json(path: Path, document: dict[str, object]) -> None:
+        os.chmod(path, 0o644)
+        path.write_text(
+            json.dumps(
+                document,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o444)
+
     def test_metrics_use_only_first_eleven_actions_and_bind_counts(self) -> None:
         self._publish_and_seal()
         result = summarize_sealed_cohort(
@@ -215,6 +230,173 @@ class StudentQualityTest(unittest.TestCase):
             quality["lineage"]["cohort_sha256"],
             artifacts.sha256_file(self.cohort / "seal.json"),
         )
+
+    def test_one_ulp_legacy_reduction_is_adopted_without_rewriting(self) -> None:
+        self._publish_and_seal()
+        run_dir = self.root / "run"
+        first = publish_student_quality(
+            self.cohort,
+            run_dir,
+            expected_lineage=_expected_lineage(),
+            expected_beta=BETA,
+        )
+        artifact_path = Path(first["artifact_path"])
+        scalar_path = Path(first["scalar_path"])
+        legacy = artifacts.load_strict_json(artifact_path)
+        changed_metrics = (
+            "student_quality/action_cosine_similarity_mean",
+            "student_quality/action_l2_mean",
+        )
+        for key in changed_metrics:
+            value = legacy["metrics"][key]
+            legacy["metrics"][key] = math.nextafter(value, math.inf)
+        self._replace_json(artifact_path, legacy)
+        legacy_bytes = artifact_path.read_bytes()
+        scalar_path.unlink()
+
+        recovered = publish_student_quality(
+            self.cohort,
+            run_dir,
+            expected_lineage=_expected_lineage(),
+            expected_beta=BETA,
+        )
+
+        self.assertEqual(artifact_path.read_bytes(), legacy_bytes)
+        self.assertEqual(recovered["metrics"], legacy["metrics"])
+        step, metrics = load_scalar_file(scalar_path)
+        self.assertEqual(step, legacy["wandb_step"])
+        self.assertEqual(metrics, legacy["metrics"])
+        recovery_files = list((run_dir / "quality" / "recovery").glob("*.json"))
+        self.assertEqual(len(recovery_files), 1)
+        evidence = artifacts.load_strict_json(recovery_files[0])
+        self.assertEqual(evidence["schema"], QUALITY_RECOVERY_SCHEMA)
+        self.assertEqual(
+            evidence["existing_artifact_sha256"],
+            artifacts.sha256_file(artifact_path),
+        )
+        self.assertEqual(
+            {item["json_path"] for item in evidence["accepted_differences"]},
+            {f"metrics/{key}" for key in changed_metrics},
+        )
+        self.assertEqual(
+            {item["ulp_distance"] for item in evidence["accepted_differences"]},
+            {1},
+        )
+
+    def test_two_ulp_legacy_reduction_difference_fails_closed(self) -> None:
+        self._publish_and_seal()
+        run_dir = self.root / "run"
+        first = publish_student_quality(
+            self.cohort,
+            run_dir,
+            expected_lineage=_expected_lineage(),
+            expected_beta=BETA,
+        )
+        artifact_path = Path(first["artifact_path"])
+        document = artifacts.load_strict_json(artifact_path)
+        key = "student_quality/action_l2_mean"
+        value = document["metrics"][key]
+        document["metrics"][key] = math.nextafter(
+            math.nextafter(value, math.inf), math.inf
+        )
+        self._replace_json(artifact_path, document)
+        Path(first["scalar_path"]).unlink()
+        with self.assertRaisesRegex(StudentQualityError, "semantic mismatch"):
+            publish_student_quality(
+                self.cohort,
+                run_dir,
+                expected_lineage=_expected_lineage(),
+                expected_beta=BETA,
+            )
+
+    def test_one_ulp_unapproved_metric_difference_fails_closed(self) -> None:
+        self._publish_and_seal()
+        run_dir = self.root / "run"
+        first = publish_student_quality(
+            self.cohort,
+            run_dir,
+            expected_lineage=_expected_lineage(),
+            expected_beta=BETA,
+        )
+        artifact_path = Path(first["artifact_path"])
+        document = artifacts.load_strict_json(artifact_path)
+        key = "student_quality/action_mse"
+        value = document["metrics"][key]
+        document["metrics"][key] = math.nextafter(value, math.inf)
+        self._replace_json(artifact_path, document)
+        Path(first["scalar_path"]).unlink()
+        with self.assertRaisesRegex(StudentQualityError, "semantic mismatch"):
+            publish_student_quality(
+                self.cohort,
+                run_dir,
+                expected_lineage=_expected_lineage(),
+                expected_beta=BETA,
+            )
+
+    def test_existing_quality_symlink_fails_closed(self) -> None:
+        self._publish_and_seal()
+        run_dir = self.root / "run"
+        first = publish_student_quality(
+            self.cohort,
+            run_dir,
+            expected_lineage=_expected_lineage(),
+            expected_beta=BETA,
+        )
+        artifact_path = Path(first["artifact_path"])
+        copy_path = run_dir / "quality-copy.json"
+        copy_path.write_bytes(artifact_path.read_bytes())
+        artifact_path.unlink()
+        artifact_path.symlink_to(copy_path)
+        with self.assertRaisesRegex(StudentQualityError, "not a regular file"):
+            publish_student_quality(
+                self.cohort,
+                run_dir,
+                expected_lineage=_expected_lineage(),
+                expected_beta=BETA,
+            )
+
+    def test_existing_writable_quality_artifact_fails_closed(self) -> None:
+        self._publish_and_seal()
+        run_dir = self.root / "run"
+        first = publish_student_quality(
+            self.cohort,
+            run_dir,
+            expected_lineage=_expected_lineage(),
+            expected_beta=BETA,
+        )
+        os.chmod(first["artifact_path"], 0o644)
+        with self.assertRaisesRegex(StudentQualityError, "not immutable"):
+            publish_student_quality(
+                self.cohort,
+                run_dir,
+                expected_lineage=_expected_lineage(),
+                expected_beta=BETA,
+            )
+
+    def test_existing_noncanonical_quality_artifact_fails_closed(self) -> None:
+        self._publish_and_seal()
+        run_dir = self.root / "run"
+        first = publish_student_quality(
+            self.cohort,
+            run_dir,
+            expected_lineage=_expected_lineage(),
+            expected_beta=BETA,
+        )
+        artifact_path = Path(first["artifact_path"])
+        document = artifacts.load_strict_json(artifact_path)
+        os.chmod(artifact_path, 0o644)
+        artifact_path.write_text(
+            json.dumps(document, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(artifact_path, 0o444)
+        with self.assertRaisesRegex(StudentQualityError, "not canonical JSON"):
+            publish_student_quality(
+                self.cohort,
+                run_dir,
+                expected_lineage=_expected_lineage(),
+                expected_beta=BETA,
+            )
 
     def test_unsealed_or_wrong_lineage_fails_closed(self) -> None:
         with self.assertRaisesRegex(StudentQualityError, "sealed cohort verification"):

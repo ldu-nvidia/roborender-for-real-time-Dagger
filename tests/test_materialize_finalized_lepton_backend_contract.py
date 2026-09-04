@@ -18,6 +18,9 @@ TEMPLATE = ROOT / "configs/round_dagger/production_learner_1x8h200_lepton.json"
 
 
 class FinalizedLeptonBackendContractTest(unittest.TestCase):
+    def test_finalizer_never_writes_bytecode_into_its_sealed_source(self) -> None:
+        self.assertTrue(finalizer.sys.dont_write_bytecode)
+
     def test_substitution_does_not_mutate_source_inventoried_template(self) -> None:
         template = json.loads(TEMPLATE.read_text())
         finalized = finalizer.finalized_document(

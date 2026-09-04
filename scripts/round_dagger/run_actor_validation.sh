@@ -63,6 +63,33 @@ required=(
 for name in "${required[@]}"; do
     [[ -n ${!name:-} ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
+if [[ $PURPOSE == train ]]; then
+    for name in ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST \
+        ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256; do
+        [[ -n ${!name:-} ]] || {
+            echo "missing required train environment: $name" >&2
+            exit 2
+        }
+    done
+    [[ $ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST == /* ]] || {
+        echo "collection motion split manifest path must be absolute" >&2
+        exit 2
+    }
+    [[ -f $ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST && \
+       ! -L $ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST ]] || {
+        echo "unsafe or missing collection motion split manifest" >&2
+        exit 2
+    }
+    [[ $ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+        echo "collection motion split manifest SHA-256 must be lowercase hexadecimal" >&2
+        exit 2
+    }
+    [[ $(sha256sum "$ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST" | awk '{print $1}') == \
+       "$ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256" ]] || {
+        echo "collection motion split manifest SHA-256 mismatch" >&2
+        exit 2
+    }
+fi
 case "$ROUND_DAGGER_COHORT_DIR:$ROUND_DAGGER_POLICY_CHECKPOINT:$ROUND_DAGGER_TEACHER_CHECKPOINT:$IMAGE3F_ENDPOINT_MANIFEST:$ANCHORS:$TRAIN_RUN_DIR" in
     /*:/*:/*:/*:/*:/*) ;;
     *) echo "all validation artifact paths must be absolute" >&2; exit 2 ;;
@@ -310,6 +337,13 @@ if [[ -n $ACTOR_RANK ]]; then
 else
     RANK_RUN_DIR=$BASE_TRAIN_RUN_DIR
 fi
+# Every isolated actor process is rank zero from the trainer/telemetry point of
+# view.  Give it a complete rank-local run root, not only a rank-local telemetry
+# override: DaggerTelemetry deliberately requires
+# ROBORENDER_TELEMETRY_DIR == TRAIN_RUN_DIR/telemetry.  Keep
+# BASE_TRAIN_RUN_DIR above for pair-wide evidence such as the lag audit.
+export TRAIN_RUN_DIR="$RANK_RUN_DIR"
+TELEMETRY_DIR="$TRAIN_RUN_DIR/telemetry"
 mkdir -p "$RANK_RUN_DIR" "$RANK_RUN_DIR/hydra" "$RANK_RUN_DIR/output"
 
 export PYTHONPATH="$ROOT:$GR00T_ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -346,8 +380,12 @@ else
 fi
 export IMAGE3F_REFERENCE_LAG=256
 export IMAGE3F_LOCAL_ENVS="$ENVS_PER_RANK"
-export ROBORENDER_TELEMETRY_DIR="$BASE_TRAIN_RUN_DIR/telemetry"
+export ROBORENDER_TELEMETRY_DIR="$TELEMETRY_DIR"
 export ROLLOUT_STEPS=$STEPS
+# Candidate v1 was produced on a NumPy-2 learner while Isaac's validated RTX
+# image carries NumPy 1.26.  Bind the exact policy digest for the narrow
+# in-process restart loader before the immutable GR00T trainer is imported.
+export EXPECTED_TRAIN_CHECKPOINT_SHA256="$ROUND_DAGGER_POLICY_SHA256"
 if [[ -n $ACTOR_RANK ]]; then
     export ROUND_DAGGER_ACTOR_RANK=$ACTOR_RANK
     export ROUND_DAGGER_ACTOR_WORLD_SIZE=$RANKS
@@ -390,6 +428,18 @@ TRAINER=(
     hydra.run.dir="$RANK_RUN_DIR/hydra"
     output_dir="$RANK_RUN_DIR/output"
 )
+if [[ $PURPOSE == train ]]; then
+    MOTION_ASSIGNMENT_OFFSET=$(( ${ACTOR_RANK:-0} * ENVS_PER_RANK ))
+    TRAINER+=(
+        ++env.config.reset_from_dataset.motion_split_manifest="$ROUND_DAGGER_COLLECTION_MOTION_SPLIT_MANIFEST"
+        ++env.config.reset_from_dataset.motion_split_manifest_sha256="$ROUND_DAGGER_MOTION_SPLIT_MANIFEST_SHA256"
+        ++env.config.reset_from_dataset.motion_split_role=collection
+        ++env.config.reset_from_dataset.motion_split_verify_content=true
+        ++env.config.reset_from_dataset.motion_split_offset=0
+        ++env.config.reset_from_dataset.motion_split_limit=null
+        ++env.config.reset_from_dataset.motion_assignment_offset="$MOTION_ASSIGNMENT_OFFSET"
+    )
+fi
 # Image3F's lag history is correctly scoped to an Isaac episode. A validation
 # rollout crossing the lag boundary therefore needs one deliberately
 # uninterrupted environment; ordinary actor/train rollouts retain every normal
@@ -412,10 +462,15 @@ if ((STEPS > 256)); then
         env.config.termination.terminate_after_finish_turning_for_student=false
     )
 fi
-COMMAND=("$GR00T_PYTHON" "${TRAINER[@]}")
+ACTOR_ENTRYPOINT="$ROOT/scripts/round_dagger/actor_training_entrypoint.py"
+[[ -f $ACTOR_ENTRYPOINT && ! -L $ACTOR_ENTRYPOINT ]] || {
+    echo "unsafe or missing actor checkpoint compatibility entrypoint" >&2
+    exit 2
+}
+COMMAND=("$GR00T_PYTHON" "$ACTOR_ENTRYPOINT" "${TRAINER[@]}")
 if ((DRY_RUN)); then
-    printf 'ROUND_ACTOR_VALIDATION_DRY_RUN ranks=%q actor_rank=%q purpose=%q envs_per_rank=%q steps=%q transitions=%q' \
-        "$RANKS" "${ACTOR_RANK:-none}" "$PURPOSE" "$ENVS_PER_RANK" "$STEPS" "$EXPECTED_TRANSITIONS"
+    printf 'ROUND_ACTOR_VALIDATION_DRY_RUN ranks=%q actor_rank=%q purpose=%q envs_per_rank=%q steps=%q transitions=%q train_run_dir=%q telemetry_dir=%q' \
+        "$RANKS" "${ACTOR_RANK:-none}" "$PURPOSE" "$ENVS_PER_RANK" "$STEPS" "$EXPECTED_TRANSITIONS" "$TRAIN_RUN_DIR" "$ROBORENDER_TELEMETRY_DIR"
     printf ' %q' "${COMMAND[@]}"
     printf '\n'
 else
@@ -444,7 +499,7 @@ else
         }
         PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 \
             "$ROOT/scripts/round_dagger/audit_reference_lag.py" \
-            --scalar-dir "$BASE_TRAIN_RUN_DIR/telemetry/scalars" \
+            --scalar-dir "$ROBORENDER_TELEMETRY_DIR/scalars" \
             --lag 256 \
             --expected-steps "$STEPS" \
             --rollout-shard "${REFERENCE_SHARDS[0]}" \

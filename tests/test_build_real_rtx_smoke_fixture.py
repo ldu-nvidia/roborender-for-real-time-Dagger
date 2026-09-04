@@ -97,36 +97,60 @@ class RealRtxSmokeFixtureTest(unittest.TestCase):
             )
         self.source_report = artifacts.seal_cohort(self.source)
 
-    def build_source_heldout(self, *, collides_with_train=False):
+    def build_source_heldout(
+        self,
+        *,
+        collides_with_train=False,
+        cases_per_cohort=1,
+        reverse_array_order=False,
+        one_dimensional_global_ids=False,
+        campaign_id="source-campaign",
+        digests=None,
+    ):
+        digests = SHA if digests is None else digests
         cohorts = []
         training_envs = (0, 1, 2, 3, 32, 33, 34, 35)
         for index in range(8):
-            env_id = training_envs[index] if collides_with_train else 1_000 + index
+            if collides_with_train:
+                env_ids = (training_envs[index],)
+            elif cases_per_cohort == 1:
+                env_ids = (1_000 + index,)
+            else:
+                base = 1_000 + index * 100
+                env_ids = tuple(range(base, base + cases_per_cohort))
+            array_env_ids = (
+                tuple(reversed(env_ids)) if reverse_array_order else env_ids
+            )
             cohort = self.root / f"source-eval-{index}"
             artifacts.create_cohort(
                 cohort,
-                campaign_id="source-campaign",
+                campaign_id=campaign_id,
                 macro_round=0,
                 cohort_index=index,
                 purpose="eval",
                 expected_ranks=[0],
-                expected_global_env_ids=[env_id],
-                expected_transitions=1,
+                expected_global_env_ids=sorted(env_ids),
+                expected_transitions=len(env_ids),
                 view_contract=VIEW_CONTRACT,
                 action_contract=ACTION_CONTRACT,
-                **SHA,
+                **digests,
             )
+            arrays = _arrays(array_env_ids, steps=1)
+            if one_dimensional_global_ids:
+                arrays["global_env_ids"] = np.asarray(
+                    array_env_ids, dtype=np.int64
+                )
             artifacts.publish_rollout_shard(
                 cohort,
                 rank=0,
                 rollout_id=0,
                 part_index=0,
-                arrays=_arrays((env_id,), steps=1),
-                campaign_id="source-campaign",
+                arrays=arrays,
+                campaign_id=campaign_id,
                 macro_round=0,
                 cohort_index=index,
                 purpose="eval",
-                **SHA,
+                **digests,
             )
             artifacts.seal_cohort(cohort)
             cohorts.append(cohort)
@@ -249,6 +273,16 @@ class RealRtxSmokeFixtureTest(unittest.TestCase):
         self.assertEqual(source_record["snapshot_sha256"], source_snapshot["snapshot_sha256"])
         self.assertTrue(source_record["full_recursive_verification"])
         self.assertEqual(source_record["source_shard_count"], 8)
+        self.assertEqual(
+            source_record["selection"],
+            {
+                "policy": "all_verified_cases",
+                "source_transition_count": 8,
+                "selected_transition_count": 8,
+                "source_shard_count": 8,
+                "selected_cases_per_source_shard": None,
+            },
+        )
 
         heldout = result["derived"]["heldout"]
         self.assertEqual(heldout["heldout_transition_count"], 8)
@@ -271,6 +305,190 @@ class RealRtxSmokeFixtureTest(unittest.TestCase):
         self.assertEqual(loaded["campaign_id"], "real-smoke-heldout")
         self.assertEqual(loaded["transition_count"], 8)
         self.assertEqual(len(loaded["resolved_shards"]), 8)
+
+    def test_deterministically_downsamples_256_cases_to_balanced_32(self):
+        source_heldout, source_snapshot = self.build_source_heldout(
+            cases_per_cohort=32,
+            reverse_array_order=True,
+            one_dimensional_global_ids=True,
+        )
+        source_bytes = {
+            path: path.read_bytes()
+            for directory in self.root.glob("source-eval-*")
+            for path in directory.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        output = self.root / "fixture-with-heldout-32"
+        result = fixture.build_fixture(
+            source_cohort=self.source,
+            output_root=output,
+            campaign_id="real-smoke-heldout-32",
+            source_heldout_snapshot=source_heldout,
+            expected_heldout_cases=32,
+        )
+
+        source_record = result["source"]["heldout"]
+        self.assertEqual(source_snapshot["transition_count"], 256)
+        self.assertEqual(source_record["transition_count"], 256)
+        self.assertEqual(source_record["selected_transition_count"], 32)
+        self.assertEqual(
+            source_record["selection"],
+            {
+                "policy": "lowest_global_env_id_per_source_shard",
+                "source_transition_count": 256,
+                "selected_transition_count": 32,
+                "source_shard_count": 8,
+                "selected_cases_per_source_shard": 4,
+            },
+        )
+
+        expected_selected = []
+        for index, cohort_record in enumerate(source_record["cohorts"]):
+            expected = list(range(1_000 + index * 100, 1_004 + index * 100))
+            expected_selected.extend(expected)
+            self.assertEqual(cohort_record["source_transition_count"], 32)
+            self.assertEqual(cohort_record["selected_transition_count"], 4)
+            self.assertEqual(cohort_record["selected_global_env_ids"], expected)
+            self.assertEqual(
+                cohort_record["selection_policy"],
+                "lowest_global_env_id_per_source_shard",
+            )
+
+        heldout = result["derived"]["heldout"]
+        self.assertEqual(heldout["heldout_transition_count"], 32)
+        cohort = artifacts.verify_cohort(output / "heldout_cohort")
+        self.assertEqual(cohort["campaign_id"], "real-smoke-heldout-32")
+        self.assertEqual(cohort["ranks"], list(range(8)))
+        self.assertEqual(cohort["transition_count"], 32)
+        self.assertEqual(cohort["global_env_ids"], sorted(expected_selected))
+        self.assertEqual(len(cohort["shards"]), 8)
+        for rank, shard in enumerate(cohort["shards"]):
+            expected = list(range(1_000 + rank * 100, 1_004 + rank * 100))
+            self.assertEqual(shard["rank"], rank)
+            self.assertEqual(shard["transition_count"], 4)
+            self.assertEqual(shard["global_env_ids"], expected)
+            with np.load(
+                output / "heldout_cohort" / shard["payload_path"],
+                allow_pickle=False,
+            ) as arrays:
+                for key, array in arrays.items():
+                    if key == "global_env_ids" and array.ndim == 1:
+                        self.assertEqual(array.shape, (4,))
+                    else:
+                        self.assertGreaterEqual(array.ndim, 2, key)
+                        self.assertEqual(array.shape[1], 4, key)
+                np.testing.assert_array_equal(
+                    arrays["global_env_ids"], np.asarray(expected)
+                )
+                expected_pixels = (
+                    np.asarray(expected)[None, :, None, None, None] % 251
+                )
+                self.assertTrue(
+                    np.all(arrays["policy_rgb"] == expected_pixels)
+                )
+
+        loaded = replay.load_heldout_snapshot(
+            output / heldout["heldout_snapshot"]["path"],
+            expected_file_sha256=heldout["heldout_snapshot"]["sha256"],
+        )
+        self.assertEqual(loaded["transition_count"], 32)
+        self.assertEqual(len(loaded["resolved_shards"]), 8)
+        self.assertEqual(
+            {
+                path: path.read_bytes()
+                for directory in self.root.glob("source-eval-*")
+                for path in directory.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            source_bytes,
+        )
+
+    def test_explicitly_pins_reused_heldout_source_campaign(self):
+        eval_digests = {
+            **SHA,
+            "beta_sha256": "7" * 64,
+            "config_sha256": "8" * 64,
+        }
+        source_heldout, _ = self.build_source_heldout(
+            cases_per_cohort=32,
+            campaign_id="fixed-eval-source",
+            digests=eval_digests,
+        )
+
+        unbound = self.root / "fixture-cross-campaign-unbound-schedule"
+        with self.assertRaisesRegex(
+            fixture.FixtureError,
+            "explicit eval schedule rebinding is required",
+        ):
+            fixture.build_fixture(
+                source_cohort=self.source,
+                output_root=unbound,
+                campaign_id="mini-campaign-unbound",
+                source_heldout_snapshot=source_heldout,
+                expected_source_heldout_campaign_id="fixed-eval-source",
+                expected_heldout_cases=32,
+            )
+        self.assertFalse((unbound / "fixture_manifest.json").exists())
+
+        output = self.root / "fixture-cross-campaign-heldout"
+        result = fixture.build_fixture(
+            source_cohort=self.source,
+            output_root=output,
+            campaign_id="mini-campaign",
+            source_heldout_snapshot=source_heldout,
+            expected_source_heldout_campaign_id="fixed-eval-source",
+            allow_source_eval_schedule_rebinding=True,
+            expected_heldout_cases=32,
+        )
+        self.assertEqual(
+            result["source"]["heldout"]["campaign_id"],
+            "fixed-eval-source",
+        )
+        self.assertEqual(
+            result["derived"]["heldout"]["heldout_transition_count"], 32
+        )
+        rebinding = result["source"]["heldout"][
+            "source_eval_schedule_rebinding"
+        ]
+        self.assertTrue(rebinding["authorized"])
+        self.assertEqual(rebinding["source"], {
+            "beta_sha256": "7" * 64,
+            "config_sha256": "8" * 64,
+        })
+        self.assertEqual(rebinding["destination"], {
+            "beta_sha256": SHA["beta_sha256"],
+            "config_sha256": SHA["config_sha256"],
+        })
+
+        rejected = self.root / "fixture-cross-campaign-rejected"
+        with self.assertRaisesRegex(
+            fixture.FixtureError,
+            "source held-out snapshot belongs to another campaign",
+        ):
+            fixture.build_fixture(
+                source_cohort=self.source,
+                output_root=rejected,
+                campaign_id="mini-campaign-rejected",
+                source_heldout_snapshot=source_heldout,
+                expected_source_heldout_campaign_id="wrong-source",
+                expected_heldout_cases=32,
+            )
+        self.assertFalse((rejected / "fixture_manifest.json").exists())
+
+    def test_rejects_unsupported_heldout_downsample_shape(self):
+        source_heldout, _ = self.build_source_heldout(cases_per_cohort=32)
+        output = self.root / "fixture-with-heldout-64"
+        with self.assertRaisesRegex(
+            fixture.FixtureError, "only deterministic 32-from-256"
+        ):
+            fixture.build_fixture(
+                source_cohort=self.source,
+                output_root=output,
+                campaign_id="real-smoke-heldout-64",
+                source_heldout_snapshot=source_heldout,
+                expected_heldout_cases=64,
+            )
+        self.assertFalse((output / "fixture_manifest.json").exists())
 
     def test_rejects_train_eval_payload_overlap(self):
         source_heldout, _ = self.build_source_heldout(collides_with_train=True)

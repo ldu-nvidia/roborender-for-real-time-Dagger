@@ -14,9 +14,11 @@ from pathlib import Path
 from unittest import mock
 
 from round_dagger import artifacts
+from round_dagger.actor_pair_terminal import publish_actor_pair_terminal
 from integrations.gr00t.image3f_frame_client import Image3FFrameClient
 from round_dagger.image3f_lifecycle import (
     Image3FLifecycleError,
+    _discover_plans,
     cleanup_prior_attempts,
     cleanup_sealed_cohort,
     create_attempt_plan,
@@ -341,6 +343,39 @@ class Image3FStreamLifecycleTest(unittest.TestCase):
         self.assertEqual(len(list(ack_dir.glob("reset_*.json"))), 64)
         self.assertFalse((self.cohort / "seal.json").exists())
         artifacts.seal_cohort(self.cohort)
+
+    def test_legacy_terminal_only_recovery_is_ignored_but_not_loosened(self) -> None:
+        """A historical W&B terminal cannot poison later stream cleanup."""
+
+        for rank in (0, 1):
+            self._publish_rank(rank)
+        artifacts.seal_cohort(self.cohort)
+        recovery = (
+            self.train
+            / "actor_pair_attempts"
+            / "wandb_recovery_20260831T065831Z_1590047_yhYPPsth"
+        )
+        recovery.mkdir()
+        publish_actor_pair_terminal(
+            attempt_dir=recovery,
+            run_dir=self.train,
+            cohort_dir=self.cohort,
+            campaign_id="actor-pair-test",
+            macro_round=0,
+            cohort_index=0,
+            rank0_exit_code=0,
+            rank1_exit_code=0,
+            lifecycle_exit_code=0,
+            quality_exit_code=0,
+            wandb_wrapper_exit_code=0,
+            delivery_pending=True,
+        )
+
+        self.assertEqual(_discover_plans(self.train, allow_empty=True), [])
+
+        (recovery / "unexpected.txt").write_text("must remain fail-closed\n")
+        with self.assertRaisesRegex(Image3FLifecycleError, "unexpected contents"):
+            _discover_plans(self.train, allow_empty=True)
 
 
 if __name__ == "__main__":

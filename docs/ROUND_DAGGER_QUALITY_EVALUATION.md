@@ -9,8 +9,8 @@ Production has three active, independently verified quality paths:
    The launcher accepts this gate only with the matching immutable W&B
    delivery receipt, so a crash between local publication and telemetry upload
    is retried under the deterministic run ID.
-2. The H100 learner evaluates the same fixed256 action labels at optimizer step
-   0 and every 100 steps through 1200. This is synchronous, bounded inference;
+2. The reserved Lepton eight-H200 learner evaluates the same fixed256 action
+   labels at optimizer step 0 and every 100 steps through 1200. This is synchronous, bounded inference;
    it does not alter gradients or simulator state.
 3. After the candidate is sealed, the established paired Isaac/Image3F gate
    runs the full round-boundary closed-loop evaluation. It logs success,

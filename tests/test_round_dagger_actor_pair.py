@@ -819,7 +819,7 @@ class ActorPairWandbRetryRecoveryTest(unittest.TestCase):
         self.assertTrue(artifacts.verify_cohort(self.cohort)["sealed"])
         self.assertFalse(self.owner_log.exists())
         terminals = list(
-            (self.run_dir / "actor_pair_attempts").glob(
+            (self.run_dir / "actor_pair_terminal_attempts").glob(
                 "recovered_complete_*/actor_pair_terminal.json"
             )
         )
@@ -994,8 +994,11 @@ class WandbRecoveryDockerIsolationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = self.docker_argv.read_text(encoding="utf-8").splitlines()
         self.assertEqual(argv[0], "run")
+        self.assertIn("--user", argv)
+        self.assertIn("0:0", argv)
         self.assertIn("--read-only", argv)
         self.assertIn("--cap-drop=ALL", argv)
+        self.assertIn("--cap-add=DAC_OVERRIDE", argv)
         self.assertIn("--security-opt=no-new-privileges", argv)
         self.assertIn("--ipc=private", argv)
         self.assertIn("--network=host", argv)

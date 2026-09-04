@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,18 @@ class EvaluationDispatchTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             "set -eu\n"
             "test \"${ROUND_DAGGER_TRUSTED_EVALUATION_DISPATCH:-}\" = 1\n"
+            "test \"$(command -v python3)\" = \"$EXPECTED_CONTROL_PYTHON3\"\n"
+            "test \"${PYTHONNOUSERSITE:-}\" = 1\n"
+            "test \"${PYTHONDONTWRITEBYTECODE:-}\" = 1\n"
+            "test \"${VIRTUAL_ENV:-}\" = \"$EXPECTED_VIRTUAL_ENV\"\n"
+            "test -z \"${BASH_ENV+x}\"\n"
+            "test -z \"${ENV+x}\"\n"
+            "test -z \"${PYTHONBREAKPOINT+x}\"\n"
+            "test -z \"${PYTHONHOME+x}\"\n"
+            "test -z \"${PYTHONINSPECT+x}\"\n"
+            "test -z \"${PYTHONPATH+x}\"\n"
+            "test -z \"${PYTHONSTARTUP+x}\"\n"
+            "python3 -c 'import numpy'\n"
             "printf trusted > \"$DISPATCH_TEST_MARKER\"\n",
             encoding="utf-8",
         )
@@ -96,6 +109,9 @@ class EvaluationDispatchTest(unittest.TestCase):
         environment = {
             "ROUND_DAGGER_EVALUATION_SOURCE_ROOT": str(root),
             "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256": inventory_sha,
+            "ROUND_DAGGER_CONTROL_PYTHON": sys.executable,
+            "EXPECTED_CONTROL_PYTHON3": str(Path(sys.executable).parent / "python3"),
+            "EXPECTED_VIRTUAL_ENV": str(Path(sys.executable).parent.parent),
             "DISPATCH_TEST_MARKER": str(marker),
         }
         return temporary, root, hook, marker, report, environment
@@ -124,6 +140,106 @@ class EvaluationDispatchTest(unittest.TestCase):
                     workdir=root,
                 )
             self.assertEqual(marker.read_text(encoding="utf-8"), "trusted")
+        finally:
+            self._cleanup(temporary)
+
+    def test_trusted_hook_scrubs_poisoned_ambient_python_environment(self) -> None:
+        temporary, root, hook, marker, report, environment = self._fixture()
+        try:
+            shell_poison = Path(temporary.name) / "ambient-shell-poison.sh"
+            poison_marker = Path(temporary.name) / "ambient-shell-poisoned"
+            shell_poison.write_text(
+                f'printf poisoned > "{poison_marker}"\n', encoding="utf-8"
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "BASH_ENV": str(shell_poison),
+                        "ENV": str(shell_poison),
+                        "PATH": "/poison/bin",
+                        "PYTHONBREAKPOINT": "poison.breakpoint",
+                        "PYTHONHOME": "/poison/home",
+                        "PYTHONINSPECT": "1",
+                        "PYTHONPATH": "/poison/modules",
+                        "PYTHONNOUSERSITE": "0",
+                        "PYTHONSTARTUP": str(shell_poison),
+                        "VIRTUAL_ENV": "/poison/venv",
+                    },
+                    clear=False,
+                ),
+                mock.patch(
+                    "round_dagger.orchestration.source_seal.verify",
+                    return_value=report,
+                ),
+            ):
+                SubprocessHookRunner().run(
+                    "evaluate",
+                    HookSpec((str(hook),), 10),
+                    environment=environment,
+                    workdir=root,
+                )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "trusted")
+            self.assertFalse(poison_marker.exists())
+        finally:
+            self._cleanup(temporary)
+
+    def test_trusted_hook_rejects_missing_or_relative_control_python(self) -> None:
+        for value in (None, "python3"):
+            with self.subTest(value=value):
+                temporary, root, hook, marker, report, environment = self._fixture()
+                try:
+                    if value is None:
+                        environment.pop("ROUND_DAGGER_CONTROL_PYTHON")
+                    else:
+                        environment["ROUND_DAGGER_CONTROL_PYTHON"] = value
+                    with mock.patch(
+                        "round_dagger.orchestration.source_seal.verify",
+                        return_value=report,
+                    ) as verifier:
+                        with self.assertRaisesRegex(
+                            OrchestrationError, "absolute control Python"
+                        ):
+                            SubprocessHookRunner().run(
+                                "evaluate",
+                                HookSpec((str(hook),), 10),
+                                environment=environment,
+                                workdir=root,
+                            )
+                    verifier.assert_not_called()
+                    self.assertFalse(marker.exists())
+                finally:
+                    self._cleanup(temporary)
+
+    def test_trusted_hook_rejects_mismatched_python3_sibling(self) -> None:
+        temporary, root, hook, marker, report, environment = self._fixture()
+        try:
+            fake_venv = Path(temporary.name) / "fake-venv"
+            fake_bin = fake_venv / "bin"
+            fake_bin.mkdir(parents=True)
+            (fake_venv / "pyvenv.cfg").write_text("home = /invalid\n", encoding="utf-8")
+            control = fake_bin / "python"
+            sibling = fake_bin / "python3"
+            control.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            sibling.write_text("#!/bin/sh\nexit 0\n# different inode\n", encoding="utf-8")
+            control.chmod(0o555)
+            sibling.chmod(0o555)
+            environment["ROUND_DAGGER_CONTROL_PYTHON"] = str(control)
+            with mock.patch(
+                "round_dagger.orchestration.source_seal.verify",
+                return_value=report,
+            ) as verifier:
+                with self.assertRaisesRegex(
+                    OrchestrationError, "python3 does not match"
+                ):
+                    SubprocessHookRunner().run(
+                        "evaluate",
+                        HookSpec((str(hook),), 10),
+                        environment=environment,
+                        workdir=root,
+                    )
+            verifier.assert_not_called()
+            self.assertFalse(marker.exists())
         finally:
             self._cleanup(temporary)
 
@@ -229,6 +345,18 @@ class EvaluationDispatchTest(unittest.TestCase):
             f'test "${{{required_marker}:-}}" = 1\n'
             'test "${ROUND_DAGGER_TRUSTED_HOOK_SOURCE_ROOT:-}" = '
             '"$EXPECTED_SOURCE_ROOT"\n'
+            'test "$(command -v python3)" = "$EXPECTED_CONTROL_PYTHON3"\n'
+            'test "${PYTHONNOUSERSITE:-}" = 1\n'
+            'test "${PYTHONDONTWRITEBYTECODE:-}" = 1\n'
+            'test "${VIRTUAL_ENV:-}" = "$EXPECTED_VIRTUAL_ENV"\n'
+            'test -z "${BASH_ENV+x}"\n'
+            'test -z "${ENV+x}"\n'
+            'test -z "${PYTHONBREAKPOINT+x}"\n'
+            'test -z "${PYTHONHOME+x}"\n'
+            'test -z "${PYTHONINSPECT+x}"\n'
+            'test -z "${PYTHONPATH+x}"\n'
+            'test -z "${PYTHONSTARTUP+x}"\n'
+            "python3 -c 'import numpy'\n"
             f'printf trusted > "{marker}"\n',
             encoding="utf-8",
         )
@@ -259,6 +387,9 @@ class EvaluationDispatchTest(unittest.TestCase):
         environment = {
             "ROUND_DAGGER_EVALUATION_SOURCE_ROOT": str(root),
             "ROUND_DAGGER_EVALUATION_SOURCE_INVENTORY_SHA256": inventory_sha,
+            "ROUND_DAGGER_CONTROL_PYTHON": sys.executable,
+            "EXPECTED_CONTROL_PYTHON3": str(Path(sys.executable).parent / "python3"),
+            "EXPECTED_VIRTUAL_ENV": str(Path(sys.executable).parent.parent),
             "EXPECTED_SOURCE_ROOT": str(root),
         }
         if name == "collect":
@@ -266,6 +397,11 @@ class EvaluationDispatchTest(unittest.TestCase):
             # same root.  The synthetic hook is sufficient as an in-root path
             # because this test exercises dispatch rather than model loading.
             environment["ROUND_DAGGER_EVALUATION_SEALED_TEACHER"] = str(hook)
+        elif name == "train":
+            # This synthetic fixture uses the explicitly named legacy OCI
+            # bridge above, so bind that backend rather than relying on an
+            # ambient/default route.
+            environment["ROUND_DAGGER_LEARNER_BACKEND"] = "oci_nrt"
         configured = REPOSITORY_ROOT / relative
         return (
             temporary,

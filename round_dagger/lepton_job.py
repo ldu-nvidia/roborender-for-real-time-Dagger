@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -177,8 +178,18 @@ _OPTIONAL_ENV = {
     "ROUND_DAGGER_POLICY_SPEC_SHA256",
     "ROUND_DAGGER_POLICY_MANIFEST_SHA256",
     "ROUND_DAGGER_LEARNER_CONTRACT",
+    "ROUND_DAGGER_BETA",
+    "ROUND_DAGGER_BETA_SHA256",
+    "ROUND_DAGGER_SCENE_SAMPLE_MANIFEST",
     "ROUND_DAGGER_WANDB_READBACK_TIMEOUT_SECONDS",
 }
+_DASHBOARD_ENV = frozenset(
+    {
+        "ROUND_DAGGER_BETA",
+        "ROUND_DAGGER_BETA_SHA256",
+        "ROUND_DAGGER_SCENE_SAMPLE_MANIFEST",
+    }
+)
 _CAMPAIGN_PATH_ENV = {
     "ROUND_DAGGER_POLICY_CHECKPOINT",
     "ROUND_DAGGER_REPLAY_SNAPSHOT",
@@ -187,6 +198,7 @@ _CAMPAIGN_PATH_ENV = {
     "ROUND_DAGGER_POLICY_MANIFEST",
     "ROUND_DAGGER_LEARNER_CONTRACT",
     "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT",
+    "ROUND_DAGGER_SCENE_SAMPLE_MANIFEST",
 }
 
 _ACTIVE_STATES = {
@@ -452,7 +464,7 @@ def load_contract(
         "secret_environment": WANDB_SECRET_ENV,
         "secret_name": WANDB_SECRET_NAME,
         "entity": "nvidia",
-        "project": "roborender-round-dagger",
+        "project": "lepton-dagger-production-1",
         "expected_email": "ldu@nvidia.com",
         "authorization_scope": "team",
     }
@@ -704,6 +716,12 @@ def _validate_public_environment(
         raise LeptonJobError(
             f"request.environment has missing={sorted(missing)} unknown={sorted(unknown)}"
         )
+    missing_dashboard = _DASHBOARD_ENV - actual
+    if missing_dashboard:
+        raise LeptonJobError(
+            "request.environment W&B dashboard contract is incomplete: "
+            f"missing={sorted(missing_dashboard)}"
+        )
     environment: dict[str, str] = {}
     for key, raw in value.items():
         if not isinstance(key, str) or _ENV_RE.fullmatch(key) is None:
@@ -757,6 +775,35 @@ def _validate_public_environment(
         "ROUND_DAGGER_HELDOUT_REPLAY_SNAPSHOT_SHA256",
     ):
         _sha(environment[key], f"request.environment[{key}]")
+    try:
+        beta = float(environment["ROUND_DAGGER_BETA"])
+    except ValueError as exc:
+        raise LeptonJobError(
+            "request.environment[ROUND_DAGGER_BETA] is malformed"
+        ) from exc
+    if not math.isfinite(beta) or not 0.0 <= beta <= 1.0:
+        raise LeptonJobError(
+            "request.environment[ROUND_DAGGER_BETA] must be finite and in [0,1]"
+        )
+    if repr(beta) != environment["ROUND_DAGGER_BETA"]:
+        raise LeptonJobError(
+            "request.environment[ROUND_DAGGER_BETA] is non-canonical"
+        )
+    beta_sha256 = _sha(
+        environment["ROUND_DAGGER_BETA_SHA256"],
+        "request.environment[ROUND_DAGGER_BETA_SHA256]",
+    )
+    beta_payload = json.dumps(
+        {"beta": beta},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    if hashlib.sha256(beta_payload).hexdigest() != beta_sha256:
+        raise LeptonJobError(
+            "request.environment DAgger beta digest does not bind its value"
+        )
     from round_dagger.learner_identity import (
         LearnerIdentityError,
         learner_identity_sha256,
@@ -828,6 +875,16 @@ def load_request(
             raise LeptonJobError(
                 f"request.environment.{name} must be inside remote campaign"
             ) from exc
+    scene_manifest = PurePosixPath(
+        environment["ROUND_DAGGER_SCENE_SAMPLE_MANIFEST"]
+    )
+    if (
+        scene_manifest.name != "manifest.json"
+        or scene_manifest.parent.name != "scene_samples"
+    ):
+        raise LeptonJobError(
+            "request scene sample manifest path is non-canonical"
+        )
     if paths["source_root"] != contract.source_root:
         raise LeptonJobError("request source root differs from the pinned sealed source")
     if PurePosixPath(environment["ROUND_DAGGER_CAMPAIGN_ROOT"]) != paths["campaign_root"]:
@@ -1962,6 +2019,109 @@ def learner_output_bundle_paths(
     }
 
 
+def _bundle_pack_temporary_patterns(
+    paths: Mapping[str, Path],
+) -> list[tuple[str, re.Pattern[str], str]]:
+    result: list[tuple[str, re.Pattern[str], str]] = []
+    for key, random_name_pattern, label in (
+        ("archive", r"[0-9a-f]{32}", "learner-output archive"),
+        ("inventory", r"[a-z0-9_]{8}", "learner-output inventory"),
+        ("manifest", r"[a-z0-9_]{8}", "learner-output manifest"),
+    ):
+        destination = paths[key]
+        prefix = f".{destination.name}."
+        result.append(
+            (
+                prefix,
+                re.compile(
+                    rf"\.{re.escape(destination.name)}\."
+                    rf"{random_name_pattern}\.incoming\Z"
+                ),
+                label,
+            )
+        )
+    return result
+
+
+def _prune_learner_output_pack_temporaries(paths: Mapping[str, Path]) -> dict[str, int]:
+    """Retire exact prior-SIGKILL pack files under the identity result root."""
+
+    root = paths["root"]
+    patterns = _bundle_pack_temporary_patterns(paths)
+    for key in ("archive", "inventory", "manifest"):
+        if paths[key].parent != root:
+            raise LeptonJobError("learner-output bundle artifact is outside its root")
+    candidates: list[tuple[Path, os.stat_result]] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                match = next(
+                    (
+                        (pattern, label)
+                        for prefix, pattern, label in patterns
+                        if entry.name.startswith(prefix)
+                    ),
+                    None,
+                )
+                if match is None:
+                    continue
+                pattern, label = match
+                if pattern.fullmatch(entry.name) is None:
+                    raise LeptonJobError(
+                        f"result root contains a malformed {label} incoming file"
+                    )
+                path = root / entry.name
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    raise LeptonJobError(
+                        f"{label} incoming must be a no-follow regular file"
+                    )
+                candidates.append((path, info))
+    except LeptonJobError:
+        raise
+    except OSError as exc:
+        raise LeptonJobError(
+            "cannot enumerate learner-output pack temporaries"
+        ) from exc
+
+    # Validate the entire candidate set before the first unlink, then recheck
+    # the exact object identity immediately before each mutation.
+    total_bytes = sum(info.st_size for _path, info in candidates)
+    for path, expected in candidates:
+        try:
+            observed = os.lstat(path)
+        except OSError as exc:
+            raise LeptonJobError(
+                "learner-output pack temporary changed before retirement"
+            ) from exc
+        identity = lambda info: (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+        if (
+            identity(observed) != identity(expected)
+            or stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISREG(observed.st_mode)
+        ):
+            raise LeptonJobError(
+                "learner-output pack temporary changed before retirement"
+            )
+        path.unlink()
+    if candidates:
+        descriptor = os.open(
+            root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return {"file_count": len(candidates), "total_bytes": total_bytes}
+
+
 def _ensure_real_directory(path: Path, *, root: Path) -> None:
     """Create descendants without accepting a symlink at any path component."""
 
@@ -2096,18 +2256,16 @@ def _validate_learner_output_bundle(
     return observed
 
 
-def _pack_learner_output(
+def _pack_learner_output_after_cleanup(
     *,
     contract: LeptonBackendContract,
     request: LeptonRunRequest,
     environment: Mapping[str, str],
     runner: Callable[..., subprocess.CompletedProcess[Any]],
+    paths: Mapping[str, Path],
 ) -> dict[str, str]:
     """Invoke the inventory-bound packer from the already-verified sealed source."""
 
-    posix_paths = learner_output_bundle_paths(contract, request)
-    paths = {key: Path(str(value)) for key, value in posix_paths.items()}
-    _ensure_real_directory(paths["root"], root=Path(str(contract.project_root)))
     tool = (
         Path(str(request.paths["source_root"]))
         / "scripts/round_dagger/lepton_campaign_archive_transfer.py"
@@ -2172,6 +2330,53 @@ def _pack_learner_output(
             "sealed learner-output packer did not report exact success"
         )
     return _validate_learner_output_bundle(contract=contract, request=request)
+
+
+def _pack_learner_output(
+    *,
+    contract: LeptonBackendContract,
+    request: LeptonRunRequest,
+    environment: Mapping[str, str],
+    runner: Callable[..., subprocess.CompletedProcess[Any]],
+) -> dict[str, str]:
+    """Pack once under an identity-scoped lock after safe SIGKILL recovery."""
+
+    posix_paths = learner_output_bundle_paths(contract, request)
+    paths = {key: Path(str(value)) for key, value in posix_paths.items()}
+    _ensure_real_directory(paths["root"], root=Path(str(contract.project_root)))
+    lock_path = paths["root"] / ".learner_output_pack.lock"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise LeptonJobError("cannot open learner-output pack lock") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise LeptonJobError("learner-output pack lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise LeptonJobError(
+                "another learner-output pack owns this identity"
+            ) from exc
+        _prune_learner_output_pack_temporaries(paths)
+        return _pack_learner_output_after_cleanup(
+            contract=contract,
+            request=request,
+            environment=environment,
+            runner=runner,
+            paths=paths,
+        )
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _publish_immutable_json(path: Path, document: Mapping[str, Any]) -> None:

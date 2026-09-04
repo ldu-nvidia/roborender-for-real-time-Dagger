@@ -25,6 +25,7 @@ class RemoteCampaignTransferTest(unittest.TestCase):
             inventory = transfer.build_inventory(root)
             output = Path(temporary) / "inventory.json"
             transfer.publish_inventory(output, inventory)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o444)
 
             self.assertEqual(
                 [item["path"] for item in inventory["files"]],

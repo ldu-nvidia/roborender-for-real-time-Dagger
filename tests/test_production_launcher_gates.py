@@ -35,9 +35,8 @@ class ProductionLauncherGatesTest(unittest.TestCase):
             GR00T / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
         ).read_text(encoding="utf-8")
 
-    def test_only_packed_oci_entrypoint_is_reachable(self):
+    def test_legacy_oci_entrypoints_are_explicit_and_canonical_is_lepton(self):
         for wrapper in (
-            self.compat,
             self.eight_hour,
             self.smoke,
             self.calibration,
@@ -45,8 +44,29 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         ):
             self.assertIn("submit_oci_packed.sh", wrapper)
             self.assertNotIn("submit_production.sh\"", wrapper)
+        self.assertIn("run_five_round_production_campaign.py", self.compat)
+        self.assertIn("--learner-backend lepton_job_v1", self.compat)
+        self.assertIn('"$@" --learner-backend lepton_job_v1', self.compat)
+        self.assertIn('--learner-backend|--learner-backend=*)', self.compat)
+        self.assertNotRegex(self.compat, r"exec[^\n]*submit_oci_packed\.sh")
+        self.assertNotIn("oci-nrt", self.compat.lower())
+        self.assertIn("ROUND_DAGGER_ENABLE_LEGACY_OCI_COMPAT", self.eight_hour)
         self.assertNotIn("image3f_server_array.sbatch\")", self.submit)
         self.assertIn("oci_packed_256x300.sbatch", self.submit)
+
+    def test_canonical_wrapper_rejects_backend_override(self):
+        completed = subprocess.run(
+            [
+                str(ROOT / "scripts/scaling/submit_production.sh"),
+                "--learner-backend",
+                "oci_nrt",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("fixes learner backend to lepton_job_v1", completed.stderr)
 
     def test_oci_scheduler_contract_is_explicit(self):
         for text in (self.packed, self.trainer, self.renderer):
@@ -315,7 +335,6 @@ class ProductionLauncherGatesTest(unittest.TestCase):
         self.assertIn("smoke_256x300", self.packed)
 
     def test_production_rechecks_ddp_sync_on_its_own_first_update(self):
-        self.assertIn("IMAGE_DAGGER_VERIFY_DDP_SYNC=1", self.compat)
         self.assertIn("IMAGE_DAGGER_VERIFY_DDP_SYNC=1", self.eight_hour)
         self.assertIn('"0:0:0:1:1"', self.submit)
         self.assertIn('"0:0:0:1:1"', self.packed)
@@ -530,7 +549,6 @@ class ProductionLauncherGatesTest(unittest.TestCase):
 
     def test_all_profiles_require_finite_nonnegative_bc_loss(self):
         for wrapper in (
-            self.compat,
             self.eight_hour,
             self.smoke,
             self.calibration,
@@ -548,7 +566,6 @@ class ProductionLauncherGatesTest(unittest.TestCase):
 
     def test_non_calibration_profiles_forbid_camera_dumps(self):
         for wrapper in (
-            self.compat,
             self.eight_hour,
             self.smoke,
             self.distributed_smoke,

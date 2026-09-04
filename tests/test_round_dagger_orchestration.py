@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -6,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from round_dagger import artifacts
+from round_dagger import actor_host_access, artifacts, wandb_delivery
 from round_dagger.artifacts import publish_immutable_json, sha256_file
 from round_dagger.orchestration import (
     BACKEND_BOUND_PRODUCTION_ORCHESTRATION_CONFIG_SCHEMA,
@@ -20,12 +21,15 @@ from round_dagger.orchestration import (
     ProductionBackend,
     ORCHESTRATION_CONFIG_SCHEMA,
     PRODUCTION_MACRO_ROUND_COUNT,
+    PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA,
     OrchestrationError,
+    RoundTelemetry,
     STEPS_PER_ENVIRONMENT,
     TARGET_ENVIRONMENTS,
     TRANSITIONS_PER_COHORT,
     TRANSITIONS_PER_MACRO_ROUND,
     TRANSITIONS_PER_CAMPAIGN,
+    WANDB_PUBLIC_CONFIG_RECOVERY_SCHEMA,
     WANDB_PUBLIC_CONFIG_SCHEMA,
     _public_wandb_config,
     validate_production_topology,
@@ -131,12 +135,15 @@ class FakeBackend:
         self.phase = "READY"
         self.revision = 0
         self.next_round = 0
+        self.active_policy_version = 0
+        self.active_policy_checkpoint_sha256 = SHA["policy"]
         self.open_round_number = None
         self.cohorts = {}
         self.collection = None
         self.snapshot = None
         self.candidate = None
         self.evaluation = None
+        self.last_resolution = None
         self.evaluation_passed = True
         self.collection_sealed = False
         self.ingest_started_after_collection = False
@@ -150,15 +157,23 @@ class FakeBackend:
             "revision": self.revision,
             "next_macro_round": self.next_round,
             "open_macro_round": self.open_round_number,
-            "active_policy": {"version": self.next_round},
+            "active_policy": {
+                "version": self.active_policy_version,
+                "checkpoint_sha256": self.active_policy_checkpoint_sha256,
+            },
             "replay_snapshot_sha256": (
                 self.snapshot["file_sha256"] if self.snapshot else None
             ),
         }
         if self.candidate is not None:
             result["candidate_policy"] = {
-                "manifest_path": self.candidate["manifest_path"]
+                "version": self.candidate["policy_version"],
+                "manifest_path": self.candidate["manifest_path"],
+                "manifest_sha256": self.candidate["manifest_sha256"],
+                "checkpoint_sha256": self.candidate["checkpoint_sha256"],
             }
+        if self.last_resolution is not None:
+            result["last_resolution"] = dict(self.last_resolution)
         return result
 
     def open_round(self):
@@ -292,12 +307,13 @@ class FakeBackend:
             "final_loss": 1.0,
         }
 
-    def stage_candidate(self, _learner_result, _snapshot):
+    def stage_candidate(self, _learner_result, _snapshot, **_kwargs):
         self.candidate = {
             "policy_version": 1,
             "macro_round": 0,
             "manifest_path": "policies/policy_000001/candidate.json",
             "manifest_sha256": SHA["candidate"],
+            "checkpoint_sha256": SHA["candidate"],
             "optimizer_steps": 12,
         }
         return dict(self.candidate)
@@ -339,6 +355,8 @@ class FakeBackend:
     def promote(self, _candidate, _evaluation):
         self.phase = "READY"
         self.next_round = 1
+        self.active_policy_version = _candidate["policy_version"]
+        self.active_policy_checkpoint_sha256 = _candidate["checkpoint_sha256"]
         self.open_round_number = None
         self.revision += 1
         return {
@@ -346,6 +364,20 @@ class FakeBackend:
             "macro_round": 0,
             "policy_version": 1,
         }
+
+    def reject(self, _candidate, _evaluation):
+        self.phase = "READY"
+        self.next_round = 1
+        self.open_round_number = None
+        self.revision += 1
+        self.last_resolution = {
+            "decision": "rejected",
+            "macro_round": 0,
+            "candidate_manifest_sha256": _candidate["manifest_sha256"],
+            "candidate_policy_version": _candidate["policy_version"],
+            "evaluation_sha256": _evaluation["evidence_sha256"],
+        }
+        return {"decision": "rejected", "retained": True}
 
 
 class RecordingRunner:
@@ -376,6 +408,193 @@ class RecordingRunner:
 
 
 class ConfigAndTopologyTest(unittest.TestCase):
+    @staticmethod
+    def _production_public_config(
+        root: Path, *, cohort_index: int | None, orchestration_sha: str
+    ):
+        production_config = replace(
+            config(root),
+            campaign_contract_sha256="0" * 64,
+            sha256=orchestration_sha,
+        )
+        production_contract = contract()
+        production_contract["data_lineage_sha256"] = "e" * 64
+        return _public_wandb_config(
+            config=production_config,
+            campaign=campaign(),
+            contract=production_contract,
+            cohort_index=cohort_index,
+        )
+
+    def test_production_public_config_resume_preserves_config_and_records_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for label, cohort_index in (("round", None), ("cohort", 0)):
+                with self.subTest(scope=label):
+                    telemetry = RoundTelemetry(root / label)
+                    old = self._production_public_config(
+                        root,
+                        cohort_index=cohort_index,
+                        orchestration_sha="c" * 64,
+                    )
+                    new = self._production_public_config(
+                        root,
+                        cohort_index=cohort_index,
+                        orchestration_sha="f" * 64,
+                    )
+                    path = telemetry.publish_config(old)
+                    run_id = path.parent / "WANDB_SIDECAR_RUN_ID"
+                    run_id.write_text("stable-run-id\n", encoding="utf-8")
+                    old_bytes = path.read_bytes()
+                    old_inode = path.stat().st_ino
+                    old_sha = sha256_file(path)
+
+                    self.assertEqual(telemetry.publish_config(new), path)
+                    # An idempotent retry must accept the same provenance too.
+                    self.assertEqual(telemetry.publish_config(new), path)
+                    self.assertEqual(path.read_bytes(), old_bytes)
+                    self.assertEqual(path.stat().st_ino, old_inode)
+                    self.assertEqual(run_id.read_text(encoding="utf-8"), "stable-run-id\n")
+
+                    recovery_path = (
+                        path.parent
+                        / "WANDB_PUBLIC_CONFIG_RECOVERY"
+                        / f"{'f' * 64}.json"
+                    )
+                    recovery = artifacts.load_strict_json(recovery_path)
+                    stable = json.loads(json.dumps(old))
+                    del stable["config"][
+                        "round_dagger/orchestration_config_sha256"
+                    ]
+                    self.assertEqual(
+                        recovery,
+                        {
+                            "schema": WANDB_PUBLIC_CONFIG_RECOVERY_SCHEMA,
+                            "old_public_config_sha256": old_sha,
+                            "new_public_config_sha256": (
+                                artifacts.canonical_json_sha256(new)
+                            ),
+                            "old_orchestration_config_sha256": "c" * 64,
+                            "new_orchestration_config_sha256": "f" * 64,
+                            "normalized_stable_config_sha256": (
+                                artifacts.canonical_json_sha256(stable)
+                            ),
+                        },
+                    )
+
+    def test_public_config_recovery_rejects_every_other_semantic_difference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = {}
+
+            policy_old = self._production_public_config(
+                root, cohort_index=None, orchestration_sha="c" * 64
+            )
+            policy_new = self._production_public_config(
+                root, cohort_index=None, orchestration_sha="f" * 64
+            )
+            policy_new["config"]["round_dagger/policy_version"] = 1
+            cases["field"] = (policy_old, policy_new, "differs beyond")
+
+            typed_old = self._production_public_config(
+                root, cohort_index=0, orchestration_sha="c" * 64
+            )
+            typed_new = self._production_public_config(
+                root, cohort_index=0, orchestration_sha="f" * 64
+            )
+            typed_old["config"]["round_dagger/beta"] = 0
+            typed_new["config"]["round_dagger/beta"] = 0.0
+            cases["json-type"] = (typed_old, typed_new, "differs beyond")
+
+            nonproduction_old = _public_wandb_config(
+                config=replace(config(root), sha256="c" * 64),
+                campaign=campaign(),
+                contract=contract(),
+                cohort_index=0,
+            )
+            nonproduction_new = _public_wandb_config(
+                config=replace(config(root), sha256="f" * 64),
+                campaign=campaign(),
+                contract=contract(),
+                cohort_index=0,
+            )
+            cases["non-production"] = (
+                nonproduction_old,
+                nonproduction_new,
+                "production v3",
+            )
+
+            for label, (old, new, message) in cases.items():
+                with self.subTest(case=label):
+                    telemetry = RoundTelemetry(root / label)
+                    path = telemetry.publish_config(old)
+                    old_bytes = path.read_bytes()
+                    with self.assertRaisesRegex(OrchestrationError, message):
+                        telemetry.publish_config(new)
+                    self.assertEqual(path.read_bytes(), old_bytes)
+                    self.assertFalse(
+                        (path.parent / "WANDB_PUBLIC_CONFIG_RECOVERY").exists()
+                    )
+
+    def test_public_config_recovery_rejects_corruption_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            requested = self._production_public_config(
+                root, cohort_index=None, orchestration_sha="f" * 64
+            )
+
+            corrupt = RoundTelemetry(root / "corrupt")
+            corrupt.telemetry_dir.mkdir(parents=True)
+            corrupt_path = corrupt.telemetry_dir / "WANDB_PUBLIC_CONFIG.json"
+            corrupt_path.write_text('{"schema":', encoding="utf-8")
+            with self.assertRaisesRegex(OrchestrationError, "corrupt, or unsafe"):
+                corrupt.publish_config(requested)
+
+            linked = RoundTelemetry(root / "linked")
+            linked.telemetry_dir.mkdir(parents=True)
+            target = root / "outside.json"
+            target.write_text(
+                json.dumps(
+                    {
+                        "schema": PRODUCTION_WANDB_PUBLIC_CONFIG_SCHEMA,
+                        "config": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (linked.telemetry_dir / "WANDB_PUBLIC_CONFIG.json").symlink_to(target)
+            with self.assertRaisesRegex(OrchestrationError, "corrupt, or unsafe"):
+                linked.publish_config(requested)
+
+    def test_base_environment_exports_external_campaign_contract_lineage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = replace(
+                config(root), campaign_contract_sha256="f" * 64
+            )
+            round_contract = {**contract(), "data_lineage_sha256": "a" * 64}
+            orchestrator = MacroRoundOrchestrator(
+                configuration, backend=FakeBackend(configuration)
+            )
+            contract_path = root / "runtime_contract.json"
+            with mock.patch.dict(
+                "os.environ",
+                {"ROUND_DAGGER_CAMPAIGN_CONTRACT": str(contract_path)},
+                clear=False,
+            ):
+                environment = orchestrator._base_environment(
+                    campaign=campaign(), contract=round_contract
+                )
+            self.assertEqual(
+                environment["ROUND_DAGGER_CAMPAIGN_CONTRACT"], str(contract_path)
+            )
+            self.assertEqual(
+                environment["ROUND_DAGGER_CAMPAIGN_CONTRACT_SHA256"], "f" * 64
+            )
+            self.assertEqual(
+                environment["ROUND_DAGGER_DATA_LINEAGE_SHA256"], "a" * 64
+            )
+
     def test_actor_source_seal_is_incomplete_without_stream_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -421,6 +640,76 @@ class ConfigAndTopologyTest(unittest.TestCase):
             ):
                 self.assertIsNone(backend.complete_cohort(source))
             verify.assert_called_once_with(source.with_name("cohort_00_run"))
+
+    def test_cross_uid_wandb_evidence_reenters_sealed_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = replace(
+                config(root), campaign_contract_sha256="f" * 64
+            )
+            backend = ProductionBackend(configuration)
+            source = (
+                configuration.actor_root
+                / "production-campaign"
+                / "macro_round_000000"
+                / "cohort_00"
+            )
+            source.mkdir(parents=True)
+            (source / artifacts.SEAL_FILENAME).write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    backend, "_require_actor_cleanup", return_value={"status": "clean"}
+                ),
+                mock.patch(
+                    "round_dagger.orchestration.wandb_delivery.verify_delivery",
+                    side_effect=wandb_delivery.WandbDeliveryError(
+                        "W&B sidecar run ID is not readable across runtime identities"
+                    ),
+                ),
+                mock.patch(
+                    "round_dagger.orchestration.actor_host_access.verify_host_access",
+                    side_effect=actor_host_access.ActorHostAccessError(
+                        "actor run layout is not host-writable: ranks"
+                    ),
+                ) as host_access,
+            ):
+                self.assertIsNone(backend.complete_cohort(source))
+            host_access.assert_called_once_with(source.with_name("cohort_00_run"))
+
+    def test_host_accessible_invalid_wandb_evidence_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = replace(
+                config(root), campaign_contract_sha256="f" * 64
+            )
+            backend = ProductionBackend(configuration)
+            source = (
+                configuration.actor_root
+                / "production-campaign"
+                / "macro_round_000000"
+                / "cohort_00"
+            )
+            source.mkdir(parents=True)
+            (source / artifacts.SEAL_FILENAME).write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    backend, "_require_actor_cleanup", return_value={"status": "clean"}
+                ),
+                mock.patch(
+                    "round_dagger.orchestration.wandb_delivery.verify_delivery",
+                    side_effect=wandb_delivery.WandbDeliveryError(
+                        "W&B upload acknowledgement is invalid"
+                    ),
+                ),
+                mock.patch(
+                    "round_dagger.orchestration.actor_host_access.verify_host_access",
+                    return_value={"status": "HOST_ACCESSIBLE"},
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    OrchestrationError, "invalid W&B delivery evidence"
+                ):
+                    backend.complete_cohort(source)
 
 
     def test_learner_result_requires_exact_colocated_policy_sidecars(self):
@@ -961,6 +1250,32 @@ class MacroRoundExecutionTest(unittest.TestCase):
                 [identity for identity, _environment, _workdir in runner.calls],
             )
 
+    def test_v5_rejection_receipt_advances_with_the_exact_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = replace(
+                config(root), advance_after_rejected_evaluation=True
+            )
+            backend = FakeBackend(configuration)
+            backend.evaluation_passed = False
+            runner = RecordingRunner(backend)
+
+            result = MacroRoundOrchestrator(
+                configuration, backend=backend, hook_runner=runner
+            ).run()
+
+            self.assertEqual(result["decision"], "rejected")
+            self.assertTrue(result["retained"])
+            self.assertEqual(backend.phase, "READY")
+            self.assertEqual(backend.next_round, 1)
+            self.assertEqual(backend.active_policy_version, 0)
+            self.assertEqual(backend.active_policy_checkpoint_sha256, SHA["policy"])
+            self.assertEqual(backend.last_resolution["decision"], "rejected")
+            self.assertNotIn(
+                ("promote", None),
+                [identity for identity, _environment, _workdir in runner.calls],
+            )
+
     def test_existing_sealed_cohort_is_verified_and_skipped_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1019,6 +1334,44 @@ class MacroRoundExecutionTest(unittest.TestCase):
                 ],
             )
 
+    def test_collection_only_seals_all_cohorts_and_skips_downstream_stages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = FakeBackend(configuration)
+            runner = RecordingRunner(backend)
+
+            result = MacroRoundOrchestrator(
+                configuration,
+                backend=backend,
+                hook_runner=runner,
+                stop_after_collected=True,
+            ).run()
+
+            self.assertEqual(result["status"], "COLLECTED")
+            self.assertEqual(result["macro_round"], 0)
+            self.assertEqual(result["cohort_count"], COHORT_COUNT)
+            self.assertEqual(result["transition_count"], TRANSITIONS_PER_MACRO_ROUND)
+            self.assertEqual(backend.phase, "COLLECTED")
+            identities = [identity for identity, _environment, _workdir in runner.calls]
+            self.assertEqual(
+                [item for item in identities if item[0] == "collect"],
+                [("collect", 0), ("collect", 1), ("collect", 2), ("collect", 3)],
+            )
+            self.assertFalse(
+                any(name in {"ingest", "train", "evaluate", "promote"} for name, _ in identities)
+            )
+
+            resumed = RecordingRunner(backend)
+            resumed_result = MacroRoundOrchestrator(
+                configuration,
+                backend=backend,
+                hook_runner=resumed,
+                stop_after_collected=True,
+            ).run()
+            self.assertEqual(resumed_result, result)
+            self.assertEqual(resumed.calls, [])
+
     def test_resume_from_ingested_skips_collection_transfer_and_ingest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1051,6 +1404,160 @@ class MacroRoundExecutionTest(unittest.TestCase):
             self.assertEqual(backend.collection, collection)
             self.assertEqual(backend.snapshot, snapshot)
             self.assertEqual(result["policy_version"], 1)
+
+    def test_lepton_result_without_acceptance_reenters_train_bridge(self):
+        class AcceptanceBackend(FakeBackend):
+            def __init__(self, configuration):
+                super().__init__(configuration)
+                self.acceptance_loaded = 0
+
+            def requires_learner_acceptance(self):
+                return True
+
+            def learner_acceptance_path(self):
+                return self.config.campaign_root / "acceptance.json"
+
+            def load_learner_acceptance(self, **_kwargs):
+                if not self.learner_acceptance_path().is_file():
+                    raise OrchestrationError("acceptance is absent")
+                self.acceptance_loaded += 1
+                return {"status": "PASS"}
+
+        class AcceptanceRunner(RecordingRunner):
+            def run(self, name, hook, *, environment, workdir):
+                super().run(name, hook, environment=environment, workdir=workdir)
+                if name == "train":
+                    self.backend.learner_acceptance_path().write_text(
+                        "accepted\n", encoding="utf-8"
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = AcceptanceBackend(configuration)
+            backend.phase = "INGESTED"
+            backend.open_round_number = 0
+            backend.snapshot = {
+                "path": str(root / "replay/snapshot.json"),
+                "file_sha256": SHA["snapshot_file"],
+                "snapshot_sha256": SHA["snapshot_semantic"],
+                "expected_train_cohorts": COHORT_COUNT,
+                "transition_count": TRANSITIONS_PER_MACRO_ROUND,
+                "cohort_count": COHORT_COUNT,
+            }
+            # The stale result must not be treated as a committed Lepton return.
+            stale = backend.learner_result_path()
+            stale.parent.mkdir(parents=True)
+            stale.write_text("{}", encoding="utf-8")
+            runner = AcceptanceRunner(backend)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": "",
+                    "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": "",
+                },
+                clear=False,
+            ):
+                os.environ.pop("ROUND_DAGGER_REMOTE_CONTAINER_SHA256", None)
+                os.environ.pop("ROUND_DAGGER_LEARNER_CONTRACT_SHA256", None)
+                MacroRoundOrchestrator(
+                    configuration, backend=backend, hook_runner=runner
+                ).run()
+            identities = [identity for identity, _env, _cwd in runner.calls]
+            self.assertIn(("train", None), identities)
+            self.assertEqual(backend.acceptance_loaded, 1)
+
+    def test_lepton_conflicting_acceptance_fails_before_candidate_stage(self):
+        class ConflictingAcceptanceBackend(FakeBackend):
+            def requires_learner_acceptance(self):
+                return True
+
+            def learner_acceptance_path(self):
+                return self.config.campaign_root / "acceptance.json"
+
+            def load_learner_acceptance(self, **_kwargs):
+                raise OrchestrationError("acceptance receipt conflicts")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = ConflictingAcceptanceBackend(configuration)
+            backend.phase = "INGESTED"
+            backend.open_round_number = 0
+            backend.snapshot = {
+                "path": str(root / "replay/snapshot.json"),
+                "file_sha256": SHA["snapshot_file"],
+                "snapshot_sha256": SHA["snapshot_semantic"],
+                "expected_train_cohorts": COHORT_COUNT,
+                "transition_count": TRANSITIONS_PER_MACRO_ROUND,
+                "cohort_count": COHORT_COUNT,
+            }
+            receipt = backend.learner_acceptance_path()
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            receipt.write_text("conflict\n", encoding="utf-8")
+            runner = RecordingRunner(backend)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ROUND_DAGGER_REMOTE_CONTAINER_SHA256": "",
+                    "ROUND_DAGGER_LEARNER_CONTRACT_SHA256": "",
+                },
+                clear=False,
+            ):
+                os.environ.pop("ROUND_DAGGER_REMOTE_CONTAINER_SHA256", None)
+                os.environ.pop("ROUND_DAGGER_LEARNER_CONTRACT_SHA256", None)
+                with self.assertRaisesRegex(
+                    OrchestrationError, "acceptance receipt conflicts"
+                ):
+                    MacroRoundOrchestrator(
+                        configuration, backend=backend, hook_runner=runner
+                    ).run()
+            self.assertIsNone(backend.candidate)
+            self.assertNotIn(
+                ("train", None),
+                [identity for identity, _env, _cwd in runner.calls],
+            )
+
+    def test_wandb_learner_receives_packaged_actor_scene_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configuration = config(root)
+            backend = FakeBackend(configuration)
+            runner = RecordingRunner(backend)
+            manifest = (
+                root
+                / "rounds/macro_round_000000/scene_samples/manifest.json"
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"ROUND_DAGGER_WANDB_PROJECT": "lepton-dagger-production-1"},
+                clear=False,
+            ), mock.patch(
+                "round_dagger.orchestration._ensure_scene_sample_manifest",
+                return_value=manifest,
+            ) as package:
+                MacroRoundOrchestrator(
+                    configuration, backend=backend, hook_runner=runner
+                ).run()
+
+            train_environments = [
+                environment
+                for (name, _), environment, _workdir in runner.calls
+                if name == "train"
+            ]
+            self.assertEqual(len(train_environments), 1)
+            self.assertEqual(
+                train_environments[0]["ROUND_DAGGER_SCENE_SAMPLE_MANIFEST"],
+                str(manifest),
+            )
+            package.assert_called_once_with(
+                actor_run_dir=(
+                    configuration.actor_root
+                    / "production-campaign/macro_round_000000/cohort_00_run"
+                ),
+                round_dir=root / "rounds/macro_round_000000",
+                campaign_id="production-campaign",
+            )
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from round_dagger.production_campaign_driver import (
     ExclusiveLauncherExecutionLock,
     ProductionDriverError,
     _check_path_chain,
+    _collection_only_receipt,
     _collection_retry_streak,
     _is_operator_cancellation,
     _load_collection_attempts,
@@ -24,6 +25,7 @@ from round_dagger.production_campaign_driver import (
     _publish_collection_attempt,
     _recoverable_collection_evidence,
     _reconcile_unmatched_attempt,
+    _parser,
     _launcher_argv,
     _publish_immutable,
     materialize_orchestration_config,
@@ -105,6 +107,7 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             launcher=self.launcher,
             launcher_sha256=artifacts.sha256_file(self.launcher),
             control_root=self.control_root,
+            learner_backend="oci_nrt",
             heartbeat_seconds=0.01,
         )
         self.runtime_contract = {
@@ -125,6 +128,13 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             launcher=launcher,
             launcher_sha256=artifacts.sha256_file(launcher),
         )
+
+    def test_canonical_driver_default_is_reserved_lepton_backend(self) -> None:
+        self.assertEqual(
+            DriverInputs.__dataclass_fields__["learner_backend"].default,
+            "lepton_job_v1",
+        )
+        self.assertEqual(_parser().get_default("learner_backend"), "lepton_job_v1")
 
     def _publish_unmatched_attempt_fixture(
         self, inputs: DriverInputs, observed: dict
@@ -856,6 +866,162 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
         self.assertEqual(result["state"], "DRY_RUN_VALIDATED")
         self.assertIn("--dry-run", captured[0])
 
+    def test_collection_only_driver_accepts_only_sealed_collection_boundary(self) -> None:
+        initial = coordinator(1, "READY")
+        collected = coordinator(1, "COLLECTED")
+        collected["last_collected_macro_round"] = 1
+        config = self.control_root / "collection-only.json"
+        captured: list[list[str]] = []
+
+        def runner(argv, **_kwargs):
+            captured.append(list(argv))
+            return 0
+
+        receipt = {
+            "collection_manifest_path": "rounds/macro_round_000001/collection.json",
+            "collection_manifest_sha256": "f" * 64,
+            "cohort_count": 4,
+            "transition_count": 131072,
+        }
+        with (
+            mock.patch.object(
+                DriverInputs,
+                "validate",
+                return_value=(self.runtime_contract, {}, self.campaign),
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver._snapshot",
+                side_effect=[(self.campaign, initial), (self.campaign, collected)],
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver.materialize_orchestration_config",
+                return_value=(config, SHA, config.with_suffix(".binding.json")),
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver._collection_only_receipt",
+                return_value=receipt,
+            ),
+        ):
+            result = run_driver(
+                self.inputs,
+                stop_after_collected=True,
+                launcher_runner=runner,
+            )
+        self.assertEqual(result["state"], "COLLECTION_ONLY_COMPLETE")
+        self.assertEqual(result["transition_count"], 131072)
+        self.assertIn("--stop-after-collected", captured[0])
+        self.assertNotIn("--dry-run", captured[0])
+
+    def test_collection_only_driver_reuses_a_valid_sealed_boundary(self) -> None:
+        collected = coordinator(1, "COLLECTED")
+        collected["last_collected_macro_round"] = 1
+        receipt = {
+            "collection_manifest_path": "rounds/macro_round_000001/collection.json",
+            "collection_manifest_sha256": "f" * 64,
+            "cohort_count": 4,
+            "transition_count": 131072,
+        }
+        launcher = mock.Mock(return_value=0)
+        with (
+            mock.patch.object(
+                DriverInputs,
+                "validate",
+                return_value=(self.runtime_contract, {}, self.campaign),
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver._snapshot",
+                return_value=(self.campaign, collected),
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver._collection_only_receipt",
+                return_value=receipt,
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver.materialize_orchestration_config"
+            ) as materialize,
+        ):
+            result = run_driver(
+                self.inputs,
+                stop_after_collected=True,
+                launcher_runner=launcher,
+            )
+        self.assertEqual(result["state"], "COLLECTION_ONLY_COMPLETE")
+        launcher.assert_not_called()
+        materialize.assert_not_called()
+
+    def test_collection_only_receipt_rejects_policy_or_topology_drift(self) -> None:
+        before = coordinator(1, "READY")
+        after = coordinator(1, "COLLECTED")
+        after["last_collected_macro_round"] = 1
+        campaign = {
+            "cohort_count": 4,
+            "target_environments": 256,
+            "steps_per_environment": 512,
+        }
+        collection = {
+            "manifest_path": "rounds/macro_round_000001/collection.json",
+            "manifest_sha256": "f" * 64,
+            "cohort_count": 4,
+            "transition_count": 131072,
+            "runtime_policy_sha256": RUNTIME,
+        }
+        with mock.patch(
+            "round_dagger.production_campaign_driver.state.load_collection_manifest",
+            return_value=collection,
+        ):
+            receipt = _collection_only_receipt(
+                campaign_root=self.campaign_root,
+                campaign=campaign,
+                before=before,
+                after=after,
+            )
+        self.assertEqual(receipt["transition_count"], 131072)
+
+        changed_policy = dict(after)
+        changed_policy["active_policy"] = dict(after["active_policy"])
+        changed_policy["active_policy"]["checkpoint_sha256"] = "b" * 64
+        with self.assertRaisesRegex(ProductionDriverError, "active policy"):
+            _collection_only_receipt(
+                campaign_root=self.campaign_root,
+                campaign=campaign,
+                before=before,
+                after=changed_policy,
+            )
+
+    def test_collection_only_dry_run_binds_the_guard_without_mutation(self) -> None:
+        initial = coordinator(1, "READY")
+        config = self.control_root / "collection-only-dry.json"
+        captured: list[list[str]] = []
+
+        def runner(argv, **_kwargs):
+            captured.append(list(argv))
+            return 0
+
+        with (
+            mock.patch.object(
+                DriverInputs,
+                "validate",
+                return_value=(self.runtime_contract, {}, self.campaign),
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver._snapshot",
+                side_effect=[(self.campaign, initial), (self.campaign, initial)],
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_driver.materialize_orchestration_config",
+                return_value=(config, SHA, config.with_suffix(".binding.json")),
+            ),
+        ):
+            result = run_driver(
+                self.inputs,
+                dry_run=True,
+                stop_after_collected=True,
+                launcher_runner=runner,
+            )
+        self.assertEqual(result["state"], "COLLECTION_ONLY_DRY_RUN_VALIDATED")
+        self.assertIn("--dry-run", captured[0])
+        self.assertIn("--stop-after-collected", captured[0])
+
     def test_fresh_immutable_config_for_same_policy(self) -> None:
         observed = coordinator(0, "READY")
         with mock.patch(
@@ -1027,6 +1193,7 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             launcher=ROOT / "scripts/round_dagger/launch_production_macro_round.sh",
             launcher_sha256="b" * 64,
             control_root=self.control_root,
+            learner_backend="oci_nrt",
         )
         with (
             mock.patch("round_dagger.production_campaign_driver._verify_file"),
@@ -1095,6 +1262,7 @@ class FiveRoundProductionDriverTests(unittest.TestCase):
             launcher=ROOT / "scripts/round_dagger/launch_production_macro_round.sh",
             launcher_sha256="b" * 64,
             control_root=self.control_root,
+            learner_backend="oci_nrt",
         )
         with self.assertRaisesRegex(
             ProductionDriverError, "evaluation sealed source root must be absolute"

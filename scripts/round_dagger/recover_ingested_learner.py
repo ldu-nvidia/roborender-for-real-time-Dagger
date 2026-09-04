@@ -18,7 +18,11 @@ from round_dagger.learner_recovery import (  # noqa: E402
     LearnerRecoveryError,
     recover_ingested_learner,
 )
-from round_dagger.orchestration import OrchestrationError  # noqa: E402
+from round_dagger.orchestration import (  # noqa: E402
+    LEARNER_BACKEND_LEPTON_JOB_V1,
+    LEARNER_BACKENDS,
+    OrchestrationError,
+)
 from round_dagger.policy_bundle import PolicyBundleError  # noqa: E402
 from round_dagger.promotion import PromotionError  # noqa: E402
 from round_dagger.replay import ReplayError  # noqa: E402
@@ -42,6 +46,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-learner-contract-sha256", required=True)
     parser.add_argument("--sealed-source-root", required=True)
     parser.add_argument("--sealed-source-inventory-sha256", required=True)
+    parser.add_argument("--evaluation-sealed-source-root", required=True, type=Path)
+    parser.add_argument(
+        "--evaluation-sealed-source-inventory-sha256", required=True
+    )
+    parser.add_argument(
+        "--learner-backend",
+        choices=LEARNER_BACKENDS,
+        default=LEARNER_BACKEND_LEPTON_JOB_V1,
+    )
+    parser.add_argument("--learner-backend-contract", type=Path)
+    parser.add_argument("--expected-learner-backend-contract-sha256")
+    parser.add_argument("--lepton-remote-backend-contract")
+    parser.add_argument("--lepton-control-exec-program", type=Path)
+    parser.add_argument("--lepton-sdk-python", type=Path)
     parser.add_argument("--expected-bridge-sha256", required=True)
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -79,7 +97,23 @@ def main(argv: list[str] | None = None) -> int:
             sealed_source_inventory_sha256=(
                 arguments.sealed_source_inventory_sha256
             ),
+            evaluation_sealed_source_root=(
+                arguments.evaluation_sealed_source_root
+            ),
+            evaluation_sealed_source_inventory_sha256=(
+                arguments.evaluation_sealed_source_inventory_sha256
+            ),
             expected_bridge_sha256=arguments.expected_bridge_sha256,
+            learner_backend=arguments.learner_backend,
+            learner_backend_contract_path=arguments.learner_backend_contract,
+            expected_learner_backend_contract_sha256=(
+                arguments.expected_learner_backend_contract_sha256
+            ),
+            lepton_remote_backend_contract=(
+                arguments.lepton_remote_backend_contract
+            ),
+            lepton_control_exec_program=arguments.lepton_control_exec_program,
+            lepton_sdk_python=arguments.lepton_sdk_python,
             dry_run=arguments.dry_run,
         )
     except (

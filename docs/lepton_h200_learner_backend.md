@@ -1,10 +1,11 @@
 # Lepton H200 learner backend
 
-This backend moves only the camera-free DAgger learner to the reserved Lepton
-node. Isaac rendering and actor collection remain on the RTX workstation. The
-existing OCI/Slurm backend is unchanged and remains the explicit default; a
-campaign selects exactly one immutable backend and never falls back between
-OCI and Lepton after launch.
+This is the canonical production backend for the camera-free DAgger learner.
+Isaac rendering and actor collection remain on the RTX workstation; training
+runs as a private Lepton Kubernetes Job on the exact reserved node. The former
+OCI-NRT/Slurm H100 backend remains available only through an explicit legacy
+compatibility selection. A campaign selects exactly one immutable backend and
+never falls back between OCI and Lepton after launch.
 
 ## Pinned allocation
 
@@ -81,7 +82,8 @@ request, Job spec, source tree, log, or command line.
 7. Every semantic attempt uses the same campaign/output namespace, restart
    checkpoint, learner identity, and W&B run ID.
 8. The in-job entrypoint verifies immutable request/contract bytes, runs the
-   existing eight-rank `run_h100_learner.sh`, publishes the normal learner
+   existing backend-neutral eight-rank learner entrypoint (still named
+   `run_h100_learner.sh` for compatibility), publishes the normal learner
    completion attestation, freezes the complete learner-output tree into an
    inventory-bound archive, then publishes `lepton_learner_success.json` and
    an exact `sha256sum` companion. The marker binds the archive, inventory,
@@ -108,7 +110,7 @@ credential.
 python scripts/round_dagger/submit_lepton_round_learner_and_wait.py plan \
   --contract /path/to/downloaded/finalized-lepton-backend.json \
   --request /path/to/immutable/lepton_request.json \
-  --remote-contract /workspace/projects/roborender/manifests/lepton_backend.json \
+  --remote-contract /workspace/projects/roborender/manifests/lepton-backend-final-run1.json \
   --remote-request /workspace/projects/roborender/handoff/incoming/lepton_request.json \
   --attempt 1
 ```
@@ -195,8 +197,16 @@ waits for `Ready`, including after a failed smoke.
 
 ## Production-driver integration status
 
-The unattended production driver now supports an immutable backend enum:
-`oci_nrt` (the default) or `lepton_job_v1`. The selected backend, finalized
+The campaign-owned training policy is materialized from
+`configs/round_dagger/production_learner_8rank_1200.json`. That portable v2
+contract contains optimizer, world-size, fixed-heldout, W&B, and source-seal
+policy only; it deliberately contains no hostname, scheduler, GPU model,
+container, or Kubernetes identity. All deployment identity lives in the
+separately reviewed finalized Lepton backend contract above.
+
+The unattended production driver supports an immutable backend enum:
+`lepton_job_v1` (the canonical/default route) or `oci_nrt` (explicit legacy
+compatibility). The selected backend, finalized
 contract path and digest, remote contract path, pinned control helper, and
 control-Python freeze are bound into launch and recovery state. There is no
 ambient discovery or fallback.
@@ -227,7 +237,7 @@ python scripts/round_dagger/submit_lepton_round_learner_and_wait.py submit \
   --contract-sha256 "$REVIEWED_CONTRACT_SHA256" \
   --request "$SEALED_LOCAL_REQUEST" \
   --request-sha256 "$REVIEWED_REQUEST_SHA256" \
-  --remote-contract /workspace/projects/roborender/manifests/lepton_backend.json \
+  --remote-contract /workspace/projects/roborender/manifests/lepton-backend-final-run1.json \
   --remote-request /workspace/projects/roborender/handoff/incoming/lepton_request.json \
   --lifecycle-state /mnt/data2/ldu/roborender_lepton_lifecycle/run1-round0.json \
   --control-exec-program /mnt/data1/ldu/lepton_pod_exec.py

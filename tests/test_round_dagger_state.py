@@ -25,12 +25,14 @@ from round_dagger.promotion import (
     load_active_policy,
     load_candidate_manifest,
     promote_candidate,
+    reject_candidate,
     stage_bootstrap_policy,
     stage_candidate,
     write_evaluation,
 )
 from round_dagger.replay import ReplayLedger
 from round_dagger.state import (
+    LEGACY_STATE_SCHEMA,
     StateError,
     _replace_state,
     beta_for_macro_round,
@@ -509,6 +511,94 @@ class StatePromotionLifecycleTest(unittest.TestCase):
                 evaluation_manifest=evaluation["manifest_path"],
             )
         self.assertEqual(load_active_policy(root)["version"], 0)
+
+    def test_rejected_candidate_retains_parent_and_consumes_its_version(self) -> None:
+        root = _campaign(self.tmp_path)
+        parent_before = load_active_policy(root)
+        _to_ingested(root)
+        first = _stage_and_bind(root, self.tmp_path)
+        rejected_evaluation = _evaluate_and_bind(root, first, passed=False)
+
+        rejection = reject_candidate(
+            root,
+            macro_round=0,
+            candidate_manifest=first["manifest_path"],
+            evaluation_manifest=rejected_evaluation["manifest_path"],
+        )
+        retained = load_state(root)
+        self.assertEqual(rejection["decision"], "rejected")
+        self.assertTrue(rejection["retained"])
+        self.assertEqual(retained["phase"], "READY")
+        self.assertEqual(retained["next_macro_round"], 1)
+        self.assertEqual(retained["next_policy_version"], 2)
+        self.assertEqual(retained["active_policy"]["version"], 0)
+        self.assertEqual(
+            retained["active_policy"]["checkpoint_sha256"],
+            first["parent_checkpoint_sha256"],
+        )
+        self.assertEqual(load_active_policy(root), parent_before)
+        self.assertEqual(retained["last_resolution"]["decision"], "rejected")
+
+        # The terminal decision is idempotent and cannot cause a second state
+        # transition after a crash/retry boundary.
+        self.assertEqual(
+            reject_candidate(
+                root,
+                macro_round=0,
+                candidate_manifest=first["manifest_path"],
+                evaluation_manifest=rejected_evaluation["manifest_path"],
+            )["resolution_sha256"],
+            rejection["resolution_sha256"],
+        )
+
+        # Round one still freezes v0, but its candidate gets a fresh v2
+        # namespace so the rejected v1 bytes can never be overwritten.
+        _to_ingested(root)
+        second = _stage_and_bind(root, self.tmp_path)
+        self.assertEqual(second["macro_round"], 1)
+        self.assertEqual(second["parent_policy_version"], 0)
+        self.assertEqual(second["policy_version"], 2)
+
+    def test_legacy_v2_completed_promotion_retries_without_resolution_receipt(self) -> None:
+        """A promotion committed before V3 must retain its historical retry."""
+
+        root = _campaign(self.tmp_path)
+        _to_ingested(root)
+        candidate = _stage_and_bind(root, self.tmp_path)
+        evaluation = _evaluate_and_bind(root, candidate, passed=True)
+        promoted = promote_candidate(
+            root,
+            macro_round=0,
+            candidate_manifest=candidate["manifest_path"],
+            evaluation_manifest=evaluation["manifest_path"],
+        )
+
+        # Materialize the exact durable shape produced by the former V2
+        # coordinator: promotion evidence exists, but terminal-resolution
+        # receipts did not exist yet.
+        state_path = root / "coordinator_state.json"
+        legacy = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy["schema"] = LEGACY_STATE_SCHEMA
+        legacy.pop("next_policy_version")
+        legacy.pop("last_resolution")
+        state_path.chmod(0o644)
+        state_path.write_text(
+            json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o444)
+        (root / "rounds/macro_round_000000/resolution.json").unlink()
+
+        retry = promote_candidate(
+            root,
+            macro_round=0,
+            candidate_manifest=candidate["manifest_path"],
+            evaluation_manifest=evaluation["manifest_path"],
+        )
+        self.assertEqual(retry["promotion_sha256"], promoted["promotion_sha256"])
+        self.assertNotIn("resolution_sha256", retry)
+        self.assertEqual(load_state(root)["schema"], LEGACY_STATE_SCHEMA)
+        self.assertEqual(load_active_policy(root)["version"], candidate["policy_version"])
 
     def test_atomic_promotion_and_exact_retry_survive_reload(self) -> None:
         root = _campaign(self.tmp_path)

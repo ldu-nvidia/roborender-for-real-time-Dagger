@@ -10,6 +10,7 @@ from unittest import mock
 
 from round_dagger import artifacts
 from round_dagger.production_campaign_monitor import (
+    DEFAULT_LEARNER_BACKEND,
     MONITOR_INTERVAL_SECONDS,
     ProductionMonitorError,
     _gpu_health,
@@ -22,6 +23,7 @@ from round_dagger.production_campaign_monitor import (
     collect_report,
     run_monitor,
 )
+from round_dagger import production_campaign_monitor
 
 
 class ProductionCampaignMonitorTests(unittest.TestCase):
@@ -39,6 +41,22 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
 
     def test_monitor_interval_is_exactly_thirty_minutes(self) -> None:
         self.assertEqual(MONITOR_INTERVAL_SECONDS, 1800.0)
+
+    def test_default_backend_is_reserved_lepton(self) -> None:
+        self.assertEqual(DEFAULT_LEARNER_BACKEND, "lepton_job_v1")
+        arguments = production_campaign_monitor._parser().parse_args(
+            [
+                "--campaign-root", str(self.campaign),
+                "--campaign-contract", str(self.contract),
+                "--campaign-contract-sha256", self.contract_sha,
+                "--output-root", str(self.output),
+                "--wandb-entity", "entity",
+                "--wandb-project", "project",
+                "--wandb-expected-email", "user@example.com",
+                "--wandb-netrc", str(self.base / ".netrc"),
+            ]
+        )
+        self.assertEqual(arguments.learner_backend, "lepton_job_v1")
 
     def test_bound_quality_process_rejects_another_campaign(self) -> None:
         pidfile = self.base / "quality.pid.json"
@@ -166,6 +184,7 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
                 telemetry_roots=(),
                 wandb_roots=(),
                 disk_paths=(self.base,),
+                learner_backend="oci_nrt",
                 oci_nrt_host="oci-nrt",
                 slurm_user="ldu",
                 slurm_job_prefix="rrd-",
@@ -189,6 +208,7 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
                 telemetry_roots=(),
                 wandb_roots=(),
                 disk_paths=(self.base,),
+                learner_backend="oci_nrt",
                 oci_nrt_host="oci-nrt",
                 slurm_user="ldu",
                 slurm_job_prefix="rrd-",
@@ -369,6 +389,7 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
                 telemetry_roots=(self.base / "telemetry",),
                 wandb_roots=(self.base / "wandb",),
                 disk_paths=(self.base,),
+                learner_backend="oci_nrt",
                 oci_nrt_host="oci-nrt",
                 slurm_user="ldu",
                 slurm_job_prefix="rrd-",
@@ -384,6 +405,74 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
             report["gpu"]["compute_processes"][0]["temporal_classification"],
             "baseline_at_monitor_start",
         )
+
+    def test_lepton_backend_never_queries_slurm(self) -> None:
+        coordinator = {
+            "campaign_id": "campaign",
+            "phase": "COLLECTING",
+            "next_macro_round": 0,
+            "open_macro_round": 0,
+            "macro_round_count": 5,
+            "completed": False,
+            "revision": 1,
+            "active_policy_version": 0,
+            "active_policy_checkpoint_sha256": "a" * 64,
+        }
+        lepton_health = {
+            "schema": "fast_roborender.round_dagger.lepton_live_health.v1",
+            "read_only": True,
+            "reachable": True,
+            "healthy": True,
+            "reason_codes": [],
+        }
+        with (
+            mock.patch(
+                "round_dagger.production_campaign_monitor._coordinator",
+                return_value=coordinator,
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._process_matches",
+                side_effect=lambda patterns: {
+                    pattern: {"count": 1, "pids": [10]} for pattern in patterns
+                },
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._slurm_health",
+                side_effect=AssertionError("Lepton monitoring queried Slurm"),
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._lepton_health",
+                return_value=lepton_health,
+            ),
+            mock.patch(
+                "round_dagger.production_campaign_monitor._gpu_health_burst",
+                return_value={
+                    "available": True,
+                    "gpus": [],
+                    "alerts": [],
+                    "compute_processes": [],
+                },
+            ),
+        ):
+            report = collect_report(
+                campaign_root=self.campaign,
+                campaign_contract=self.contract,
+                campaign_contract_sha256=self.contract_sha,
+                actor_patterns=(),
+                fleet_patterns=(),
+                telemetry_roots=(),
+                wandb_roots=(),
+                disk_paths=(self.base,),
+                lepton_backend_contract=self.base / "backend.json",
+                lepton_backend_contract_sha256="b" * 64,
+                lepton_sdk_python=self.base / "python",
+                lepton_handoff_root=self.base / "handoff",
+            )
+        self.assertEqual(
+            report["learner_control_plane"]["backend"], "lepton_job_v1"
+        )
+        self.assertIsNone(report["oci_nrt_slurm"])
+        self.assertIs(report["lepton_h200"], lepton_health)
 
     def test_collecting_warns_for_missing_actor_and_two_stale_polls(self) -> None:
         telemetry = self.base / "telemetry"
@@ -461,6 +550,7 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
                 telemetry_roots=(telemetry,),
                 wandb_roots=(wandb,),
                 disk_paths=(self.base,),
+                learner_backend="oci_nrt",
                 oci_nrt_host="oci-nrt",
                 slurm_user="ldu",
                 slurm_job_prefix="rrd-",
@@ -519,6 +609,7 @@ class ProductionCampaignMonitorTests(unittest.TestCase):
                 fleet_patterns=("renderer",),
                 required_process_patterns=("student_quality_wandb_bridge.py",),
                 telemetry_roots=(), wandb_roots=(), disk_paths=(self.base,),
+                learner_backend="oci_nrt",
                 oci_nrt_host="oci-nrt", slurm_user="ldu", slurm_job_prefix="rrd-",
             )
         self.assertFalse(report["progress_health"]["required_processes_healthy"])

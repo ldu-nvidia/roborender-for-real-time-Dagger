@@ -25,6 +25,7 @@ import zipfile
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -65,12 +66,25 @@ TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
 HELDOUT_TELEMETRY_SCHEMA = (
     "fast_roborender.round_dagger.learner_heldout_telemetry.v1"
 )
+TRAINING_QUALITY_TELEMETRY_SCHEMA = (
+    "fast_roborender.round_dagger.learner_training_quality.v2"
+)
+TRAINING_CONTEXT_TELEMETRY_SCHEMA = (
+    "fast_roborender.round_dagger.learner_training_context.v1"
+)
+TRAINING_QUALITY_PROBE_POLICY = (
+    "lineage_stratified_current_historical_replay.v1"
+)
+TRAINING_QUALITY_PROBE_BUDGET = 256
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 CUDA_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 SINGLE_PROCESS_GRADIENT_REDUCTION = "single_process_v1"
 ORDERED_ALLGATHER_GRADIENT_REDUCTION = "ordered_allgather_rank_sum_v1"
 _PROBE_SEED_DOMAIN = b"fast_roborender.round_dagger.loss_probe.v1"
+_TRAINING_QUALITY_PROBE_DOMAIN = (
+    b"fast_roborender.round_dagger.training_quality_probe.v1"
+)
 
 
 class LearnerError(RuntimeError):
@@ -575,6 +589,524 @@ def partition_shards(
     )[rank]
 
 
+_TRAINING_QUALITY_PROBE_SUMMARY_KEYS = {
+    "policy",
+    "budget",
+    "campaign_id",
+    "macro_round",
+    "snapshot_file_sha256",
+    "snapshot_sha256",
+    "partition_seed",
+    "world_size",
+    "replay_transitions_per_rank",
+    "replay_transitions_global",
+    "transitions_per_rank",
+    "transitions_global",
+    "current_round_transitions_per_rank",
+    "current_round_transitions_global",
+    "historical_transitions_per_rank",
+    "historical_transitions_global",
+    "rank_selection_sha256s",
+    "selection_sha256",
+}
+
+
+def _training_quality_probe_digest_payload(
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "domain": _TRAINING_QUALITY_PROBE_DOMAIN.decode("ascii"),
+        **{
+            key: summary[key]
+            for key in sorted(_TRAINING_QUALITY_PROBE_SUMMARY_KEYS - {"selection_sha256"})
+        },
+    }
+
+
+def validate_training_quality_probe_summary(
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and normalize the immutable fixed-probe selection contract."""
+
+    if not isinstance(summary, Mapping) or set(summary) != (
+        _TRAINING_QUALITY_PROBE_SUMMARY_KEYS
+    ):
+        raise LearnerError("training-quality probe summary fields mismatch")
+    clean = dict(summary)
+    if clean.get("policy") != TRAINING_QUALITY_PROBE_POLICY:
+        raise LearnerError("training-quality probe policy mismatch")
+    budget = _true_int(clean.get("budget"), "training-quality probe budget", minimum=1)
+    if budget != TRAINING_QUALITY_PROBE_BUDGET:
+        raise LearnerError("training-quality probe budget mismatch")
+    campaign_id = clean.get("campaign_id")
+    if not isinstance(campaign_id, str) or not campaign_id:
+        raise LearnerError("training-quality probe campaign ID is invalid")
+    macro_round = _true_int(
+        clean.get("macro_round"), "training-quality probe macro round"
+    )
+    _require_sha256(
+        clean.get("snapshot_file_sha256"),
+        "training-quality probe snapshot file SHA-256",
+    )
+    _require_sha256(
+        clean.get("snapshot_sha256"),
+        "training-quality probe snapshot semantic SHA-256",
+    )
+    _true_int(clean.get("partition_seed"), "training-quality probe partition seed")
+    world_size = _true_int(
+        clean.get("world_size"), "training-quality probe world size", minimum=1
+    )
+
+    list_fields = (
+        "replay_transitions_per_rank",
+        "transitions_per_rank",
+        "current_round_transitions_per_rank",
+        "historical_transitions_per_rank",
+    )
+    normalized_lists: dict[str, list[int]] = {}
+    for field in list_fields:
+        values = clean.get(field)
+        if not isinstance(values, list) or len(values) != world_size:
+            raise LearnerError(f"training-quality probe {field} violates world size")
+        minimum = 1 if field in {"replay_transitions_per_rank", "transitions_per_rank"} else 0
+        normalized_lists[field] = [
+            _true_int(value, f"training-quality probe {field}", minimum=minimum)
+            for value in values
+        ]
+    replay_counts = normalized_lists["replay_transitions_per_rank"]
+    counts = normalized_lists["transitions_per_rank"]
+    current_counts = normalized_lists["current_round_transitions_per_rank"]
+    historical_counts = normalized_lists["historical_transitions_per_rank"]
+    if any(
+        selected > replay
+        or selected != current + historical
+        for selected, replay, current, historical in zip(
+            counts, replay_counts, current_counts, historical_counts
+        )
+    ):
+        raise LearnerError("training-quality probe rank coverage is inconsistent")
+    totals = {
+        "replay_transitions_global": sum(replay_counts),
+        "transitions_global": sum(counts),
+        "current_round_transitions_global": sum(current_counts),
+        "historical_transitions_global": sum(historical_counts),
+    }
+    if any(clean.get(key) != value for key, value in totals.items()):
+        raise LearnerError("training-quality probe global counts are inconsistent")
+    if clean["transitions_global"] > budget:
+        raise LearnerError("training-quality probe exceeds its declared budget")
+    if clean["transitions_global"] != min(
+        budget, clean["replay_transitions_global"]
+    ):
+        raise LearnerError("training-quality probe does not cover its bounded budget")
+    if (
+        clean["current_round_transitions_global"]
+        + clean["historical_transitions_global"]
+        != clean["transitions_global"]
+    ):
+        raise LearnerError("training-quality probe source counts do not cover selection")
+    if macro_round == 0 and clean["historical_transitions_global"] != 0:
+        raise LearnerError("round-zero training-quality probe cannot be historical")
+    if (
+        macro_round > 0
+        and clean["transitions_global"] == TRAINING_QUALITY_PROBE_BUDGET
+        and clean["current_round_transitions_global"] != budget // 2
+    ):
+        raise LearnerError(
+            "production training-quality probe must split current/historical evenly"
+        )
+    rank_digests = clean.get("rank_selection_sha256s")
+    if (
+        not isinstance(rank_digests, list)
+        or len(rank_digests) != world_size
+        or len(set(rank_digests)) != world_size
+    ):
+        raise LearnerError("training-quality probe rank digest coverage mismatch")
+    for digest in rank_digests:
+        _require_sha256(digest, "training-quality probe rank selection SHA-256")
+    declared = _require_sha256(
+        clean.get("selection_sha256"),
+        "training-quality probe selection SHA-256",
+    )
+    expected = canonical_json_sha256(_training_quality_probe_digest_payload(clean))
+    if declared != expected:
+        raise LearnerError("training-quality probe selection digest mismatch")
+    return clean
+
+
+@dataclass(frozen=True)
+class TrainingQualityProbe:
+    """One fixed, lineage-bound held-in probe reused at every frontier."""
+
+    summary_document: Mapping[str, Any]
+    indices_by_rank: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self) -> None:
+        clean = validate_training_quality_probe_summary(self.summary_document)
+        world_size = clean["world_size"]
+        if len(self.indices_by_rank) != world_size:
+            raise LearnerError("training-quality probe index rank coverage mismatch")
+        for rank, indices in enumerate(self.indices_by_rank):
+            if len(indices) != clean["transitions_per_rank"][rank]:
+                raise LearnerError("training-quality probe rank index count mismatch")
+            if len(indices) != len(set(indices)) or any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0
+                for index in indices
+            ):
+                raise LearnerError("training-quality probe contains invalid/duplicate index")
+        object.__setattr__(self, "summary_document", clean)
+
+    def summary(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self.summary_document, sort_keys=True))
+
+
+def _probe_tie_digest(*parts: Any) -> str:
+    payload = ":".join(str(part) for part in parts).encode("utf-8")
+    return hashlib.sha256(_TRAINING_QUALITY_PROBE_DOMAIN + b":" + payload).hexdigest()
+
+
+def build_training_quality_probe(
+    snapshot: Mapping[str, Any],
+    *,
+    world_size: int,
+    partition_seed: int,
+    budget: int = TRAINING_QUALITY_PROBE_BUDGET,
+) -> TrainingQualityProbe:
+    """Select a deterministic bounded probe without enumerating replay rows.
+
+    The selection is stratified by current versus historical replay, rank,
+    macro-round, and cohort.  Local indices match :class:`ReplayPartition`
+    exactly because both use the same balanced shard assignment and canonical
+    per-rank shard order.
+    """
+
+    if not isinstance(snapshot, Mapping):
+        raise LearnerError("training-quality probe snapshot must be a mapping")
+    world_size = _true_int(world_size, "training-quality probe world size", minimum=1)
+    partition_seed = _true_int(
+        partition_seed, "training-quality probe partition seed"
+    )
+    budget = _true_int(budget, "training-quality probe budget", minimum=1)
+    if budget != TRAINING_QUALITY_PROBE_BUDGET:
+        raise LearnerError(
+            f"training-quality probe budget must be {TRAINING_QUALITY_PROBE_BUDGET}"
+        )
+    campaign_id = snapshot.get("campaign_id")
+    if not isinstance(campaign_id, str) or not campaign_id:
+        raise LearnerError("training-quality probe campaign ID is invalid")
+    macro_round = _true_int(
+        snapshot.get("through_macro_round"),
+        "training-quality probe snapshot macro round",
+    )
+    snapshot_file_sha256 = _require_sha256(
+        snapshot.get("file_sha256"), "training-quality probe snapshot file SHA-256"
+    )
+    snapshot_sha256 = _require_sha256(
+        snapshot.get("snapshot_sha256"),
+        "training-quality probe snapshot semantic SHA-256",
+    )
+    shards = snapshot.get("resolved_shards")
+    if not isinstance(shards, Sequence) or isinstance(shards, (str, bytes)) or not shards:
+        raise LearnerError("training-quality probe snapshot has no resolved shards")
+    assignments = _balanced_shard_assignments(
+        shards, world_size=world_size, seed=partition_seed
+    )
+    if any(not assigned for assigned in assignments):
+        raise LearnerError("training-quality probe partition leaves an empty rank")
+
+    # A cell contains one rank/source/round/cohort stratum and one or more
+    # non-contiguous shard segments expressed in rank-local replay coordinates.
+    cells: dict[tuple[int, str, int, int], dict[str, Any]] = {}
+    replay_counts: list[int] = []
+    current_capacity = 0
+    historical_capacity = 0
+    for rank, assigned in enumerate(assignments):
+        local_base = 0
+        for shard in assigned:
+            shard_round = _true_int(
+                shard.get("macro_round"), "training-quality probe shard macro round"
+            )
+            cohort_index = _true_int(
+                shard.get("cohort_index"), "training-quality probe cohort index"
+            )
+            if shard_round > macro_round:
+                raise LearnerError("training-quality probe snapshot contains a future shard")
+            count = _true_int(
+                shard.get("transition_count"),
+                "training-quality probe shard transition count",
+                minimum=1,
+            )
+            source = "current" if shard_round == macro_round else "historical"
+            key = (rank, source, shard_round, cohort_index)
+            cell = cells.setdefault(key, {"capacity": 0, "segments": []})
+            cell["segments"].append(
+                {
+                    "local_start": local_base,
+                    "count": count,
+                    "logical_id": shard["logical_id"],
+                    "shard_id": shard["shard_id"],
+                    "macro_round": shard_round,
+                    "cohort_index": cohort_index,
+                }
+            )
+            cell["capacity"] += count
+            if source == "current":
+                current_capacity += count
+            else:
+                historical_capacity += count
+            local_base += count
+        replay_counts.append(local_base)
+    replay_total = sum(replay_counts)
+    if replay_total != _true_int(
+        snapshot.get("transition_count"),
+        "training-quality probe replay transition count",
+        minimum=1,
+    ):
+        raise LearnerError("training-quality probe replay coverage mismatch")
+    selected_total = min(budget, replay_total)
+    if selected_total < world_size:
+        raise LearnerError("training-quality probe budget cannot cover every rank")
+    if macro_round == 0:
+        if historical_capacity:
+            raise LearnerError("round-zero replay unexpectedly contains historical rows")
+        current_quota, historical_quota = selected_total, 0
+    elif selected_total == budget:
+        half = budget // 2
+        if current_capacity < half or historical_capacity < half:
+            raise LearnerError(
+                "production probe requires at least 128 current and 128 historical rows"
+            )
+        current_quota, historical_quota = half, budget - half
+    else:
+        current_quota = min((selected_total + 1) // 2, current_capacity)
+        historical_quota = selected_total - current_quota
+        if historical_quota > historical_capacity:
+            shift = historical_quota - historical_capacity
+            historical_quota -= shift
+            current_quota += shift
+        if current_quota > current_capacity:
+            shift = current_quota - current_capacity
+            current_quota -= shift
+            historical_quota += shift
+    source_quotas = {"current": current_quota, "historical": historical_quota}
+
+    allocation = {key: 0 for key in cells}
+    sources_by_rank: dict[int, list[str]] = {}
+    for rank in range(world_size):
+        sources_by_rank[rank] = [
+            source
+            for source in ("current", "historical")
+            if any(key[0] == rank and key[1] == source for key in cells)
+        ]
+        if not sources_by_rank[rank]:
+            raise LearnerError("training-quality probe rank has no source rows")
+    current_only = [rank for rank, sources in sources_by_rank.items() if sources == ["current"]]
+    historical_only = [
+        rank for rank, sources in sources_by_rank.items() if sources == ["historical"]
+    ]
+    dual = [rank for rank, sources in sources_by_rank.items() if len(sources) == 2]
+    lower_current_dual = max(
+        0, len(dual) - (historical_quota - len(historical_only))
+    )
+    upper_current_dual = min(len(dual), current_quota - len(current_only))
+    if lower_current_dual > upper_current_dual:
+        raise LearnerError("training-quality source quotas cannot cover every rank")
+    desired_current_dual = round(len(dual) * current_quota / selected_total)
+    current_dual_count = min(
+        upper_current_dual, max(lower_current_dual, desired_current_dual)
+    )
+    ordered_dual = sorted(
+        dual,
+        key=lambda rank: _probe_tie_digest(
+            snapshot_file_sha256,
+            snapshot_sha256,
+            campaign_id,
+            macro_round,
+            partition_seed,
+            world_size,
+            "rank-source",
+            rank,
+        ),
+    )
+    reserved_source = {rank: "current" for rank in current_only}
+    reserved_source.update({rank: "historical" for rank in historical_only})
+    reserved_source.update(
+        {
+            rank: ("current" if offset < current_dual_count else "historical")
+            for offset, rank in enumerate(ordered_dual)
+        }
+    )
+    for rank, source in reserved_source.items():
+        candidates = [key for key in cells if key[0] == rank and key[1] == source]
+        chosen = min(
+            candidates,
+            key=lambda key: _probe_tie_digest(
+                snapshot_file_sha256,
+                snapshot_sha256,
+                campaign_id,
+                macro_round,
+                partition_seed,
+                world_size,
+                "rank-cell",
+                *key,
+            ),
+        )
+        allocation[chosen] += 1
+
+    for source, quota in source_quotas.items():
+        remaining = quota - sum(
+            count for key, count in allocation.items() if key[1] == source
+        )
+        if remaining < 0:
+            raise LearnerError("training-quality probe source reservation exceeds quota")
+        for _ in range(remaining):
+            candidates = [
+                key
+                for key, cell in cells.items()
+                if key[1] == source and allocation[key] < cell["capacity"]
+            ]
+            if not candidates:
+                raise LearnerError("training-quality probe source capacity exhausted")
+            chosen = min(
+                candidates,
+                key=lambda key: (
+                    Fraction(allocation[key] + 1, cells[key]["capacity"]),
+                    _probe_tie_digest(
+                        snapshot_file_sha256,
+                        snapshot_sha256,
+                        campaign_id,
+                        macro_round,
+                        partition_seed,
+                        world_size,
+                        "cell-allocation",
+                        *key,
+                    ),
+                ),
+            )
+            allocation[chosen] += 1
+
+    descriptors_by_rank: list[list[dict[str, Any]]] = [
+        [] for _ in range(world_size)
+    ]
+    for key in sorted(cells):
+        selected = allocation[key]
+        if selected == 0:
+            continue
+        rank, source, shard_round, cohort_index = key
+        cell = cells[key]
+        capacity = int(cell["capacity"])
+        segments = list(cell["segments"])
+        segment_ends: list[int] = []
+        segment_total = 0
+        for segment in segments:
+            segment_total += int(segment["count"])
+            segment_ends.append(segment_total)
+        if segment_total != capacity or selected > capacity:
+            raise LearnerError("training-quality probe cell capacity mismatch")
+        for ordinal in range(selected):
+            lower = ordinal * capacity // selected
+            upper = (ordinal + 1) * capacity // selected
+            width = upper - lower
+            if width < 1:
+                raise LearnerError("training-quality probe stratum over-selected")
+            phase = int(
+                _probe_tie_digest(
+                    snapshot_file_sha256,
+                    snapshot_sha256,
+                    campaign_id,
+                    macro_round,
+                    partition_seed,
+                    world_size,
+                    "sample",
+                    *key,
+                    ordinal,
+                ),
+                16,
+            ) % width
+            cell_offset = lower + phase
+            segment_index = bisect_right(segment_ends, cell_offset)
+            segment_base = 0 if segment_index == 0 else segment_ends[segment_index - 1]
+            segment = segments[segment_index]
+            transition_index = cell_offset - segment_base
+            descriptors_by_rank[rank].append(
+                {
+                    "rank": rank,
+                    "source": source,
+                    "macro_round": shard_round,
+                    "cohort_index": cohort_index,
+                    "logical_id": segment["logical_id"],
+                    "shard_id": segment["shard_id"],
+                    "transition_index": transition_index,
+                    "local_index": int(segment["local_start"]) + transition_index,
+                }
+            )
+
+    indices_by_rank: list[tuple[int, ...]] = []
+    counts: list[int] = []
+    current_counts: list[int] = []
+    historical_counts: list[int] = []
+    rank_digests: list[str] = []
+    for rank, descriptors in enumerate(descriptors_by_rank):
+        descriptors.sort(key=lambda item: item["local_index"])
+        local_indices = tuple(int(item["local_index"]) for item in descriptors)
+        if not local_indices or len(local_indices) != len(set(local_indices)):
+            raise LearnerError("training-quality probe rank selection overlaps/is empty")
+        if any(index >= replay_counts[rank] for index in local_indices):
+            raise LearnerError("training-quality probe local index exceeds replay partition")
+        indices_by_rank.append(local_indices)
+        counts.append(len(descriptors))
+        current_counts.append(sum(item["source"] == "current" for item in descriptors))
+        historical_counts.append(
+            sum(item["source"] == "historical" for item in descriptors)
+        )
+        rank_digests.append(
+            canonical_json_sha256(
+                {
+                    "domain": _TRAINING_QUALITY_PROBE_DOMAIN.decode("ascii"),
+                    "policy": TRAINING_QUALITY_PROBE_POLICY,
+                    "campaign_id": campaign_id,
+                    "macro_round": macro_round,
+                    "snapshot_file_sha256": snapshot_file_sha256,
+                    "snapshot_sha256": snapshot_sha256,
+                    "partition_seed": partition_seed,
+                    "world_size": world_size,
+                    "rank": rank,
+                    "replay_transitions_rank": replay_counts[rank],
+                    "samples": descriptors,
+                }
+            )
+        )
+    base_summary = {
+        "policy": TRAINING_QUALITY_PROBE_POLICY,
+        "budget": budget,
+        "campaign_id": campaign_id,
+        "macro_round": macro_round,
+        "snapshot_file_sha256": snapshot_file_sha256,
+        "snapshot_sha256": snapshot_sha256,
+        "partition_seed": partition_seed,
+        "world_size": world_size,
+        "replay_transitions_per_rank": replay_counts,
+        "replay_transitions_global": replay_total,
+        "transitions_per_rank": counts,
+        "transitions_global": sum(counts),
+        "current_round_transitions_per_rank": current_counts,
+        "current_round_transitions_global": sum(current_counts),
+        "historical_transitions_per_rank": historical_counts,
+        "historical_transitions_global": sum(historical_counts),
+        "rank_selection_sha256s": rank_digests,
+    }
+    summary = {
+        **base_summary,
+        "selection_sha256": canonical_json_sha256(
+            _training_quality_probe_digest_payload(base_summary)
+        ),
+    }
+    return TrainingQualityProbe(
+        summary_document=summary,
+        indices_by_rank=tuple(indices_by_rank),
+    )
+
+
 def _read_npz_from_verified_descriptor(
     path: Path, expected_sha256: str
 ) -> dict[str, np.ndarray]:
@@ -795,6 +1327,7 @@ def load_replay_partition(
     rank: int = 0,
     world_size: int = 1,
     expected_snapshot_file_sha256: str | None = None,
+    artifact_root: str | os.PathLike[str] | None = None,
 ) -> ReplayPartition:
     """Load only the rank's shards after replay and held-FD digest validation."""
 
@@ -804,7 +1337,9 @@ def load_replay_partition(
         raise LearnerError("rank must be smaller than world_size")
     try:
         snapshot = load_snapshot(
-            snapshot_path, expected_file_sha256=expected_snapshot_file_sha256
+            snapshot_path,
+            expected_file_sha256=expected_snapshot_file_sha256,
+            artifact_root=artifact_root,
         )
     except Exception as exc:
         raise LearnerError(f"replay snapshot validation failed: {exc}") from exc
@@ -897,6 +1432,7 @@ def load_heldout_partition(
     *,
     rank: int = 0,
     world_size: int = 1,
+    artifact_root: str | os.PathLike[str] | None = None,
 ) -> ReplayPartition:
     """Load one rank's immutable evaluation-only replay partition."""
 
@@ -910,6 +1446,7 @@ def load_heldout_partition(
         snapshot = load_heldout_snapshot(
             snapshot_path,
             expected_file_sha256=config.heldout_snapshot_file_sha256,
+            artifact_root=artifact_root,
         )
     except Exception as exc:
         raise LearnerError(
@@ -1041,6 +1578,24 @@ def supervised_action_loss(
     return torch.mean(torch.square(predictions.float() - targets.float()))
 
 
+def _linear_quantile(values: np.ndarray, probability: float) -> float:
+    """Return a deterministic NumPy-compatible linear quantile."""
+
+    flattened = np.asarray(values, dtype=np.float64).reshape(-1)
+    if flattened.size == 0:
+        raise LearnerError("held-out quantile population is empty")
+    if not np.isfinite(flattened).all():
+        raise LearnerError("held-out quantile population is non-finite")
+    ordered = np.sort(flattened, kind="mergesort")
+    position = (ordered.size - 1) * float(probability)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return float(ordered[lower])
+    fraction = position - lower
+    return float(ordered[lower] + fraction * (ordered[upper] - ordered[lower]))
+
+
 def evaluate_heldout_actions(
     model: nn.Module,
     *,
@@ -1048,28 +1603,86 @@ def evaluate_heldout_actions(
     adapter: PolicyAdapter,
     device: torch.device | str,
     optimizer_step: int,
+    indices: Sequence[int] | None = None,
+    transition_counts_by_rank: Sequence[int] | None = None,
+    include_per_action_p90: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate every held-out transition and globally reduce exact sums."""
+    """Evaluate an exact population or an explicitly bounded fixed subset.
+
+    Held-out validation retains its exhaustive default.  Training-quality
+    callers supply their immutable rank-local probe indices and exact global
+    rank counts, ensuring every frontier performs bounded work.
+    """
 
     optimizer_step = _true_int(optimizer_step, "optimizer_step")
     device = torch.device(device)
     rank, world_size = _distributed_context()
     if rank != partition.rank or world_size != partition.world_size:
         raise LearnerError("held-out partition does not match distributed context")
+    if indices is None:
+        local_indices = tuple(range(partition.transition_count))
+        selected_counts = partition.transition_counts_by_rank
+        if transition_counts_by_rank is not None:
+            raise LearnerError(
+                "held-out transition counts require explicit selected indices"
+            )
+    else:
+        local_indices = tuple(indices)
+        if not local_indices:
+            raise LearnerError("held-out selected evaluation indices are empty")
+        if len(local_indices) != len(set(local_indices)) or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < partition.transition_count
+            for index in local_indices
+        ):
+            raise LearnerError(
+                "held-out selected evaluation indices overlap or exceed partition"
+            )
+        if (
+            not isinstance(transition_counts_by_rank, Sequence)
+            or isinstance(transition_counts_by_rank, (str, bytes))
+            or len(transition_counts_by_rank) != world_size
+        ):
+            raise LearnerError(
+                "held-out selected transition counts violate world size"
+            )
+        selected_counts = tuple(
+            _true_int(
+                count,
+                "held-out selected transitions per rank",
+                minimum=1,
+            )
+            for count in transition_counts_by_rank
+        )
+        if selected_counts[rank] != len(local_indices):
+            raise LearnerError(
+                "held-out selected indices disagree with this rank's count"
+            )
+        if any(
+            selected > replay
+            for selected, replay in zip(
+                selected_counts, partition.transition_counts_by_rank
+            )
+        ):
+            raise LearnerError(
+                "held-out selected counts exceed replay rank population"
+            )
     preserved_rng = _rng_state()
     was_training = model.training
     model.eval()
     statistics: torch.Tensor | None = None
     action_indices: tuple[int, ...] | None = None
+    absolute_error_chunks: list[np.ndarray] = []
+    action_l2_chunks: list[np.ndarray] = []
     try:
         with torch.no_grad():
-            for start in range(0, partition.transition_count, partition.config.batch_size):
-                stop = min(
-                    start + partition.config.batch_size,
-                    partition.transition_count,
-                )
+            for start in range(
+                0, len(local_indices), partition.config.batch_size
+            ):
+                stop = min(start + partition.config.batch_size, len(local_indices))
                 observations, targets = partition.batch(
-                    list(range(start, stop)), device=device
+                    local_indices[start:stop], device=device
                 )
                 predictions = adapter.actions(_unwrap_model(model), observations)
                 predictions, targets, current_indices = _aligned_learned_actions(
@@ -1101,6 +1714,18 @@ def evaluate_heldout_actions(
                 difference = flat_predictions - flat_targets
                 squared = torch.square(difference)
                 absolute = torch.abs(difference)
+                absolute_error_chunks.append(
+                    absolute.detach().cpu().numpy().reshape(
+                        -1, absolute.shape[-1]
+                    )
+                )
+                action_l2_chunks.append(
+                    torch.linalg.vector_norm(difference, dim=-1)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                )
                 prediction_norm = torch.linalg.vector_norm(
                     flat_predictions, dim=-1
                 )
@@ -1140,8 +1765,36 @@ def evaluate_heldout_actions(
         _restore_rng_state(preserved_rng)
     if statistics is None or action_indices is None:
         raise LearnerError("held-out replay evaluation produced no samples")
+    local_absolute_errors = np.concatenate(absolute_error_chunks, axis=0)
+    local_action_l2 = np.concatenate(action_l2_chunks)
     if world_size > 1:
         statistics = _ordered_allgather_sum(statistics, world_size)
+        gathered: list[Any] = [None] * world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            (local_absolute_errors.tolist(), local_action_l2.tolist()),
+        )
+        absolute_by_rank: list[np.ndarray] = []
+        action_l2_by_rank: list[np.ndarray] = []
+        for rank_payload in gathered:
+            if (
+                not isinstance(rank_payload, (tuple, list))
+                or len(rank_payload) != 2
+            ):
+                raise LearnerError("held-out quantile gather contract mismatch")
+            absolute_by_rank.append(
+                np.asarray(rank_payload[0], dtype=np.float64).reshape(
+                    -1, len(action_indices)
+                )
+            )
+            action_l2_by_rank.append(
+                np.asarray(rank_payload[1], dtype=np.float64).reshape(-1)
+            )
+        global_absolute_errors = np.concatenate(absolute_by_rank, axis=0)
+        global_action_l2 = np.concatenate(action_l2_by_rank)
+    else:
+        global_absolute_errors = local_absolute_errors
+        global_action_l2 = local_action_l2
     dimension = len(action_indices)
     element_count = float(statistics[2].item())
     row_count = float(statistics[4].item())
@@ -1190,23 +1843,298 @@ def evaluate_heldout_actions(
             "rmse": math.sqrt(action_mse),
             "cosine": action_cosine,
         }
-    return {
+    result = {
         "schema": HELDOUT_TELEMETRY_SCHEMA,
         "campaign_id": partition.config.campaign_id,
         "macro_round": partition.config.macro_round,
         "optimizer_step": optimizer_step,
         "heldout_snapshot_sha256": partition.snapshot["snapshot_sha256"],
         "heldout_snapshot_file_sha256": partition.snapshot["file_sha256"],
-        "heldout_transitions_rank": partition.transition_count,
-        "heldout_transitions_per_rank": list(partition.transition_counts_by_rank),
-        "heldout_transitions_global": partition.global_transition_count,
+        "heldout_transitions_rank": len(local_indices),
+        "heldout_transitions_per_rank": list(selected_counts),
+        "heldout_transitions_global": sum(selected_counts),
         "world_size": world_size,
         "learned_action_indices": list(action_indices),
         "action_mse": mse,
         "action_mae": mae,
         "action_rmse": math.sqrt(mse),
         "action_cosine": cosine,
+        "action_absolute_error_p90": _linear_quantile(
+            global_absolute_errors, 0.90
+        ),
+        "action_l2_p90": _linear_quantile(global_action_l2, 0.90),
         "per_action": per_action,
+    }
+    if include_per_action_p90:
+        result["per_action_absolute_error_p90"] = {
+            str(action_index): _linear_quantile(
+                global_absolute_errors[:, offset], 0.90
+            )
+            for offset, action_index in enumerate(action_indices)
+        }
+    return result
+
+
+def _training_quality_record(
+    record: Mapping[str, Any],
+    *,
+    probe: TrainingQualityProbe,
+    rank: int,
+) -> dict[str, Any]:
+    """Relabel a fixed held-in probe as training-distribution evidence.
+
+    ``evaluate_heldout_actions`` is intentionally reused because it already
+    implements the deterministic, globally reduced action metrics.  This
+    adapter prevents training examples from ever being published under the
+    validation namespace merely because they share the same evaluator.
+    """
+
+    if record.get("schema") != HELDOUT_TELEMETRY_SCHEMA:
+        raise LearnerError("training-quality source record schema mismatch")
+    summary = probe.summary()
+    rank = _true_int(rank, "training-quality probe record rank")
+    if rank >= summary["world_size"]:
+        raise LearnerError("training-quality probe record rank exceeds world size")
+    expected_source = {
+        "campaign_id": summary["campaign_id"],
+        "macro_round": summary["macro_round"],
+        "heldout_snapshot_sha256": summary["snapshot_sha256"],
+        "heldout_snapshot_file_sha256": summary["snapshot_file_sha256"],
+        "heldout_transitions_rank": summary["transitions_per_rank"][rank],
+        "heldout_transitions_per_rank": summary["transitions_per_rank"],
+        "heldout_transitions_global": summary["transitions_global"],
+        "world_size": summary["world_size"],
+    }
+    if any(record.get(key) != value for key, value in expected_source.items()):
+        raise LearnerError("training-quality probe/source identity mismatch")
+    per_action_p90 = record.get("per_action_absolute_error_p90")
+    if not isinstance(per_action_p90, Mapping):
+        raise LearnerError("training-quality source lacks per-action p90")
+    return {
+        "schema": TRAINING_QUALITY_TELEMETRY_SCHEMA,
+        "campaign_id": record["campaign_id"],
+        "macro_round": record["macro_round"],
+        "optimizer_step": record["optimizer_step"],
+        "training_snapshot_sha256": record["heldout_snapshot_sha256"],
+        "training_snapshot_file_sha256": record[
+            "heldout_snapshot_file_sha256"
+        ],
+        "training_probe_policy": summary["policy"],
+        "training_probe_budget": summary["budget"],
+        "training_probe_partition_seed": summary["partition_seed"],
+        "training_probe_selection_sha256": summary["selection_sha256"],
+        "training_probe_rank_selection_sha256s": summary[
+            "rank_selection_sha256s"
+        ],
+        "training_probe_record_rank": rank,
+        "training_probe_rank_selection_sha256": summary[
+            "rank_selection_sha256s"
+        ][rank],
+        "training_probe_transitions_rank": summary["transitions_per_rank"][rank],
+        "training_probe_transitions_per_rank": summary["transitions_per_rank"],
+        "training_probe_transitions_global": summary["transitions_global"],
+        "training_probe_current_round_transitions_rank": summary[
+            "current_round_transitions_per_rank"
+        ][rank],
+        "training_probe_current_round_transitions_per_rank": summary[
+            "current_round_transitions_per_rank"
+        ],
+        "training_probe_current_round_transitions_global": summary[
+            "current_round_transitions_global"
+        ],
+        "training_probe_historical_transitions_rank": summary[
+            "historical_transitions_per_rank"
+        ][rank],
+        "training_probe_historical_transitions_per_rank": summary[
+            "historical_transitions_per_rank"
+        ],
+        "training_probe_historical_transitions_global": summary[
+            "historical_transitions_global"
+        ],
+        "training_replay_transitions_rank": summary[
+            "replay_transitions_per_rank"
+        ][rank],
+        "training_replay_transitions_per_rank": summary[
+            "replay_transitions_per_rank"
+        ],
+        "training_replay_transitions_global": summary[
+            "replay_transitions_global"
+        ],
+        "world_size": record["world_size"],
+        "learned_action_indices": record["learned_action_indices"],
+        "action_mse": record["action_mse"],
+        "action_mae": record["action_mae"],
+        "action_rmse": record["action_rmse"],
+        "action_cosine": record["action_cosine"],
+        "action_absolute_error_p90": record["action_absolute_error_p90"],
+        "action_l2_p90": record["action_l2_p90"],
+        "per_action": record["per_action"],
+        "per_action_absolute_error_p90": dict(per_action_p90),
+    }
+
+
+def summarize_training_rollout_context(
+    partition: ReplayPartition,
+    train_action_slice: tuple[int, int] | None,
+    *,
+    scheduled_beta: float,
+    probe: TrainingQualityProbe | None = None,
+) -> dict[str, float | int]:
+    """Summarize the sealed DAgger collection that produced the replay.
+
+    These are data-collection diagnostics, not learner evaluation.  Keeping
+    them in the training section makes the expert intervention mix and replay
+    coverage visible without contaminating the OOD validation section.
+    """
+
+    rank, world_size = _distributed_context()
+    if rank != partition.rank or world_size != partition.world_size:
+        raise LearnerError("training context partition does not match distributed context")
+    scheduled_beta = _finite_float(scheduled_beta, "scheduled DAgger beta")
+    if not 0.0 <= scheduled_beta <= 1.0:
+        raise LearnerError("scheduled DAgger beta must be in [0,1]")
+    probe_indices: tuple[int, ...] | None = None
+    if probe is not None:
+        summary = probe.summary()
+        if (
+            summary["campaign_id"] != partition.config.campaign_id
+            or summary["macro_round"] != partition.config.macro_round
+            or summary["world_size"] != world_size
+            or summary["snapshot_file_sha256"] != partition.snapshot["file_sha256"]
+            or summary["snapshot_sha256"] != partition.snapshot["snapshot_sha256"]
+            or summary["replay_transitions_per_rank"]
+            != list(partition.transition_counts_by_rank)
+        ):
+            raise LearnerError("training context probe identity mismatch")
+        probe_indices = probe.indices_by_rank[rank]
+    scalar = torch.zeros(9, dtype=torch.float64)
+    action_l2_chunks: list[np.ndarray] = []
+    environment_ids: set[int] = set()
+    for shard in partition.shards:
+        arrays = shard.arrays
+        required = {
+            "student_actions",
+            "expert_actions",
+            "behavior_actions",
+            "expert_mask",
+            "dones",
+            "global_env_ids",
+        }
+        if not required <= set(arrays):
+            raise LearnerError(
+                "training replay lacks DAgger context arrays: "
+                + ", ".join(sorted(required - set(arrays)))
+            )
+        student = torch.from_numpy(arrays["student_actions"]).float()
+        expert = torch.from_numpy(arrays["expert_actions"]).float()
+        behavior = torch.from_numpy(arrays["behavior_actions"]).float()
+        student, expert, _ = _aligned_learned_actions(
+            student, expert, train_action_slice
+        )
+        behavior, _, _ = _aligned_learned_actions(
+            behavior, torch.from_numpy(arrays["expert_actions"]).float(), train_action_slice
+        )
+        difference = student.double() - expert.double()
+        flat_difference = difference.reshape(-1, difference.shape[-1])
+        flat_student = student.double().reshape(-1, student.shape[-1])
+        flat_expert = expert.double().reshape(-1, expert.shape[-1])
+        denominator = torch.linalg.vector_norm(flat_student, dim=-1) * torch.linalg.vector_norm(
+            flat_expert, dim=-1
+        )
+        cosine = torch.zeros_like(denominator)
+        nonzero = denominator > 0
+        cosine[nonzero] = torch.sum(
+            flat_student[nonzero] * flat_expert[nonzero], dim=-1
+        ) / denominator[nonzero]
+        cosine[
+            (torch.linalg.vector_norm(flat_student, dim=-1) == 0)
+            & (torch.linalg.vector_norm(flat_expert, dim=-1) == 0)
+        ] = 1.0
+        scalar[0] += torch.square(flat_difference).sum()
+        scalar[1] += torch.abs(flat_difference).sum()
+        scalar[2] += flat_difference.numel()
+        scalar[3] += cosine.sum()
+        scalar[4] += cosine.numel()
+        scalar[5] += int(np.count_nonzero(arrays["expert_mask"]))
+        scalar[6] += int(
+            np.count_nonzero(
+                np.all(
+                    behavior.detach().cpu().numpy()
+                    == expert.detach().cpu().numpy(),
+                    axis=-1,
+                )
+            )
+        )
+        scalar[7] += int(np.count_nonzero(arrays["dones"]))
+        scalar[8] += flat_difference.shape[0]
+        if probe_indices is None:
+            action_l2_chunks.append(
+                torch.linalg.vector_norm(flat_difference, dim=-1).cpu().numpy()
+            )
+        ids = arrays["global_env_ids"]
+        environment_ids.update(int(value) for value in ids.reshape(-1).tolist())
+    if probe_indices is not None:
+        student_rows: list[np.ndarray] = []
+        expert_rows: list[np.ndarray] = []
+        for index in probe_indices:
+            shard, time_index, env_index = partition._location(index)
+            student_rows.append(shard.arrays["student_actions"][time_index, env_index])
+            expert_rows.append(shard.arrays["expert_actions"][time_index, env_index])
+        student_probe = torch.from_numpy(np.stack(student_rows)).float()
+        expert_probe = torch.from_numpy(np.stack(expert_rows)).float()
+        student_probe, expert_probe, _ = _aligned_learned_actions(
+            student_probe, expert_probe, train_action_slice
+        )
+        local_l2 = (
+            torch.linalg.vector_norm(
+                student_probe.double() - expert_probe.double(), dim=-1
+            )
+            .cpu()
+            .numpy()
+            .reshape(-1)
+        )
+    else:
+        if not action_l2_chunks:
+            raise LearnerError("training context replay is empty")
+        local_l2 = np.concatenate(action_l2_chunks).reshape(-1)
+    if world_size > 1:
+        gathered_scalars: list[Any] = [None] * world_size
+        gathered_l2: list[Any] = [None] * world_size
+        gathered_envs: list[Any] = [None] * world_size
+        torch.distributed.all_gather_object(gathered_scalars, scalar.tolist())
+        torch.distributed.all_gather_object(gathered_l2, local_l2.tolist())
+        torch.distributed.all_gather_object(gathered_envs, sorted(environment_ids))
+        scalar = torch.as_tensor(
+            np.sum(np.asarray(gathered_scalars, dtype=np.float64), axis=0),
+            dtype=torch.float64,
+        )
+        global_l2 = np.concatenate(
+            [np.asarray(values, dtype=np.float64) for values in gathered_l2]
+        )
+        global_environment_ids = {
+            int(value) for values in gathered_envs for value in values
+        }
+    else:
+        global_l2 = local_l2
+        global_environment_ids = environment_ids
+    element_count = float(scalar[2])
+    transition_count = int(scalar[8])
+    if element_count <= 0 or transition_count <= 0:
+        raise LearnerError("training context aggregation is empty")
+    mse = float(scalar[0] / element_count)
+    return {
+        "parent_rollout_action_mse": mse,
+        "parent_rollout_action_mae": float(scalar[1] / element_count),
+        "parent_rollout_action_rmse": math.sqrt(mse),
+        "parent_rollout_action_cosine": float(scalar[3] / scalar[4]),
+        "parent_rollout_action_l2_p90": _linear_quantile(global_l2, 0.90),
+        "expert_intervention_rate": float(scalar[5] / transition_count),
+        "behavior_expert_match_rate": float(scalar[6] / transition_count),
+        "expert_label_coverage": 1.0,
+        "replay_transitions": transition_count,
+        "replay_environments": len(global_environment_ids),
+        "done_rate": float(scalar[7] / transition_count),
+        "scheduled_beta": scheduled_beta,
     }
 
 
@@ -1469,6 +2397,9 @@ class JsonlTelemetry:
         *,
         enabled: bool,
         heldout_path: str | os.PathLike[str] | None = None,
+        training_quality_path: str | os.PathLike[str] | None = None,
+        dagger_dashboard: bool = False,
+        scene_sample_manifest: str | os.PathLike[str] | None = None,
         wandb_project: str | None = None,
         wandb_entity: str | None = None,
         wandb_run_id: str | None = None,
@@ -1482,6 +2413,12 @@ class JsonlTelemetry:
             else None
         )
         self.wandb_run = None
+        self.dagger_dashboard = bool(dagger_dashboard)
+        self.scene_sample_manifest = (
+            Path(os.path.abspath(Path(scene_sample_manifest).expanduser()))
+            if scene_sample_manifest is not None and enabled
+            else None
+        )
         if heldout_path is not None and not enabled:
             self.heldout_path = None
         elif heldout_path is not None:
@@ -1494,10 +2431,29 @@ class JsonlTelemetry:
             )
         else:
             self.heldout_path = None
+        if training_quality_path is not None and not enabled:
+            self.training_quality_path = None
+        elif training_quality_path is not None:
+            self.training_quality_path = Path(
+                os.path.abspath(Path(training_quality_path).expanduser())
+            )
+        elif self.path is not None and self.dagger_dashboard:
+            self.training_quality_path = self.path.with_name(
+                f"{self.path.stem}.training_quality{self.path.suffix}"
+            )
+        else:
+            self.training_quality_path = None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.heldout_path is not None:
             self.heldout_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.training_quality_path is not None:
+            self.training_quality_path.parent.mkdir(parents=True, exist_ok=True)
+        self.training_context_path = (
+            self.training_quality_path.with_name("training_context.json")
+            if self.training_quality_path is not None and self.dagger_dashboard
+            else None
+        )
         if enabled and wandb_project:
             if wandb_resume_must and wandb_resume_never:
                 raise LearnerError(
@@ -1514,11 +2470,11 @@ class JsonlTelemetry:
             try:
                 import wandb  # type: ignore
 
-                self.wandb_run = wandb.init(
-                    project=wandb_project,
-                    entity=wandb_entity,
-                    id=wandb_run_id,
-                    resume=(
+                init_arguments: dict[str, Any] = {
+                    "project": wandb_project,
+                    "entity": wandb_entity,
+                    "id": wandb_run_id,
+                    "resume": (
                         "must"
                         if wandb_resume_must
                         else (
@@ -1527,17 +2483,46 @@ class JsonlTelemetry:
                             else ("allow" if wandb_run_id else None)
                         )
                     ),
-                    config=dict(wandb_config or {}),
+                    "config": dict(wandb_config or {}),
+                }
+                # Old validation fakes intentionally implement only the W&B
+                # init surface.  Real supported SDKs expose Settings; keep the
+                # low-overhead production behavior without making that helper
+                # an artificial requirement of the transport contract.
+                if hasattr(wandb, "Settings"):
+                    init_arguments["settings"] = wandb.Settings(
+                        x_disable_stats=True
+                    )
+                self.wandb_run = wandb.init(
+                    **init_arguments,
                 )
                 # Bind every model-quality series to the actual optimizer
                 # frontier.  Without this declaration W&B's generated panels
                 # can collapse sparse held-out evaluations into one-value bar
                 # summaries, which obscures whether the student improves.
                 self.wandb_run.define_metric("optimizer_step")
-                self.wandb_run.define_metric("loss", step_metric="optimizer_step")
-                self.wandb_run.define_metric(
-                    "quality/*", step_metric="optimizer_step"
-                )
+                if self.dagger_dashboard:
+                    self.wandb_run.define_metric(
+                        "loss", step_metric="optimizer_step", hidden=True
+                    )
+                    self.wandb_run.define_metric(
+                        "quality/*", step_metric="optimizer_step", hidden=True
+                    )
+                    for namespace in (
+                        "1_scene_samples/*",
+                        "2_training_quality/*",
+                        "3_validation_ood/*",
+                    ):
+                        self.wandb_run.define_metric(
+                            namespace, step_metric="optimizer_step"
+                        )
+                else:
+                    self.wandb_run.define_metric(
+                        "loss", step_metric="optimizer_step"
+                    )
+                    self.wandb_run.define_metric(
+                        "quality/*", step_metric="optimizer_step"
+                    )
             except Exception as exc:
                 raise LearnerError(f"W&B initialization failed: {exc}") from exc
 
@@ -1601,10 +2586,21 @@ class JsonlTelemetry:
     def _heldout_wandb_payload(record: Mapping[str, Any]) -> dict[str, Any]:
         payload = {
             "optimizer_step": record["optimizer_step"],
+            "quality/eval_frontier": record["eval_frontier"],
             "quality/heldout_action_mse": record["action_mse"],
             "quality/heldout_action_mae": record["action_mae"],
             "quality/heldout_action_rmse": record["action_rmse"],
             "quality/heldout_action_cosine": record["action_cosine"],
+            "quality/heldout_action_absolute_error_p90": record[
+                "action_absolute_error_p90"
+            ],
+            "quality/heldout_action_l2_p90": record["action_l2_p90"],
+            "quality/heldout_action_mse_delta_from_step0": record[
+                "action_mse_delta_from_step0"
+            ],
+            "quality/heldout_action_mse_relative_improvement_from_step0": record[
+                "action_mse_relative_improvement_from_step0"
+            ],
             "quality/heldout_transitions": record["heldout_transitions_global"],
         }
         per_action = record.get("per_action")
@@ -1616,6 +2612,273 @@ class JsonlTelemetry:
             for metric in ("mse", "mae", "rmse", "cosine"):
                 payload[f"quality/action_{action_index}/{metric}"] = metrics[metric]
         return payload
+
+    @staticmethod
+    def _training_wandb_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+        if record.get("schema") != TRAINING_QUALITY_TELEMETRY_SCHEMA:
+            raise LearnerError("training-quality telemetry schema mismatch")
+        payload = {
+            "optimizer_step": record["optimizer_step"],
+            "2_training_quality/probe_policy": record[
+                "training_probe_policy"
+            ],
+            "2_training_quality/probe_selection_sha256": record[
+                "training_probe_selection_sha256"
+            ],
+            "2_training_quality/probe_snapshot_sha256": record[
+                "training_snapshot_sha256"
+            ],
+            "2_training_quality/probe_budget": record[
+                "training_probe_budget"
+            ],
+            "2_training_quality/action_mse": record["action_mse"],
+            "2_training_quality/action_mae": record["action_mae"],
+            "2_training_quality/action_rmse": record["action_rmse"],
+            "2_training_quality/action_cosine": record["action_cosine"],
+            "2_training_quality/action_absolute_error_p90": record[
+                "action_absolute_error_p90"
+            ],
+            "2_training_quality/action_l2_p90": record["action_l2_p90"],
+            "2_training_quality/probe_transitions": record[
+                "training_probe_transitions_global"
+            ],
+            "2_training_quality/probe_current_round_transitions": record[
+                "training_probe_current_round_transitions_global"
+            ],
+            "2_training_quality/probe_historical_transitions": record[
+                "training_probe_historical_transitions_global"
+            ],
+            "2_training_quality/replay_population": record[
+                "training_replay_transitions_global"
+            ],
+        }
+        per_action = record.get("per_action")
+        per_action_p90 = record.get("per_action_absolute_error_p90")
+        if not isinstance(per_action, Mapping) or not isinstance(
+            per_action_p90, Mapping
+        ):
+            raise LearnerError("training-quality per-action metrics are malformed")
+        if set(per_action) != set(per_action_p90):
+            raise LearnerError("training-quality per-action p90 coverage mismatch")
+        for action_index, metrics in per_action.items():
+            if not isinstance(metrics, Mapping):
+                raise LearnerError("training-quality per-action metrics must be mappings")
+            for metric in ("mse", "mae", "rmse", "cosine"):
+                payload[
+                    f"2_training_quality/action_{action_index}/{metric}"
+                ] = metrics[metric]
+            payload[
+                f"2_training_quality/action_{action_index}/absolute_error_p90"
+            ] = per_action_p90[action_index]
+        return payload
+
+    @staticmethod
+    def _training_context_wandb_payload(
+        record: Mapping[str, float | int],
+    ) -> dict[str, Any]:
+        allowed = {
+            "parent_rollout_action_mse",
+            "parent_rollout_action_mae",
+            "parent_rollout_action_rmse",
+            "parent_rollout_action_cosine",
+            "parent_rollout_action_l2_p90",
+            "expert_intervention_rate",
+            "behavior_expert_match_rate",
+            "expert_label_coverage",
+            "replay_transitions",
+            "replay_environments",
+            "done_rate",
+            "scheduled_beta",
+        }
+        if set(record) != allowed:
+            raise LearnerError("training rollout context metric contract mismatch")
+        return {
+            f"2_training_quality/{key}": value for key, value in record.items()
+        }
+
+    @staticmethod
+    def _validation_ood_wandb_payload(
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        payload = {
+            "3_validation_ood/eval_frontier": record["eval_frontier"],
+            "3_validation_ood/action_mse": record["action_mse"],
+            "3_validation_ood/action_mae": record["action_mae"],
+            "3_validation_ood/action_rmse": record["action_rmse"],
+            "3_validation_ood/action_cosine": record["action_cosine"],
+            "3_validation_ood/action_absolute_error_p90": record[
+                "action_absolute_error_p90"
+            ],
+            "3_validation_ood/action_l2_p90": record["action_l2_p90"],
+            "3_validation_ood/action_mse_delta_from_step0": record[
+                "action_mse_delta_from_step0"
+            ],
+            "3_validation_ood/action_mse_relative_improvement_from_step0": record[
+                "action_mse_relative_improvement_from_step0"
+            ],
+            "3_validation_ood/transitions": record[
+                "heldout_transitions_global"
+            ],
+        }
+        per_action = record.get("per_action")
+        if not isinstance(per_action, Mapping):
+            raise LearnerError("held-out telemetry per_action must be a mapping")
+        for action_index, metrics in per_action.items():
+            if not isinstance(metrics, Mapping):
+                raise LearnerError("held-out per-action metrics must be mappings")
+            for metric in ("mse", "mae", "rmse", "cosine"):
+                payload[
+                    f"3_validation_ood/action_{action_index}/{metric}"
+                ] = metrics[metric]
+        return payload
+
+    def persist_training_context(self, record: Mapping[str, Any]) -> None:
+        """Publish one immutable local record for static rollout context.
+
+        The context is computed from the sealed replay and is invariant across
+        optimizer frontiers.  Persist it before the first W&B update so local
+        evidence never depends on successful remote delivery.  A restart may
+        replay this publication only when the canonical bytes are identical.
+        """
+
+        path = self.training_context_path
+        if path is None:
+            return
+        clean = dict(record)
+        expected_keys = {
+            "schema",
+            "campaign_id",
+            "macro_round",
+            "learner_config_sha256",
+            "model_lineage_sha256",
+            "replay_snapshot_file_sha256",
+            "replay_snapshot_sha256",
+            "training_probe_selection_sha256",
+            "metrics",
+        }
+        metrics = clean.get("metrics")
+        if (
+            set(clean) != expected_keys
+            or clean.get("schema") != TRAINING_CONTEXT_TELEMETRY_SCHEMA
+            or not isinstance(clean.get("campaign_id"), str)
+            or not clean["campaign_id"]
+            or isinstance(clean.get("macro_round"), bool)
+            or not isinstance(clean.get("macro_round"), int)
+            or clean["macro_round"] < 0
+            or not isinstance(metrics, Mapping)
+        ):
+            raise LearnerError("training-context telemetry contract mismatch")
+        for key in (
+            "learner_config_sha256",
+            "model_lineage_sha256",
+            "replay_snapshot_file_sha256",
+            "replay_snapshot_sha256",
+            "training_probe_selection_sha256",
+        ):
+            _require_sha256(clean.get(key), f"training-context {key}")
+        # This validates exact metric coverage before anything reaches W&B.
+        self._training_context_wandb_payload(metrics)
+        for key, value in metrics.items():
+            _finite_float(value, f"training-context metric {key}")
+        canonical = (
+            json.dumps(
+                clean,
+                sort_keys=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or not path.is_file():
+                raise LearnerError("training-context telemetry path is unsafe")
+            if path.read_bytes() != canonical:
+                raise LearnerError("training-context telemetry changed across restart")
+            return
+        self._persist(path, clean)
+
+    @staticmethod
+    def _heldout_baseline_from_history(
+        path: Path | None, record: Mapping[str, Any]
+    ) -> float | None:
+        if path is None or not path.exists():
+            return None
+        if path.is_symlink() or not path.is_file():
+            raise LearnerError("held-out telemetry path is unsafe")
+        raw = path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            raise LearnerError("held-out telemetry log has a torn final record")
+        identity_keys = (
+            "campaign_id",
+            "macro_round",
+            "heldout_snapshot_sha256",
+            "heldout_snapshot_file_sha256",
+            "learned_action_indices",
+        )
+        baselines: list[float] = []
+        for line_number, line in enumerate(raw.splitlines(), start=1):
+            try:
+                existing = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise LearnerError(
+                    f"held-out telemetry line {line_number} is invalid"
+                ) from exc
+            if not isinstance(existing, Mapping):
+                raise LearnerError("held-out telemetry history is malformed")
+            if existing.get("optimizer_step") != 0:
+                continue
+            if any(existing.get(key) != record.get(key) for key in identity_keys):
+                raise LearnerError("held-out step-zero baseline identity mismatch")
+            baseline = _finite_float(
+                existing.get("action_mse"), "held-out step-zero action_mse"
+            )
+            if baseline < 0.0:
+                raise LearnerError("held-out step-zero action_mse is negative")
+            baselines.append(baseline)
+        if not baselines:
+            return None
+        if any(value != baselines[0] for value in baselines[1:]):
+            raise LearnerError("held-out telemetry has conflicting step-zero baselines")
+        return baselines[0]
+
+    def _enrich_heldout_record(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        clean = dict(record)
+        step = _true_int(clean.get("optimizer_step"), "optimizer_step")
+        mse = _finite_float(clean.get("action_mse"), "held-out action_mse")
+        if mse < 0.0:
+            raise LearnerError("held-out action_mse is negative")
+        baseline = getattr(self, "_heldout_baseline_action_mse", None)
+        if step == 0:
+            if baseline is not None and baseline != mse:
+                raise LearnerError("held-out step-zero baseline changed")
+            baseline = mse
+            self._heldout_baseline_action_mse = baseline
+        elif baseline is None:
+            baseline = self._heldout_baseline_from_history(self.heldout_path, clean)
+            if baseline is None:
+                raise LearnerError(
+                    "held-out step-zero baseline is required before later evaluations"
+                )
+            self._heldout_baseline_action_mse = baseline
+        delta = mse - baseline
+        if baseline == 0.0:
+            if mse != 0.0:
+                raise LearnerError(
+                    "held-out relative improvement is undefined from a zero baseline"
+                )
+            relative_improvement = 0.0
+        else:
+            relative_improvement = (baseline - mse) / baseline
+        derived = {
+            "eval_frontier": step,
+            "action_mse_delta_from_step0": delta,
+            "action_mse_relative_improvement_from_step0": relative_improvement,
+        }
+        for key, value in derived.items():
+            if key in clean and clean[key] != value:
+                raise LearnerError(f"held-out derived metric {key} changed")
+            clean[key] = value
+        return clean
 
     @staticmethod
     def _heldout_record_already_persisted(
@@ -1687,6 +2950,24 @@ class JsonlTelemetry:
         self._persist(self.path, clean)
         if self.wandb_run is not None:
             wandb_record = dict(clean)
+            if self.dagger_dashboard:
+                wandb_record.update(
+                    {
+                        "2_training_quality/optimization_loss": clean["loss"],
+                        "2_training_quality/gradient_l2_norm": clean[
+                            "gradient_l2_norm"
+                        ],
+                        "2_training_quality/learning_rate": clean[
+                            "learning_rate"
+                        ],
+                        "2_training_quality/global_samples_seen": clean[
+                            "global_samples_seen"
+                        ],
+                        "2_training_quality/replay_transitions": clean[
+                            "replay_transitions_global"
+                        ],
+                    }
+                )
             if wandb_extra is not None:
                 extension = dict(wandb_extra)
                 duplicate = set(wandb_record) & set(extension)
@@ -1709,10 +2990,167 @@ class JsonlTelemetry:
             # an out-of-order global-step update.
             self.wandb_run.log(wandb_record)
 
-    def log_heldout(
+    def log_training_quality(
         self, record: Mapping[str, Any], *, log_wandb: bool = True
     ) -> dict[str, Any]:
         clean = dict(record)
+        if clean.get("schema") != TRAINING_QUALITY_TELEMETRY_SCHEMA:
+            raise LearnerError("training-quality telemetry schema mismatch")
+        already_persisted = False
+        path = self.training_quality_path
+        if path is not None and path.exists():
+            if path.is_symlink() or not path.is_file():
+                raise LearnerError("training-quality telemetry path is unsafe")
+            raw = path.read_bytes()
+            if raw and not raw.endswith(b"\n"):
+                raise LearnerError(
+                    "training-quality telemetry has a torn final record"
+                )
+            target_step = _true_int(clean.get("optimizer_step"), "optimizer_step")
+            target = json.dumps(
+                clean,
+                sort_keys=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            observed: dict[int, bytes] = {}
+            for line_number, line in enumerate(raw.splitlines(), start=1):
+                try:
+                    existing = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise LearnerError(
+                        f"training-quality telemetry line {line_number} is invalid"
+                    ) from exc
+                if (
+                    not isinstance(existing, Mapping)
+                    or existing.get("schema") != TRAINING_QUALITY_TELEMETRY_SCHEMA
+                ):
+                    raise LearnerError("training-quality telemetry schema mismatch")
+                step = _true_int(existing.get("optimizer_step"), "optimizer_step")
+                canonical = json.dumps(
+                    dict(existing),
+                    sort_keys=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if step in observed and observed[step] != canonical:
+                    raise LearnerError(
+                        "training-quality telemetry has conflicting duplicate steps"
+                    )
+                observed[step] = canonical
+            if target_step in observed:
+                if observed[target_step] != target:
+                    raise LearnerError(
+                        "training-quality telemetry changed across restart"
+                    )
+                already_persisted = True
+            elif observed and target_step < max(observed):
+                raise LearnerError(
+                    "training-quality restart would create a historical gap"
+                )
+        if not already_persisted:
+            self._persist(path, clean)
+        payload = self._training_wandb_payload(clean)
+        if log_wandb and self.wandb_run is not None:
+            self.wandb_run.log(payload)
+        return payload
+
+    def log_dashboard_frontier(
+        self,
+        *,
+        optimizer_step: int,
+        training_quality: Mapping[str, Any],
+        validation_ood: Mapping[str, Any],
+        training_context: Mapping[str, float | int] | None = None,
+        include_scene_samples: bool = False,
+    ) -> None:
+        """Publish one sparse, sectioned dashboard frontier."""
+
+        if not self.dagger_dashboard or self.wandb_run is None:
+            return
+        payload: dict[str, Any] = {"optimizer_step": optimizer_step}
+        payload.update(training_quality)
+        payload.update(validation_ood)
+        if training_context is not None:
+            payload.update(self._training_context_wandb_payload(training_context))
+        if include_scene_samples:
+            payload.update(self._scene_sample_wandb_payload())
+        self.wandb_run.log(payload)
+
+    def _scene_sample_wandb_payload(self) -> dict[str, Any]:
+        """Load only SHA-pinned, bounded contact sheets from the handoff."""
+
+        manifest_path = self.scene_sample_manifest
+        if manifest_path is None:
+            raise LearnerError("scene sample manifest is required by dashboard mode")
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise LearnerError("scene sample manifest must be a regular file")
+        try:
+            manifest = load_strict_json(manifest_path)
+        except Exception as exc:
+            raise LearnerError("scene sample manifest is invalid") from exc
+        if manifest.get("schema") != "fast_roborender.round_dagger.scene_samples.v1":
+            raise LearnerError("scene sample manifest schema mismatch")
+        core = dict(manifest)
+        claimed_set_sha256 = core.pop("sample_set_sha256", None)
+        if (
+            not isinstance(claimed_set_sha256, str)
+            or canonical_json_sha256(core) != claimed_set_sha256
+        ):
+            raise LearnerError("scene sample set digest mismatch")
+        samples = manifest.get("samples")
+        if not isinstance(samples, list) or not 1 <= len(samples) <= 4:
+            raise LearnerError("scene sample count must be in [1,4]")
+        row_labels = manifest.get("row_labels")
+        view_labels = manifest.get("view_labels")
+        if row_labels != ["depth", "mask", "client_anchor", "generated"]:
+            raise LearnerError("scene sample row labels are not canonical")
+        if view_labels != ["head_color", "hand_left", "hand_right"]:
+            raise LearnerError("scene sample view labels are not canonical")
+        try:
+            import wandb  # type: ignore
+        except Exception as exc:
+            raise LearnerError("W&B media support is unavailable") from exc
+        images: list[Any] = []
+        for sample in samples:
+            if not isinstance(sample, Mapping):
+                raise LearnerError("scene sample record is malformed")
+            name = sample.get("path")
+            if (
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not name.endswith("_conditions_generated.png")
+            ):
+                raise LearnerError("scene sample path is unsafe")
+            path = manifest_path.parent / name
+            if path.is_symlink() or not path.is_file():
+                raise LearnerError("scene sample image must be a regular file")
+            if sample.get("width") != 1252 or sample.get("height") != 1046:
+                raise LearnerError("scene sample dimensions changed")
+            expected_sha256 = sample.get("sha256")
+            if (
+                not isinstance(expected_sha256, str)
+                or _SHA256_RE.fullmatch(expected_sha256) is None
+                or sha256_file(path) != expected_sha256
+            ):
+                raise LearnerError("scene sample image digest mismatch")
+            images.append(
+                wandb.Image(
+                    str(path),
+                    caption=(
+                        f"actor rank {manifest['actor_rank']} · rollout step "
+                        f"{sample['rollout_step']} · rows depth | mask | "
+                        "client anchor | RoboRender generated · columns "
+                        "head | left hand | right hand"
+                    ),
+                )
+            )
+        return {"1_scene_samples/conditions_and_rendered": images}
+
+    def log_heldout(
+        self, record: Mapping[str, Any], *, log_wandb: bool = True
+    ) -> dict[str, Any]:
+        clean = self._enrich_heldout_record(record)
         if clean.get("schema") != HELDOUT_TELEMETRY_SCHEMA:
             raise LearnerError("held-out telemetry schema mismatch")
         already_persisted = self._heldout_record_already_persisted(
@@ -1721,6 +3159,8 @@ class JsonlTelemetry:
         if not already_persisted:
             self._persist(self.heldout_path, clean)
         wandb_payload = self._heldout_wandb_payload(clean)
+        if self.dagger_dashboard:
+            wandb_payload.update(self._validation_ood_wandb_payload(clean))
         # Local JSONL idempotence and remote delivery are separate frontiers.
         # A process can be killed after the fsynced record is durable but
         # before the W&B sender acknowledges it.  Re-log an identical due
@@ -1760,12 +3200,14 @@ def train_from_replay(
     resume_from: str | os.PathLike[str] | None = None,
     expected_snapshot_file_sha256: str | None = None,
     heldout_snapshot_path: str | os.PathLike[str] | None = None,
+    artifact_root: str | os.PathLike[str] | None = None,
     save_every: int = 100,
     telemetry: JsonlTelemetry | None = None,
     validation_stop_at_step: int | None = None,
     learner_identity_sha256: str | None = None,
     runtime_container_sha256: str | None = None,
     learner_contract_sha256: str | None = None,
+    dagger_beta: float | None = None,
 ) -> TrainResult:
     """Run supervised DAgger updates over one immutable cumulative snapshot."""
 
@@ -1812,6 +3254,7 @@ def train_from_replay(
         rank=rank,
         world_size=world_size,
         expected_snapshot_file_sha256=expected_snapshot_file_sha256,
+        artifact_root=artifact_root,
     )
     if config.heldout_evaluation_enabled != (heldout_snapshot_path is not None):
         raise LearnerError(
@@ -1825,6 +3268,7 @@ def train_from_replay(
             config,
             rank=rank,
             world_size=world_size,
+            artifact_root=artifact_root,
         )
         _assert_training_and_heldout_are_disjoint(
             partition.snapshot, heldout_partition.snapshot
@@ -1901,18 +3345,61 @@ def train_from_replay(
         config.batch_size,
         seed=_probe_seed(config.seed, rank),
     )
-    probe_indices = probe_schedule.indices(0)
+    loss_probe_indices = probe_schedule.indices(0)
     if first_loss is None:
         first_loss = _evaluate_loss_probe(
             model,
             partition=partition,
-            indices=probe_indices,
+            indices=loss_probe_indices,
             adapter=adapter,
             device=device,
             train_action_slice=config.train_action_slice,
             seed=config.seed,
             rank=rank,
             world_size=world_size,
+        )
+    dashboard_enabled = telemetry is not None and telemetry.dagger_dashboard
+    if dashboard_enabled != (dagger_beta is not None):
+        raise LearnerError(
+            "dashboard training requires exactly one lineage-verified DAgger beta"
+        )
+    training_quality_probe = (
+        build_training_quality_probe(
+            partition.snapshot,
+            world_size=world_size,
+            partition_seed=config.partition_seed,
+        )
+        if dashboard_enabled
+        else None
+    )
+    training_context = (
+        summarize_training_rollout_context(
+            partition,
+            config.train_action_slice,
+            scheduled_beta=float(dagger_beta),
+            probe=training_quality_probe,
+        )
+        if dashboard_enabled
+        else None
+    )
+    if dashboard_enabled and rank == 0:
+        assert telemetry is not None
+        assert training_context is not None
+        assert training_quality_probe is not None
+        telemetry.persist_training_context(
+            {
+                "schema": TRAINING_CONTEXT_TELEMETRY_SCHEMA,
+                "campaign_id": config.campaign_id,
+                "macro_round": config.macro_round,
+                "learner_config_sha256": config.sha256,
+                "model_lineage_sha256": config.model_lineage_sha256,
+                "replay_snapshot_file_sha256": partition.snapshot["file_sha256"],
+                "replay_snapshot_sha256": partition.snapshot["snapshot_sha256"],
+                "training_probe_selection_sha256": training_quality_probe.summary()[
+                    "selection_sha256"
+                ],
+                "metrics": dict(training_context),
+            }
         )
     model.train()
     # Re-evaluate a due restart frontier before taking another update.  This
@@ -1937,8 +3424,43 @@ def train_from_replay(
             device=device,
             optimizer_step=completed_steps,
         )
+        training_record = None
+        if dashboard_enabled:
+            assert training_quality_probe is not None
+            training_record = _training_quality_record(
+                evaluate_heldout_actions(
+                    model,
+                    partition=partition,
+                    adapter=adapter,
+                    device=device,
+                    optimizer_step=completed_steps,
+                    indices=training_quality_probe.indices_by_rank[rank],
+                    transition_counts_by_rank=training_quality_probe.summary()[
+                        "transitions_per_rank"
+                    ],
+                    include_per_action_p90=True,
+                ),
+                probe=training_quality_probe,
+                rank=rank,
+            )
         if rank == 0 and telemetry is not None:
-            telemetry.log_heldout(heldout_record, log_wandb=True)
+            if dashboard_enabled:
+                assert training_record is not None
+                training_wandb = telemetry.log_training_quality(
+                    training_record, log_wandb=False
+                )
+                heldout_wandb = telemetry.log_heldout(
+                    heldout_record, log_wandb=False
+                )
+                telemetry.log_dashboard_frontier(
+                    optimizer_step=completed_steps,
+                    training_quality=training_wandb,
+                    validation_ood=heldout_wandb,
+                    training_context=training_context,
+                    include_scene_samples=completed_steps == 0,
+                )
+            else:
+                telemetry.log_heldout(heldout_record, log_wandb=True)
     for step in range(completed_steps, training_frontier):
         observations, targets = partition.batch(schedule.indices(step), device=device)
         optimizer.zero_grad(set_to_none=True)
@@ -1947,13 +3469,25 @@ def train_from_replay(
         if not torch.isfinite(loss):
             raise LearnerError(f"non-finite supervised loss at optimizer step {step}")
         loss.backward()
+        gradient_norm_tensor = torch.nn.utils.clip_grad_norm_(
+            _unwrap_model(model).parameters(),
+            max_norm=float("inf"),
+            norm_type=2.0,
+            error_if_nonfinite=True,
+            foreach=False,
+        )
+        gradient_norm = float(gradient_norm_tensor.detach().cpu())
+        if not math.isfinite(gradient_norm):
+            raise LearnerError(
+                f"non-finite gradient norm at optimizer step {step}"
+            )
         optimizer.step()
         scalar = loss.detach()
         if world_size > 1:
             scalar = _ordered_allgather_sum(scalar, world_size) / world_size
         loss_value = float(scalar.cpu())
         completed_steps = step + 1
-        heldout_wandb: Mapping[str, Any] | None = None
+        dashboard_wandb: dict[str, Any] = {}
         heldout_due = (
             heldout_partition is not None
             and config.heldout_eval_interval is not None
@@ -1971,9 +3505,35 @@ def train_from_replay(
                 device=device,
                 optimizer_step=completed_steps,
             )
+            training_record = None
+            if dashboard_enabled:
+                assert training_quality_probe is not None
+                training_record = _training_quality_record(
+                    evaluate_heldout_actions(
+                        model,
+                        partition=partition,
+                        adapter=adapter,
+                        device=device,
+                        optimizer_step=completed_steps,
+                        indices=training_quality_probe.indices_by_rank[rank],
+                        transition_counts_by_rank=training_quality_probe.summary()[
+                            "transitions_per_rank"
+                        ],
+                        include_per_action_p90=True,
+                    ),
+                    probe=training_quality_probe,
+                    rank=rank,
+                )
             if rank == 0 and telemetry is not None:
-                heldout_wandb = telemetry.log_heldout(
-                    heldout_record, log_wandb=False
+                if dashboard_enabled:
+                    assert training_record is not None
+                    dashboard_wandb.update(
+                        telemetry.log_training_quality(
+                            training_record, log_wandb=False
+                        )
+                    )
+                dashboard_wandb.update(
+                    telemetry.log_heldout(heldout_record, log_wandb=False)
                 )
         if rank == 0 and telemetry is not None:
             telemetry.log(
@@ -1983,6 +3543,11 @@ def train_from_replay(
                     "macro_round": config.macro_round,
                     "optimizer_step": completed_steps,
                     "loss": loss_value,
+                    "gradient_l2_norm": gradient_norm,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                    "global_samples_seen": completed_steps
+                    * config.batch_size
+                    * world_size,
                     "replay_transitions_rank": partition.transition_count,
                     "replay_transitions_per_rank": list(
                         partition.transition_counts_by_rank
@@ -1991,7 +3556,7 @@ def train_from_replay(
                     "world_size": world_size,
                     "gradient_reduction": gradient_reduction,
                 },
-                wandb_extra=heldout_wandb,
+                wandb_extra=dashboard_wandb or None,
             )
         if (
             completed_steps % save_every == 0
@@ -2061,7 +3626,7 @@ def train_from_replay(
     final_loss = _evaluate_loss_probe(
         model,
         partition=partition,
-        indices=probe_indices,
+        indices=loss_probe_indices,
         adapter=adapter,
         device=device,
         train_action_slice=config.train_action_slice,
@@ -2246,19 +3811,27 @@ __all__ = [
     "CHECKPOINT_SCHEMA",
     "RESULT_SCHEMA",
     "HELDOUT_TELEMETRY_SCHEMA",
+    "TRAINING_QUALITY_TELEMETRY_SCHEMA",
+    "TRAINING_CONTEXT_TELEMETRY_SCHEMA",
+    "TRAINING_QUALITY_PROBE_POLICY",
+    "TRAINING_QUALITY_PROBE_BUDGET",
     "LearnerError",
     "LearnerBundleConfig",
     "PolicyAdapter",
     "MappingPolicyAdapter",
     "ReplayPartition",
+    "TrainingQualityProbe",
     "DeterministicBatchSchedule",
     "JsonlTelemetry",
     "TrainResult",
     "partition_shards",
+    "build_training_quality_probe",
+    "validate_training_quality_probe_summary",
     "load_replay_partition",
     "load_heldout_partition",
     "supervised_action_loss",
     "evaluate_heldout_actions",
+    "summarize_training_rollout_context",
     "CUDA_CUBLAS_WORKSPACE_CONFIG",
     "SINGLE_PROCESS_GRADIENT_REDUCTION",
     "ORDERED_ALLGATHER_GRADIENT_REDUCTION",

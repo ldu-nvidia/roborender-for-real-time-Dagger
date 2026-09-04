@@ -1,4 +1,12 @@
-# HSG GB200 256-environment production runbook
+# Legacy HSG GB200 256-environment compatibility runbook
+
+> **Not the canonical production backend.** This runbook preserves the superseded packed
+> HSG/GB200 Slurm workflow for reproduction and portability testing. Current production collects
+> four 64-environment cohorts on the RTX workstation and trains with a private Lepton Kubernetes
+> Job on the reserved one-node/eight-H200 allocation. Use
+> [`lepton_h200_learner_backend.md`](lepton_h200_learner_backend.md) and
+> [`lepton_campaign_archive_transport.md`](lepton_campaign_archive_transport.md). There is no
+> automatic fallback from Lepton to this HSG path.
 
 This runbook covers the fail-closed 256-environment, 300-step DAgger campaign.
 It requests one packed `batch_long` allocation: 15 nodes × 4 GB200s, with 52

@@ -158,6 +158,15 @@ class _RestrictedRestartUnpickler(pickle.Unpickler):
     """Resolve only tensor and NumPy RNG primitives used by learner restarts."""
 
     def find_class(self, module: str, name: str) -> Any:
+        # NumPy 2 writes this helper under ``numpy._core`` while the validated
+        # RTX Isaac runtime intentionally carries NumPy 1.26, where the exact
+        # same ABI helper lives under ``numpy.core``.  Resolve only this one
+        # reviewed reconstruction primitive; do not install a process-global
+        # module alias or broaden the checkpoint pickle surface.
+        if (module, name) == ("numpy._core.multiarray", "_reconstruct"):
+            from numpy.core.multiarray import _reconstruct
+
+            return _reconstruct
         if (module, name) in _ALLOWED_RESTART_GLOBALS:
             return super().find_class(module, name)
         raise pickle.UnpicklingError(
@@ -378,8 +387,58 @@ def load_restricted_restart_document(
     return document
 
 
+def load_hash_pinned_restart_document(
+    checkpoint_path: str | os.PathLike[str],
+    *,
+    expected_sha256: str,
+    map_location: Any = "cpu",
+) -> Mapping[str, Any]:
+    """Load one exact full learner checkpoint through the restart allowlist.
+
+    This is the actor warm-start counterpart to
+    :func:`load_hash_pinned_policy_state_dict`.  It retains the small amount
+    of reviewed provenance (notably ``homie_controller_sha256``) consumed by
+    GR00T's post-load identity gate, while safely discarding neither model
+    weights nor required controller provenance.  The exact bytes are pinned
+    before the restricted NumPy-1/NumPy-2 compatible unpickler sees them.
+    """
+
+    payload = _read_pinned_regular_file(checkpoint_path, expected_sha256)
+    if not zipfile.is_zipfile(io.BytesIO(payload)):
+        raise CheckpointCompatibilityError(
+            "restart checkpoint must use Torch ZIP serialization"
+        )
+    _preflight_checkpoint_pickle(payload, allowed_globals=_ALLOWED_RESTART_GLOBALS)
+    try:
+        import torch
+
+        document = torch.load(
+            io.BytesIO(payload),
+            map_location=map_location,
+            pickle_module=_RestrictedRestartPickleModule,
+            weights_only=False,
+        )
+    except Exception as exc:
+        raise CheckpointCompatibilityError(
+            f"hash-pinned restart checkpoint load failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(document, Mapping):
+        raise CheckpointCompatibilityError(
+            "restart checkpoint must contain a top-level mapping"
+        )
+    state = document.get("policy_state_dict")
+    if not isinstance(state, Mapping) or not all(
+        isinstance(key, str) for key in state
+    ):
+        raise CheckpointCompatibilityError(
+            "restart checkpoint lacks a string-keyed policy_state_dict"
+        )
+    return document
+
+
 __all__ = [
     "CheckpointCompatibilityError",
     "load_hash_pinned_policy_state_dict",
+    "load_hash_pinned_restart_document",
     "load_restricted_restart_document",
 ]

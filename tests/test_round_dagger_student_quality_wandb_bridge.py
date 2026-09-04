@@ -48,8 +48,13 @@ class _FakeRun:
 class _FakeWandb:
     def __init__(self, run: _FakeRun | None = None) -> None:
         self.init_calls: list[dict] = []
+        self.settings_calls: list[dict] = []
         self.runs: list[_FakeRun] = []
         self._run = run
+
+    def Settings(self, **kwargs):
+        self.settings_calls.append(dict(kwargs))
+        return SimpleNamespace(**kwargs)
 
     def init(self, **kwargs):
         self.init_calls.append(kwargs)
@@ -147,6 +152,10 @@ class StudentQualityWandbBridgeTest(unittest.TestCase):
                 self.assertEqual(bridge.main(arguments), 0)
 
             self.assertEqual(len(fake.init_calls), 1, "empty campaigns must initialize W&B")
+            self.assertTrue(fake.init_calls[0]["name"].endswith("-rollout-quality"))
+            self.assertIn("rollout-quality", fake.init_calls[0]["tags"])
+            self.assertNotIn("student-quality", fake.init_calls[0]["tags"])
+            self.assertEqual(fake.settings_calls, [{"x_disable_stats": True}])
             run = fake.runs[0]
             self.assertEqual(run.finished, [0])
             campaign_log = next(

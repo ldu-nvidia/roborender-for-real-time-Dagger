@@ -12,25 +12,36 @@ Code lives in `GR00T-VisualSim2Real/`; launchers and assets live here in `fast_r
 
 ## Setup
 
-The primary production target is HSG GB200.  It uses two sealed ARM64 containers: one for the
-SM100 Image3F/TensorRT renderer and one for Isaac Sim 5.1, Isaac Lab, GR00T, and W&B telemetry.
-The source checkout is staged separately as an immutable, content-addressed snapshot and mounted
-read-only into both containers.  The HSG launchers live under `scripts/scaling/hsg_gb200_*` and
-fail closed on source, container, model, engine, anchor-pool, teacher, camera, predecessor-smoke,
-and the explicitly authorized `ldu@nvidia.com` + `nvidia` W&B team identity.
+The canonical production topology is **round-based RTX collection plus a reserved Lepton
+Kubernetes learner**:
 
-Always point `ROOT` at the exact read-only snapshot created for the campaign, never the mutable
-`$STAGE_ROOT/src/fast_roborender` compatibility path:
+- the RTX 6000 workstation runs Isaac/PhysX, the three-view Image3F renderer fleet, expert
+  labeling, and four sequential 64-environment actor cohorts (256 environments total);
+- the camera-free learner runs as one private Lepton Job on the exact reserved allocation
+  `cosmos-solution-architect-xcwtffiq` in node group
+  `neb-cdg-lepton-001-trrjqlvo`, using one worker and all eight H200 GPUs; and
+- `/users/ldu` is mounted at `/workspace`, with every project artifact under
+  `/workspace/projects/roborender`.
 
-```bash
-export STAGE_ROOT=/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/ldu/roborender_gb200_sm100
-export ROOT="$STAGE_ROOT/src_snapshots/fast_roborender_<fast7>_<gr00t7>_sealed"
-export GR00T_ROOT="$ROOT/GR00T-VisualSim2Real"
-```
+The control Deployment `leo-cosmos-h200-dev` is an authenticated transfer and lifecycle gateway,
+not the training process. The bridge stops that Deployment before scheduling the private learner
+Job on the same exclusive reservation, then restores it after every terminal path. Kubernetes
+worker/job retries are zero; identity-preserving semantic retries are owned by the coordinator.
+See [`docs/lepton_h200_learner_backend.md`](docs/lepton_h200_learner_backend.md) and
+[`docs/lepton_campaign_archive_transport.md`](docs/lepton_campaign_archive_transport.md).
 
-The older OCI/H100 setup remains available for development and portability testing.  OCI uses
-three separate environments because the host telemetry process, Image3F renderer, and
-Isaac/GR00T trainer have incompatible runtime requirements:
+The checked-in Lepton contract is a template. Production must use the create-only finalized
+contract under `/workspace/projects/roborender/manifests`, whose source-inventory and Python-freeze
+digests bind the sealed learner tree and environment. The production driver selects
+`lepton_job_v1`; selecting `oci_nrt` is an explicit legacy-compatibility choice, never an ambient
+fallback.
+
+### Legacy cluster compatibility (not the canonical production route)
+
+The HSG/GB200 packed Slurm and OCI-NRT/H100 launchers remain for regression and portability work.
+They do not describe or launch the current production campaign. OCI uses three separate
+environments because the host telemetry process, Image3F renderer, and Isaac/GR00T trainer have
+incompatible runtime requirements:
 
 | Environment | Built by | Used for |
 |---|---|---|
@@ -39,7 +50,7 @@ Isaac/GR00T trainer have incompatible runtime requirements:
 | Isaac/GR00T venv | `scripts/scaling/oci_h100_trainer_setup.sbatch` | Isaac Sim 5.1, IsaacLab, integrated GR00T trainer, and evaluation |
 
 ```bash
-# Shared OCI/Lustre paths used by all three jobs.
+# Legacy OCI/Lustre paths used by all three compatibility jobs.
 source scripts/setup/oci_env.sh
 
 # These environments are independent and may be submitted together.
@@ -51,14 +62,14 @@ sbatch scripts/scaling/oci_h100_trainer_setup.sbatch
 bash scripts/setup/check_env.sh
 ```
 
-`check_env.sh` is read-only and prints PASS/WARN/FAIL for the three OCI environments,
+`check_env.sh` is read-only and prints PASS/WARN/FAIL for the three legacy OCI environments,
 Image3F adapter and foundation weights, the H100 TensorRT engine, anchor pool, expert
 labeler, and the `general_cs_infra` Slurm account. WARN means “fine unless you need that
 stage.” Exit status is non-zero only on hard failures.
 
-### Setup gotchas
+### Legacy OCI setup gotchas
 
-- **Engines are per GPU architecture and TensorRT version.** OCI production builds an
+- **Engines are per GPU architecture and TensorRT version.** The OCI compatibility path builds an
   H100 `sm90` engine with TensorRT 10.13.3.9. A different GPU/software stack or LoRA
   requires a fresh ONNX export and engine build. Nothing is shipped prebuilt —
   `assets/generated/` starts empty by design.
@@ -84,7 +95,8 @@ scripts/
   scaling/  scale_plan.py  image3f_probe.py  install_gr00t_integration.py
             oci_host_wandb_setup.sbatch  oci_h100_image3f_setup.sbatch
             oci_h100_trainer_setup.sbatch  oci_packed_256x300.sbatch
-            submit_oci_packed.sh  submit_production.sh  submit_8h_256env.sh
+            submit_production.sh (canonical Lepton)  submit_oci_packed.sh (legacy)
+            submit_8h_256env.sh (legacy, explicit opt-in)
   data/     collect_data.sbatch  offline_render.sbatch  render_shard.sbatch
             offline_render_dataset.py  renormalize_depth.py
   anchors/  anchor_pool.sbatch  render_anchor_pool.py  rich_prompts.py
@@ -102,7 +114,7 @@ tests/      login-node unit tests for scale math and lag-reference semantics
 archive/    superseded one-off diagnostics and earlier experiments
 
 GR00T-VisualSim2Real/         trainer, configs, simulator (own git repo, pinned
-                              OCI integration branch)
+                              learner/actor integration revision)
 roborender-acceleration/      LADD student bundle + TensorRT engines (own repo)
 ```
 
@@ -328,7 +340,7 @@ the student's undiluted state distribution, which is the point of DAgger. β aff
 training rollouts only; evaluation always runs the student.
 
 ```bash
-# The HSG packed launcher starts renderer and trainer steps inside one allocation.
+# Legacy HSG compatibility only: packed renderer/trainer allocation.
 RUN_PROFILE=production_256x300 DRY_RUN=1 \
   bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
 bash "$ROOT/scripts/scaling/submit_hsg_gb200_production.sh"
@@ -351,7 +363,7 @@ relabelling is requested with no live renderer, and warns when there are fewer s
 `ceil(envs × (1 − MIX) / 5)`. Too few servers does not fail — it serialises the rollout, so
 watch `Iteration time` (expect ~145 s at 16 envs / 3 servers / `MIX=0.5`).
 
-That table describes the earlier small-run launcher. HSG production fixes `MIX=0`, starts
+That table describes the earlier small-run launcher. The legacy HSG packed profile fixes `MIX=0`, starts
 the student from base initialization (`CKPT=none`), and validates all 52 renderer endpoints
 inside the packed job before training.
 
@@ -377,12 +389,38 @@ Historically, round 4 warm-started from round 3 and reached `dagger_bc_loss` 0.1
 reuse that policy: its ImageNet-pretrained ResNet-18 encoder and policy heads start from the
 base model path, while the expert checkpoint is used only to label actions.
 
-### Production scale: 256 environments × 300 rollout steps
+### Canonical round-based production: 4 × 64 environments × 512 steps
 
-For exact fresh, resume, validation-only, lease, and artifact procedures, see
+The current campaign contract is
+`configs/round_dagger/production_campaign_256x512.json`. Each macro-round collects four
+independently sealed 64-environment cohorts on the two-GPU RTX actor host. Each cohort has two
+logical ranks with 32 environments per rank and 512 steps per environment, for 131,072 accepted
+transitions per macro-round and 655,360 across five macro-rounds. The actor consumes the ordered
+three-view vertical tile `[head_color, hand_left, hand_right]` and uses a 256-frame RGB reference
+lag.
+
+After the four cohorts are sealed, the coordinator transfers only the camera-free learner
+projection to `/workspace/projects/roborender` and schedules one private `lepton_job_v1` Job on the
+reserved eight-H200 node. The Job runs eight synchronized learner ranks, evaluates the immutable
+fixed-256 held-out action set at optimizer step 0 and every 100 steps through 1,200, publishes an
+inventory-bound result archive, and returns it to RTX for promotion and the paired closed-loop
+evaluation. Actor collection, learner execution, W&B delivery, and evaluation remain distinct,
+restart-safe phases of one five-round state machine.
+
+The exact Lepton reservation, node group, image digest, NFS mount, W&B secret reference, zero
+platform retries, and control-Deployment lifecycle are pinned by the finalized backend contract.
+There is no Slurm submission or HSG/OCI scheduler dependency in this canonical learner path.
+
+### Legacy HSG packed scale: 256 environments × 300 rollout steps
+
+The remainder of this subsection documents the superseded packed HSG/GB200 compatibility path. It
+is retained to reproduce earlier release evidence; it is not the current production launch
+procedure.
+
+For the legacy HSG fresh, resume, validation-only, lease, and artifact procedures, see
 [`docs/HSG_GB200_PRODUCTION_RUNBOOK.md`](docs/HSG_GB200_PRODUCTION_RUNBOOK.md).
 
-HSG production is one packed Slurm allocation on `batch_long`: **15 nodes × 4 GB200 GPUs =
+The legacy HSG profile is one packed Slurm allocation on `batch_long`: **15 nodes × 4 GB200 GPUs =
 60 GB200s** for eight hours.  One concurrent step runs 52 persistent Image3F renderer tasks;
 the first seven nodes host four renderers each and the remaining eight host three renderers plus
 one synchronized trainer rank.  The launcher attests this exact host/GPU placement before the
@@ -441,7 +479,7 @@ optimizer/scheduler/per-rank DAgger stream state.  A completed step-500 checkpoi
 validation-only recovery path; it is never retrained or silently accepted without telemetry and
 post-run validation.
 
-Production behavior is explicit and recorded in both manifests. It uses per-decision β mixing,
+The legacy packed profile's behavior is explicit and recorded in both manifests. It uses per-decision β mixing,
 annealed linearly from 1.0 to 0.0 over 500 rollout iterations: the expert dominates while the
 fresh student is random, and the student increasingly drives the visited-state distribution.
 The legacy parent-trainer mixer remains disabled. `NUM_LEARNING_EPOCHS=1`, one minibatch,
@@ -450,7 +488,7 @@ views and the actor consumes the ordered vertical tile `[head_color, hand_left, 
 `324x192x3`. Runtime assertions reject any composed Hydra configuration that disagrees with this
 contract.
 
-### Explicit production gates
+#### Legacy HSG release gates
 
 Release validation is deliberately sequential. First submit the HSG calibration profile; its two
 diagnostic panels are
@@ -524,7 +562,7 @@ CAMERA_CALIBRATION_ACCEPTANCE="$CALIBRATION_ACCEPTANCE" \
 ```
 
 The submitter and packed allocation independently rehash the predecessor manifest, checkpoints,
-finite-loss marker, and (for the full smoke) eight-rank DDP policy digest. Production submission
+finite-loss marker, and (for the full smoke) eight-rank DDP policy digest. Legacy HSG submission
 remains blocked until every predecessor artifact validates against the same source revisions.
 
 | Gate | Must pass before/while running |
@@ -543,9 +581,9 @@ integrated GR00T checkout, expert labeler, Image3F adapter and foundation weight
 target-built SM100 TensorRT engine, sealed dual-container runtime, and W&B authentication must all
 be present. A failed gate never becomes a nominal production run.
 
-### W&B production telemetry
+#### Legacy HSG W&B telemetry
 
-Production submission fails closed unless W&B is online, the authenticated account email is
+The legacy packed submission fails closed unless W&B is online, the authenticated account email is
 `ldu@nvidia.com`, and exact team entity `nvidia` membership and entity type are verified.
 The trainer's rank-zero process logs optimization and environment scalars, including DAgger BC
 loss, learning rate, rewards, episode lengths, FPS, collection time, and learning time. A separate
@@ -558,9 +596,9 @@ step is stopped. `RUN_DONE` is written only after a successful trainer and telem
 production failures write attempt-scoped `ATTEMPT_FAILED` and a hash-bound resume candidate with
 the preserved trainer exit status.
 
-### Fixed-seed policy-improvement gate
+#### Legacy HSG fixed-seed policy-improvement gate
 
-The packed production launcher intentionally submits only the training allocation; it does not
+The legacy packed launcher intentionally submits only the training allocation; it does not
 silently create follow-on evaluation jobs. After training, the fixed-seed evaluation entrypoints
 compare a declared baseline, early, midpoint, and final checkpoint on the same eight Isaac
 seed blocks with 32 environments per block. Each environment contributes exactly one episode,
@@ -575,8 +613,9 @@ gate does not rely on a particular trainer variant happening to emit `metrics_ev
 
 Two distinct gates are provided. `submit_hsg_gb200_fixed_seed_gate.sh` is a secondary
 simulator-RGB policy-mechanics diagnostic; it must not be presented as evidence for the deployed
-observation distribution. `submit_hsg_gb200_image3f_fixed_seed_gate.sh` is the primary production
-gate: it uses the certified three-view Image3F stream, one warm seven-renderer fleet, sequential
+observation distribution. `submit_hsg_gb200_image3f_fixed_seed_gate.sh` is the primary gate for
+that legacy packed profile: it uses the certified three-view Image3F stream, one warm
+seven-renderer fleet, sequential
 baseline/early/mid/final evaluation, paired condition fingerprints, and before/after renderer
 request/error/runtime attestations.
 
@@ -588,7 +627,7 @@ reported as a diagnostic but are not silently mixed into the success criterion. 
 is explicitly excluded as evidence of closed-loop improvement. Baseline/early/mid/final success,
 Wilson intervals, reward intervals, and the gate result are logged to a separate evaluation run
 in the same authorized `nvidia` W&B team project. This post-run scientific gate does not change the lifecycle or
-ownership of the completed packed production job.
+ownership of the completed legacy packed job.
 
 Before the full job, validate environment imports, the GB200 renderer smoke test, endpoint
 identity checks, and a bounded distributed rollout. Acceptance requires exact global transition
@@ -634,7 +673,12 @@ Things that follow from the taller observation:
 
 Verified end to end (`MIX=0.0`, 4 envs, from scratch): history buffer `(324, 192, 3)`,
 storage `obs_dim=186624`, two learning iterations with `dagger_bc_loss` 1.089 -> 0.873.
+
 ## Evaluation — read this first
+
+The `sbatch` commands in this section are legacy cluster entrypoints. The checkpoint/config
+identity rules remain applicable, while canonical round-based production invokes its paired
+evaluator from the RTX coordinator instead of submitting these jobs.
 
 **`eval_agent_trl.py` loads `config.yaml` from the checkpoint's own directory.** A DAgger
 run's config describes a different environment than the baseline's, so scoring a DAgger
@@ -712,11 +756,11 @@ The patches carry code only. Also needed on the target machine, none of it in th
 | Rendered dataset | `scripts/data/` (offline BC only) |
 | Launchers and this README | `fast_roborender/` |
 
-The canonical production launchers target HSG account `llmservice_nemotron_ultra`: bounded probes
-use `batch`, while the 15-node production allocation uses `batch_long` with normal QoS and an
-eight-hour limit.  The OCI launchers remain as legacy H100 portability paths under
-`general_cs_infra`. On a workstation with no Slurm, run the training command directly—the
-launchers are thin wrappers around it:
+The canonical campaign runs actor collection on the RTX workstation and the camera-free learner
+through the reserved Lepton Kubernetes backend described above. The HSG launchers targeting
+`llmservice_nemotron_ultra` and OCI-NRT launchers targeting `general_cs_infra` are explicit legacy
+compatibility paths. They are not fallbacks for a failed Lepton launch. For local development on a
+workstation, the underlying training command may still be run directly:
 
 ```bash
 cd GR00T-VisualSim2Real
@@ -735,8 +779,8 @@ Start the renderer first with `runtime/image3f_deploy.py` behind
 `scripts/server/image3f_server.py`, and point `image3f_endpoint_files` at the file it
 writes.
 
-`bash scripts/setup/check_env.sh` reports which assets are missing. Its paths default to
-the OCI/Lustre layout and are overridable:
+`bash scripts/setup/check_env.sh` reports which legacy OCI assets are missing. Its paths default to
+the OCI/Lustre compatibility layout and are overridable:
 
 ```bash
 ROOT=/your/checkout IMAGE3F=/your/image3f_bundle VIRAL_PY=$CONDA_PREFIX/bin/python \
@@ -803,7 +847,8 @@ every arm by 0.7-1.2 dB. Training was never affected -- it always went through t
   from a previous run. Verify the endpoint's hostname matches the server job's node.
 - **Shared storage stalls.** Check `ps -o wchan` and the Lustre client state when a job
   runs with an empty log; never work around this by writing large artifacts to the root disk.
-- **Slurm.** `--nodelist=A,B` requests *all* listed nodes. HSG production requests
+- **Legacy Slurm compatibility.** `--nodelist=A,B` requests *all* listed nodes. The retired HSG
+  packed profile requests
   15 nodes with four GB200 GPUs per node; placement is 52 renderer tasks plus eight trainer ranks.
   Hydra needs a `+` prefix for keys absent from
   the base config. A timeout is an interrupted attempt, never a success marker: resume from the

@@ -39,7 +39,7 @@
     "expected_email": "ldu@nvidia.com",
     "entity": "nvidia",
     "authorization_scope": "team",
-    "project": "roborender-round-dagger"
+    "project": "lepton-dagger-production-1"
   },
   "source": {
     "must_be_sealed": true,

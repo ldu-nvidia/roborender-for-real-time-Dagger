@@ -1,43 +1,35 @@
-#!/bin/bash
-# Compatibility entry point for the production DAgger launch.
+#!/usr/bin/env bash
+# Canonical production entry point: RTX cohorts + reserved Lepton 8xH200 learner.
 #
-# The only supported production topology is the packed OCI allocation. Keeping
-# this wrapper prevents older operator commands from silently submitting the
-# retired multi-job topology.
+# All campaign, source-seal, and backend identities are explicit arguments to
+# the fail-closed five-round driver. The legacy packed OCI workflow remains at
+# submit_oci_packed.sh and is never selected as a fallback from this wrapper.
 set -Eeuo pipefail
 
-SCRIPT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-STAGE_ROOT=${STAGE_ROOT:-/lustre/fs11/portfolios/llmservice/projects/llmservice_fm_vision/ldu_roborender_scale}
-OCI_ROOT="$STAGE_ROOT/src/fast_roborender"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+DRIVER="$ROOT/scripts/round_dagger/run_five_round_production_campaign.py"
+PYTHON=${ROUND_DAGGER_CONTROL_PYTHON:-/mnt/data2/ldu/lacwm_runtime/envs/lacwm-b200-py310/bin/python}
 
-if [ -n "${ROOT:-}" ] && [ "$ROOT" != "$OCI_ROOT" ]; then
-    echo "FATAL: production ROOT must be the OCI staged checkout: $OCI_ROOT" >&2
+for argument in "$@"; do
+    case "$argument" in
+        --learner-backend|--learner-backend=*)
+            echo "FATAL: canonical production fixes learner backend to lepton_job_v1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+[[ -f $DRIVER && ! -L $DRIVER ]] || {
+    echo "FATAL: canonical round-based production driver is unavailable" >&2
     exit 2
-fi
-if [ -n "${GR00T_ROOT:-}" ] && [ "$GR00T_ROOT" != "$OCI_ROOT/GR00T-VisualSim2Real" ]; then
-    echo "FATAL: production GR00T_ROOT must be inside the OCI staged checkout" >&2
+}
+PYTHON_REAL=$(realpath -e -- "$PYTHON") || {
+    echo "FATAL: control Python cannot be resolved" >&2
     exit 2
-fi
+}
+[[ -f $PYTHON_REAL && -x $PYTHON_REAL ]] || {
+    echo "FATAL: control Python is not executable" >&2
+    exit 2
+}
 
-export STAGE_ROOT
-export ROOT="$OCI_ROOT"
-export GR00T_ROOT="$OCI_ROOT/GR00T-VisualSim2Real"
-export RUN_PROFILE=production_256x300
-export PACKED_NODES=8
-export PACKED_GPUS_PER_NODE=8
-export GLOBAL_NUM_ENVS=256
-export ROLLOUT_STEPS=300
-export TRAINER_NODES=8
-export ENVS_PER_RENDERER=5
-export EXPECTED_RENDERERS=52
-export PACKED_PARTITION=grizzly
-export PACKED_CPUS_PER_GPU=10
-export PACKED_MEM=768G
-export IMAGE_DAGGER_DUMP_SIM_RGB=0
-export IMAGE_DAGGER_DUMP_MAX_STEPS=0
-export IMAGE_DAGGER_DUMP_MAX_ENVS=0
-export IMAGE_DAGGER_VERIFY_DDP_SYNC=1
-export IMAGE_DAGGER_REQUIRE_FINITE_BC_LOSS=1
-
-echo "Production uses the packed OCI 8-node/64-H100 launcher."
-exec bash "$SCRIPT_ROOT/scripts/scaling/submit_oci_packed.sh"
+exec "$PYTHON" "$DRIVER" "$@" --learner-backend lepton_job_v1

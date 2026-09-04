@@ -1,9 +1,10 @@
 """Read-only 30-minute health monitor for the production DAgger campaign.
 
-Campaign files, processes, GPUs, and the remote OCI-NRT Slurm control plane are
-observed only.  Reports are written to a separate operator-owned output root;
-the monitor never invokes a campaign command, signals a process, or submits,
-cancels, holds, or releases a job.
+Campaign files, processes, GPUs, W&B, and the selected learner control plane
+(OCI-NRT Slurm or the reserved Lepton H200 node) are observed only.  Reports
+are written to a separate operator-owned output root; the monitor never
+invokes a campaign command, signals a process, or submits, cancels, holds,
+releases, scales, or deletes a job or deployment.
 """
 
 from __future__ import annotations
@@ -24,14 +25,33 @@ from pathlib import Path
 from typing import Any
 
 from round_dagger import artifacts, state
+from round_dagger.lepton_monitor import HEALTH_SCHEMA as LEPTON_HEALTH_SCHEMA
 
 
-MONITOR_REPORT_SCHEMA = "fast_roborender.round_dagger.production_health_report.v1"
+MONITOR_REPORT_SCHEMA = "fast_roborender.round_dagger.production_health_report.v2"
 MONITOR_INTERVAL_SECONDS = 1800.0
 GPU_BURST_SAMPLES = 12
 GPU_BURST_INTERVAL_SECONDS = 5.0
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
+_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?i)(?:wandb_v1_[A-Za-z0-9_-]+|bearer\s+[A-Za-z0-9._~-]+)"
+)
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LEPTON_HEALTH_PROBE = (
+    ROOT / "scripts/round_dagger/read_lepton_production_health.py"
+)
+LEARNER_BACKENDS = {"oci_nrt", "lepton_job_v1"}
+DEFAULT_LEARNER_BACKEND = "lepton_job_v1"
+PINNED_LEPTON_SDK_PYTHON = Path(
+    "/mnt/data2/ldu/roborender_lepton_control/env/bin/python"
+)
+PINNED_LEPTON_SDK_FREEZE = Path(
+    "/mnt/data2/ldu/roborender_lepton_control/control.freeze.txt"
+)
+PINNED_LEPTON_SDK_FREEZE_SHA256 = (
+    "aa3cadd8d69359f84997ffc76f71bcfeadbdd37f2aac249fb6a2ee9e04c58104"
+)
 
 
 class ProductionMonitorError(RuntimeError):
@@ -233,7 +253,8 @@ def _has_argument_pair(argv: Sequence[str], name: str, value: str) -> bool:
 
 
 def _bound_process_matches(
-    pidfiles: Sequence[Path], *, campaign_root: Path
+    pidfiles: Sequence[Path], *, campaign_root: Path,
+    expected_driver_status: Path | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Check exact campaign process identities, never a cross-campaign substring."""
 
@@ -280,6 +301,11 @@ def _bound_process_matches(
             report["pid"] = pid
             if bound_campaign != str(campaign_root):
                 raise ValueError("campaign_mismatch")
+            if (
+                expected_driver_status is not None
+                and driver_status != str(expected_driver_status)
+            ):
+                raise ValueError("driver_status_mismatch")
             if _process_start_ticks(pid) != start_ticks:
                 raise ValueError("process_identity_not_live")
             argv = _process_argv(pid)
@@ -710,6 +736,228 @@ def _slurm_health(host: str, user: str, job_prefix: str) -> dict[str, Any]:
     return report
 
 
+def _lepton_health(
+    *,
+    backend_contract: Path,
+    backend_contract_sha256: str,
+    sdk_python: Path,
+    handoff_root: Path,
+    campaign_id: str,
+    macro_round: int,
+    probe: Path = DEFAULT_LEPTON_HEALTH_PROBE,
+) -> dict[str, Any]:
+    """Run the checked-in read-only Lepton probe with an explicit SDK Python.
+
+    The monitor Python intentionally does not carry the Lepton SDK.  Keep that
+    dependency boundary explicit and accept only the probe's small, sanitized
+    schema.  Provider stderr is never copied into the report because SDK error
+    payloads are not an approved telemetry surface.
+    """
+
+    contract = _absolute(backend_contract, "Lepton backend contract")
+    contract_sha = _sha(
+        backend_contract_sha256, "Lepton backend contract SHA-256"
+    )
+    _regular_immutable(contract, contract_sha, "Lepton backend contract")
+    python = _absolute(sdk_python, "Lepton SDK Python")
+    if python != PINNED_LEPTON_SDK_PYTHON:
+        raise ProductionMonitorError("Lepton SDK Python differs from production pin")
+    _regular_immutable(
+        PINNED_LEPTON_SDK_FREEZE,
+        PINNED_LEPTON_SDK_FREEZE_SHA256,
+        "Lepton control environment freeze",
+    )
+    handoff = _absolute(handoff_root, "Lepton handoff root")
+    probe_path = _absolute(probe, "Lepton health probe")
+    try:
+        resolved_python = python.resolve(strict=True)
+        python_info = os.lstat(resolved_python)
+        probe_info = os.lstat(probe_path)
+    except OSError as exc:
+        raise ProductionMonitorError("Lepton health executable is unavailable") from exc
+    if not stat.S_ISREG(python_info.st_mode) or not os.access(resolved_python, os.X_OK):
+        raise ProductionMonitorError(
+            "Lepton SDK Python must resolve to a regular executable"
+        )
+    if not stat.S_ISREG(probe_info.st_mode) or probe_info.st_mode & 0o222:
+        raise ProductionMonitorError(
+            "Lepton health probe must be an immutable non-symlink file"
+        )
+
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if any(
+            token in name.upper()
+            for token in ("WANDB_API_KEY", "WANDB_ACCESS_TOKEN", "WANDB_IDENTITY_TOKEN")
+        ):
+            environment.pop(name, None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = str(ROOT) + (f":{existing}" if existing else "")
+    try:
+        sdk_check = subprocess.run(
+            [
+                str(python),
+                "-c",
+                (
+                    "import leptonai,numpy;"
+                    "assert getattr(leptonai,'__version__',None)=='0.27.3';"
+                    "assert numpy.__version__=='2.2.6'"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=15,
+            env=environment,
+        )
+        freeze_check = subprocess.run(
+            [str(python), "-m", "pip", "freeze", "--all"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError):
+        sdk_check = freeze_check = None
+    expected_freeze = PINNED_LEPTON_SDK_FREEZE.read_bytes()
+    if (
+        sdk_check is None
+        or freeze_check is None
+        or sdk_check.returncode != 0
+        or freeze_check.returncode != 0
+        or freeze_check.stdout.replace(b"\r\n", b"\n") != expected_freeze
+    ):
+        return {
+            "schema": LEPTON_HEALTH_SCHEMA,
+            "backend": "lepton_job_v1",
+            "reachable": False,
+            "healthy": False,
+            "error": "sdk_environment_mismatch",
+            "read_only": True,
+        }
+    command = [
+        str(python),
+        str(probe_path),
+        "--backend-contract",
+        str(contract),
+        "--backend-contract-sha256",
+        contract_sha,
+        "--handoff-root",
+        str(handoff),
+        "--campaign-id",
+        campaign_id,
+        "--macro-round",
+        str(macro_round),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "schema": LEPTON_HEALTH_SCHEMA,
+            "backend": "lepton_job_v1",
+            "reachable": False,
+            "healthy": False,
+            "error": type(exc).__name__,
+            "read_only": True,
+        }
+    if completed.returncode != 0:
+        return {
+            "schema": LEPTON_HEALTH_SCHEMA,
+            "backend": "lepton_job_v1",
+            "reachable": False,
+            "healthy": False,
+            "error": f"probe_exit_{completed.returncode}",
+            "read_only": True,
+        }
+    raw = completed.stdout.strip()
+    if len(raw.encode("utf-8")) > 65536 or _CREDENTIAL_VALUE_RE.search(raw):
+        return {
+            "schema": LEPTON_HEALTH_SCHEMA,
+            "backend": "lepton_job_v1",
+            "reachable": False,
+            "healthy": False,
+            "error": "unsafe_probe_output",
+            "read_only": True,
+        }
+    try:
+        document = json.loads(
+            raw,
+            object_pairs_hook=lambda pairs: _strict_pairs(pairs),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        document = None
+    expected_probe_keys = {
+        "schema",
+        "backend",
+        "reachable",
+        "healthy",
+        "backend_contract_sha256",
+        "workspace",
+        "reservation",
+        "node_group",
+        "resource_shape",
+        "control_deployment",
+        "control_state",
+        "active_job_count",
+        "active_jobs",
+        "malformed_active_jobs",
+        "current_request",
+        "reason_codes",
+        "read_only",
+    }
+    allowed_reason_codes = {
+        "reserved_job_identity_invalid",
+        "multiple_active_reserved_jobs",
+        "orphan_active_reserved_job",
+        "control_not_ready_without_owned_transition",
+        "active_job_while_control_ready",
+        "stop_transition_inconsistent",
+        "stopped_transition_inconsistent",
+        "restore_transition_inconsistent",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected_probe_keys
+        or document.get("schema") != LEPTON_HEALTH_SCHEMA
+        or document.get("backend") != "lepton_job_v1"
+        or document.get("backend_contract_sha256") != contract_sha
+        or type(document.get("reachable")) is not bool
+        or type(document.get("healthy")) is not bool
+        or document.get("read_only") is not True
+        or not isinstance(document.get("reason_codes"), list)
+        or any(
+            not isinstance(reason, str) or reason not in allowed_reason_codes
+            for reason in document.get("reason_codes", [])
+        )
+    ):
+        return {
+            "schema": LEPTON_HEALTH_SCHEMA,
+            "backend": "lepton_job_v1",
+            "reachable": False,
+            "healthy": False,
+            "error": "invalid_probe_schema",
+            "read_only": True,
+        }
+    return document
+
+
+def _strict_pairs(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"duplicate JSON key: {key}")
+        document[key] = value
+    return document
+
+
 def _viewer_value(viewer: object, key: str) -> object:
     if isinstance(viewer, Mapping):
         return viewer.get(key)
@@ -944,15 +1192,22 @@ def collect_report(
     telemetry_roots: Sequence[Path],
     wandb_roots: Sequence[Path],
     disk_paths: Sequence[Path],
-    oci_nrt_host: str,
-    slurm_user: str,
-    slurm_job_prefix: str,
+    learner_backend: str = DEFAULT_LEARNER_BACKEND,
+    oci_nrt_host: str | None = None,
+    slurm_user: str | None = None,
+    slurm_job_prefix: str | None = None,
+    lepton_backend_contract: Path | None = None,
+    lepton_backend_contract_sha256: str | None = None,
+    lepton_sdk_python: Path | None = None,
+    lepton_handoff_root: Path | None = None,
+    lepton_health_probe: Path = DEFAULT_LEPTON_HEALTH_PROBE,
     wandb_entity: str | None = None,
     wandb_project: str | None = None,
     wandb_expected_email: str | None = None,
     wandb_netrc: Path | None = None,
     required_process_patterns: Sequence[str] = (),
     required_process_pidfiles: Sequence[Path] = (),
+    expected_driver_status: Path | None = None,
     previous: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     _regular_immutable(campaign_contract, campaign_contract_sha256, "runtime campaign contract")
@@ -975,7 +1230,9 @@ def collect_report(
     fleet = _process_matches(fleet_patterns)
     required_processes = _process_matches(required_process_patterns)
     required_bound_processes = _bound_process_matches(
-        required_process_pidfiles, campaign_root=campaign_root
+        required_process_pidfiles,
+        campaign_root=campaign_root,
+        expected_driver_status=expected_driver_status,
     )
     actors = _process_matches(actor_patterns)
     actor_visible = any(item["count"] for item in actors.values())
@@ -1008,9 +1265,61 @@ def collect_report(
             f"required campaign-bound process is not healthy: {path}"
             for path in missing_required_bound_processes
         )
-    slurm = _slurm_health(oci_nrt_host, slurm_user, slurm_job_prefix)
-    if not slurm["reachable"]:
-        warnings.append("OCI-NRT Slurm status is unreachable")
+    if learner_backend not in LEARNER_BACKENDS:
+        raise ProductionMonitorError("unsupported learner backend")
+    oci_values = (oci_nrt_host, slurm_user, slurm_job_prefix)
+    lepton_values = (
+        lepton_backend_contract,
+        lepton_backend_contract_sha256,
+        lepton_sdk_python,
+        lepton_handoff_root,
+    )
+    oci_health: dict[str, Any] | None = None
+    lepton_health: dict[str, Any] | None = None
+    if learner_backend == "oci_nrt":
+        if not all(value is not None for value in oci_values) or any(
+            value is not None for value in lepton_values
+        ):
+            raise ProductionMonitorError(
+                "OCI learner monitoring requires only host, user, and job prefix"
+            )
+        oci_health = _slurm_health(
+            str(oci_nrt_host), str(slurm_user), str(slurm_job_prefix)
+        )
+        control_plane_healthy = bool(oci_health["reachable"])
+        if not control_plane_healthy:
+            warnings.append("OCI-NRT Slurm status is unreachable")
+    else:
+        if not all(value is not None for value in lepton_values) or any(
+            value is not None for value in oci_values
+        ):
+            raise ProductionMonitorError(
+                "Lepton learner monitoring requires only contract, SHA-256, and SDK Python"
+            )
+        lepton_health = _lepton_health(
+            backend_contract=Path(lepton_backend_contract),
+            backend_contract_sha256=str(lepton_backend_contract_sha256),
+            sdk_python=Path(lepton_sdk_python),
+            handoff_root=Path(lepton_handoff_root),
+            campaign_id=str(coordinator["campaign_id"]),
+            macro_round=int(
+                coordinator["open_macro_round"]
+                if coordinator["open_macro_round"] is not None
+                else coordinator["next_macro_round"]
+            ),
+            probe=lepton_health_probe,
+        )
+        control_plane_healthy = bool(
+            lepton_health.get("reachable") and lepton_health.get("healthy")
+        )
+        if not lepton_health.get("reachable"):
+            warnings.append("Lepton H200 control plane is unreachable")
+        elif not lepton_health.get("healthy"):
+            warnings.append("Lepton H200 reserved allocation is inconsistent")
+        warnings.extend(
+            f"Lepton H200 health reason: {reason}"
+            for reason in lepton_health.get("reason_codes", [])
+        )
     disks = _disk_health(disk_paths)
     for disk in disks:
         if disk.get("free_percent", 100.0) < 5.0:
@@ -1109,6 +1418,11 @@ def collect_report(
         warnings.append(
             "COLLECTING local W&B artifacts have not moved for two consecutive 30-minute polls"
         )
+    wandb_remote_healthy = bool(
+        isinstance(wandb_remote, Mapping)
+        and wandb_remote.get("reachable")
+        and wandb_remote.get("authorized")
+    )
     progress_health = {
         "telemetry_progressed": telemetry_progressed,
         "telemetry_stale_polls": telemetry_stale_polls,
@@ -1120,7 +1434,16 @@ def collect_report(
         "required_processes_healthy": not (
             missing_required_processes or missing_required_bound_processes
         ),
+        "learner_control_plane_healthy": control_plane_healthy,
+        "renderer_fleet_healthy": not fleet_patterns or fleet_visible,
+        "wandb_remote_healthy": wandb_remote_healthy,
     }
+    progress_health["production_observability_healthy"] = bool(
+        progress_health["required_processes_healthy"]
+        and progress_health["learner_control_plane_healthy"]
+        and progress_health["renderer_fleet_healthy"]
+        and progress_health["wandb_remote_healthy"]
+    )
 
     return {
         "schema": MONITOR_REPORT_SCHEMA,
@@ -1138,7 +1461,13 @@ def collect_report(
             "required_bound_processes": required_bound_processes,
             "missing_required_bound_processes": missing_required_bound_processes,
         },
-        "oci_nrt_slurm": slurm,
+        "learner_control_plane": {
+            "backend": learner_backend,
+            "healthy": control_plane_healthy,
+            "health": oci_health if oci_health is not None else lepton_health,
+        },
+        "oci_nrt_slurm": oci_health,
+        "lepton_h200": lepton_health,
         "file_movement": file_movement,
         "wandb_remote": wandb_remote,
         "progress_health": progress_health,
@@ -1159,19 +1488,32 @@ def run_monitor(
     telemetry_roots: Sequence[Path],
     wandb_roots: Sequence[Path],
     disk_paths: Sequence[Path],
-    oci_nrt_host: str,
-    slurm_user: str,
-    slurm_job_prefix: str,
+    learner_backend: str = DEFAULT_LEARNER_BACKEND,
+    oci_nrt_host: str | None = None,
+    slurm_user: str | None = None,
+    slurm_job_prefix: str | None = None,
+    lepton_backend_contract: Path | None = None,
+    lepton_backend_contract_sha256: str | None = None,
+    lepton_sdk_python: Path | None = None,
+    lepton_handoff_root: Path | None = None,
+    lepton_health_probe: Path = DEFAULT_LEPTON_HEALTH_PROBE,
     wandb_entity: str | None = None,
     wandb_project: str | None = None,
     wandb_expected_email: str | None = None,
     wandb_netrc: Path | None = None,
     required_process_patterns: Sequence[str] = (),
     required_process_pidfiles: Sequence[Path] = (),
+    expected_driver_status: Path | None = None,
+    ready_marker: Path | None = None,
     max_polls: int | None = None,
     test_poll_interval_seconds: float | None = None,
 ) -> dict[str, Any]:
     _outside_campaign(output_root, campaign_root)
+    if ready_marker is not None:
+        if ready_marker.parent != output_root or ready_marker.name != "MONITOR_READY.json":
+            raise ProductionMonitorError(
+                "monitor readiness marker must be the canonical output-root marker"
+            )
     if max_polls is not None and max_polls < 1:
         raise ProductionMonitorError("max_polls must be positive")
     if test_poll_interval_seconds is not None:
@@ -1194,15 +1536,22 @@ def run_monitor(
                 telemetry_roots=telemetry_roots,
                 wandb_roots=wandb_roots,
                 disk_paths=disk_paths,
+                learner_backend=learner_backend,
                 oci_nrt_host=oci_nrt_host,
                 slurm_user=slurm_user,
                 slurm_job_prefix=slurm_job_prefix,
+                lepton_backend_contract=lepton_backend_contract,
+                lepton_backend_contract_sha256=lepton_backend_contract_sha256,
+                lepton_sdk_python=lepton_sdk_python,
+                lepton_handoff_root=lepton_handoff_root,
+                lepton_health_probe=lepton_health_probe,
                 wandb_entity=wandb_entity,
                 wandb_project=wandb_project,
                 wandb_expected_email=wandb_expected_email,
                 wandb_netrc=wandb_netrc,
                 required_process_patterns=required_process_patterns,
                 required_process_pidfiles=required_process_pidfiles,
+                expected_driver_status=expected_driver_status,
                 previous=previous,
             )
             poll += 1
@@ -1210,6 +1559,34 @@ def run_monitor(
             snapshot_path = output_root / "snapshots" / f"{report['observed_unix_ns']}-{poll:06d}.json"
             _atomic_json(snapshot_path, report)
             _atomic_json(latest, report)
+            if poll == 1 and ready_marker is not None:
+                if not report["progress_health"][
+                    "production_observability_healthy"
+                ]:
+                    raise ProductionMonitorError(
+                        "first production observability report is unhealthy"
+                    )
+                _atomic_json(
+                    ready_marker,
+                    {
+                        "schema": (
+                            "fast_roborender.round_dagger."
+                            "production_monitor_ready.v1"
+                        ),
+                        "process_id": os.getpid(),
+                        "campaign_root": str(campaign_root),
+                        "output_root": str(output_root),
+                        "driver_status": (
+                            str(expected_driver_status)
+                            if expected_driver_status is not None
+                            else None
+                        ),
+                        "learner_backend": learner_backend,
+                        "report_path": str(latest),
+                        "report_sha256": artifacts.sha256_file(latest),
+                        "ready_unix_ns": time.time_ns(),
+                    },
+                )
             print(json.dumps(report, sort_keys=True, allow_nan=False), flush=True)
             previous = report
             if max_polls is not None and poll >= max_polls:
@@ -1232,9 +1609,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--telemetry-root", type=Path, action="append", default=[])
     parser.add_argument("--wandb-root", type=Path, action="append", default=[])
     parser.add_argument("--disk-path", type=Path, action="append", default=[])
-    parser.add_argument("--oci-nrt-host", required=True)
-    parser.add_argument("--slurm-user", required=True)
-    parser.add_argument("--slurm-job-prefix", required=True)
+    parser.add_argument(
+        "--learner-backend",
+        choices=sorted(LEARNER_BACKENDS),
+        default=DEFAULT_LEARNER_BACKEND,
+    )
+    parser.add_argument("--oci-nrt-host")
+    parser.add_argument("--slurm-user")
+    parser.add_argument("--slurm-job-prefix")
+    parser.add_argument("--lepton-backend-contract", type=Path)
+    parser.add_argument("--lepton-backend-contract-sha256")
+    parser.add_argument("--lepton-sdk-python", type=Path)
+    parser.add_argument("--lepton-handoff-root", type=Path)
+    parser.add_argument(
+        "--lepton-health-probe",
+        type=Path,
+        default=DEFAULT_LEPTON_HEALTH_PROBE,
+    )
+    parser.add_argument("--expected-driver-status", type=Path)
+    parser.add_argument("--ready-marker", type=Path)
     parser.add_argument("--wandb-entity", required=True)
     parser.add_argument("--wandb-project", required=True)
     parser.add_argument("--wandb-expected-email", required=True)
@@ -1279,13 +1672,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             wandb_roots=tuple(wandb_roots),
             disk_paths=tuple(_absolute(item, "disk path") for item in arguments.disk_path)
             or (campaign_root.parent,),
+            learner_backend=arguments.learner_backend,
             oci_nrt_host=arguments.oci_nrt_host,
             slurm_user=arguments.slurm_user,
             slurm_job_prefix=arguments.slurm_job_prefix,
+            lepton_backend_contract=(
+                _absolute(
+                    arguments.lepton_backend_contract,
+                    "Lepton backend contract",
+                )
+                if arguments.lepton_backend_contract is not None
+                else None
+            ),
+            lepton_backend_contract_sha256=(
+                arguments.lepton_backend_contract_sha256
+            ),
+            lepton_sdk_python=(
+                _absolute(arguments.lepton_sdk_python, "Lepton SDK Python")
+                if arguments.lepton_sdk_python is not None
+                else None
+            ),
+            lepton_handoff_root=(
+                _absolute(arguments.lepton_handoff_root, "Lepton handoff root")
+                if arguments.lepton_handoff_root is not None
+                else None
+            ),
+            lepton_health_probe=_absolute(
+                arguments.lepton_health_probe, "Lepton health probe"
+            ),
             wandb_entity=arguments.wandb_entity,
             wandb_project=arguments.wandb_project,
             wandb_expected_email=arguments.wandb_expected_email,
             wandb_netrc=_absolute(arguments.wandb_netrc, "W&B netrc"),
+            expected_driver_status=(
+                _absolute(arguments.expected_driver_status, "driver status")
+                if arguments.expected_driver_status is not None
+                else None
+            ),
+            ready_marker=(
+                _absolute(arguments.ready_marker, "monitor readiness marker")
+                if arguments.ready_marker is not None
+                else None
+            ),
             max_polls=max_polls,
             test_poll_interval_seconds=test_interval,
         )
