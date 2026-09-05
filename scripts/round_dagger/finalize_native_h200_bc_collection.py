@@ -211,13 +211,33 @@ def _finalize_collection_unlocked(
     protocol = source / "configs/round_dagger/native_h200_experiment_protocol.json"
     output = generation / "BC_COLLECTION_COMPLETE.json"
 
-    postprocess_provenance = build_postprocess_provenance(source, protocol)
+    current_postprocess_provenance = build_postprocess_provenance(source, protocol)
     source_evidence = verify_exact_bc_collection_source(
         campaign,
         protocol_path=protocol,
     )
-    if source_evidence["postprocess_provenance"] != postprocess_provenance:
+    if (
+        source_evidence["postprocess_provenance"]
+        != current_postprocess_provenance
+    ):
         raise ConditioningSplitError("deep source audit postprocess provenance differs")
+
+    try:
+        os.lstat(output)
+        marker_exists = True
+    except FileNotFoundError:
+        marker_exists = False
+    existing: dict[str, Any] | None = None
+    existing_digest: str | None = None
+    if marker_exists:
+        existing, existing_digest = _load_immutable_completion(output)
+        # The marker records the exact code that originally produced the
+        # already-sealed split.  Keep checking that historical identity against
+        # the split plan after relocation; do not reinterpret its source_root
+        # metadata as a live checkout path.
+        sealed_postprocess_provenance = existing["postprocess_provenance"]
+    else:
+        sealed_postprocess_provenance = current_postprocess_provenance
 
     reports = {
         split: verify_split(
@@ -229,7 +249,7 @@ def _finalize_collection_unlocked(
             consumer="renderer" if split == "train" else split,
             expected_transitions_per_group=EXPECTED_BC_TRANSITIONS_PER_GLOBAL_ENV,
             expected_source_evidence=source_evidence,
-            expected_postprocess_provenance=postprocess_provenance,
+            expected_postprocess_provenance=sealed_postprocess_provenance,
         )
         for split in SPLITS
     }
@@ -258,23 +278,23 @@ def _finalize_collection_unlocked(
     ):
         raise ConditioningSplitError("BC split coverage is overlapping or incomplete")
 
-    try:
-        os.lstat(output)
-        marker_exists = True
-    except FileNotFoundError:
-        marker_exists = False
     if marker_exists:
-        existing, digest = _load_immutable_completion(output)
+        if existing is None or existing_digest is None:  # pragma: no cover
+            raise ConditioningSplitError("BC completion marker state is incomplete")
         original_audit = _exact_original_rendering_audit(existing["rendering_audit"])
         expected = _completion_document(
             source_evidence=source_evidence,
             reports=reports,
             rendering_audit=original_audit,
-            postprocess_provenance=postprocess_provenance,
+            postprocess_provenance=sealed_postprocess_provenance,
         )
         if existing != expected:
             raise ConditioningSplitError("existing BC completion marker differs")
-        return {"status": "complete", "path": str(output), "sha256": digest}
+        return {
+            "status": "complete",
+            "path": str(output),
+            "sha256": existing_digest,
+        }
 
     rendering_audit = audit_pre_render_replay_root(generation)
     _exact_original_rendering_audit(rendering_audit)
@@ -282,7 +302,7 @@ def _finalize_collection_unlocked(
         source_evidence=source_evidence,
         reports=reports,
         rendering_audit=rendering_audit,
-        postprocess_provenance=postprocess_provenance,
+        postprocess_provenance=sealed_postprocess_provenance,
     )
     try:
         digest = publish_immutable_json(output, document)

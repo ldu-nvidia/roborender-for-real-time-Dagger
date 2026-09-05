@@ -50,6 +50,9 @@ CANONICAL_CAMPAIGN_ROOT = Path(
     "/workspace/project/roborender/data"
 )
 SOURCE_RELATIVE_ROOT = Path("BC/collection/conditioning/waves")
+FROZEN_BC_SOURCE_RELATIVE_ROOT = Path(
+    f"generations/{GENERATION_ID}/conditioning/waves"
+)
 SPLITS = ("train", "validation", "test")
 SPLIT_SEED = 42
 DEFAULT_WEIGHTS = {"train": 80, "validation": 10, "test": 10}
@@ -300,6 +303,55 @@ def _absolute(path: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
 
+def _resolve_sealed_cohort_path(
+    source_root: Path,
+    value: Any,
+) -> tuple[Path, Path, Path]:
+    """Resolve a sealed cohort after the campaign directory has been moved.
+
+    Collection-time manifests intentionally retain their original absolute
+    paths as immutable provenance.  Operational verification binds those
+    references to the canonical local cohort by their strict semantic suffix;
+    it never follows or requires the historical prefix.
+    """
+
+    if not isinstance(value, (str, os.PathLike)):
+        raise ConditioningSplitError(
+            "saturation cohort escapes conditioning waves"
+        )
+    reported_value = Path(os.path.expanduser(os.fspath(value)))
+    if not reported_value.is_absolute() or ".." in reported_value.parts:
+        raise ConditioningSplitError(
+            "saturation cohort escapes conditioning waves"
+        )
+    reported = _absolute(reported_value)
+    name = reported.name
+    if (
+        len(name) != len("wave-000")
+        or not name.startswith("wave-")
+        or not name.removeprefix("wave-").isdigit()
+        or tuple(reported.parts[-3:]) != ("conditioning", "waves", name)
+    ):
+        raise ConditioningSplitError(
+            "saturation cohort escapes conditioning waves"
+        )
+    canonical_source = _absolute(source_root)
+    canonical = canonical_source / name
+    if reported == canonical:
+        identity_root = SOURCE_RELATIVE_ROOT
+    elif (
+        canonical_source == CANONICAL_CAMPAIGN_ROOT / SOURCE_RELATIVE_ROOT
+        and tuple(reported.parts[-5:])
+        == tuple((FROZEN_BC_SOURCE_RELATIVE_ROOT / name).parts)
+    ):
+        identity_root = FROZEN_BC_SOURCE_RELATIVE_ROOT
+    else:
+        raise ConditioningSplitError(
+            "saturation cohort escapes conditioning waves"
+        )
+    return reported, canonical, identity_root / name
+
+
 def _require_safe_tree(path: Path, *, allow_missing_leaf: bool = False) -> None:
     target = _absolute(path)
     current = Path(target.anchor)
@@ -472,19 +524,19 @@ def _verify_cohort(
     }
     if not isinstance(reference, Mapping) or set(reference) != required_reference:
         raise ConditioningSplitError("saturation cohort reference fields differ")
-    cohort = _absolute(reference["path"])
-    try:
-        cohort.relative_to(source_root)
-    except (TypeError, ValueError) as exc:
-        raise ConditioningSplitError(
-            "saturation cohort escapes conditioning waves"
-        ) from exc
+    reported_cohort, cohort, _ = _resolve_sealed_cohort_path(
+        source_root, reference["path"]
+    )
     if cohort.parent != source_root or not cohort.name.startswith("wave-"):
         raise ConditioningSplitError(
             "saturation cohort is not an immediate wave directory"
         )
-    seal_path = _absolute(reference["seal_path"])
-    if seal_path != cohort / "seal.json" or reference["purpose"] != "train":
+    reported_seal = _absolute(reference["seal_path"])
+    seal_path = cohort / "seal.json"
+    if (
+        reported_seal != reported_cohort / "seal.json"
+        or reference["purpose"] != "train"
+    ):
         raise ConditioningSplitError("saturation cohort seal identity differs")
     _, seal_sha = _immutable_regular(
         seal_path,
@@ -926,7 +978,7 @@ def _sealed_source_manifests(
     source_root: Path,
     *,
     require_exact_production: bool = False,
-) -> tuple[list[Path], dict[str, Any]]:
+) -> tuple[list[Path], dict[str, Any], Path]:
     _require_safe_tree(source_root)
     if not source_root.is_dir():
         raise ConditioningSplitError(
@@ -978,20 +1030,27 @@ def _sealed_source_manifests(
     cohort_evidence: list[dict[str, Any]] = []
     inventory_by_cohort: dict[str, list[dict[str, Any]]] = {}
     seal_by_cohort: dict[str, dict[str, Any]] = {}
+    reported_paths_by_cohort: dict[str, tuple[Path, Path]] = {}
+    identity_paths_by_cohort: dict[str, Path] = {}
     for reference in references:
         seal, paths, inventory = _verify_cohort(campaign_root, source_root, reference)
-        cohort_path = str(_absolute(reference["path"]))
+        reported_cohort, cohort, identity_path = _resolve_sealed_cohort_path(
+            source_root, reference["path"]
+        )
+        reported_seal = _absolute(reference["seal_path"])
+        cohort_path = str(cohort)
         manifests.extend(paths)
         inventory_by_cohort[cohort_path] = inventory
         seal_by_cohort[cohort_path] = seal
+        reported_paths_by_cohort[cohort_path] = (
+            reported_cohort,
+            reported_seal,
+        )
+        identity_paths_by_cohort[cohort_path] = identity_path
         cohort_evidence.append(
             {
-                "path": _relative(
-                    Path(cohort_path), campaign_root, "conditioning cohort"
-                ),
-                "seal_path": _relative(
-                    _absolute(reference["seal_path"]), campaign_root, "cohort seal"
-                ),
+                "path": identity_path.as_posix(),
+                "seal_path": (identity_path / "seal.json").as_posix(),
                 "seal_sha256": reference["seal_sha256"],
                 "transition_count": seal["transition_count"],
                 "episode_count": seal["episode_count"],
@@ -1002,20 +1061,34 @@ def _sealed_source_manifests(
         )
     if len(inventory_by_cohort) != len(references):
         raise ConditioningSplitError("generation saturation manifest repeats a cohort")
+    identity_roots = {
+        path.parent for path in identity_paths_by_cohort.values()
+    }
+    if len(identity_roots) != 1:
+        raise ConditioningSplitError(
+            "conditioning cohorts mix source path identities"
+        )
+    source_identity_root = next(iter(identity_roots))
 
     wave_paths: list[str] = []
     flat_from_waves: list[dict[str, Any]] = []
     for wave in waves:
         if not isinstance(wave, Mapping) or not isinstance(wave.get("seal"), Mapping):
             raise ConditioningSplitError("generation wave lacks seal evidence")
-        cohort_path = str(_absolute(wave.get("cohort_dir", "")))
+        reported_cohort, cohort, identity_path = _resolve_sealed_cohort_path(
+            source_root, wave.get("cohort_dir")
+        )
+        cohort_path = str(cohort)
         seal_evidence = wave["seal"]
         cohort_seal = seal_by_cohort.get(cohort_path)
+        reported_pair = reported_paths_by_cohort.get(cohort_path)
+        reported_seal = _absolute(seal_evidence.get("path", ""))
         if (
             cohort_path not in inventory_by_cohort
             or not isinstance(cohort_seal, Mapping)
-            or _absolute(seal_evidence.get("path", ""))
-            != Path(cohort_path) / "seal.json"
+            or reported_pair != (reported_cohort, reported_seal)
+            or identity_paths_by_cohort.get(cohort_path) != identity_path
+            or reported_seal != reported_cohort / "seal.json"
             or seal_evidence.get("sha256")
             != sha256_file(Path(cohort_path) / "seal.json")
             or seal_evidence.get("shards") != inventory_by_cohort[cohort_path]
@@ -1078,7 +1151,10 @@ def _sealed_source_manifests(
             ]
             if (
                 cohort_row["path"]
-                != f"generations/{GENERATION_ID}/conditioning/waves/wave-{wave_index:03d}"
+                != (
+                    f"{source_identity_root.as_posix()}"
+                    f"/wave-{wave_index:03d}"
+                )
                 or cohort_row["transition_count"]
                 != EXPECTED_BC_TRANSITIONS_PER_WAVE
                 or cohort_row["global_env_ids"]
@@ -1149,7 +1225,9 @@ def _sealed_source_manifests(
             "generation completed image/episode counts differ from cohort seals"
         )
     return sorted(manifests), {
-        "path": _relative(saturation_path, campaign_root, "saturation manifest"),
+        "path": (
+            source_identity_root.parents[1] / "saturation_manifest.json"
+        ).as_posix(),
         "sha256": saturation_sha,
         "size_bytes": saturation_size,
         "status": saturation["status"],
@@ -1160,11 +1238,13 @@ def _sealed_source_manifests(
         "completed_episode_count": saturation["completed_episode_count"],
         "cohorts": sorted(cohort_evidence, key=lambda row: row["path"]),
         "physical_gpu_inventory": physical_inventory,
-    }
+    }, source_identity_root
 
 
 def _inventory(
-    campaign_root: Path, manifest_paths: Sequence[Path]
+    source_root: Path,
+    source_identity_root: Path,
+    manifest_paths: Sequence[Path],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     units: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
@@ -1200,7 +1280,13 @@ def _inventory(
             raise ConditioningSplitError(
                 "source artifact motion_ids differ from its motion allowlist"
             )
-        source_relative = _relative(manifest_path, campaign_root, "source manifest")
+        try:
+            source_suffix = manifest_path.relative_to(source_root)
+        except ValueError as exc:
+            raise ConditioningSplitError(
+                "source manifest escapes conditioning waves"
+            ) from exc
+        source_relative = (source_identity_root / source_suffix).as_posix()
         sources.append(
             {
                 "manifest_path": source_relative,
@@ -1434,6 +1520,7 @@ def _plan_document(
     ratio_source: str,
     seed: int,
     completion: Mapping[str, Any],
+    source_identity_root: Path,
     expected_transitions_per_group: int | None,
     postprocess_provenance: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -1441,7 +1528,7 @@ def _plan_document(
         "schema": PLAN_SCHEMA,
         "campaign_id": CAMPAIGN_ID,
         "generation_id": GENERATION_ID,
-        "source_root": SOURCE_RELATIVE_ROOT.as_posix(),
+        "source_root": source_identity_root.as_posix(),
         "strategy": STRATEGY,
         "seed": seed,
         "grouping": "complete_global_environment_stream",
@@ -1468,6 +1555,8 @@ def _plan_document(
 
 def _materialize(
     campaign_root: Path,
+    source_root: Path,
+    source_identity_root: Path,
     units: Sequence[Mapping[str, Any]],
     assignments: Mapping[str, Sequence[int]],
     plan_sha256: str,
@@ -1482,7 +1571,14 @@ def _materialize(
         by_source[str(unit["source_manifest_path"])].append(global_id)
 
     for source_relative in sorted(by_source):
-        source_path = campaign_root / source_relative
+        try:
+            source_suffix = Path(source_relative).relative_to(source_identity_root)
+        except ValueError as exc:
+            raise ConditioningSplitError(
+                "source manifest escapes its sealed identity root"
+            ) from exc
+        source_path = source_root / source_suffix
+        _require_safe_tree(source_path)
         report, arrays = load_raw_conditioning_artifact(source_path)
         for global_id in sorted(by_source[source_relative]):
             unit = by_global_id[global_id]
@@ -1712,6 +1808,19 @@ def _is_sha256(value: Any) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _is_strict_relative_descendant(value: Any, root: Path) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = Path(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return False
+    try:
+        suffix = path.relative_to(root)
+    except ValueError:
+        return False
+    return suffix != Path(".")
 
 
 def _validate_plan_source_bindings(
@@ -2123,6 +2232,7 @@ def verify_split(
     provenance = (
         plan.get("postprocess_provenance") if isinstance(plan, Mapping) else None
     )
+    plan_source_root = plan.get("source_root") if isinstance(plan, Mapping) else None
     if (
         not isinstance(plan, Mapping)
         or set(plan) != _PLAN_KEYS
@@ -2131,7 +2241,11 @@ def verify_split(
         or plan.get("schema") != PLAN_SCHEMA
         or plan.get("campaign_id") != CAMPAIGN_ID
         or plan.get("generation_id") != GENERATION_ID
-        or plan.get("source_root") != SOURCE_RELATIVE_ROOT.as_posix()
+        or plan_source_root
+        not in {
+            SOURCE_RELATIVE_ROOT.as_posix(),
+            FROZEN_BC_SOURCE_RELATIVE_ROOT.as_posix(),
+        }
         or plan.get("seed") != SPLIT_SEED
         or plan.get("strategy") != STRATEGY
         or plan.get("grouping") != "complete_global_environment_stream"
@@ -2162,6 +2276,18 @@ def verify_split(
             "split manifest/seal does not bind the global plan"
         )
     units_by_id = _validate_plan_source_bindings(source_inventory, units)
+    if not isinstance(plan_source_root, str):  # guarded above; keep -O safe
+        raise ConditioningSplitError("global plan source root is malformed")
+    if any(
+        not _is_strict_relative_descendant(
+            source.get("manifest_path") if isinstance(source, Mapping) else None,
+            Path(plan_source_root),
+        )
+        for source in source_inventory
+    ):
+        raise ConditioningSplitError(
+            "global plan source inventory escapes its declared root"
+        )
     if {candidate: list(assignments[candidate]) for candidate in SPLITS} != _assign(
         units, plan["target_counts"], SPLIT_SEED
     ):
@@ -2271,7 +2397,21 @@ def verify_training_projection_source(
             campaign,
             protocol_path=protocol,
         )
-        provenance = source_evidence["postprocess_provenance"]
+        plan_path = campaign / "BC/contracts/bc_collection_split.v1.json"
+        try:
+            _immutable_regular(
+                plan_path, "global split plan", exact_mode=0o444
+            )
+            plan = load_strict_json(plan_path)
+        except ArtifactError as exc:
+            raise ConditioningSplitError(
+                f"cannot load sealed split-plan provenance: {exc}"
+            ) from exc
+        provenance = _validate_postprocess_provenance(
+            plan.get("postprocess_provenance")
+            if isinstance(plan, Mapping)
+            else None
+        )
     return verify_split(
         root,
         consumer="renderer",
@@ -2345,12 +2485,16 @@ def verify_exact_bc_collection_source(
         Path(__file__).resolve().parents[1], protocol
     )
     weights, ratio_source = _load_weights(protocol)
-    manifests, completion = _sealed_source_manifests(
+    manifests, completion, source_identity_root = _sealed_source_manifests(
         root,
         root / SOURCE_RELATIVE_ROOT,
         require_exact_production=True,
     )
-    units, sources = _inventory(root, manifests)
+    units, sources = _inventory(
+        root / SOURCE_RELATIVE_ROOT,
+        source_identity_root,
+        manifests,
+    )
     targets = _target_counts(len(units), weights)
     source_counts = _validate_exact_bc_prepublication(
         units=units,
@@ -2423,12 +2567,16 @@ def _split_collection_unlocked(
         )
     weights, ratio_source = _load_weights(protocol)
     source_root = root / SOURCE_RELATIVE_ROOT
-    manifest_paths, completion = _sealed_source_manifests(
+    manifest_paths, completion, source_identity_root = _sealed_source_manifests(
         root,
         source_root,
         require_exact_production=exact_production,
     )
-    units, sources = _inventory(root, manifest_paths)
+    units, sources = _inventory(
+        source_root,
+        source_identity_root,
+        manifest_paths,
+    )
     if expected_transitions_per_group is not None:
         malformed = [
             int(unit["global_env_id"])
@@ -2459,6 +2607,7 @@ def _split_collection_unlocked(
         ratio_source=ratio_source,
         seed=seed,
         completion=completion,
+        source_identity_root=source_identity_root,
         expected_transitions_per_group=expected_transitions_per_group,
         postprocess_provenance=postprocess_provenance,
     )
@@ -2470,7 +2619,14 @@ def _split_collection_unlocked(
     if published_plan_sha != sha256_file(plan_path):
         raise ConditioningSplitError("published split plan hash differs")
     _immutable_regular(plan_path, "published split plan", exact_mode=0o444)
-    entries = _materialize(root, units, assignments, published_plan_sha)
+    entries = _materialize(
+        root,
+        source_root,
+        source_identity_root,
+        units,
+        assignments,
+        published_plan_sha,
+    )
 
     source_evidence = {
         "saturation_manifest_sha256": completion["sha256"],

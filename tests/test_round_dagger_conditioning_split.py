@@ -33,9 +33,14 @@ from round_dagger.conditioning_split import (
     EXPECTED_BC_TRANSITIONS_PER_GLOBAL_ENV,
     EXPECTED_BC_TRANSITIONS_PER_WAVE,
     EXPECTED_BC_WAVE_COUNT,
+    FROZEN_BC_SOURCE_RELATIVE_ROOT,
+    SOURCE_RELATIVE_ROOT,
     _assign,
     _exact_wave_shard_names,
     _generation_lock,
+    _inventory,
+    _materialize,
+    _sealed_source_manifests,
     _target_counts,
     _validate_exact_bc_saturation,
     _validate_exact_bc_prepublication,
@@ -371,6 +376,21 @@ class ConditioningSplitTest(unittest.TestCase):
             ],
         }
         publish_immutable_json(generation / "saturation_manifest.json", saturation)
+
+    def rewrite_saturation_cohort_paths(self, prefix: Path) -> None:
+        path = self.root / "BC/collection/saturation_manifest.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        for reference in document["train_conditioning_cohorts"]:
+            cohort = prefix / Path(reference["path"]).name
+            reference["path"] = str(cohort)
+            reference["seal_path"] = str(cohort / "seal.json")
+        for wave in document["waves"]:
+            cohort = prefix / Path(wave["cohort_dir"]).name
+            wave["cohort_dir"] = str(cohort)
+            wave["seal"]["path"] = str(cohort / "seal.json")
+        path.chmod(0o644)
+        path.write_text(json.dumps(document), encoding="utf-8")
+        path.chmod(0o444)
 
     def test_protocol_ratio_whole_environment_coverage_and_training_isolation(
         self,
@@ -745,6 +765,83 @@ class ConditioningSplitTest(unittest.TestCase):
         ):
             split_collection(self.root, protocol_path=self.protocol)
 
+    def test_frozen_cohort_paths_resolve_into_canonical_collection(self) -> None:
+        self.publish_source("rank-0000", [10, 11, 12])
+        self.seal_sources()
+        frozen = Path("/retired/campaign") / FROZEN_BC_SOURCE_RELATIVE_ROOT
+        self.rewrite_saturation_cohort_paths(frozen)
+
+        with patch(
+            "round_dagger.conditioning_split.CANONICAL_CAMPAIGN_ROOT", self.root
+        ):
+            manifests, completion, identity_root = _sealed_source_manifests(
+                self.root,
+                self.root / SOURCE_RELATIVE_ROOT,
+            )
+
+        self.assertEqual(identity_root, FROZEN_BC_SOURCE_RELATIVE_ROOT)
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(
+            completion["cohorts"][0]["path"],
+            (
+                FROZEN_BC_SOURCE_RELATIVE_ROOT
+                / "wave-000"
+            ).as_posix(),
+        )
+
+    def test_frozen_cohort_path_requires_exact_generation_suffix(self) -> None:
+        self.publish_source("rank-0000", [10, 11, 12])
+        self.seal_sources()
+        self.rewrite_saturation_cohort_paths(
+            Path("/retired/campaign/not-a-generation/conditioning/waves")
+        )
+
+        with (
+            patch(
+                "round_dagger.conditioning_split.CANONICAL_CAMPAIGN_ROOT",
+                self.root,
+            ),
+            self.assertRaisesRegex(
+                ConditioningSplitError, "escapes conditioning waves"
+            ),
+        ):
+            _sealed_source_manifests(
+                self.root,
+                self.root / SOURCE_RELATIVE_ROOT,
+            )
+
+    def test_frozen_source_identity_materializes_from_canonical_files(self) -> None:
+        self.publish_source("rank-0000", [10, 11, 12])
+        self.seal_sources()
+        frozen = Path("/retired/campaign") / FROZEN_BC_SOURCE_RELATIVE_ROOT
+        self.rewrite_saturation_cohort_paths(frozen)
+        source_root = self.root / SOURCE_RELATIVE_ROOT
+
+        with patch(
+            "round_dagger.conditioning_split.CANONICAL_CAMPAIGN_ROOT", self.root
+        ):
+            manifests, _, identity_root = _sealed_source_manifests(
+                self.root,
+                source_root,
+            )
+        units, _ = _inventory(source_root, identity_root, manifests)
+        entries = _materialize(
+            self.root,
+            source_root,
+            identity_root,
+            units,
+            {"train": [10], "validation": [11], "test": [12]},
+            "a" * 64,
+        )
+
+        self.assertEqual(
+            {split: len(rows) for split, rows in entries.items()},
+            {"train": 1, "validation": 1, "test": 1},
+        )
+        self.assertTrue(
+            (self.root / "BC/train/artifacts/global-env-000000000010.npz").is_file()
+        )
+
     def test_unexpected_unsealed_shard_is_rejected(self) -> None:
         self.publish_source("rank-0000", [10, 11, 12])
         self.seal_sources()
@@ -805,7 +902,12 @@ class ConditioningSplitTest(unittest.TestCase):
         generation = campaign / "BC/collection"
         (generation / "replay/manifests").mkdir(parents=True, exist_ok=True)
         (generation / "replay/shards").mkdir(exist_ok=True)
-        provenance = {"schema": "test", "sources": [], "protocol": {}}
+        provenance = {"schema": "historical", "sources": [], "protocol": {}}
+        current_provenance = {
+            "schema": "current",
+            "sources": [],
+            "protocol": {},
+        }
         source_evidence = {
             "saturation_manifest_sha256": "a" * 64,
             "source_inventory_sha256": "b" * 64,
@@ -817,13 +919,22 @@ class ConditioningSplitTest(unittest.TestCase):
             "weights": {"train": 23, "validation": 5, "test": 5},
             "postprocess_provenance": provenance,
         }
+        current_source_evidence = {
+            **source_evidence,
+            "postprocess_provenance": current_provenance,
+        }
         boundaries = {
             "train": range(0, 178),
             "validation": range(178, 217),
             "test": range(217, 256),
         }
 
-        def report_for(path, **_kwargs):
+        observed_expected_provenance = []
+
+        def report_for(path, **kwargs):
+            observed_expected_provenance.append(
+                kwargs["expected_postprocess_provenance"]
+            )
             split = {
                 campaign / "BC/train": "train",
                 campaign / "validation/BC": "validation",
@@ -847,12 +958,12 @@ class ConditioningSplitTest(unittest.TestCase):
             patch.object(
                 finalizer,
                 "build_postprocess_provenance",
-                return_value=provenance,
+                side_effect=[provenance, current_provenance],
             ),
             patch.object(
                 finalizer,
                 "verify_exact_bc_collection_source",
-                return_value=source_evidence,
+                side_effect=[source_evidence, current_source_evidence],
             ),
             patch.object(finalizer, "verify_split", side_effect=report_for),
             patch.object(
@@ -873,6 +984,10 @@ class ConditioningSplitTest(unittest.TestCase):
         self.assertIs(marker["rendering_started"], False)
         self.assertIs(marker["rendering_audit"]["rendering_started"], False)
         self.assertEqual(marker["postprocess_provenance"], provenance)
+        self.assertEqual(
+            observed_expected_provenance,
+            [provenance] * (2 * len(("train", "validation", "test"))),
+        )
 
 
 if __name__ == "__main__":
