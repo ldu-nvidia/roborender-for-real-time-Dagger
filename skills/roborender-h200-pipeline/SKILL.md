@@ -33,6 +33,15 @@ Do not create alternate project or data roots. If another apparent root is
 found, inspect it read-only and report it; moving, merging, linking, or deleting
 it requires explicit user authorization.
 
+The sealed initial-BC manifests retain collection-time absolute location
+strings and a historical `generations/gen-000-bc/...` logical identity. These
+are checksum-bound lineage, not live filesystem selectors. Relocation-aware
+verification maps only that exact frozen wave identity to the canonical
+`data/BC/collection/conditioning/waves` tree and performs every file read there.
+Never recreate the old directories or rewrite the sealed bytes. Use
+`scripts/round_dagger/finalize_native_h200_bc_collection.py` to prove the moved
+source and all three splits remain complete.
+
 ## Current verified state
 
 The initial Isaac BC collection is complete and its split is sealed:
