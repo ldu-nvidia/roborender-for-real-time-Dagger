@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "status": "h200_sm90_engine_built_and_runtime_validated",
+  "created_utc": "2026-09-05T08:09:56Z",
+  "canonical_renderer_root": "/workspace/project/roborender/renderer",
+  "source_bundle": {
+    "bundle_id": "roborender_rgb030_depth030_h200_bundle_v1_20260905T063022Z",
+    "relative_path": "releases/roborender_rgb030_depth030_h200_bundle_v1_20260905T063022Z",
+    "accepted_regular_files": 937,
+    "accepted_bytes": 23602282875,
+    "bundle_info_sha256": "5bc338ac58489e9330d1c29d2cdba582d2712dab349420e4af303ebe4865b881",
+    "payload_sha256sum_manifest_sha256": "fa6cf2f2f6917c57efea65867cc266c2e72a130ea558e3b699d17abcb8b0581f",
+    "payload_sha256sum_entries": 935,
+    "acceptance": {
+      "sha256sum_check": "PASS",
+      "missing_files": 0,
+      "unexpected_files": 0,
+      "symlinks": 0,
+      "foreign_engine_plan_or_cache_files": 0
+    }
+  },
+  "release": {
+    "release_id": "roborender-image3f-rgb030-depth030-step5000-4090-source-1.0.0",
+    "active_relative_target": "releases/roborender_rgb030_depth030_h200_bundle_v1_20260905T063022Z/payload/roborender_image3f",
+    "foundation_model": "PAI/Wan2.1-Fun-V1.1-1.3B-Control",
+    "adapter": {
+      "file": "adapter/rgb030-depth030-step-5000.safetensors",
+      "bytes": 699995040,
+      "sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588"
+    }
+  },
+  "runtime": {
+    "environment_relative_path": "envs/image3f-py313-cu130-trt10133/venv",
+    "python": "3.13.12",
+    "torch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "tensorrt": "10.13.3.9",
+    "onnx": "1.21.0",
+    "onnxscript": "0.7.0",
+    "safetensors": "0.8.0",
+    "cuda_forward_compatibility_library": "/usr/local/cuda/compat/lib/libcuda.so.610.43.02"
+  },
+  "hardware": {
+    "gpu": "NVIDIA H200",
+    "compute_capability": "9.0",
+    "architecture": "SM90",
+    "driver": "570.211.01",
+    "bf16_supported": true,
+    "total_vram_gib": 139.81085205078125,
+    "build_gpu_index": 0
+  },
+  "onnx": {
+    "export_key": "953952da9ff746d911a8725228aaee4518ed5a6362d5c109778d9966c5098f33",
+    "export_manifest_sha256": "55ddcb7b04abc440ed25c43af8f325e32ba1f5fcad4f1ab0b5758e9bea033b58",
+    "graph_sha256": "251d83a01e6c41c6f213dbfd4643fc0e572c0d749241d4b7c939a0e40bfaa697",
+    "external_data_sha256": "b2e098fdb553567f979590d6aaba42fa1874d5ac95585fb95ffc64ccdf2a99f3",
+    "correctness_capture_sha256": "ae6b1cef003f1d8ece649304bc196d0754acd73c9afee1587f5d4005137af18c"
+  },
+  "engine": {
+    "tag": "sm90_dc561f656ef687c7",
+    "engine_key": "dc561f656ef687c740118ca8e4d65ee2eaee2098417d198354fe09416898eb80",
+    "relative_path": "active/assets/generated/engines/sm90_dc561f656ef687c7/image3f_dit_block_stack_reference_bf16.engine",
+    "bytes": 3086921708,
+    "sha256": "d945ca84ba14725a96e2e771d8f8706eb35902d31492b0fd4934a4cf2644bd4b",
+    "manifest_sha256": "c00f23b7d7fa18b34a873fb2335b4013bc030b81d730244e48e6cabaeadf2e2e",
+    "correctness_and_latency_sha256": "2681d2cbc97ebceca65d43db7e927aaad6ba884d363a6996ce6afe02480dd3dd",
+    "precision": "bf16_fp16",
+    "workspace_gib": 64.0,
+    "builder_optimization_level": 5,
+    "cuda_graph": false,
+    "scope": "30-block DiT transformer stack"
+  },
+  "timing_cache": {
+    "relative_path": "active/assets/generated/timing/sm90_dc561f656ef687c7.cache",
+    "bytes": 13030933,
+    "sha256": "ecb39968602562aeb9e127e91e331e3e164f1f6aca249b907f2dcc335e7f1c5d"
+  },
+  "validation": {
+    "pre_build_doctor": "PASS",
+    "runtime_doctor": "PASS",
+    "engine_deserialization_and_capture_comparison": {
+      "status": "PASS",
+      "warmup": 10,
+      "iterations": 50,
+      "all_finite": true,
+      "relative_rms_error": 0.013219454325735569,
+      "maximum_allowed_relative_rms_error": 0.05,
+      "mean_block_latency_ms": 18.67365410551429,
+      "p90_block_latency_ms": 18.76572798937559
+    },
+    "three_view_full_runtime_smoke": {
+      "status": "PASS",
+      "output_type": "rgb",
+      "views": [
+        "ext1",
+        "ext2",
+        "wrist"
+      ],
+      "steps": 5,
+      "cfg_scale": 1.0,
+      "tea_cache_threshold": 0.3,
+      "all_finite": true,
+      "measured_end_to_end_ms": 150.5181733518839,
+      "horizontal_image_sha256": "65880bf13b7ec9dd321c4a99c9b8c51fa97c93300830b279633a61aa9a4fecbc",
+      "stacked_image_sha256": "0e808143074c9be2b13521fd5765e34fadb57694fbe90ff443fd4e14110dabb3"
+    },
+    "persistent_rgb_five_fps_gate": {
+      "status": "PASS",
+      "warmup": 5,
+      "iterations": 50,
+      "all_finite": true,
+      "mean_end_to_end_ms": 146.67782735079527,
+      "median_end_to_end_ms": 146.12967194989324,
+      "p90_end_to_end_ms": 149.58723448216915,
+      "max_end_to_end_ms": 153.03635131567717,
+      "p90_frames_per_second": 6.685062421681446,
+      "required_frames_per_second": 5.0,
+      "estimated_process_gpu_peak_gib_max": 19.099661827087402,
+      "run_manifest_sha256": "ebf548ee44698f32807e27443f207eccb709e3b10f958cc95a3cfc6636a8ff1a",
+      "benchmark_log_sha256": "0b2d0655dc5ff6e1032482cdffc45ff07aa35d27f7c4c2e1345f81bc2baa2415"
+    }
+  },
+  "policy": {
+    "foreign_sm120_engine_reused": false,
+    "engine_may_run_on_other_identical_h200_gpus_in_this_node": true,
+    "models_environments_logs_and_generated_media_are_not_committed_to_git": true
+  }
+}

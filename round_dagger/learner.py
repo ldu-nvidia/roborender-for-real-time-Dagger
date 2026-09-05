@@ -42,6 +42,10 @@ from round_dagger.artifacts import (
 )
 from round_dagger.actor import ActorExportError, runtime_state_dict_sha256
 from round_dagger.gr00t_policy import GR00TPolicyError, validate_policy_spec
+from round_dagger.learner_identity import (
+    LearnerIdentityError,
+    learner_identity_sha256 as compute_learner_identity_sha256,
+)
 from round_dagger.policy_bundle import (
     BOOTSTRAP_MANIFEST_SCHEMA as POLICY_BUNDLE_MANIFEST_SCHEMA,
     PolicyBundleError,
@@ -52,17 +56,23 @@ from round_dagger.policy_identity import (
     runtime_policy_identity_sha256,
     validate_homie_controller_sha256,
 )
-from round_dagger.replay import load_heldout_snapshot, load_snapshot
+from round_dagger.replay import load_snapshot
 from round_dagger.checkpoint_compat import (
     CheckpointCompatibilityError,
     load_restricted_restart_document,
 )
+from round_dagger.native_actor_protocol import GENERATION_IDS, train_round_relative_root
 
 
-BUNDLE_SCHEMA = "fast_roborender.round_dagger.learner_bundle.v1"
-CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v3"
-RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
-TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v2"
+BUNDLE_SCHEMA = "fast_roborender.round_dagger.train_only_learner_bundle.v2"
+CANONICAL_CAMPAIGN_ID = "dagger-redo-v001"
+CANONICAL_CAMPAIGN_ROOT = Path(
+    "/workspace/project/roborender/data"
+)
+CHECKPOINT_SCHEMA = "fast_roborender.round_dagger.learner_checkpoint.v4"
+LEGACY_RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v2"
+RESULT_SCHEMA = "fast_roborender.round_dagger.learner_result.v4"
+TELEMETRY_SCHEMA = "fast_roborender.round_dagger.learner_telemetry.v3"
 HELDOUT_TELEMETRY_SCHEMA = (
     "fast_roborender.round_dagger.learner_heldout_telemetry.v1"
 )
@@ -78,6 +88,9 @@ TRAINING_QUALITY_PROBE_POLICY = (
 TRAINING_QUALITY_PROBE_BUDGET = 256
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
+_GENERATION_RE = re.compile(
+    rf"(?:{'|'.join(map(re.escape, GENERATION_IDS))})\Z"
+)
 CUDA_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 SINGLE_PROCESS_GRADIENT_REDUCTION = "single_process_v1"
 ORDERED_ALLGATHER_GRADIENT_REDUCTION = "ordered_allgather_rank_sum_v1"
@@ -202,11 +215,35 @@ def _finite_float(value: Any, label: str, *, positive: bool = False) -> float:
     return result
 
 
+def _require_campaign_storage_path(
+    value: str | os.PathLike[str],
+    label: str,
+    *,
+    generation_id: str | None = None,
+) -> Path:
+    """Confine canonical learner inputs and outputs to the local H200 data root."""
+
+    root = CANONICAL_CAMPAIGN_ROOT.resolve(strict=True)
+    required_root = (
+        root
+        if generation_id is None
+        else (root / train_round_relative_root(generation_id)).resolve(strict=True)
+    )
+    path = Path(value).expanduser()
+    resolved = path.resolve(strict=path.exists())
+    try:
+        resolved.relative_to(required_root)
+    except ValueError as exc:
+        raise LearnerError(f"{label} lies outside canonical campaign storage") from exc
+    return resolved
+
+
 @dataclass(frozen=True)
 class LearnerBundleConfig:
     """Immutable policy/input/optimizer contract shared by every learner rank."""
 
     campaign_id: str
+    generation_id: str
     macro_round: int
     model_lineage_sha256: str
     code_sha256: str
@@ -218,28 +255,37 @@ class LearnerBundleConfig:
     observation_key_map: tuple[tuple[str, str], ...] = ()
     train_action_slice: tuple[int, int] | None = None
     batch_size: int = 64
-    # Production supplies its 1200-step target explicitly through the sealed
-    # learner contract.  Keep the generic bundle default stable for smoke and
-    # library callers that intentionally omit a production target.
-    max_steps: int = 500
-    save_every: int = 100
+    target_optimizer_examples: int = 4096
+    checkpoint_every_optimizer_examples: int = 1024
     learning_rate: float = 1.0e-4
     weight_decay: float = 0.0
     seed: int = 0
     partition_seed: int = 0
     initial_checkpoint_sha256: str | None = None
-    heldout_snapshot_sha256: str | None = None
-    heldout_snapshot_file_sha256: str | None = None
-    heldout_eval_interval: int | None = None
     model_config_json: str = "{}"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "LearnerBundleConfig":
         if not isinstance(raw, Mapping):
             raise LearnerError("learner bundle must be a mapping")
+        forbidden = sorted(
+            key
+            for key in raw
+            if isinstance(key, str)
+            and any(
+                token in key.lower()
+                for token in ("validation", "heldout", "held_out", "test", "eval")
+            )
+        )
+        if forbidden:
+            raise LearnerError(
+                "train-only learner bundle forbids validation/test fields: "
+                + ", ".join(forbidden)
+            )
         allowed = {
             "schema",
             "campaign_id",
+            "generation_id",
             "macro_round",
             "model_lineage_sha256",
             "code_sha256",
@@ -251,22 +297,20 @@ class LearnerBundleConfig:
             "observation_key_map",
             "train_action_slice",
             "batch_size",
-            "max_steps",
-            "save_every",
+            "target_optimizer_examples",
+            "checkpoint_every_optimizer_examples",
             "learning_rate",
             "weight_decay",
             "seed",
             "partition_seed",
             "initial_checkpoint_sha256",
-            "heldout_snapshot_sha256",
-            "heldout_snapshot_file_sha256",
-            "heldout_eval_interval",
             "model_config",
         }
         unknown = set(raw) - allowed
         required = {
             "schema",
             "campaign_id",
+            "generation_id",
             "macro_round",
             "model_lineage_sha256",
             "code_sha256",
@@ -281,8 +325,23 @@ class LearnerBundleConfig:
         if raw["schema"] != BUNDLE_SCHEMA:
             raise LearnerError("learner bundle schema mismatch")
         campaign_id = raw["campaign_id"]
-        if not isinstance(campaign_id, str) or not campaign_id:
-            raise LearnerError("campaign_id must be a non-empty string")
+        if campaign_id != CANONICAL_CAMPAIGN_ID:
+            raise LearnerError(
+                f"campaign_id must be exactly {CANONICAL_CAMPAIGN_ID!r}"
+            )
+        generation_id = raw["generation_id"]
+        if not isinstance(generation_id, str) or _GENERATION_RE.fullmatch(
+            generation_id
+        ) is None:
+            raise LearnerError("generation_id is not a canonical native-H200 generation")
+        macro_round = _true_int(raw["macro_round"], "macro_round")
+        expected_generation = (
+            GENERATION_IDS[macro_round]
+            if macro_round < len(GENERATION_IDS)
+            else None
+        )
+        if generation_id != expected_generation:
+            raise LearnerError("generation_id does not match macro_round")
 
         def channel_vector(name: str, *, positive: bool) -> tuple[float, float, float]:
             values = raw[name]
@@ -348,30 +407,6 @@ class LearnerBundleConfig:
         initial_sha = raw.get("initial_checkpoint_sha256")
         if initial_sha is not None:
             initial_sha = _require_sha256(initial_sha, "initial_checkpoint_sha256")
-        heldout_values = (
-            raw.get("heldout_snapshot_sha256"),
-            raw.get("heldout_snapshot_file_sha256"),
-            raw.get("heldout_eval_interval"),
-        )
-        if any(value is not None for value in heldout_values) and any(
-            value is None for value in heldout_values
-        ):
-            raise LearnerError(
-                "held-out evaluation fields must be supplied together"
-            )
-        heldout_snapshot_sha256 = None
-        heldout_snapshot_file_sha256 = None
-        heldout_eval_interval = None
-        if all(value is not None for value in heldout_values):
-            heldout_snapshot_sha256 = _require_sha256(
-                heldout_values[0], "heldout_snapshot_sha256"
-            )
-            heldout_snapshot_file_sha256 = _require_sha256(
-                heldout_values[1], "heldout_snapshot_file_sha256"
-            )
-            heldout_eval_interval = _true_int(
-                heldout_values[2], "heldout_eval_interval", minimum=1
-            )
         model_config = raw.get("model_config", {})
         if not isinstance(model_config, Mapping):
             raise LearnerError("model_config must be a mapping")
@@ -392,7 +427,8 @@ class LearnerBundleConfig:
             raise LearnerError("weight_decay must be non-negative")
         return cls(
             campaign_id=campaign_id,
-            macro_round=_true_int(raw["macro_round"], "macro_round"),
+            generation_id=generation_id,
+            macro_round=macro_round,
             model_lineage_sha256=_require_sha256(
                 raw["model_lineage_sha256"], "model_lineage_sha256"
             ),
@@ -405,8 +441,16 @@ class LearnerBundleConfig:
             observation_key_map=tuple(key_map),
             train_action_slice=action_slice,
             batch_size=_true_int(raw.get("batch_size", 64), "batch_size", minimum=1),
-            max_steps=_true_int(raw.get("max_steps", 500), "max_steps", minimum=1),
-            save_every=_true_int(raw.get("save_every", 100), "save_every", minimum=1),
+            target_optimizer_examples=_true_int(
+                raw.get("target_optimizer_examples", 4096),
+                "target_optimizer_examples",
+                minimum=1,
+            ),
+            checkpoint_every_optimizer_examples=_true_int(
+                raw.get("checkpoint_every_optimizer_examples", 1024),
+                "checkpoint_every_optimizer_examples",
+                minimum=1,
+            ),
             learning_rate=_finite_float(
                 raw.get("learning_rate", 1.0e-4), "learning_rate", positive=True
             ),
@@ -414,9 +458,6 @@ class LearnerBundleConfig:
             seed=_true_int(raw.get("seed", 0), "seed"),
             partition_seed=_true_int(raw.get("partition_seed", 0), "partition_seed"),
             initial_checkpoint_sha256=initial_sha,
-            heldout_snapshot_sha256=heldout_snapshot_sha256,
-            heldout_snapshot_file_sha256=heldout_snapshot_file_sha256,
-            heldout_eval_interval=heldout_eval_interval,
             model_config_json=model_config_json,
         )
 
@@ -428,6 +469,7 @@ class LearnerBundleConfig:
         result: dict[str, Any] = {
             "schema": BUNDLE_SCHEMA,
             "campaign_id": self.campaign_id,
+            "generation_id": self.generation_id,
             "macro_round": self.macro_round,
             "model_lineage_sha256": self.model_lineage_sha256,
             "code_sha256": self.code_sha256,
@@ -443,8 +485,10 @@ class LearnerBundleConfig:
                 else None
             ),
             "batch_size": self.batch_size,
-            "max_steps": self.max_steps,
-            "save_every": self.save_every,
+            "target_optimizer_examples": self.target_optimizer_examples,
+            "checkpoint_every_optimizer_examples": (
+                self.checkpoint_every_optimizer_examples
+            ),
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
             "seed": self.seed,
@@ -452,17 +496,7 @@ class LearnerBundleConfig:
             "initial_checkpoint_sha256": self.initial_checkpoint_sha256,
             "model_config": json.loads(self.model_config_json),
         }
-        if self.heldout_snapshot_sha256 is not None:
-            result.update(
-                heldout_snapshot_sha256=self.heldout_snapshot_sha256,
-                heldout_snapshot_file_sha256=self.heldout_snapshot_file_sha256,
-                heldout_eval_interval=self.heldout_eval_interval,
-            )
         return result
-
-    @property
-    def heldout_evaluation_enabled(self) -> bool:
-        return self.heldout_snapshot_sha256 is not None
 
     @property
     def sha256(self) -> str:
@@ -541,24 +575,34 @@ def _balanced_shard_assignments(
         ).hexdigest()
         normalized.append((transitions, seeded_digest, identity, dict(raw)))
 
-    # Largest shards are placed first.  The seeded digest makes ties stable
-    # without depending on manifest order or Python hash randomization.
-    normalized.sort(key=lambda item: (-item[0], item[1], item[2]))
     assignments: list[list[dict[str, Any]]] = [[] for _ in range(world_size)]
-    transition_totals = [0 for _ in range(world_size)]
-    shard_totals = [0 for _ in range(world_size)]
-    for transitions, _digest, _identity, shard in normalized:
-        rank = min(
-            range(world_size),
-            key=lambda candidate: (
-                transition_totals[candidate],
-                shard_totals[candidate],
-                candidate,
-            ),
-        )
-        assignments[rank].append(shard)
-        transition_totals[rank] += transitions
-        shard_totals[rank] += 1
+    frontier = max(
+        _true_int(item[3].get("macro_round"), "replay shard macro_round")
+        for item in normalized
+    )
+    strata = (
+        [item for item in normalized if int(item[3]["macro_round"]) < frontier],
+        [item for item in normalized if int(item[3]["macro_round"]) == frontier],
+    ) if frontier > 0 else (normalized,)
+    # Balance newest and cumulative-prior shards independently.  This makes
+    # every DDP rank sample the same exact 50/50 source mix instead of letting
+    # whole-shard placement silently erase one side of the DAgger batch.
+    for stratum in strata:
+        stratum.sort(key=lambda item: (-item[0], item[1], item[2]))
+        transition_totals = [0 for _ in range(world_size)]
+        shard_totals = [0 for _ in range(world_size)]
+        for transitions, _digest, _identity, shard in stratum:
+            rank = min(
+                range(world_size),
+                key=lambda candidate: (
+                    transition_totals[candidate],
+                    shard_totals[candidate],
+                    candidate,
+                ),
+            )
+            assignments[rank].append(shard)
+            transition_totals[rank] += transitions
+            shard_totals[rank] += 1
 
     for assigned in assignments:
         assigned.sort(
@@ -1160,6 +1204,7 @@ def _read_npz_from_verified_descriptor(
 @dataclass
 class _LoadedShard:
     identity: str
+    macro_round: int
     arrays: dict[str, np.ndarray]
     steps: int
     envs: int
@@ -1181,6 +1226,7 @@ class ReplayPartition:
         rank: int,
         world_size: int,
         transition_counts_by_rank: Sequence[int],
+        training_frontier: int | None,
     ):
         if not shards:
             raise LearnerError(
@@ -1207,11 +1253,16 @@ class ReplayPartition:
                 "per-rank replay transition counts disagree with snapshot total"
             )
         self._ends: list[int] = []
+        indices_by_round: dict[int, list[int]] = {}
         total = 0
         obs_keys: set[str] | None = None
         for shard in self.shards:
+            start = total
             total += shard.transitions
             self._ends.append(total)
+            indices_by_round.setdefault(shard.macro_round, []).extend(
+                range(start, total)
+            )
             current = {key for key in shard.arrays if key.startswith("obs__")}
             if "obs__actor_obs" not in current:
                 raise LearnerError("every replay shard must contain obs__actor_obs")
@@ -1227,6 +1278,33 @@ class ReplayPartition:
                 "loaded replay transition count disagrees with rank assignment"
             )
         self.observation_keys = tuple(sorted(obs_keys or ()))
+        if training_frontier is None:
+            newest = tuple(range(self.transition_count))
+            prior = ()
+        else:
+            if set(indices_by_round) - set(range(training_frontier + 1)):
+                raise LearnerError("replay partition contains a future macro-round")
+            newest = tuple(indices_by_round.get(training_frontier, ()))
+            prior = tuple(
+                index
+                for macro_round in range(training_frontier)
+                for index in indices_by_round.get(macro_round, ())
+            )
+            if not newest:
+                raise LearnerError(
+                    "replay partition has no newest sealed-round examples"
+                )
+            if training_frontier == 0:
+                if prior or len(newest) != self.transition_count:
+                    raise LearnerError(
+                        "BC replay must contain only round-zero train examples"
+                    )
+            elif not prior:
+                raise LearnerError(
+                    "DAgger replay partition has no cumulative-prior train examples"
+                )
+        self.newest_round_indices = newest
+        self.cumulative_prior_indices = prior
 
     def _location(self, index: int) -> tuple[_LoadedShard, int, int]:
         if (
@@ -1331,6 +1409,11 @@ def load_replay_partition(
 ) -> ReplayPartition:
     """Load only the rank's shards after replay and held-FD digest validation."""
 
+    snapshot_path = _require_campaign_storage_path(
+        snapshot_path,
+        "train replay snapshot",
+        generation_id=config.generation_id,
+    )
     rank = _true_int(rank, "rank")
     world_size = _true_int(world_size, "world_size", minimum=1)
     if rank >= world_size:
@@ -1350,7 +1433,11 @@ def load_replay_partition(
             "learner macro_round does not match replay snapshot frontier"
         )
     return _partition_loaded_snapshot(
-        snapshot, config, rank=rank, world_size=world_size
+        snapshot,
+        config,
+        rank=rank,
+        world_size=world_size,
+        training_frontier=config.macro_round,
     )
 
 
@@ -1360,6 +1447,7 @@ def _partition_loaded_snapshot(
     *,
     rank: int,
     world_size: int,
+    training_frontier: int | None,
 ) -> ReplayPartition:
     view_shape = tuple(snapshot["view_contract"].get("shape", ()))
     action_shape = snapshot["action_contract"].get("shape")
@@ -1392,6 +1480,32 @@ def _partition_loaded_snapshot(
             "replay shard partition leaves ranks without data: "
             f"{empty_ranks}; use fewer ranks or publish more shard parts"
         )
+    if training_frontier is not None:
+        newest_counts = tuple(
+            sum(
+                int(shard["transition_count"])
+                for shard in assigned_shards
+                if int(shard["macro_round"]) == training_frontier
+            )
+            for assigned_shards in assignments
+        )
+        prior_counts = tuple(
+            sum(
+                int(shard["transition_count"])
+                for shard in assigned_shards
+                if int(shard["macro_round"]) < training_frontier
+            )
+            for assigned_shards in assignments
+        )
+        required = (newest_counts,) if training_frontier == 0 else (
+            newest_counts,
+            prior_counts,
+        )
+        if any(0 in counts or len(set(counts)) != 1 for counts in required):
+            raise LearnerError(
+                "exact uniform replay sampling requires equal non-empty source "
+                "populations on every learner rank"
+            )
     assigned = assignments[rank]
     transition_counts_by_rank = tuple(
         sum(int(shard["transition_count"]) for shard in assigned_shards)
@@ -1411,6 +1525,9 @@ def _partition_loaded_snapshot(
         loaded.append(
             _LoadedShard(
                 identity=f"{shard['logical_id']}/{shard['shard_id']}",
+                macro_round=_true_int(
+                    shard.get("macro_round"), "replay shard macro_round"
+                ),
                 arrays=arrays,
                 steps=steps,
                 envs=envs,
@@ -1423,41 +1540,7 @@ def _partition_loaded_snapshot(
         rank=rank,
         world_size=world_size,
         transition_counts_by_rank=transition_counts_by_rank,
-    )
-
-
-def load_heldout_partition(
-    snapshot_path: str | os.PathLike[str],
-    config: LearnerBundleConfig,
-    *,
-    rank: int = 0,
-    world_size: int = 1,
-    artifact_root: str | os.PathLike[str] | None = None,
-) -> ReplayPartition:
-    """Load one rank's immutable evaluation-only replay partition."""
-
-    if not config.heldout_evaluation_enabled:
-        raise LearnerError("learner bundle does not enable held-out evaluation")
-    rank = _true_int(rank, "rank")
-    world_size = _true_int(world_size, "world_size", minimum=1)
-    if rank >= world_size:
-        raise LearnerError("rank must be smaller than world_size")
-    try:
-        snapshot = load_heldout_snapshot(
-            snapshot_path,
-            expected_file_sha256=config.heldout_snapshot_file_sha256,
-            artifact_root=artifact_root,
-        )
-    except Exception as exc:
-        raise LearnerError(
-            f"held-out replay snapshot validation failed: {exc}"
-        ) from exc
-    if snapshot["snapshot_sha256"] != config.heldout_snapshot_sha256:
-        raise LearnerError("held-out replay snapshot semantic digest mismatch")
-    if snapshot["campaign_id"] != config.campaign_id:
-        raise LearnerError("learner campaign does not match held-out replay")
-    return _partition_loaded_snapshot(
-        snapshot, config, rank=rank, world_size=world_size
+        training_frontier=training_frontier,
     )
 
 
@@ -1521,6 +1604,159 @@ class DeterministicBatchSchedule:
             epoch, offset = divmod(position, self.size)
             result.append(self._permutation_for(epoch)[offset])
         return result
+
+
+class CumulativeDaggerBatchSchedule:
+    """Step-addressable BC/DAgger sampling over immutable example strata.
+
+    Round zero is pure behavior cloning.  Every later optimizer batch contains
+    exactly half examples from the newest sealed round and half from the union
+    of every earlier train round.  Each half walks an independent seeded random
+    permutation, so every example in that source population is sampled
+    uniformly before the schedule begins its next shuffled epoch.
+    """
+
+    def __init__(
+        self,
+        partition: ReplayPartition,
+        batch_size: int,
+        *,
+        seed: int,
+    ):
+        self.partition = partition
+        self.batch_size = _true_int(batch_size, "batch_size", minimum=1)
+        self.seed = _true_int(seed, "seed")
+        self.is_bc = partition.config.macro_round == 0
+        if self.is_bc:
+            self._bc = DeterministicBatchSchedule(
+                len(partition.newest_round_indices), self.batch_size, seed=self.seed
+            )
+            self._newest = None
+            self._prior = None
+            return
+        if self.batch_size % 2:
+            raise LearnerError(
+                "DAgger batch_size must be even for the exact 50/50 source contract"
+            )
+        half = self.batch_size // 2
+        self._bc = None
+        self._newest = DeterministicBatchSchedule(
+            len(partition.newest_round_indices),
+            half,
+            seed=self.seed + 0x4E4557,
+        )
+        self._prior = DeterministicBatchSchedule(
+            len(partition.cumulative_prior_indices),
+            half,
+            seed=self.seed + 0x5052494F52,
+        )
+
+    def indices(self, optimizer_step: int) -> list[int]:
+        optimizer_step = _true_int(optimizer_step, "optimizer_step")
+        if self.is_bc:
+            assert self._bc is not None
+            return [
+                self.partition.newest_round_indices[index]
+                for index in self._bc.indices(optimizer_step)
+            ]
+        assert self._newest is not None and self._prior is not None
+        newest = [
+            self.partition.newest_round_indices[index]
+            for index in self._newest.indices(optimizer_step)
+        ]
+        prior = [
+            self.partition.cumulative_prior_indices[index]
+            for index in self._prior.indices(optimizer_step)
+        ]
+        # Interleaving prevents source order from becoming an accidental model
+        # input while retaining an exact count that tests and telemetry can audit.
+        return [index for pair in zip(newest, prior) for index in pair]
+
+    def source_counts(self, optimizer_steps: int) -> dict[str, int]:
+        optimizer_steps = _true_int(optimizer_steps, "optimizer_steps")
+        examples = optimizer_steps * self.batch_size
+        if self.is_bc:
+            return {
+                "newest_source_examples": examples,
+                "prior_source_examples": 0,
+            }
+        return {
+            "newest_source_examples": examples // 2,
+            "prior_source_examples": examples // 2,
+        }
+
+
+def optimizer_source_exposure(
+    config: LearnerBundleConfig, *, completed_steps: int, world_size: int
+) -> dict[str, int | str]:
+    """Return the auditable global optimizer-example and source exposure."""
+
+    completed_steps = _true_int(completed_steps, "completed_steps")
+    world_size = _true_int(world_size, "world_size", minimum=1)
+    optimizer_examples = completed_steps * config.batch_size * world_size
+    if config.macro_round == 0:
+        return {
+            "sampling_policy": "bc_train_uniform_v1",
+            "optimizer_examples": optimizer_examples,
+            "newest_source_examples": optimizer_examples,
+            "prior_source_examples": 0,
+        }
+    if config.batch_size % 2:
+        raise LearnerError(
+            "DAgger batch_size must be even for the exact 50/50 source contract"
+        )
+    return {
+        "sampling_policy": "newest_half_cumulative_prior_half_uniform_v1",
+        "optimizer_examples": optimizer_examples,
+        "newest_source_examples": optimizer_examples // 2,
+        "prior_source_examples": optimizer_examples // 2,
+    }
+
+
+def optimizer_exposure_summary(
+    snapshot: Mapping[str, Any],
+    config: LearnerBundleConfig,
+    *,
+    completed_steps: int,
+    world_size: int,
+) -> dict[str, int | float | str]:
+    """Bind optimizer examples to source populations and expected passes."""
+
+    exposure = optimizer_source_exposure(
+        config, completed_steps=completed_steps, world_size=world_size
+    )
+    counts = snapshot.get("counts_by_round")
+    if not isinstance(counts, Mapping) or set(counts) != {
+        str(index) for index in range(config.macro_round + 1)
+    }:
+        raise LearnerError("training snapshot round populations are incomplete")
+    normalized = {
+        int(key): _true_int(value, f"round {key} transition count", minimum=1)
+        for key, value in counts.items()
+    }
+    newest_population = normalized[config.macro_round]
+    prior_population = sum(
+        normalized[index] for index in range(config.macro_round)
+    )
+    if config.macro_round == 0:
+        unit_examples = newest_population
+        prior_passes = 0.0
+    else:
+        if prior_population <= 0:
+            raise LearnerError("DAgger snapshot has no cumulative-prior population")
+        unit_examples = 2 * max(newest_population, prior_population)
+        prior_passes = int(exposure["prior_source_examples"]) / prior_population
+    optimizer_examples = int(exposure["optimizer_examples"])
+    return {
+        **exposure,
+        "newest_source_population": newest_population,
+        "prior_source_population": prior_population,
+        "balanced_exposure_unit_examples": unit_examples,
+        "balanced_exposure_units": optimizer_examples / unit_examples,
+        "newest_expected_passes": int(exposure["newest_source_examples"])
+        / newest_population,
+        "prior_expected_passes": prior_passes,
+    }
 
 
 def _aligned_learned_actions(
@@ -2240,12 +2476,9 @@ def _atomic_torch_save(path: Path, document: Mapping[str, Any]) -> None:
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        # RTX learner validation runs in the root-based Isaac image while the
-        # host coordinator runs as the workspace user.  A mkstemp-derived 0600
-        # restart is resumable by a later root container but cannot be hashed,
-        # copied, or attested by that coordinator.  Restart state contains no
-        # credentials; keep it owner-writable and make it read-only to group/
-        # other so cross-container persistence remains verifiable.
+        # Local H200 ranks may run as root while the campaign is owned by the
+        # submitting user. Keep restart state owner-writable and readable by
+        # later local stages so its digest can be verified.
         os.chmod(
             path,
             stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH,
@@ -2289,6 +2522,12 @@ def _checkpoint_document(
         )
     except PolicyIdentityError as exc:
         raise LearnerError(str(exc)) from exc
+    exposure = optimizer_exposure_summary(
+        snapshot,
+        config,
+        completed_steps=completed_steps,
+        world_size=world_size,
+    )
     return {
         "schema": CHECKPOINT_SCHEMA,
         # These two fields make the promoted payload directly consumable by
@@ -2299,6 +2538,7 @@ def _checkpoint_document(
         "policy_parameter_names": sorted(name for name, _ in policy.named_parameters()),
         "homie_controller_sha256": controller_sha256,
         "campaign_id": config.campaign_id,
+        "generation_id": config.generation_id,
         "macro_round": config.macro_round,
         "model_lineage_sha256": config.model_lineage_sha256,
         "code_sha256": config.code_sha256,
@@ -2308,7 +2548,9 @@ def _checkpoint_document(
         "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_sha256": snapshot["snapshot_sha256"],
         "replay_snapshot_file_sha256": snapshot["file_sha256"],
+        "training_counts_by_round": dict(snapshot["counts_by_round"]),
         "completed_steps": completed_steps,
+        **exposure,
         # This is the eval-mode loss on the deterministic replay probe before
         # the first update.  Keeping it in the restart frontier prevents a
         # resumed run from replacing the comparable experiment baseline.
@@ -2350,6 +2592,7 @@ def _load_restart(
         raise LearnerError("restart checkpoint schema mismatch")
     expected = {
         "campaign_id": config.campaign_id,
+        "generation_id": config.generation_id,
         "macro_round": config.macro_round,
         "model_lineage_sha256": config.model_lineage_sha256,
         "code_sha256": config.code_sha256,
@@ -2359,6 +2602,7 @@ def _load_restart(
         "learner_contract_sha256": learner_contract_sha256,
         "replay_snapshot_sha256": snapshot["snapshot_sha256"],
         "replay_snapshot_file_sha256": snapshot["file_sha256"],
+        "training_counts_by_round": dict(snapshot["counts_by_round"]),
         "world_size": world_size,
         "gradient_reduction": gradient_reduction,
         "homie_controller_sha256": config.to_mapping()["model_config"].get(
@@ -2371,6 +2615,14 @@ def _load_restart(
     if mismatches:
         raise LearnerError(f"restart lineage mismatch: {', '.join(mismatches)}")
     completed = _true_int(checkpoint.get("completed_steps"), "completed_steps")
+    exposure = optimizer_exposure_summary(
+        snapshot,
+        config,
+        completed_steps=completed,
+        world_size=world_size,
+    )
+    if any(checkpoint.get(key) != value for key, value in exposure.items()):
+        raise LearnerError("restart optimizer-example exposure mismatch")
     initial_loss = _finite_float(checkpoint.get("initial_loss"), "initial_loss")
     if initial_loss < 0.0:
         raise LearnerError("initial_loss must be non-negative")
@@ -2389,798 +2641,52 @@ def _load_restart(
 
 
 class JsonlTelemetry:
-    """Rank-zero durable JSONL telemetry with optional authenticated W&B logging."""
+    """Append rank-zero learner metrics to one local JSONL file."""
 
     def __init__(
-        self,
-        path: str | os.PathLike[str] | None,
-        *,
-        enabled: bool,
-        heldout_path: str | os.PathLike[str] | None = None,
-        training_quality_path: str | os.PathLike[str] | None = None,
-        dagger_dashboard: bool = False,
-        scene_sample_manifest: str | os.PathLike[str] | None = None,
-        wandb_project: str | None = None,
-        wandb_entity: str | None = None,
-        wandb_run_id: str | None = None,
-        wandb_resume_must: bool = False,
-        wandb_resume_never: bool = False,
-        wandb_config: Mapping[str, Any] | None = None,
-    ):
+        self, path: str | os.PathLike[str] | None, *, enabled: bool = True
+    ) -> None:
         self.path = (
-            Path(os.path.abspath(Path(path).expanduser()))
-            if path is not None and enabled
-            else None
+            None
+            if path is None or not enabled
+            else Path(os.path.abspath(Path(path).expanduser()))
         )
-        self.wandb_run = None
-        self.dagger_dashboard = bool(dagger_dashboard)
-        self.scene_sample_manifest = (
-            Path(os.path.abspath(Path(scene_sample_manifest).expanduser()))
-            if scene_sample_manifest is not None and enabled
-            else None
-        )
-        if heldout_path is not None and not enabled:
-            self.heldout_path = None
-        elif heldout_path is not None:
-            self.heldout_path = Path(
-                os.path.abspath(Path(heldout_path).expanduser())
-            )
-        elif self.path is not None:
-            self.heldout_path = self.path.with_name(
-                f"{self.path.stem}.heldout{self.path.suffix}"
-            )
-        else:
-            self.heldout_path = None
-        if training_quality_path is not None and not enabled:
-            self.training_quality_path = None
-        elif training_quality_path is not None:
-            self.training_quality_path = Path(
-                os.path.abspath(Path(training_quality_path).expanduser())
-            )
-        elif self.path is not None and self.dagger_dashboard:
-            self.training_quality_path = self.path.with_name(
-                f"{self.path.stem}.training_quality{self.path.suffix}"
-            )
-        else:
-            self.training_quality_path = None
         if self.path is not None:
+            if self.path.is_symlink():
+                raise LearnerError("telemetry path must not be a symbolic link")
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.heldout_path is not None:
-            self.heldout_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.training_quality_path is not None:
-            self.training_quality_path.parent.mkdir(parents=True, exist_ok=True)
-        self.training_context_path = (
-            self.training_quality_path.with_name("training_context.json")
-            if self.training_quality_path is not None and self.dagger_dashboard
-            else None
-        )
-        if enabled and wandb_project:
-            if wandb_resume_must and wandb_resume_never:
-                raise LearnerError(
-                    "W&B resume='must' and resume='never' are mutually exclusive"
-                )
-            if wandb_resume_must and not wandb_run_id:
-                raise LearnerError(
-                    "strict W&B resume requires a durable prior run ID"
-                )
-            if wandb_resume_never and not wandb_run_id:
-                raise LearnerError(
-                    "W&B resume='never' requires a canonical run ID"
-                )
-            try:
-                import wandb  # type: ignore
 
-                init_arguments: dict[str, Any] = {
-                    "project": wandb_project,
-                    "entity": wandb_entity,
-                    "id": wandb_run_id,
-                    "resume": (
-                        "must"
-                        if wandb_resume_must
-                        else (
-                            "never"
-                            if wandb_resume_never
-                            else ("allow" if wandb_run_id else None)
-                        )
-                    ),
-                    "config": dict(wandb_config or {}),
-                }
-                # Old validation fakes intentionally implement only the W&B
-                # init surface.  Real supported SDKs expose Settings; keep the
-                # low-overhead production behavior without making that helper
-                # an artificial requirement of the transport contract.
-                if hasattr(wandb, "Settings"):
-                    init_arguments["settings"] = wandb.Settings(
-                        x_disable_stats=True
-                    )
-                self.wandb_run = wandb.init(
-                    **init_arguments,
-                )
-                # Bind every model-quality series to the actual optimizer
-                # frontier.  Without this declaration W&B's generated panels
-                # can collapse sparse held-out evaluations into one-value bar
-                # summaries, which obscures whether the student improves.
-                self.wandb_run.define_metric("optimizer_step")
-                if self.dagger_dashboard:
-                    self.wandb_run.define_metric(
-                        "loss", step_metric="optimizer_step", hidden=True
-                    )
-                    self.wandb_run.define_metric(
-                        "quality/*", step_metric="optimizer_step", hidden=True
-                    )
-                    for namespace in (
-                        "1_scene_samples/*",
-                        "2_training_quality/*",
-                        "3_validation_ood/*",
-                    ):
-                        self.wandb_run.define_metric(
-                            namespace, step_metric="optimizer_step"
-                        )
-                else:
-                    self.wandb_run.define_metric(
-                        "loss", step_metric="optimizer_step"
-                    )
-                    self.wandb_run.define_metric(
-                        "quality/*", step_metric="optimizer_step"
-                    )
-            except Exception as exc:
-                raise LearnerError(f"W&B initialization failed: {exc}") from exc
-
-    @staticmethod
-    def _persist(path: Path | None, clean: Mapping[str, Any]) -> None:
-        if path is None:
+    def log(self, record: Mapping[str, Any]) -> None:
+        if self.path is None:
             return
-        clean = dict(clean)
-        payload = (
-            json.dumps(
-                clean, sort_keys=True, allow_nan=False, separators=(",", ":")
-            )
-            + "\n"
-        ).encode("utf-8")
-        # A scheduler can deliver SIGKILL while telemetry is being persisted.
-        # Appending directly to JSONL can then leave a torn final line,
-        # permanently wedging completion attestation even though the last
-        # durable restart is valid.  The production log is small (1200 scalar
-        # rows), so rewrite it through a same-directory temporary and
-        # atomically replace the old inode.  A crash exposes either the
-        # complete previous log or the complete new log.
-        if path.is_symlink():
-            raise LearnerError("telemetry path must not be a symlink")
-        existing = b""
-        if path.exists():
-            if not path.is_file():
-                raise LearnerError("telemetry path must be a regular file")
-            existing = path.read_bytes()
-            if existing and not existing.endswith(b"\n"):
-                raise LearnerError("telemetry log has a torn final record")
-        descriptor, name = tempfile.mkstemp(
-            prefix=f".{path.name}.", dir=path.parent
-        )
-        temporary = Path(name)
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(existing)
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            os.chmod(
-                path,
-                stat.S_IRUSR
-                | stat.S_IWUSR
-                | stat.S_IRGRP
-                | stat.S_IROTH,
-            )
-            directory = os.open(
-                path.parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            payload = (
+                json.dumps(
+                    dict(record), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True, allow_nan=False,
+                )
+                + "\n"
+            ).encode("ascii")
+        except (TypeError, ValueError) as exc:
+            raise LearnerError("telemetry record is not canonical JSON") from exc
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(self.path, flags, 0o644)
+        try:
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
         finally:
-            temporary.unlink(missing_ok=True)
-
-    @staticmethod
-    def _heldout_wandb_payload(record: Mapping[str, Any]) -> dict[str, Any]:
-        payload = {
-            "optimizer_step": record["optimizer_step"],
-            "quality/eval_frontier": record["eval_frontier"],
-            "quality/heldout_action_mse": record["action_mse"],
-            "quality/heldout_action_mae": record["action_mae"],
-            "quality/heldout_action_rmse": record["action_rmse"],
-            "quality/heldout_action_cosine": record["action_cosine"],
-            "quality/heldout_action_absolute_error_p90": record[
-                "action_absolute_error_p90"
-            ],
-            "quality/heldout_action_l2_p90": record["action_l2_p90"],
-            "quality/heldout_action_mse_delta_from_step0": record[
-                "action_mse_delta_from_step0"
-            ],
-            "quality/heldout_action_mse_relative_improvement_from_step0": record[
-                "action_mse_relative_improvement_from_step0"
-            ],
-            "quality/heldout_transitions": record["heldout_transitions_global"],
-        }
-        per_action = record.get("per_action")
-        if not isinstance(per_action, Mapping):
-            raise LearnerError("held-out telemetry per_action must be a mapping")
-        for action_index, metrics in per_action.items():
-            if not isinstance(metrics, Mapping):
-                raise LearnerError("held-out per-action metrics must be mappings")
-            for metric in ("mse", "mae", "rmse", "cosine"):
-                payload[f"quality/action_{action_index}/{metric}"] = metrics[metric]
-        return payload
-
-    @staticmethod
-    def _training_wandb_payload(record: Mapping[str, Any]) -> dict[str, Any]:
-        if record.get("schema") != TRAINING_QUALITY_TELEMETRY_SCHEMA:
-            raise LearnerError("training-quality telemetry schema mismatch")
-        payload = {
-            "optimizer_step": record["optimizer_step"],
-            "2_training_quality/probe_policy": record[
-                "training_probe_policy"
-            ],
-            "2_training_quality/probe_selection_sha256": record[
-                "training_probe_selection_sha256"
-            ],
-            "2_training_quality/probe_snapshot_sha256": record[
-                "training_snapshot_sha256"
-            ],
-            "2_training_quality/probe_budget": record[
-                "training_probe_budget"
-            ],
-            "2_training_quality/action_mse": record["action_mse"],
-            "2_training_quality/action_mae": record["action_mae"],
-            "2_training_quality/action_rmse": record["action_rmse"],
-            "2_training_quality/action_cosine": record["action_cosine"],
-            "2_training_quality/action_absolute_error_p90": record[
-                "action_absolute_error_p90"
-            ],
-            "2_training_quality/action_l2_p90": record["action_l2_p90"],
-            "2_training_quality/probe_transitions": record[
-                "training_probe_transitions_global"
-            ],
-            "2_training_quality/probe_current_round_transitions": record[
-                "training_probe_current_round_transitions_global"
-            ],
-            "2_training_quality/probe_historical_transitions": record[
-                "training_probe_historical_transitions_global"
-            ],
-            "2_training_quality/replay_population": record[
-                "training_replay_transitions_global"
-            ],
-        }
-        per_action = record.get("per_action")
-        per_action_p90 = record.get("per_action_absolute_error_p90")
-        if not isinstance(per_action, Mapping) or not isinstance(
-            per_action_p90, Mapping
-        ):
-            raise LearnerError("training-quality per-action metrics are malformed")
-        if set(per_action) != set(per_action_p90):
-            raise LearnerError("training-quality per-action p90 coverage mismatch")
-        for action_index, metrics in per_action.items():
-            if not isinstance(metrics, Mapping):
-                raise LearnerError("training-quality per-action metrics must be mappings")
-            for metric in ("mse", "mae", "rmse", "cosine"):
-                payload[
-                    f"2_training_quality/action_{action_index}/{metric}"
-                ] = metrics[metric]
-            payload[
-                f"2_training_quality/action_{action_index}/absolute_error_p90"
-            ] = per_action_p90[action_index]
-        return payload
-
-    @staticmethod
-    def _training_context_wandb_payload(
-        record: Mapping[str, float | int],
-    ) -> dict[str, Any]:
-        allowed = {
-            "parent_rollout_action_mse",
-            "parent_rollout_action_mae",
-            "parent_rollout_action_rmse",
-            "parent_rollout_action_cosine",
-            "parent_rollout_action_l2_p90",
-            "expert_intervention_rate",
-            "behavior_expert_match_rate",
-            "expert_label_coverage",
-            "replay_transitions",
-            "replay_environments",
-            "done_rate",
-            "scheduled_beta",
-        }
-        if set(record) != allowed:
-            raise LearnerError("training rollout context metric contract mismatch")
-        return {
-            f"2_training_quality/{key}": value for key, value in record.items()
-        }
-
-    @staticmethod
-    def _validation_ood_wandb_payload(
-        record: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        payload = {
-            "3_validation_ood/eval_frontier": record["eval_frontier"],
-            "3_validation_ood/action_mse": record["action_mse"],
-            "3_validation_ood/action_mae": record["action_mae"],
-            "3_validation_ood/action_rmse": record["action_rmse"],
-            "3_validation_ood/action_cosine": record["action_cosine"],
-            "3_validation_ood/action_absolute_error_p90": record[
-                "action_absolute_error_p90"
-            ],
-            "3_validation_ood/action_l2_p90": record["action_l2_p90"],
-            "3_validation_ood/action_mse_delta_from_step0": record[
-                "action_mse_delta_from_step0"
-            ],
-            "3_validation_ood/action_mse_relative_improvement_from_step0": record[
-                "action_mse_relative_improvement_from_step0"
-            ],
-            "3_validation_ood/transitions": record[
-                "heldout_transitions_global"
-            ],
-        }
-        per_action = record.get("per_action")
-        if not isinstance(per_action, Mapping):
-            raise LearnerError("held-out telemetry per_action must be a mapping")
-        for action_index, metrics in per_action.items():
-            if not isinstance(metrics, Mapping):
-                raise LearnerError("held-out per-action metrics must be mappings")
-            for metric in ("mse", "mae", "rmse", "cosine"):
-                payload[
-                    f"3_validation_ood/action_{action_index}/{metric}"
-                ] = metrics[metric]
-        return payload
-
-    def persist_training_context(self, record: Mapping[str, Any]) -> None:
-        """Publish one immutable local record for static rollout context.
-
-        The context is computed from the sealed replay and is invariant across
-        optimizer frontiers.  Persist it before the first W&B update so local
-        evidence never depends on successful remote delivery.  A restart may
-        replay this publication only when the canonical bytes are identical.
-        """
-
-        path = self.training_context_path
-        if path is None:
-            return
-        clean = dict(record)
-        expected_keys = {
-            "schema",
-            "campaign_id",
-            "macro_round",
-            "learner_config_sha256",
-            "model_lineage_sha256",
-            "replay_snapshot_file_sha256",
-            "replay_snapshot_sha256",
-            "training_probe_selection_sha256",
-            "metrics",
-        }
-        metrics = clean.get("metrics")
-        if (
-            set(clean) != expected_keys
-            or clean.get("schema") != TRAINING_CONTEXT_TELEMETRY_SCHEMA
-            or not isinstance(clean.get("campaign_id"), str)
-            or not clean["campaign_id"]
-            or isinstance(clean.get("macro_round"), bool)
-            or not isinstance(clean.get("macro_round"), int)
-            or clean["macro_round"] < 0
-            or not isinstance(metrics, Mapping)
-        ):
-            raise LearnerError("training-context telemetry contract mismatch")
-        for key in (
-            "learner_config_sha256",
-            "model_lineage_sha256",
-            "replay_snapshot_file_sha256",
-            "replay_snapshot_sha256",
-            "training_probe_selection_sha256",
-        ):
-            _require_sha256(clean.get(key), f"training-context {key}")
-        # This validates exact metric coverage before anything reaches W&B.
-        self._training_context_wandb_payload(metrics)
-        for key, value in metrics.items():
-            _finite_float(value, f"training-context metric {key}")
-        canonical = (
-            json.dumps(
-                clean,
-                sort_keys=True,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("utf-8")
-        if path.exists() or path.is_symlink():
-            if path.is_symlink() or not path.is_file():
-                raise LearnerError("training-context telemetry path is unsafe")
-            if path.read_bytes() != canonical:
-                raise LearnerError("training-context telemetry changed across restart")
-            return
-        self._persist(path, clean)
-
-    @staticmethod
-    def _heldout_baseline_from_history(
-        path: Path | None, record: Mapping[str, Any]
-    ) -> float | None:
-        if path is None or not path.exists():
-            return None
-        if path.is_symlink() or not path.is_file():
-            raise LearnerError("held-out telemetry path is unsafe")
-        raw = path.read_bytes()
-        if raw and not raw.endswith(b"\n"):
-            raise LearnerError("held-out telemetry log has a torn final record")
-        identity_keys = (
-            "campaign_id",
-            "macro_round",
-            "heldout_snapshot_sha256",
-            "heldout_snapshot_file_sha256",
-            "learned_action_indices",
-        )
-        baselines: list[float] = []
-        for line_number, line in enumerate(raw.splitlines(), start=1):
-            try:
-                existing = json.loads(line)
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise LearnerError(
-                    f"held-out telemetry line {line_number} is invalid"
-                ) from exc
-            if not isinstance(existing, Mapping):
-                raise LearnerError("held-out telemetry history is malformed")
-            if existing.get("optimizer_step") != 0:
-                continue
-            if any(existing.get(key) != record.get(key) for key in identity_keys):
-                raise LearnerError("held-out step-zero baseline identity mismatch")
-            baseline = _finite_float(
-                existing.get("action_mse"), "held-out step-zero action_mse"
-            )
-            if baseline < 0.0:
-                raise LearnerError("held-out step-zero action_mse is negative")
-            baselines.append(baseline)
-        if not baselines:
-            return None
-        if any(value != baselines[0] for value in baselines[1:]):
-            raise LearnerError("held-out telemetry has conflicting step-zero baselines")
-        return baselines[0]
-
-    def _enrich_heldout_record(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        clean = dict(record)
-        step = _true_int(clean.get("optimizer_step"), "optimizer_step")
-        mse = _finite_float(clean.get("action_mse"), "held-out action_mse")
-        if mse < 0.0:
-            raise LearnerError("held-out action_mse is negative")
-        baseline = getattr(self, "_heldout_baseline_action_mse", None)
-        if step == 0:
-            if baseline is not None and baseline != mse:
-                raise LearnerError("held-out step-zero baseline changed")
-            baseline = mse
-            self._heldout_baseline_action_mse = baseline
-        elif baseline is None:
-            baseline = self._heldout_baseline_from_history(self.heldout_path, clean)
-            if baseline is None:
-                raise LearnerError(
-                    "held-out step-zero baseline is required before later evaluations"
-                )
-            self._heldout_baseline_action_mse = baseline
-        delta = mse - baseline
-        if baseline == 0.0:
-            if mse != 0.0:
-                raise LearnerError(
-                    "held-out relative improvement is undefined from a zero baseline"
-                )
-            relative_improvement = 0.0
-        else:
-            relative_improvement = (baseline - mse) / baseline
-        derived = {
-            "eval_frontier": step,
-            "action_mse_delta_from_step0": delta,
-            "action_mse_relative_improvement_from_step0": relative_improvement,
-        }
-        for key, value in derived.items():
-            if key in clean and clean[key] != value:
-                raise LearnerError(f"held-out derived metric {key} changed")
-            clean[key] = value
-        return clean
-
-    @staticmethod
-    def _heldout_record_already_persisted(
-        path: Path | None, record: Mapping[str, Any]
-    ) -> bool:
-        """Make replayed evaluation frontiers idempotent after restart."""
-
-        if path is None or not path.exists():
-            return False
-        if path.is_symlink() or not path.is_file():
-            raise LearnerError("held-out telemetry path is unsafe")
-        raw = path.read_bytes()
-        if raw and not raw.endswith(b"\n"):
-            raise LearnerError("held-out telemetry log has a torn final record")
-        target_step = _true_int(record.get("optimizer_step"), "optimizer_step")
-        target_bytes = json.dumps(
-            dict(record),
-            sort_keys=True,
-            allow_nan=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        seen: dict[int, bytes] = {}
-        for line_number, line in enumerate(raw.splitlines(), start=1):
-            try:
-                existing = json.loads(line)
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise LearnerError(
-                    f"held-out telemetry line {line_number} is invalid"
-                ) from exc
-            if (
-                not isinstance(existing, Mapping)
-                or existing.get("schema") != HELDOUT_TELEMETRY_SCHEMA
-            ):
-                raise LearnerError("held-out telemetry history schema mismatch")
-            step = _true_int(
-                existing.get("optimizer_step"),
-                f"held-out telemetry line {line_number} optimizer_step",
-            )
-            canonical = json.dumps(
-                dict(existing),
-                sort_keys=True,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            if step in seen and seen[step] != canonical:
-                raise LearnerError(
-                    "held-out telemetry contains conflicting duplicate steps"
-                )
-            seen[step] = canonical
-        if target_step in seen:
-            if seen[target_step] != target_bytes:
-                raise LearnerError(
-                    "held-out telemetry changed across deterministic restart"
-                )
-            return True
-        if seen and target_step < max(seen):
-            raise LearnerError(
-                "held-out telemetry restart would create a missing historical step"
-            )
-        return False
-
-    def log(
-        self,
-        record: Mapping[str, Any],
-        *,
-        wandb_extra: Mapping[str, Any] | None = None,
-    ) -> None:
-        clean = dict(record)
-        self._persist(self.path, clean)
-        if self.wandb_run is not None:
-            wandb_record = dict(clean)
-            if self.dagger_dashboard:
-                wandb_record.update(
-                    {
-                        "2_training_quality/optimization_loss": clean["loss"],
-                        "2_training_quality/gradient_l2_norm": clean[
-                            "gradient_l2_norm"
-                        ],
-                        "2_training_quality/learning_rate": clean[
-                            "learning_rate"
-                        ],
-                        "2_training_quality/global_samples_seen": clean[
-                            "global_samples_seen"
-                        ],
-                        "2_training_quality/replay_transitions": clean[
-                            "replay_transitions_global"
-                        ],
-                    }
-                )
-            if wandb_extra is not None:
-                extension = dict(wandb_extra)
-                duplicate = set(wandb_record) & set(extension)
-                conflicting = {
-                    key
-                    for key in duplicate
-                    if wandb_record[key] != extension[key]
-                }
-                if conflicting:
-                    raise LearnerError(
-                        "W&B telemetry extension conflicts with base fields: "
-                        + ", ".join(sorted(conflicting))
-                    )
-                for key in duplicate:
-                    extension.pop(key)
-                wandb_record.update(extension)
-            # W&B's internal step remains append-only across restarts.  The
-            # explicit optimizer_step field is the declared custom x-axis, so
-            # replaying an equal/older durable frontier cannot be discarded as
-            # an out-of-order global-step update.
-            self.wandb_run.log(wandb_record)
-
-    def log_training_quality(
-        self, record: Mapping[str, Any], *, log_wandb: bool = True
-    ) -> dict[str, Any]:
-        clean = dict(record)
-        if clean.get("schema") != TRAINING_QUALITY_TELEMETRY_SCHEMA:
-            raise LearnerError("training-quality telemetry schema mismatch")
-        already_persisted = False
-        path = self.training_quality_path
-        if path is not None and path.exists():
-            if path.is_symlink() or not path.is_file():
-                raise LearnerError("training-quality telemetry path is unsafe")
-            raw = path.read_bytes()
-            if raw and not raw.endswith(b"\n"):
-                raise LearnerError(
-                    "training-quality telemetry has a torn final record"
-                )
-            target_step = _true_int(clean.get("optimizer_step"), "optimizer_step")
-            target = json.dumps(
-                clean,
-                sort_keys=True,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            observed: dict[int, bytes] = {}
-            for line_number, line in enumerate(raw.splitlines(), start=1):
-                try:
-                    existing = json.loads(line)
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise LearnerError(
-                        f"training-quality telemetry line {line_number} is invalid"
-                    ) from exc
-                if (
-                    not isinstance(existing, Mapping)
-                    or existing.get("schema") != TRAINING_QUALITY_TELEMETRY_SCHEMA
-                ):
-                    raise LearnerError("training-quality telemetry schema mismatch")
-                step = _true_int(existing.get("optimizer_step"), "optimizer_step")
-                canonical = json.dumps(
-                    dict(existing),
-                    sort_keys=True,
-                    allow_nan=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                if step in observed and observed[step] != canonical:
-                    raise LearnerError(
-                        "training-quality telemetry has conflicting duplicate steps"
-                    )
-                observed[step] = canonical
-            if target_step in observed:
-                if observed[target_step] != target:
-                    raise LearnerError(
-                        "training-quality telemetry changed across restart"
-                    )
-                already_persisted = True
-            elif observed and target_step < max(observed):
-                raise LearnerError(
-                    "training-quality restart would create a historical gap"
-                )
-        if not already_persisted:
-            self._persist(path, clean)
-        payload = self._training_wandb_payload(clean)
-        if log_wandb and self.wandb_run is not None:
-            self.wandb_run.log(payload)
-        return payload
-
-    def log_dashboard_frontier(
-        self,
-        *,
-        optimizer_step: int,
-        training_quality: Mapping[str, Any],
-        validation_ood: Mapping[str, Any],
-        training_context: Mapping[str, float | int] | None = None,
-        include_scene_samples: bool = False,
-    ) -> None:
-        """Publish one sparse, sectioned dashboard frontier."""
-
-        if not self.dagger_dashboard or self.wandb_run is None:
-            return
-        payload: dict[str, Any] = {"optimizer_step": optimizer_step}
-        payload.update(training_quality)
-        payload.update(validation_ood)
-        if training_context is not None:
-            payload.update(self._training_context_wandb_payload(training_context))
-        if include_scene_samples:
-            payload.update(self._scene_sample_wandb_payload())
-        self.wandb_run.log(payload)
-
-    def _scene_sample_wandb_payload(self) -> dict[str, Any]:
-        """Load only SHA-pinned, bounded contact sheets from the handoff."""
-
-        manifest_path = self.scene_sample_manifest
-        if manifest_path is None:
-            raise LearnerError("scene sample manifest is required by dashboard mode")
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise LearnerError("scene sample manifest must be a regular file")
-        try:
-            manifest = load_strict_json(manifest_path)
-        except Exception as exc:
-            raise LearnerError("scene sample manifest is invalid") from exc
-        if manifest.get("schema") != "fast_roborender.round_dagger.scene_samples.v1":
-            raise LearnerError("scene sample manifest schema mismatch")
-        core = dict(manifest)
-        claimed_set_sha256 = core.pop("sample_set_sha256", None)
-        if (
-            not isinstance(claimed_set_sha256, str)
-            or canonical_json_sha256(core) != claimed_set_sha256
-        ):
-            raise LearnerError("scene sample set digest mismatch")
-        samples = manifest.get("samples")
-        if not isinstance(samples, list) or not 1 <= len(samples) <= 4:
-            raise LearnerError("scene sample count must be in [1,4]")
-        row_labels = manifest.get("row_labels")
-        view_labels = manifest.get("view_labels")
-        if row_labels != ["depth", "mask", "client_anchor", "generated"]:
-            raise LearnerError("scene sample row labels are not canonical")
-        if view_labels != ["head_color", "hand_left", "hand_right"]:
-            raise LearnerError("scene sample view labels are not canonical")
-        try:
-            import wandb  # type: ignore
-        except Exception as exc:
-            raise LearnerError("W&B media support is unavailable") from exc
-        images: list[Any] = []
-        for sample in samples:
-            if not isinstance(sample, Mapping):
-                raise LearnerError("scene sample record is malformed")
-            name = sample.get("path")
-            if (
-                not isinstance(name, str)
-                or Path(name).name != name
-                or not name.endswith("_conditions_generated.png")
-            ):
-                raise LearnerError("scene sample path is unsafe")
-            path = manifest_path.parent / name
-            if path.is_symlink() or not path.is_file():
-                raise LearnerError("scene sample image must be a regular file")
-            if sample.get("width") != 1252 or sample.get("height") != 1046:
-                raise LearnerError("scene sample dimensions changed")
-            expected_sha256 = sample.get("sha256")
-            if (
-                not isinstance(expected_sha256, str)
-                or _SHA256_RE.fullmatch(expected_sha256) is None
-                or sha256_file(path) != expected_sha256
-            ):
-                raise LearnerError("scene sample image digest mismatch")
-            images.append(
-                wandb.Image(
-                    str(path),
-                    caption=(
-                        f"actor rank {manifest['actor_rank']} · rollout step "
-                        f"{sample['rollout_step']} · rows depth | mask | "
-                        "client anchor | RoboRender generated · columns "
-                        "head | left hand | right hand"
-                    ),
-                )
-            )
-        return {"1_scene_samples/conditions_and_rendered": images}
-
-    def log_heldout(
-        self, record: Mapping[str, Any], *, log_wandb: bool = True
-    ) -> dict[str, Any]:
-        clean = self._enrich_heldout_record(record)
-        if clean.get("schema") != HELDOUT_TELEMETRY_SCHEMA:
-            raise LearnerError("held-out telemetry schema mismatch")
-        already_persisted = self._heldout_record_already_persisted(
-            self.heldout_path, clean
-        )
-        if not already_persisted:
-            self._persist(self.heldout_path, clean)
-        wandb_payload = self._heldout_wandb_payload(clean)
-        if self.dagger_dashboard:
-            wandb_payload.update(self._validation_ood_wandb_payload(clean))
-        # Local JSONL idempotence and remote delivery are separate frontiers.
-        # A process can be killed after the fsynced record is durable but
-        # before the W&B sender acknowledges it.  Re-log an identical due
-        # frontier on restart; the explicit optimizer step makes the update
-        # deterministic, while the local history still contains exactly one
-        # canonical row per step.
-        if log_wandb and self.wandb_run is not None:
-            self.wandb_run.log(wandb_payload)
-        return wandb_payload
+            os.close(descriptor)
 
     def close(self, *, exit_code: int = 0) -> None:
-        if self.wandb_run is not None:
-            self.wandb_run.finish(exit_code=exit_code)
+        if type(exit_code) is not int:
+            raise LearnerError("telemetry exit code must be an integer")
 
 
 @dataclass(frozen=True)
 class TrainResult:
     completed_steps: int
     target_steps: int
-    validation_stopped: bool
+    exposure: Mapping[str, int | float | str]
     initial_loss: float
     final_loss: float
     restart_checkpoint: str
@@ -3194,25 +2700,42 @@ def train_from_replay(
     snapshot_path: str | os.PathLike[str],
     config: LearnerBundleConfig,
     output_dir: str | os.PathLike[str],
-    max_steps: int,
+    target_optimizer_examples: int,
     adapter: PolicyAdapter | None = None,
     device: torch.device | str = "cpu",
     resume_from: str | os.PathLike[str] | None = None,
     expected_snapshot_file_sha256: str | None = None,
-    heldout_snapshot_path: str | os.PathLike[str] | None = None,
     artifact_root: str | os.PathLike[str] | None = None,
-    save_every: int = 100,
+    checkpoint_every_optimizer_examples: int,
     telemetry: JsonlTelemetry | None = None,
-    validation_stop_at_step: int | None = None,
     learner_identity_sha256: str | None = None,
     runtime_container_sha256: str | None = None,
     learner_contract_sha256: str | None = None,
-    dagger_beta: float | None = None,
 ) -> TrainResult:
     """Run supervised DAgger updates over one immutable cumulative snapshot."""
 
-    max_steps = _true_int(max_steps, "max_steps", minimum=1)
-    save_every = _true_int(save_every, "save_every", minimum=1)
+    target_optimizer_examples = _true_int(
+        target_optimizer_examples, "target_optimizer_examples", minimum=1
+    )
+    snapshot_path = _require_campaign_storage_path(
+        snapshot_path,
+        "train replay snapshot",
+        generation_id=config.generation_id,
+    )
+    output_dir = _require_campaign_storage_path(
+        output_dir,
+        "learner output",
+        generation_id=config.generation_id,
+    )
+    if resume_from is not None:
+        resume_from = _require_campaign_storage_path(
+            resume_from, "restart checkpoint"
+        )
+    checkpoint_every_optimizer_examples = _true_int(
+        checkpoint_every_optimizer_examples,
+        "checkpoint_every_optimizer_examples",
+        minimum=1,
+    )
     semantic_identity = (
         learner_identity_sha256,
         runtime_container_sha256,
@@ -3232,15 +2755,31 @@ def train_from_replay(
         learner_contract_sha256 = _require_sha256(
             learner_contract_sha256, "learner contract SHA-256"
         )
-    if validation_stop_at_step is not None:
-        validation_stop_at_step = _true_int(
-            validation_stop_at_step, "validation_stop_at_step", minimum=1
-        )
-        if validation_stop_at_step >= max_steps:
-            raise LearnerError(
-                "validation_stop_at_step must be below the final max_steps frontier"
-            )
     rank, world_size = _distributed_context()
+    examples_per_step = config.batch_size * world_size
+    max_steps, remainder = divmod(target_optimizer_examples, examples_per_step)
+    if remainder or max_steps < 1:
+        raise LearnerError(
+            "target_optimizer_examples must be a positive multiple of "
+            "batch_size * world_size"
+        )
+    if target_optimizer_examples > config.target_optimizer_examples:
+        raise LearnerError(
+            "target_optimizer_examples exceeds the immutable stage maximum"
+        )
+    save_every, save_remainder = divmod(
+        checkpoint_every_optimizer_examples, examples_per_step
+    )
+    if (
+        save_remainder
+        or save_every < 1
+        or checkpoint_every_optimizer_examples
+        != config.checkpoint_every_optimizer_examples
+    ):
+        raise LearnerError(
+            "checkpoint_every_optimizer_examples must be a positive bundle-pinned "
+            "multiple of batch_size * world_size"
+        )
     device = torch.device(device)
     configure_deterministic_runtime(device)
     random.seed(config.seed + rank)
@@ -3256,23 +2795,6 @@ def train_from_replay(
         expected_snapshot_file_sha256=expected_snapshot_file_sha256,
         artifact_root=artifact_root,
     )
-    if config.heldout_evaluation_enabled != (heldout_snapshot_path is not None):
-        raise LearnerError(
-            "held-out snapshot path and immutable bundle configuration must "
-            "be supplied together"
-        )
-    heldout_partition = None
-    if heldout_snapshot_path is not None:
-        heldout_partition = load_heldout_partition(
-            heldout_snapshot_path,
-            config,
-            rank=rank,
-            world_size=world_size,
-            artifact_root=artifact_root,
-        )
-        _assert_training_and_heldout_are_disjoint(
-            partition.snapshot, heldout_partition.snapshot
-        )
     model = model.to(device)
     gradient_reduction = SINGLE_PROCESS_GRADIENT_REDUCTION
     if world_size > 1 and not isinstance(model, DistributedDataParallel):
@@ -3318,26 +2840,15 @@ def train_from_replay(
         )
     if completed_steps > max_steps:
         raise LearnerError("restart completed_steps exceeds requested max_steps")
-    if (
-        validation_stop_at_step is not None
-        and completed_steps >= validation_stop_at_step
-    ):
-        raise LearnerError(
-            "validation_stop_at_step must be beyond the restart completed_steps"
-        )
-    training_frontier = (
-        max_steps
-        if validation_stop_at_step is None
-        else validation_stop_at_step
-    )
+    training_frontier = max_steps
     saved_at_step = (
         completed_steps
         if resume_from is not None
         and Path(resume_from).expanduser().resolve() == restart_path
         else -1
     )
-    schedule = DeterministicBatchSchedule(
-        partition.transition_count, config.batch_size, seed=config.seed
+    schedule = CumulativeDaggerBatchSchedule(
+        partition, config.batch_size, seed=config.seed
     )
     adapter = adapter or MappingPolicyAdapter(config.output_key)
     probe_schedule = DeterministicBatchSchedule(
@@ -3358,109 +2869,7 @@ def train_from_replay(
             rank=rank,
             world_size=world_size,
         )
-    dashboard_enabled = telemetry is not None and telemetry.dagger_dashboard
-    if dashboard_enabled != (dagger_beta is not None):
-        raise LearnerError(
-            "dashboard training requires exactly one lineage-verified DAgger beta"
-        )
-    training_quality_probe = (
-        build_training_quality_probe(
-            partition.snapshot,
-            world_size=world_size,
-            partition_seed=config.partition_seed,
-        )
-        if dashboard_enabled
-        else None
-    )
-    training_context = (
-        summarize_training_rollout_context(
-            partition,
-            config.train_action_slice,
-            scheduled_beta=float(dagger_beta),
-            probe=training_quality_probe,
-        )
-        if dashboard_enabled
-        else None
-    )
-    if dashboard_enabled and rank == 0:
-        assert telemetry is not None
-        assert training_context is not None
-        assert training_quality_probe is not None
-        telemetry.persist_training_context(
-            {
-                "schema": TRAINING_CONTEXT_TELEMETRY_SCHEMA,
-                "campaign_id": config.campaign_id,
-                "macro_round": config.macro_round,
-                "learner_config_sha256": config.sha256,
-                "model_lineage_sha256": config.model_lineage_sha256,
-                "replay_snapshot_file_sha256": partition.snapshot["file_sha256"],
-                "replay_snapshot_sha256": partition.snapshot["snapshot_sha256"],
-                "training_probe_selection_sha256": training_quality_probe.summary()[
-                    "selection_sha256"
-                ],
-                "metrics": dict(training_context),
-            }
-        )
     model.train()
-    # Re-evaluate a due restart frontier before taking another update.  This
-    # closes the crash window in which the checkpoint and local quality row are
-    # durable but the remote telemetry sender has not synchronized yet.  The
-    # JSONL writer verifies that a repeated frontier is byte-identical.
-    heldout_frontier_due = (
-        heldout_partition is not None
-        and config.heldout_eval_interval is not None
-        and (
-            completed_steps == 0
-            or completed_steps % config.heldout_eval_interval == 0
-            or completed_steps == max_steps
-        )
-    )
-    if heldout_frontier_due:
-        assert heldout_partition is not None
-        heldout_record = evaluate_heldout_actions(
-            model,
-            partition=heldout_partition,
-            adapter=adapter,
-            device=device,
-            optimizer_step=completed_steps,
-        )
-        training_record = None
-        if dashboard_enabled:
-            assert training_quality_probe is not None
-            training_record = _training_quality_record(
-                evaluate_heldout_actions(
-                    model,
-                    partition=partition,
-                    adapter=adapter,
-                    device=device,
-                    optimizer_step=completed_steps,
-                    indices=training_quality_probe.indices_by_rank[rank],
-                    transition_counts_by_rank=training_quality_probe.summary()[
-                        "transitions_per_rank"
-                    ],
-                    include_per_action_p90=True,
-                ),
-                probe=training_quality_probe,
-                rank=rank,
-            )
-        if rank == 0 and telemetry is not None:
-            if dashboard_enabled:
-                assert training_record is not None
-                training_wandb = telemetry.log_training_quality(
-                    training_record, log_wandb=False
-                )
-                heldout_wandb = telemetry.log_heldout(
-                    heldout_record, log_wandb=False
-                )
-                telemetry.log_dashboard_frontier(
-                    optimizer_step=completed_steps,
-                    training_quality=training_wandb,
-                    validation_ood=heldout_wandb,
-                    training_context=training_context,
-                    include_scene_samples=completed_steps == 0,
-                )
-            else:
-                telemetry.log_heldout(heldout_record, log_wandb=True)
     for step in range(completed_steps, training_frontier):
         observations, targets = partition.batch(schedule.indices(step), device=device)
         optimizer.zero_grad(set_to_none=True)
@@ -3487,67 +2896,24 @@ def train_from_replay(
             scalar = _ordered_allgather_sum(scalar, world_size) / world_size
         loss_value = float(scalar.cpu())
         completed_steps = step + 1
-        dashboard_wandb: dict[str, Any] = {}
-        heldout_due = (
-            heldout_partition is not None
-            and config.heldout_eval_interval is not None
-            and (
-                completed_steps % config.heldout_eval_interval == 0
-                or completed_steps == max_steps
-            )
-        )
-        if heldout_due:
-            assert heldout_partition is not None
-            heldout_record = evaluate_heldout_actions(
-                model,
-                partition=heldout_partition,
-                adapter=adapter,
-                device=device,
-                optimizer_step=completed_steps,
-            )
-            training_record = None
-            if dashboard_enabled:
-                assert training_quality_probe is not None
-                training_record = _training_quality_record(
-                    evaluate_heldout_actions(
-                        model,
-                        partition=partition,
-                        adapter=adapter,
-                        device=device,
-                        optimizer_step=completed_steps,
-                        indices=training_quality_probe.indices_by_rank[rank],
-                        transition_counts_by_rank=training_quality_probe.summary()[
-                            "transitions_per_rank"
-                        ],
-                        include_per_action_p90=True,
-                    ),
-                    probe=training_quality_probe,
-                    rank=rank,
-                )
-            if rank == 0 and telemetry is not None:
-                if dashboard_enabled:
-                    assert training_record is not None
-                    dashboard_wandb.update(
-                        telemetry.log_training_quality(
-                            training_record, log_wandb=False
-                        )
-                    )
-                dashboard_wandb.update(
-                    telemetry.log_heldout(heldout_record, log_wandb=False)
-                )
         if rank == 0 and telemetry is not None:
+            exposure = optimizer_exposure_summary(
+                partition.snapshot,
+                config,
+                completed_steps=completed_steps,
+                world_size=world_size,
+            )
             telemetry.log(
                 {
                     "schema": TELEMETRY_SCHEMA,
                     "campaign_id": config.campaign_id,
+                    "generation_id": config.generation_id,
                     "macro_round": config.macro_round,
                     "optimizer_step": completed_steps,
                     "loss": loss_value,
                     "gradient_l2_norm": gradient_norm,
                     "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                    "global_samples_seen": completed_steps
-                    * config.batch_size
-                    * world_size,
+                    **exposure,
                     "replay_transitions_rank": partition.transition_count,
                     "replay_transitions_per_rank": list(
                         partition.transition_counts_by_rank
@@ -3556,7 +2922,6 @@ def train_from_replay(
                     "world_size": world_size,
                     "gradient_reduction": gradient_reduction,
                 },
-                wandb_extra=dashboard_wandb or None,
             )
         if (
             completed_steps % save_every == 0
@@ -3634,10 +2999,16 @@ def train_from_replay(
         rank=rank,
         world_size=world_size,
     )
+    exposure = optimizer_exposure_summary(
+        partition.snapshot,
+        config,
+        completed_steps=completed_steps,
+        world_size=world_size,
+    )
     return TrainResult(
         completed_steps=completed_steps,
         target_steps=max_steps,
-        validation_stopped=validation_stop_at_step is not None,
+        exposure=exposure,
         initial_loss=first_loss,
         final_loss=final_loss,
         restart_checkpoint=str(restart_path),
@@ -3646,50 +3017,243 @@ def train_from_replay(
     )
 
 
-def _publish_immutable_binary(source: Path, destination: Path) -> str:
-    source = source.expanduser().resolve()
-    if source.is_symlink() or not source.is_file():
-        raise LearnerError("candidate source checkpoint is missing or unsafe")
+def _private_binary_snapshot(
+    source: Path, destination: Path
+) -> tuple[Path, str, bool]:
+    """Copy a possibly mutable source once into a private same-filesystem inode."""
+
+    source = Path(os.path.abspath(source.expanduser()))
+    source_descriptor: int | None = None
+    snapshot: Path | None = None
+    snapshot_descriptor: int | None = None
+    snapshot_ready = False
     destination = destination.expanduser().resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    expected = sha256_file(source)
-    if destination.exists():
-        if destination.is_symlink() or sha256_file(destination) != expected:
-            raise LearnerError(
-                "immutable candidate path already contains different bytes"
-            )
-        return expected
-    descriptor, name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", dir=destination.parent
-    )
-    temporary = Path(name)
+    parent_preexisted = destination.parent.exists()
     try:
-        with source.open("rb") as incoming, os.fdopen(descriptor, "wb") as outgoing:
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+            raise LearnerError("candidate source checkpoint is missing or unsafe")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_descriptor, snapshot_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.snapshot.", dir=destination.parent
+        )
+        snapshot = Path(snapshot_name)
+        with os.fdopen(source_descriptor, "rb") as incoming, os.fdopen(
+            snapshot_descriptor, "wb"
+        ) as outgoing:
+            source_descriptor = None
+            snapshot_descriptor = None
             for chunk in iter(lambda: incoming.read(8 * 1024 * 1024), b""):
                 outgoing.write(chunk)
             outgoing.flush()
             os.fsync(outgoing.fileno())
-        if sha256_file(temporary) != expected:
-            raise LearnerError("candidate checkpoint copy digest mismatch")
-        try:
-            os.link(temporary, destination)
-        except FileExistsError:
-            if sha256_file(destination) != expected:
-                raise LearnerError("competing candidate publication changed bytes")
-        os.chmod(destination, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-        directory = os.open(
-            destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        os.chmod(snapshot, stat.S_IRUSR)
+        snapshot_sha256 = sha256_file(snapshot)
+        snapshot_ready = True
+        return snapshot, snapshot_sha256, parent_preexisted
+    except OSError as exc:
+        raise LearnerError("candidate source checkpoint is missing or unsafe") from exc
     finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+        if snapshot_descriptor is not None:
+            os.close(snapshot_descriptor)
+        if not snapshot_ready:
+            if snapshot is not None:
+                try:
+                    snapshot.unlink()
+                except FileNotFoundError:
+                    pass
+            if not parent_preexisted:
+                try:
+                    destination.parent.rmdir()
+                except OSError:
+                    pass
+
+
+def _publish_immutable_binary(
+    snapshot: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+    parent_preexisted: bool,
+) -> str:
+    """Link one already-validated private snapshot into its canonical basename."""
+
+    snapshot = Path(os.path.abspath(snapshot.expanduser()))
+    destination = destination.expanduser().resolve()
+    expected = _require_sha256(
+        expected_sha256, "candidate source checkpoint SHA-256"
+    )
+    published = False
+    created_destination = False
+    try:
+        if (
+            snapshot.is_symlink()
+            or not snapshot.is_file()
+            or snapshot.parent != destination.parent
+            or sha256_file(snapshot) != expected
+        ):
+            raise LearnerError(
+                "private candidate checkpoint changed before publication"
+            )
+        if destination.exists():
+            if destination.is_symlink() or sha256_file(destination) != expected:
+                raise LearnerError(
+                    "immutable candidate path already contains different bytes"
+                )
+            published = True
+            return expected
         try:
-            temporary.unlink()
+            os.link(snapshot, destination)
+            created_destination = True
+        except FileExistsError:
+            if destination.is_symlink() or sha256_file(destination) != expected:
+                raise LearnerError("competing candidate publication changed bytes")
+        try:
+            os.chmod(destination, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+            directory = os.open(
+                destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except BaseException:
+            if created_destination:
+                destination.unlink(missing_ok=True)
+                created_destination = False
+            raise
+        published = True
+        return expected
+    finally:
+        if not published and created_destination:
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            snapshot.unlink()
         except FileNotFoundError:
             pass
-    return expected
+        if not published and not parent_preexisted:
+            try:
+                destination.parent.rmdir()
+            except OSError:
+                pass
+
+
+def _discard_private_binary_snapshot(
+    snapshot: Path, destination: Path, *, parent_preexisted: bool
+) -> None:
+    try:
+        snapshot.unlink()
+    except FileNotFoundError:
+        pass
+    if not parent_preexisted:
+        try:
+            destination.parent.rmdir()
+        except OSError:
+            pass
+
+
+def _validate_candidate_attestation(
+    *,
+    checkpoint: Mapping[str, Any],
+    result: TrainResult,
+    config: LearnerBundleConfig,
+    learner_identity_sha256: str | None,
+    runtime_container_sha256: str | None,
+    learner_contract_sha256: str | None,
+) -> dict[str, str] | None:
+    """Verify the exact execution identity before publishing a candidate.
+
+    The library keeps an all-null development mode so existing local restart
+    workflows and legacy checkpoints remain readable.  Supplying any identity
+    field, however, selects the production path: all three values must be
+    present, must match the saved restart, and the learner identity must bind
+    the complete immutable training semantics again at publication time.
+    """
+
+    supplied = (
+        learner_identity_sha256,
+        runtime_container_sha256,
+        learner_contract_sha256,
+    )
+    if all(value is None for value in supplied):
+        return None
+    if any(value is None for value in supplied):
+        raise LearnerError("candidate attestation fields are incomplete")
+    identity_sha = _require_sha256(
+        learner_identity_sha256, "learner identity SHA-256"
+    )
+    container_sha = _require_sha256(
+        runtime_container_sha256, "runtime container SHA-256"
+    )
+    contract_sha = _require_sha256(
+        learner_contract_sha256, "learner contract SHA-256"
+    )
+    checkpoint_expected = {
+        "campaign_id": config.campaign_id,
+        "generation_id": config.generation_id,
+        "macro_round": config.macro_round,
+        "model_lineage_sha256": config.model_lineage_sha256,
+        "code_sha256": config.code_sha256,
+        "learner_config_sha256": config.sha256,
+        "learner_identity_sha256": identity_sha,
+        "runtime_container_sha256": container_sha,
+        "learner_contract_sha256": contract_sha,
+        "replay_snapshot_sha256": result.replay_snapshot_sha256,
+        **dict(result.exposure),
+    }
+    mismatches = [
+        key
+        for key, expected in checkpoint_expected.items()
+        if checkpoint.get(key) != expected
+    ]
+    if mismatches:
+        raise LearnerError(
+            "candidate checkpoint attestation mismatch: " + ", ".join(mismatches)
+        )
+    if result.learner_config_sha256 != config.sha256:
+        raise LearnerError("learner result/config identity mismatch")
+    replay_file_sha = _require_sha256(
+        checkpoint.get("replay_snapshot_file_sha256"),
+        "replay snapshot file SHA-256",
+    )
+    parent_runtime_sha = _require_sha256(
+        config.to_mapping()["model_config"].get("runtime_policy_sha256"),
+        "parent runtime policy SHA-256",
+    )
+    try:
+        computed_identity_sha = compute_learner_identity_sha256(
+            campaign_id=config.campaign_id,
+            macro_round=config.macro_round,
+            learner_code_sha256=config.code_sha256,
+            learner_config_sha256=config.sha256,
+            replay_snapshot_file_sha256=replay_file_sha,
+            replay_snapshot_sha256=result.replay_snapshot_sha256,
+            parent_checkpoint_sha256=config.model_lineage_sha256,
+            parent_runtime_policy_sha256=parent_runtime_sha,
+            runtime_container_sha256=container_sha,
+            learner_contract_sha256=contract_sha,
+        )
+    except LearnerIdentityError as exc:
+        raise LearnerError(f"candidate attestation is invalid: {exc}") from exc
+    if computed_identity_sha != identity_sha:
+        raise LearnerError(
+            "candidate learner identity does not bind the exact training semantics"
+        )
+    return {
+        "learner_identity_sha256": identity_sha,
+        "runtime_container_sha256": container_sha,
+        "learner_contract_sha256": contract_sha,
+    }
 
 
 def publish_learner_result(
@@ -3697,26 +3261,40 @@ def publish_learner_result(
     output_dir: str | os.PathLike[str],
     result: TrainResult,
     config: LearnerBundleConfig,
+    learner_identity_sha256: str | None = None,
+    runtime_container_sha256: str | None = None,
+    learner_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Seal a learner payload and a manifest consumable by policy staging."""
 
-    if result.validation_stopped or result.completed_steps != result.target_steps:
-        raise LearnerError(
-            "validation-stopped or incomplete learner result cannot be published"
-        )
+    if result.completed_steps != result.target_steps:
+        raise LearnerError("incomplete learner result cannot be published")
 
-    output = Path(output_dir).expanduser().resolve()
+    output = _require_campaign_storage_path(
+        output_dir,
+        "learner output",
+        generation_id=config.generation_id,
+    )
     checkpoint_name = f"candidate_round_{config.macro_round:06d}.pt"
     checkpoint_path = output / checkpoint_name
-    checkpoint_sha = _publish_immutable_binary(
-        Path(result.restart_checkpoint), checkpoint_path
+    restart_path = Path(result.restart_checkpoint)
+    private_checkpoint, checkpoint_sha, parent_preexisted = _private_binary_snapshot(
+        restart_path, checkpoint_path
     )
     try:
         checkpoint_document = load_restricted_restart_document(
-            checkpoint_path, map_location="cpu"
+            private_checkpoint, map_location="cpu"
         )
         if not isinstance(checkpoint_document, Mapping):
-            raise LearnerError("candidate checkpoint root must be a mapping")
+            raise LearnerError("restart checkpoint root must be a mapping")
+        attestation = _validate_candidate_attestation(
+            checkpoint=checkpoint_document,
+            result=result,
+            config=config,
+            learner_identity_sha256=learner_identity_sha256,
+            runtime_container_sha256=runtime_container_sha256,
+            learner_contract_sha256=learner_contract_sha256,
+        )
         policy_state = checkpoint_document.get("policy_state_dict")
         if not isinstance(policy_state, Mapping) or not policy_state:
             raise LearnerError(
@@ -3750,7 +3328,32 @@ def publish_learner_result(
         KeyError,
         TypeError,
     ) as exc:
+        _discard_private_binary_snapshot(
+            private_checkpoint,
+            checkpoint_path,
+            parent_preexisted=parent_preexisted,
+        )
         raise LearnerError(f"cannot publish candidate policy sidecars: {exc}") from exc
+    except BaseException:
+        _discard_private_binary_snapshot(
+            private_checkpoint,
+            checkpoint_path,
+            parent_preexisted=parent_preexisted,
+        )
+        raise
+
+    # Hashing, restricted loading, identity validation, and policy derivation
+    # all use one private snapshot.  Publication links that exact inode, so a
+    # concurrent replacement or mutation of the original restart cannot split
+    # candidate bytes from the semantics that were attested above.
+    published_checkpoint_sha = _publish_immutable_binary(
+        private_checkpoint,
+        checkpoint_path,
+        expected_sha256=checkpoint_sha,
+        parent_preexisted=parent_preexisted,
+    )
+    if published_checkpoint_sha != checkpoint_sha:
+        raise LearnerError("candidate checkpoint changed after attestation")
 
     policy_spec_name = f"{checkpoint_name}.policy_spec.json"
     policy_spec_path = output / policy_spec_name
@@ -3779,8 +3382,9 @@ def publish_learner_result(
     except PolicyBundleError as exc:
         raise LearnerError(f"published candidate policy bundle is invalid: {exc}") from exc
     document = {
-        "schema": RESULT_SCHEMA,
+        "schema": RESULT_SCHEMA if attestation is not None else LEGACY_RESULT_SCHEMA,
         "campaign_id": config.campaign_id,
+        "generation_id": config.generation_id,
         "macro_round": config.macro_round,
         "checkpoint_path": checkpoint_name,
         "checkpoint_sha256": checkpoint_sha,
@@ -3794,8 +3398,10 @@ def publish_learner_result(
         "code_sha256": config.code_sha256,
         "learner_config_sha256": result.learner_config_sha256,
         "optimizer_steps": result.completed_steps,
+        **dict(result.exposure),
         "initial_loss": result.initial_loss,
         "final_loss": result.final_loss,
+        **({} if attestation is None else attestation),
     }
     manifest_path = output / f"learner_result_round_{config.macro_round:06d}.json"
     publish_immutable_json(manifest_path, document)
@@ -3809,6 +3415,7 @@ def publish_learner_result(
 __all__ = [
     "BUNDLE_SCHEMA",
     "CHECKPOINT_SCHEMA",
+    "LEGACY_RESULT_SCHEMA",
     "RESULT_SCHEMA",
     "HELDOUT_TELEMETRY_SCHEMA",
     "TRAINING_QUALITY_TELEMETRY_SCHEMA",
@@ -3822,13 +3429,15 @@ __all__ = [
     "ReplayPartition",
     "TrainingQualityProbe",
     "DeterministicBatchSchedule",
+    "CumulativeDaggerBatchSchedule",
     "JsonlTelemetry",
     "TrainResult",
     "partition_shards",
     "build_training_quality_probe",
     "validate_training_quality_probe_summary",
     "load_replay_partition",
-    "load_heldout_partition",
+    "optimizer_source_exposure",
+    "optimizer_exposure_summary",
     "supervised_action_loss",
     "evaluate_heldout_actions",
     "summarize_training_rollout_context",

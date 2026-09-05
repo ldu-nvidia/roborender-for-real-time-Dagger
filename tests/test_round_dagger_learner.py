@@ -2,7 +2,6 @@ import copy
 import json
 import os
 import stat
-import sys
 import tempfile
 import types
 import unittest
@@ -19,6 +18,7 @@ except ImportError:  # The artifact/control-plane test environment is CPU-only.
     nn = types.SimpleNamespace(Module=object)
 
 from round_dagger import artifacts, replay
+from round_dagger.learner_identity import learner_identity_sha256
 from tests.policy_bundle_helpers import portable_policy_spec
 
 if torch is not None:
@@ -30,16 +30,14 @@ if torch is not None:
         LearnerError,
         MappingPolicyAdapter,
         ORDERED_ALLGATHER_GRADIENT_REDUCTION,
+        RESULT_SCHEMA,
         SINGLE_PROCESS_GRADIENT_REDUCTION,
-        TRAINING_CONTEXT_TELEMETRY_SCHEMA,
         TRAINING_QUALITY_PROBE_BUDGET,
-        TRAINING_QUALITY_TELEMETRY_SCHEMA,
         TrainingQualityProbe,
         _ordered_allgather_gradient_hook,
         build_training_quality_probe,
         configure_deterministic_runtime,
         evaluate_heldout_actions,
-        load_heldout_partition,
         load_replay_partition,
         partition_shards,
         publish_learner_result,
@@ -109,12 +107,11 @@ def _config(
     *,
     model_lineage="a" * 64,
     mean=(0.5, 0.5, 0.5),
-    heldout_snapshot=None,
-    heldout_eval_interval=2,
 ):
     mapping = {
         "schema": BUNDLE_SCHEMA,
         "campaign_id": "learner-test",
+        "generation_id": "gen-000-bc",
         "macro_round": 0,
         "model_lineage_sha256": model_lineage,
         "code_sha256": "b" * 64,
@@ -125,19 +122,29 @@ def _config(
         "output_key": "actions",
         "train_action_slice": [0, 1],
         "batch_size": 8,
+        "target_optimizer_examples": 960,
+        "checkpoint_every_optimizer_examples": 8,
         "learning_rate": 0.025,
         "weight_decay": 0.0,
         "seed": 17,
         "partition_seed": 23,
         "model_config": portable_policy_spec(model_lineage, "2" * 64),
     }
-    if heldout_snapshot is not None:
-        mapping.update(
-            heldout_snapshot_sha256=heldout_snapshot["snapshot_sha256"],
-            heldout_snapshot_file_sha256=heldout_snapshot["file_sha256"],
-            heldout_eval_interval=heldout_eval_interval,
-        )
     return LearnerBundleConfig.from_mapping(mapping)
+
+
+def _train_for_steps(model, *, optimizer_steps, config, **kwargs):
+    """Express compact CPU fixtures through the optimizer-example API."""
+
+    return train_from_replay(
+        model,
+        config=config,
+        target_optimizer_examples=optimizer_steps * config.batch_size,
+        checkpoint_every_optimizer_examples=(
+            config.checkpoint_every_optimizer_examples
+        ),
+        **kwargs,
+    )
 
 
 def _rollout_arrays(env_id, *, steps=8):
@@ -230,7 +237,19 @@ class OrderedGradientReductionTest(unittest.TestCase):
 class LearnerFixture(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.campaign_root = Path(self.temporary.name) / "data"
+        self.root = self.campaign_root / "BC"
+        self.root.mkdir(parents=True)
+        self.campaign_root_patch = mock.patch(
+            "round_dagger.learner.CANONICAL_CAMPAIGN_ROOT", self.campaign_root
+        )
+        self.campaign_root_patch.start()
+        self.addCleanup(self.campaign_root_patch.stop)
+        self.campaign_id_patch = mock.patch(
+            "round_dagger.learner.CANONICAL_CAMPAIGN_ID", "learner-test"
+        )
+        self.campaign_id_patch.start()
+        self.addCleanup(self.campaign_id_patch.stop)
         self.cohort = self.root / "cohort"
         artifacts.create_cohort(
             self.cohort,
@@ -270,128 +289,42 @@ class LearnerFixture(unittest.TestCase):
             self.snapshot = ledger.build_snapshot(
                 "learner-test",
                 through_macro_round=0,
-                expected_train_cohorts=1,
                 output=self.snapshot_path,
             )
-        self.eval_cohort = self.root / "eval-cohort"
-        artifacts.create_cohort(
-            self.eval_cohort,
-            campaign_id="learner-test",
-            macro_round=0,
-            cohort_index=0,
-            purpose="eval",
-            expected_ranks=[0],
-            expected_global_env_ids=[2, 3],
-            expected_transitions=16,
-            view_contract={
-                "dtype": "uint8",
-                "layout": "vertical",
-                "shape": [3, 2, 3],
-                "views": ["ext1", "ext2", "wrist"],
-            },
-            action_contract={"dtype": "float32", "shape": [2]},
-            **SHA,
-        )
-        for part, env_id in enumerate((2, 3)):
-            artifacts.publish_rollout_shard(
-                self.eval_cohort,
-                rank=0,
-                rollout_id=0,
-                part_index=part,
-                arrays=_rollout_arrays(env_id),
-                campaign_id="learner-test",
-                macro_round=0,
-                cohort_index=0,
-                purpose="eval",
-                **SHA,
-            )
-        artifacts.seal_cohort(self.eval_cohort)
-        self.heldout_snapshot_path = self.root / "heldout-snapshot.json"
-        self.heldout_snapshot = replay.build_heldout_snapshot(
-            [self.eval_cohort], output=self.heldout_snapshot_path
-        )
 
     def tearDown(self):
         self.temporary.cleanup()
 
+    def learner_attestation(self, config):
+        container_sha = "c" * 64
+        contract_sha = "d" * 64
+        identity_sha = learner_identity_sha256(
+            campaign_id=config.campaign_id,
+            macro_round=config.macro_round,
+            learner_code_sha256=config.code_sha256,
+            learner_config_sha256=config.sha256,
+            replay_snapshot_file_sha256=self.snapshot["file_sha256"],
+            replay_snapshot_sha256=self.snapshot["snapshot_sha256"],
+            parent_checkpoint_sha256=config.model_lineage_sha256,
+            parent_runtime_policy_sha256=config.to_mapping()["model_config"][
+                "runtime_policy_sha256"
+            ],
+            runtime_container_sha256=container_sha,
+            learner_contract_sha256=contract_sha,
+        )
+        return {
+            "learner_identity_sha256": identity_sha,
+            "runtime_container_sha256": container_sha,
+            "learner_contract_sha256": contract_sha,
+        }
+
 
 class ReplayInputContractTest(LearnerFixture):
-    def test_heldout_snapshot_is_eval_only_and_bundle_lineage_is_all_or_none(self):
-        with self.assertRaisesRegex(replay.ReplayError, "purpose='eval'"):
-            replay.build_heldout_snapshot(
-                [self.cohort], output=self.root / "invalid-heldout.json"
-            )
-        loaded = replay.load_heldout_snapshot(
-            self.heldout_snapshot_path,
-            expected_file_sha256=self.heldout_snapshot["file_sha256"],
-        )
-        self.assertEqual(loaded["purpose"], "eval")
-        self.assertEqual(loaded["transition_count"], 16)
-        self.assertTrue(
-            all("payload_path" in item for item in loaded["resolved_shards"])
-        )
-
+    def test_train_only_bundle_rejects_validation_fields(self):
         raw = _config().to_mapping()
-        raw["heldout_snapshot_sha256"] = self.heldout_snapshot["snapshot_sha256"]
-        with self.assertRaisesRegex(LearnerError, "supplied together"):
+        raw["validation_snapshot_sha256"] = "9" * 64
+        with self.assertRaisesRegex(LearnerError, "forbids validation/test fields"):
             LearnerBundleConfig.from_mapping(raw)
-
-    def test_heldout_partition_requires_exact_pinned_snapshot_identity(self):
-        config = _config(heldout_snapshot=self.heldout_snapshot)
-        partition = load_heldout_partition(self.heldout_snapshot_path, config)
-        self.assertEqual(partition.transition_count, 16)
-        wrong = config.to_mapping()
-        wrong["heldout_snapshot_sha256"] = "f" * 64
-        with self.assertRaisesRegex(LearnerError, "semantic digest mismatch"):
-            load_heldout_partition(
-                self.heldout_snapshot_path,
-                LearnerBundleConfig.from_mapping(wrong),
-            )
-
-    def test_training_rejects_heldout_snapshot_that_reuses_training_payload(self):
-        cohort = self.root / "overlap-eval"
-        artifacts.create_cohort(
-            cohort,
-            campaign_id="learner-test",
-            macro_round=1,
-            cohort_index=0,
-            purpose="eval",
-            expected_ranks=[0],
-            expected_global_env_ids=[0],
-            expected_transitions=8,
-            view_contract={
-                "dtype": "uint8",
-                "layout": "vertical",
-                "shape": [3, 2, 3],
-                "views": ["ext1", "ext2", "wrist"],
-            },
-            action_contract={"dtype": "float32", "shape": [2]},
-            **SHA,
-        )
-        artifacts.publish_rollout_shard(
-            cohort,
-            rank=0,
-            rollout_id=0,
-            part_index=0,
-            arrays=_rollout_arrays(0),
-            campaign_id="learner-test",
-            macro_round=1,
-            cohort_index=0,
-            purpose="eval",
-            **SHA,
-        )
-        artifacts.seal_cohort(cohort)
-        snapshot_path = self.root / "overlap-heldout.json"
-        snapshot = replay.build_heldout_snapshot([cohort], output=snapshot_path)
-        with self.assertRaisesRegex(LearnerError, "reuse artifact identities"):
-            train_from_replay(
-                TinyPolicy(),
-                snapshot_path=self.snapshot_path,
-                config=_config(heldout_snapshot=snapshot),
-                heldout_snapshot_path=snapshot_path,
-                output_dir=self.root / "must-not-train-on-overlap",
-                max_steps=1,
-            )
 
     def test_rgb_is_normalized_and_all_policy_observations_are_reconstructed(self):
         config = _config()
@@ -694,12 +627,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             with self.assertRaisesRegex(
                 LearnerError, "requires CUBLAS_WORKSPACE_CONFIG"
             ):
-                train_from_replay(
+                _train_for_steps(
                     TinyPolicy(),
                     snapshot_path=self.root / "must-not-be-read.json",
                     config=_config(),
                     output_dir=self.root / "must-not-be-created",
-                    max_steps=1,
+                    optimizer_steps=1,
                     device="cuda:0",
                 )
             self.assertFalse((self.root / "must-not-be-created").exists())
@@ -739,13 +672,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
     def test_supervised_loss_decreases_and_fixed_action_dimensions_are_masked(self):
         model = TinyPolicy()
         initial_second = model.linear.weight.detach()[1].clone()
-        result = train_from_replay(
+        result = _train_for_steps(
             model,
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "single",
-            max_steps=120,
-            save_every=17,
+            optimizer_steps=120,
         )
         self.assertLess(result.final_loss, result.initial_loss * 0.08)
         torch.testing.assert_close(
@@ -782,13 +714,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         )
 
     def test_candidate_publication_rejects_controller_lineage_drift(self):
-        result = train_from_replay(
+        result = _train_for_steps(
             TinyPolicy(),
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "controller-drift",
-            max_steps=1,
-            save_every=1,
+            optimizer_steps=1,
         )
         checkpoint = torch.load(
             result.restart_checkpoint, map_location="cpu", weights_only=False
@@ -804,15 +735,174 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
                 config=_config(),
             )
 
+    def test_attested_candidate_publication_rechecks_saved_execution_identity(self):
+        config = _config()
+        attestation = self.learner_attestation(config)
+        result = _train_for_steps(
+            TinyPolicy(),
+            snapshot_path=self.snapshot_path,
+            config=config,
+            output_dir=self.root / "attested",
+            optimizer_steps=1,
+            **attestation,
+        )
+        report = publish_learner_result(
+            output_dir=self.root / "attested",
+            result=result,
+            config=config,
+            **attestation,
+        )
+        self.assertEqual(report["schema"], RESULT_SCHEMA)
+        for field, expected in attestation.items():
+            self.assertEqual(report[field], expected)
+        persisted_result = artifacts.load_strict_json(
+            self.root / "attested" / "learner_result_round_000000.json"
+        )
+        self.assertEqual(persisted_result, {
+            key: value
+            for key, value in report.items()
+            if key not in {"manifest_path", "manifest_sha256"}
+        })
+        checkpoint = torch.load(
+            self.root / "attested" / report["checkpoint_path"],
+            map_location="cpu",
+            weights_only=False,
+        )
+        for field, expected in attestation.items():
+            self.assertEqual(checkpoint[field], expected)
+
+        with self.assertRaisesRegex(
+            LearnerError, "runtime_container_sha256"
+        ):
+            publish_learner_result(
+                output_dir=self.root / "attested-mismatch",
+                result=result,
+                config=config,
+                **dict(attestation, runtime_container_sha256="e" * 64),
+            )
+        self.assertFalse((self.root / "attested-mismatch").exists())
+
+    def test_attested_publication_requires_the_complete_identity_triplet(self):
+        config = _config()
+        result = _train_for_steps(
+            TinyPolicy(),
+            snapshot_path=self.snapshot_path,
+            config=config,
+            output_dir=self.root / "partial-attestation",
+            optimizer_steps=1,
+        )
+        with self.assertRaisesRegex(
+            LearnerError, "candidate attestation fields are incomplete"
+        ):
+            publish_learner_result(
+                output_dir=self.root / "partial-attestation-publish",
+                result=result,
+                config=config,
+                learner_identity_sha256="a" * 64,
+            )
+        self.assertFalse((self.root / "partial-attestation-publish").exists())
+
+    def test_source_mutation_after_private_load_cannot_poison_candidate(self):
+        config = _config()
+        attestation = self.learner_attestation(config)
+        result = _train_for_steps(
+            TinyPolicy(),
+            snapshot_path=self.snapshot_path,
+            config=config,
+            output_dir=self.root / "race-source",
+            optimizer_steps=1,
+            **attestation,
+        )
+        restart_path = Path(result.restart_checkpoint).resolve()
+        restart_sha256 = artifacts.sha256_file(restart_path)
+        source_mutated = False
+        from round_dagger import learner as learner_module
+
+        original_loader = learner_module.load_restricted_restart_document
+
+        def mutate_source_after_load(path, **kwargs):
+            nonlocal source_mutated
+            document = original_loader(path, **kwargs)
+            if Path(path).resolve() != restart_path and not source_mutated:
+                source_mutated = True
+                restart_path.chmod(0o644)
+                with restart_path.open("ab") as stream:
+                    stream.write(b"concurrent mutation")
+            return document
+
+        publish_output = self.root / "race-publish"
+        with mock.patch(
+            "round_dagger.learner.load_restricted_restart_document",
+            side_effect=mutate_source_after_load,
+        ):
+            report = publish_learner_result(
+                output_dir=publish_output,
+                result=result,
+                config=config,
+                **attestation,
+            )
+        self.assertTrue(source_mutated)
+        self.assertNotEqual(artifacts.sha256_file(restart_path), restart_sha256)
+        self.assertEqual(report["checkpoint_sha256"], restart_sha256)
+        self.assertEqual(
+            artifacts.sha256_file(publish_output / report["checkpoint_path"]),
+            restart_sha256,
+        )
+
+    def test_private_snapshot_race_leaves_no_published_artifact(self):
+        config = _config()
+        attestation = self.learner_attestation(config)
+        result = _train_for_steps(
+            TinyPolicy(),
+            snapshot_path=self.snapshot_path,
+            config=config,
+            output_dir=self.root / "private-race-source",
+            optimizer_steps=1,
+            **attestation,
+        )
+        from round_dagger import learner as learner_module
+
+        original_state_digest = learner_module.runtime_state_dict_sha256
+        publish_output = self.root / "private-race-publish"
+        private_mutated = False
+
+        def mutate_private_snapshot(policy_state):
+            nonlocal private_mutated
+            digest = original_state_digest(policy_state)
+            snapshots = list(
+                publish_output.glob(".candidate_round_000000.pt.snapshot.*")
+            )
+            self.assertEqual(len(snapshots), 1)
+            snapshots[0].chmod(0o600)
+            with snapshots[0].open("ab") as stream:
+                stream.write(b"private snapshot mutation")
+            private_mutated = True
+            return digest
+
+        with mock.patch(
+            "round_dagger.learner.runtime_state_dict_sha256",
+            side_effect=mutate_private_snapshot,
+        ):
+            with self.assertRaisesRegex(
+                LearnerError, "private candidate checkpoint changed"
+            ):
+                publish_learner_result(
+                    output_dir=publish_output,
+                    result=result,
+                    config=config,
+                    **attestation,
+                )
+        self.assertTrue(private_mutated)
+        self.assertFalse(publish_output.exists())
+
     def test_initial_and_final_losses_use_the_identical_deterministic_probe(self):
         model = ProbeRecordingPolicy()
-        result = train_from_replay(
+        result = _train_for_steps(
             model,
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "fixed-probe",
-            max_steps=7,
-            save_every=7,
+            optimizer_steps=7,
         )
         self.assertEqual(len(model.probe_batches), 2)
         self.assertEqual(
@@ -844,13 +934,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
 
         # The same reduced-output contract works through the full replay loop.
         model = PrefixOnlyPolicy()
-        result = train_from_replay(
+        result = _train_for_steps(
             model,
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "prefix-only",
-            max_steps=100,
-            save_every=100,
+            optimizer_steps=100,
         )
         self.assertLess(result.final_loss, result.initial_loss * 0.1)
 
@@ -858,48 +947,35 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         initial = self._initial_state()
         full = TinyPolicy()
         full.load_state_dict(initial)
-        full_result = train_from_replay(
+        full_result = _train_for_steps(
             full,
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "full",
-            max_steps=40,
-            save_every=40,
+            optimizer_steps=40,
         )
 
         partial = TinyPolicy()
         partial.load_state_dict(initial)
-        partial_result = train_from_replay(
+        partial_result = _train_for_steps(
             partial,
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "resumed",
-            max_steps=40,
-            save_every=17,
-            validation_stop_at_step=13,
+            optimizer_steps=13,
         )
-        self.assertTrue(partial_result.validation_stopped)
         self.assertEqual(partial_result.completed_steps, 13)
-        self.assertEqual(partial_result.target_steps, 40)
-        with self.assertRaisesRegex(LearnerError, "cannot be published"):
-            publish_learner_result(
-                output_dir=self.root / "partial-publication",
-                result=partial_result,
-                config=_config(),
-            )
-        self.assertFalse((self.root / "partial-publication").exists())
+        self.assertEqual(partial_result.target_steps, 13)
         resumed = TinyPolicy()
-        resumed_result = train_from_replay(
+        resumed_result = _train_for_steps(
             resumed,
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "resumed",
-            max_steps=40,
+            optimizer_steps=40,
             resume_from=partial_result.restart_checkpoint,
-            save_every=40,
         )
         self.assertEqual(full_result.completed_steps, resumed_result.completed_steps)
-        self.assertFalse(resumed_result.validation_stopped)
         self.assertEqual(full_result.initial_loss, partial_result.initial_loss)
         self.assertEqual(full_result.initial_loss, resumed_result.initial_loss)
         self.assertEqual(full_result.final_loss, resumed_result.final_loss)
@@ -922,108 +998,16 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH,
         )
 
-    def test_validation_stop_and_restart_baseline_fail_closed(self):
-        common = {
-            "snapshot_path": self.snapshot_path,
-            "config": _config(),
-            "output_dir": self.root / "invalid-stop",
-            "max_steps": 10,
-        }
-        with self.assertRaisesRegex(LearnerError, "below the final max_steps"):
-            train_from_replay(
-                TinyPolicy(), **common, validation_stop_at_step=10
-            )
-
-        partial = train_from_replay(
-            TinyPolicy(),
-            **dict(common, output_dir=self.root / "missing-baseline"),
-            validation_stop_at_step=3,
-        )
-        checkpoint = torch.load(
-            partial.restart_checkpoint, map_location="cpu", weights_only=False
-        )
-        checkpoint.pop("initial_loss")
-        torch.save(checkpoint, partial.restart_checkpoint)
-        with self.assertRaisesRegex(LearnerError, "initial_loss"):
-            train_from_replay(
-                TinyPolicy(),
-                **dict(common, output_dir=self.root / "missing-baseline"),
-                resume_from=partial.restart_checkpoint,
-            )
-
-    def test_wandb_resume_is_strict_for_a_durable_prior_run_id(self):
-        fake_run = types.SimpleNamespace(
-            log=mock.Mock(),
-            finish=mock.Mock(),
-            define_metric=mock.Mock(),
-        )
-        fake_wandb = types.SimpleNamespace(
-            init=mock.Mock(return_value=fake_run),
-            Settings=mock.Mock(return_value=object()),
-        )
-        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
-            first = JsonlTelemetry(
-                None,
-                enabled=True,
-                wandb_project="project",
-                wandb_run_id="durable-run-id",
-            )
-            first.close()
-            resumed = JsonlTelemetry(
-                None,
-                enabled=True,
-                wandb_project="project",
-                wandb_run_id="durable-run-id",
-                wandb_resume_must=True,
-            )
-            resumed.close()
-
-        self.assertEqual(fake_wandb.init.call_args_list[0].kwargs["resume"], "allow")
-        self.assertEqual(fake_wandb.init.call_args_list[1].kwargs["resume"], "must")
-        fake_wandb.Settings.assert_has_calls(
-            [mock.call(x_disable_stats=True), mock.call(x_disable_stats=True)]
-        )
-        self.assertEqual(
-            [call.kwargs["exit_code"] for call in fake_run.finish.call_args_list],
-            [0, 0],
-        )
-        with self.assertRaisesRegex(LearnerError, "durable prior run ID"):
-            JsonlTelemetry(
-                None,
-                enabled=True,
-                wandb_project="project",
-                wandb_resume_must=True,
-            )
-
-    def test_wandb_close_propagates_training_failure_status(self):
-        fake_run = types.SimpleNamespace(
-            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
-        )
-        fake_wandb = types.SimpleNamespace(
-            init=mock.Mock(return_value=fake_run),
-            Settings=mock.Mock(return_value=object()),
-        )
-        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
-            telemetry = JsonlTelemetry(
-                None,
-                enabled=True,
-                wandb_project="quality-project",
-                wandb_run_id="failed-quality-run",
-            )
-            telemetry.close(exit_code=2)
-        fake_run.finish.assert_called_once_with(exit_code=2)
-
     def test_jsonl_telemetry_is_durable_and_step_monotonic(self):
         path = self.root / "telemetry" / "learner.jsonl"
         telemetry = JsonlTelemetry(path, enabled=True)
         try:
-            train_from_replay(
+            _train_for_steps(
                 TinyPolicy(),
                 snapshot_path=self.snapshot_path,
                 config=_config(),
                 output_dir=self.root / "telemetry-run",
-                max_steps=3,
-                save_every=3,
+                optimizer_steps=3,
                 telemetry=telemetry,
             )
         finally:
@@ -1035,9 +1019,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         self.assertTrue(
             all(
                 item["schema"]
-                == "fast_roborender.round_dagger.learner_telemetry.v2"
+                == "fast_roborender.round_dagger.learner_telemetry.v3"
                 for item in records
             )
+        )
+        self.assertTrue(
+            all(item["generation_id"] == "gen-000-bc" for item in records)
         )
         self.assertTrue(
             all(item["replay_transitions_per_rank"] == [16] for item in records)
@@ -1046,474 +1033,55 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             all(item["replay_transitions_global"] == 16 for item in records)
         )
 
-    def test_heldout_quality_is_logged_at_zero_interval_and_final(self):
-        training_path = self.root / "quality-telemetry" / "learner.jsonl"
-        heldout_path = self.root / "quality-telemetry" / "heldout.jsonl"
-        telemetry = JsonlTelemetry(
-            training_path,
-            heldout_path=heldout_path,
-            enabled=True,
-        )
-        try:
-            train_from_replay(
-                TinyPolicy(),
-                snapshot_path=self.snapshot_path,
-                config=_config(
-                    heldout_snapshot=self.heldout_snapshot,
-                    heldout_eval_interval=2,
-                ),
-                heldout_snapshot_path=self.heldout_snapshot_path,
-                output_dir=self.root / "quality-run",
-                max_steps=5,
-                save_every=5,
-                telemetry=telemetry,
-            )
-        finally:
-            telemetry.close()
-        training_records = [
-            json.loads(line) for line in training_path.read_text().splitlines()
-        ]
-        quality_records = [
-            json.loads(line) for line in heldout_path.read_text().splitlines()
-        ]
-        self.assertEqual(
-            [record["optimizer_step"] for record in training_records],
-            [1, 2, 3, 4, 5],
-        )
-        self.assertEqual(
-            [record["optimizer_step"] for record in quality_records],
-            [0, 2, 4, 5],
-        )
-        self.assertTrue(all("action_mse" not in record for record in training_records))
-        for record in quality_records:
-            self.assertEqual(record["learned_action_indices"], [0])
-            self.assertEqual(set(record["per_action"]), {"0"})
-            self.assertEqual(record["heldout_transitions_global"], 16)
-            self.assertEqual(record["eval_frontier"], record["optimizer_step"])
-            self.assertAlmostEqual(record["action_rmse"] ** 2, record["action_mse"])
-            self.assertGreaterEqual(record["action_absolute_error_p90"], 0.0)
-            self.assertGreaterEqual(record["action_l2_p90"], 0.0)
-            self.assertTrue(np.isfinite(record["action_cosine"]))
-            self.assertAlmostEqual(
-                record["action_mse_delta_from_step0"],
-                record["action_mse"] - quality_records[0]["action_mse"],
-            )
-            self.assertAlmostEqual(
-                record["action_mse_relative_improvement_from_step0"],
-                (
-                    quality_records[0]["action_mse"] - record["action_mse"]
-                )
-                / quality_records[0]["action_mse"],
-            )
-        resumed_telemetry = JsonlTelemetry(
-            None, heldout_path=heldout_path, enabled=True
-        )
-        resumed_telemetry.log_heldout(quality_records[-1], log_wandb=False)
-        self.assertEqual(len(heldout_path.read_text().splitlines()), 4)
-
-    def test_heldout_evaluation_does_not_change_training_or_rng_frontier(self):
-        initial = self._initial_state()
-        baseline = TinyPolicy()
-        baseline.load_state_dict(initial)
-        train_from_replay(
-            baseline,
-            snapshot_path=self.snapshot_path,
-            config=_config(),
-            output_dir=self.root / "quality-baseline",
-            max_steps=7,
-            save_every=7,
-        )
-        evaluated = TinyPolicy()
-        evaluated.load_state_dict(initial)
-        train_from_replay(
-            evaluated,
-            snapshot_path=self.snapshot_path,
-            config=_config(
-                heldout_snapshot=self.heldout_snapshot,
-                heldout_eval_interval=2,
-            ),
-            heldout_snapshot_path=self.heldout_snapshot_path,
-            output_dir=self.root / "quality-evaluated",
-            max_steps=7,
-            save_every=7,
-        )
-        for key, value in baseline.state_dict().items():
-            torch.testing.assert_close(
-                value, evaluated.state_dict()[key], rtol=0, atol=0
-            )
-
-    def test_heldout_quality_is_merged_into_one_wandb_record_per_step(self):
-        fake_run = types.SimpleNamespace(
-            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
-        )
-        fake_wandb = types.SimpleNamespace(
-            init=mock.Mock(return_value=fake_run),
-            Settings=mock.Mock(return_value=object()),
-        )
-        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
-            telemetry = JsonlTelemetry(
-                None,
-                enabled=True,
-                wandb_project="quality-project",
-                wandb_run_id="quality-run",
-            )
-            try:
-                train_from_replay(
-                    TinyPolicy(),
-                    snapshot_path=self.snapshot_path,
-                    config=_config(
-                        heldout_snapshot=self.heldout_snapshot,
-                        heldout_eval_interval=2,
-                    ),
-                    heldout_snapshot_path=self.heldout_snapshot_path,
-                    output_dir=self.root / "quality-wandb",
-                    max_steps=2,
-                    save_every=2,
-                    telemetry=telemetry,
-                )
-            finally:
-                telemetry.close()
-        self.assertEqual(
-            [call.args[0]["optimizer_step"] for call in fake_run.log.call_args_list],
-            [0, 1, 2],
-        )
-        self.assertTrue(
-            all("step" not in call.kwargs for call in fake_run.log.call_args_list)
-        )
-        initial_quality = fake_run.log.call_args_list[0].args[0]
-        final_combined = fake_run.log.call_args_list[2].args[0]
-        self.assertIn("quality/heldout_action_mse", initial_quality)
-        self.assertIn("quality/heldout_action_absolute_error_p90", initial_quality)
-        self.assertIn("quality/heldout_action_l2_p90", initial_quality)
-        self.assertEqual(initial_quality["quality/eval_frontier"], 0)
-        self.assertEqual(
-            initial_quality["quality/heldout_action_mse_delta_from_step0"], 0.0
-        )
-        self.assertEqual(
-            initial_quality[
-                "quality/heldout_action_mse_relative_improvement_from_step0"
-            ],
-            0.0,
-        )
-        self.assertEqual(initial_quality["optimizer_step"], 0)
-        self.assertIn("loss", final_combined)
-        self.assertIn("quality/heldout_action_mse", final_combined)
-        fake_run.define_metric.assert_any_call("optimizer_step")
-        fake_run.define_metric.assert_any_call(
-            "quality/*", step_metric="optimizer_step"
-        )
-
-    def test_dagger_dashboard_separates_scene_training_and_ood_validation(self):
-        scene_dir = self.root / "dashboard-scene" / "scene_samples"
-        scene_dir.mkdir(parents=True)
-        scene_image = scene_dir / "step_000000000_conditions_generated.png"
-        scene_image.write_bytes(b"test-scene")
-        scene_image.chmod(0o444)
-        scene_core = {
-            "schema": "fast_roborender.round_dagger.scene_samples.v1",
-            "campaign_id": "learner-test",
-            "actor_rank": 0,
-            "rollout_steps": 2,
-            "view_labels": ["head_color", "hand_left", "hand_right"],
-            "row_labels": ["depth", "mask", "client_anchor", "generated"],
-            "sampling_policy": {"name": "test"},
-            "source": {"candidate_count": 1},
-            "sampled_rollout_steps": [0],
-            "samples": [
-                {
-                    "path": scene_image.name,
-                    "rollout_step": 0,
-                    "sha256": artifacts.sha256_file(scene_image),
-                    "size_bytes": scene_image.stat().st_size,
-                    "width": 1252,
-                    "height": 1046,
-                }
-            ],
-        }
-        scene_manifest = {
-            **scene_core,
-            "sample_set_sha256": artifacts.canonical_json_sha256(scene_core),
-        }
-        manifest_path = scene_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(scene_manifest), encoding="utf-8")
-        manifest_path.chmod(0o444)
-        fake_run = types.SimpleNamespace(
-            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
-        )
-        fake_wandb = types.SimpleNamespace(
-            init=mock.Mock(return_value=fake_run),
-            Settings=mock.Mock(return_value=object()),
-            Image=mock.Mock(
-                side_effect=lambda path, caption: {"path": path, "caption": caption}
-            ),
-        )
-        training_quality_path = self.root / "dashboard" / "training_quality.jsonl"
-        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
-            telemetry = JsonlTelemetry(
-                self.root / "dashboard" / "training.jsonl",
-                heldout_path=self.root / "dashboard" / "validation_ood.jsonl",
-                training_quality_path=training_quality_path,
-                dagger_dashboard=True,
-                scene_sample_manifest=manifest_path,
-                enabled=True,
-                wandb_project="dashboard-project",
-                wandb_run_id="dashboard-run",
-            )
-            try:
-                train_from_replay(
-                    TinyPolicy(),
-                    snapshot_path=self.snapshot_path,
-                    config=_config(
-                        heldout_snapshot=self.heldout_snapshot,
-                        heldout_eval_interval=2,
-                    ),
-                    heldout_snapshot_path=self.heldout_snapshot_path,
-                    output_dir=self.root / "dashboard" / "run",
-                    max_steps=2,
-                    save_every=2,
-                    telemetry=telemetry,
-                    dagger_beta=0.5,
-                )
-            finally:
-                telemetry.close()
-        rows = [call.args[0] for call in fake_run.log.call_args_list]
-        self.assertEqual([row["optimizer_step"] for row in rows], [0, 1, 2])
-        self.assertIn("1_scene_samples/conditions_and_rendered", rows[0])
-        self.assertIn("2_training_quality/action_mse", rows[0])
-        self.assertIn("2_training_quality/expert_intervention_rate", rows[0])
-        self.assertIn("3_validation_ood/action_mse", rows[0])
-        self.assertIn("3_validation_ood/action_0/mse", rows[0])
-        self.assertIn("3_validation_ood/action_0/cosine", rows[0])
-        self.assertIn("2_training_quality/optimization_loss", rows[1])
-        self.assertIn("2_training_quality/gradient_l2_norm", rows[1])
-        self.assertNotIn("3_validation_ood/action_mse", rows[1])
-        self.assertIn("2_training_quality/action_mse", rows[2])
-        self.assertIn("3_validation_ood/action_mse", rows[2])
-        quality_rows = [
-            json.loads(line) for line in training_quality_path.read_text().splitlines()
-        ]
-        self.assertEqual(
-            [row["optimizer_step"] for row in quality_rows], [0, 2]
-        )
-        self.assertTrue(
-            all(
-                row["schema"]
-                == TRAINING_QUALITY_TELEMETRY_SCHEMA
-                for row in quality_rows
-            )
-        )
-        self.assertTrue(
-            all(row["training_probe_transitions_global"] == 16 for row in quality_rows)
-        )
-        self.assertTrue(
-            all(row["training_replay_transitions_global"] == 16 for row in quality_rows)
-        )
-        self.assertEqual(
-            len({row["training_probe_selection_sha256"] for row in quality_rows}),
-            1,
-        )
-        training_context_path = training_quality_path.with_name(
-            "training_context.json"
-        )
-        training_context = json.loads(training_context_path.read_text())
-        self.assertEqual(
-            training_context["schema"], TRAINING_CONTEXT_TELEMETRY_SCHEMA
-        )
-        self.assertEqual(training_context["campaign_id"], "learner-test")
-        self.assertEqual(training_context["macro_round"], 0)
-        self.assertEqual(
-            training_context["training_probe_selection_sha256"],
-            quality_rows[0]["training_probe_selection_sha256"],
-        )
-        self.assertEqual(
-            training_context["metrics"]["expert_label_coverage"], 1.0
-        )
-        self.assertEqual(
-            training_context["metrics"]["scheduled_beta"], 0.5
-        )
-        fake_run.define_metric.assert_any_call(
-            "2_training_quality/*", step_metric="optimizer_step"
-        )
-        fake_run.define_metric.assert_any_call(
-            "3_validation_ood/*", step_metric="optimizer_step"
-        )
-
-    def test_training_context_local_artifact_is_restart_idempotent(self):
-        quality_path = self.root / "context-resume" / "training_quality.jsonl"
-        record = {
-            "schema": TRAINING_CONTEXT_TELEMETRY_SCHEMA,
-            "campaign_id": "learner-test",
-            "macro_round": 0,
-            "learner_config_sha256": "a" * 64,
-            "model_lineage_sha256": "b" * 64,
-            "replay_snapshot_file_sha256": "c" * 64,
-            "replay_snapshot_sha256": "d" * 64,
-            "training_probe_selection_sha256": "e" * 64,
-            "metrics": {
-                "parent_rollout_action_mse": 0.1,
-                "parent_rollout_action_mae": 0.2,
-                "parent_rollout_action_rmse": 0.3,
-                "parent_rollout_action_cosine": 0.4,
-                "parent_rollout_action_l2_p90": 0.5,
-                "expert_intervention_rate": 0.6,
-                "behavior_expert_match_rate": 0.7,
-                "expert_label_coverage": 1.0,
-                "replay_transitions": 128,
-                "replay_environments": 8,
-                "done_rate": 0.1,
-                "scheduled_beta": 0.5,
-            },
-        }
-        first = JsonlTelemetry(
-            None,
-            training_quality_path=quality_path,
-            dagger_dashboard=True,
-            enabled=True,
-        )
-        first.persist_training_context(record)
-        context_path = quality_path.with_name("training_context.json")
-        durable = context_path.read_bytes()
-
-        resumed = JsonlTelemetry(
-            None,
-            training_quality_path=quality_path,
-            dagger_dashboard=True,
-            enabled=True,
-        )
-        resumed.persist_training_context(record)
-        self.assertEqual(context_path.read_bytes(), durable)
-        changed = copy.deepcopy(record)
-        changed["metrics"]["scheduled_beta"] = 0.4
-        with self.assertRaisesRegex(
-            LearnerError, "training-context telemetry changed across restart"
-        ):
-            resumed.persist_training_context(changed)
-
-    def test_resume_relogs_due_heldout_frontier_without_duplicate_jsonl(self):
-        heldout_path = self.root / "quality-resume" / "heldout.jsonl"
-        config = _config(
-            heldout_snapshot=self.heldout_snapshot,
-            heldout_eval_interval=2,
-        )
-        partial_telemetry = JsonlTelemetry(
-            None, heldout_path=heldout_path, enabled=True
-        )
-        try:
-            partial = train_from_replay(
-                TinyPolicy(),
-                snapshot_path=self.snapshot_path,
-                config=config,
-                heldout_snapshot_path=self.heldout_snapshot_path,
-                output_dir=self.root / "quality-resume" / "run",
-                max_steps=4,
-                save_every=2,
-                telemetry=partial_telemetry,
-                validation_stop_at_step=2,
-            )
-        finally:
-            partial_telemetry.close()
-        self.assertEqual(
-            [
-                json.loads(line)["optimizer_step"]
-                for line in heldout_path.read_text().splitlines()
-            ],
-            [0, 2],
-        )
-
-        fake_run = types.SimpleNamespace(
-            log=mock.Mock(), finish=mock.Mock(), define_metric=mock.Mock()
-        )
-        fake_wandb = types.SimpleNamespace(
-            init=mock.Mock(return_value=fake_run),
-            Settings=mock.Mock(return_value=object()),
-        )
-        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
-            resumed_telemetry = JsonlTelemetry(
-                None,
-                heldout_path=heldout_path,
-                enabled=True,
-                wandb_project="quality-project",
-                wandb_run_id="quality-resume-run",
-                wandb_resume_must=True,
-            )
-            try:
-                train_from_replay(
-                    TinyPolicy(),
-                    snapshot_path=self.snapshot_path,
-                    config=config,
-                    heldout_snapshot_path=self.heldout_snapshot_path,
-                    output_dir=self.root / "quality-resume" / "run",
-                    max_steps=4,
-                    save_every=2,
-                    telemetry=resumed_telemetry,
-                    resume_from=partial.restart_checkpoint,
-                )
-            finally:
-                resumed_telemetry.close()
-
-        self.assertEqual(
-            [call.args[0]["optimizer_step"] for call in fake_run.log.call_args_list],
-            [2, 3, 4],
-        )
-        self.assertIn(
-            "quality/heldout_action_mse", fake_run.log.call_args_list[0].args[0]
-        )
-        self.assertEqual(
-            [
-                json.loads(line)["optimizer_step"]
-                for line in heldout_path.read_text().splitlines()
-            ],
-            [0, 2, 4],
-        )
-
-    def test_jsonl_telemetry_append_is_atomic_across_replace_failure(self):
+    def test_jsonl_telemetry_write_failure_preserves_durable_prefix(self):
         path = self.root / "atomic-telemetry" / "learner.jsonl"
         telemetry = JsonlTelemetry(path, enabled=True)
         telemetry.log({"optimizer_step": 1, "loss": 1.0})
         durable = path.read_bytes()
         with (
             mock.patch(
-                "round_dagger.learner.os.replace",
+                "round_dagger.learner.os.write",
                 side_effect=OSError("simulated scheduler interruption"),
             ),
             self.assertRaisesRegex(OSError, "scheduler interruption"),
         ):
             telemetry.log({"optimizer_step": 2, "loss": 0.5})
         self.assertEqual(path.read_bytes(), durable)
-        self.assertEqual(list(path.parent.glob(".learner.jsonl.*")), [])
 
-    def test_jsonl_telemetry_rejects_unsafe_or_torn_existing_log(self):
+    def test_jsonl_telemetry_rejects_symlink_and_appends_canonical_record(self):
         root = self.root / "unsafe-telemetry"
         root.mkdir()
         target = root / "target.jsonl"
         target.write_text("{}\n", encoding="utf-8")
         link = root / "learner.jsonl"
         link.symlink_to(target)
-        with self.assertRaisesRegex(LearnerError, "must not be a symlink"):
+        with self.assertRaisesRegex(LearnerError, "must not be a symbolic link"):
             JsonlTelemetry(link, enabled=True).log({"optimizer_step": 1})
 
         link.unlink()
-        link.write_text('{"optimizer_step":', encoding="utf-8")
-        with self.assertRaisesRegex(LearnerError, "torn final record"):
-            JsonlTelemetry(link, enabled=True).log({"optimizer_step": 1})
+        link.write_text('{"optimizer_step":0}\n', encoding="utf-8")
+        JsonlTelemetry(link, enabled=True).log({"optimizer_step": 1})
+        self.assertEqual(
+            [json.loads(line)["optimizer_step"] for line in link.read_text().splitlines()],
+            [0, 1],
+        )
 
     def test_resume_rejects_model_config_and_snapshot_lineage_mismatch(self):
         model = TinyPolicy()
-        partial = train_from_replay(
+        partial = _train_for_steps(
             model,
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "mismatch",
-            max_steps=2,
-            save_every=2,
+            optimizer_steps=2,
         )
         with self.assertRaisesRegex(LearnerError, "restart lineage mismatch"):
-            train_from_replay(
+            _train_for_steps(
                 TinyPolicy(),
                 snapshot_path=self.snapshot_path,
                 config=_config(model_lineage="c" * 64),
                 output_dir=self.root / "mismatch-2",
-                max_steps=3,
+                optimizer_steps=3,
                 resume_from=partial.restart_checkpoint,
             )
         tampered = torch.load(partial.restart_checkpoint, weights_only=False)
@@ -1521,12 +1089,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         tampered_path = self.root / "wrong-gradient-reduction.pt"
         torch.save(tampered, tampered_path)
         with self.assertRaisesRegex(LearnerError, "gradient_reduction"):
-            train_from_replay(
+            _train_for_steps(
                 TinyPolicy(),
                 snapshot_path=self.snapshot_path,
                 config=_config(),
                 output_dir=self.root / "mismatch-gradient-reduction",
-                max_steps=3,
+                optimizer_steps=3,
                 resume_from=tampered_path,
             )
         tampered = torch.load(partial.restart_checkpoint, weights_only=False)
@@ -1534,21 +1102,21 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         tampered_path = self.root / "wrong-snapshot.pt"
         torch.save(tampered, tampered_path)
         with self.assertRaisesRegex(LearnerError, "replay_snapshot_sha256"):
-            train_from_replay(
+            _train_for_steps(
                 TinyPolicy(),
                 snapshot_path=self.snapshot_path,
                 config=_config(),
                 output_dir=self.root / "mismatch-4",
-                max_steps=3,
+                optimizer_steps=3,
                 resume_from=tampered_path,
             )
         with self.assertRaisesRegex(LearnerError, "restart lineage mismatch"):
-            train_from_replay(
+            _train_for_steps(
                 TinyPolicy(),
                 snapshot_path=self.snapshot_path,
                 config=_config(mean=(0.4, 0.5, 0.5)),
                 output_dir=self.root / "mismatch-3",
-                max_steps=3,
+                optimizer_steps=3,
                 resume_from=partial.restart_checkpoint,
             )
 
@@ -1556,13 +1124,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
         identity = "a" * 64
         container = "b" * 64
         contract = "c" * 64
-        partial = train_from_replay(
+        partial = _train_for_steps(
             TinyPolicy(),
             snapshot_path=self.snapshot_path,
             config=_config(),
             output_dir=self.root / "semantic-restart",
-            max_steps=2,
-            save_every=2,
+            optimizer_steps=2,
             learner_identity_sha256=identity,
             runtime_container_sha256=container,
             learner_contract_sha256=contract,
@@ -1575,12 +1142,12 @@ class SupervisedTrainingAndResumeTest(LearnerFixture):
             with self.subTest(field=field), self.assertRaisesRegex(
                 LearnerError, field
             ):
-                train_from_replay(
+                _train_for_steps(
                     TinyPolicy(),
                     snapshot_path=self.snapshot_path,
                     config=_config(),
                     output_dir=self.root / f"semantic-restart-{field}",
-                    max_steps=3,
+                    optimizer_steps=3,
                     resume_from=partial.restart_checkpoint,
                     learner_identity_sha256=values[0],
                     runtime_container_sha256=values[1],

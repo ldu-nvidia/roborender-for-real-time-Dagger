@@ -7,7 +7,7 @@ import argparse
 import importlib
 import json
 import os
-import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,11 +26,9 @@ from round_dagger.checkpoint_compat import (  # noqa: E402
     CheckpointCompatibilityError,
     load_hash_pinned_policy_state_dict,
 )
-from round_dagger.learner_identity import (  # noqa: E402
-    learner_identity_sha256,
-    learner_wandb_run_id,
-)
+from round_dagger.learner_identity import learner_identity_sha256  # noqa: E402
 from round_dagger.learner import (  # noqa: E402
+    CANONICAL_CAMPAIGN_ROOT,
     JsonlTelemetry,
     LearnerBundleConfig,
     LearnerError,
@@ -40,10 +38,19 @@ from round_dagger.learner import (  # noqa: E402
     publish_learner_result,
     train_from_replay,
 )
-from round_dagger.replay import load_heldout_snapshot, load_snapshot  # noqa: E402
+from round_dagger.native_actor_protocol import train_round_relative_root  # noqa: E402
+from round_dagger.replay import load_snapshot  # noqa: E402
 
 
-_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+def _require_campaign_path(path: Path, label: str, *, current_generation: Path | None = None) -> Path:
+    resolved = path.expanduser().resolve(strict=path.exists())
+    root = CANONICAL_CAMPAIGN_ROOT.resolve(strict=True)
+    required_root = root if current_generation is None else current_generation
+    try:
+        resolved.relative_to(required_root)
+    except ValueError as exc:
+        raise LearnerError(f"{label} lies outside canonical campaign storage") from exc
+    return resolved
 
 
 def _symbol(specification: str) -> Any:
@@ -112,46 +119,43 @@ def _rank() -> int:
     return 0
 
 
-def _wandb_resume_modes(arguments: argparse.Namespace) -> tuple[bool, bool]:
-    """Return strict W&B modes without changing ordinary production behavior."""
+def _publish_frontier(source: Path, destination: Path) -> str:
+    """Create one read-only checkpoint for a validation frontier."""
 
-    resume_must = (
-        arguments.resume_from is not None and arguments.wandb_run_id is not None
+    source = source.resolve(strict=True)
+    destination = destination.resolve(strict=False)
+    if source.is_symlink() or not source.is_file():
+        raise LearnerError("learner restart checkpoint is missing or unsafe")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     )
-    resume_never = bool(arguments.wandb_resume_never)
-    if resume_never and resume_must:
-        raise LearnerError(
-            "--wandb-resume-never cannot be combined with --resume-from"
-        )
-    if resume_never and (
-        arguments.wandb_project is None or arguments.wandb_run_id is None
-    ):
-        raise LearnerError(
-            "--wandb-resume-never requires --wandb-project and --wandb-run-id"
-        )
-    return resume_must, resume_never
-
-
-def _expected_wandb_run_id(
-    canonical_run_id: str, binding_sha256: str | None
-) -> str:
-    """Derive the exact external run ID, optionally bound to a live gate.
-
-    Ordinary production learners retain the canonical semantic learner ID.
-    The heldout-100 validation gate additionally binds its fresh campaign,
-    held-out snapshot, and production contract into ``binding_sha256``.  Do
-    not accept an arbitrary caller suffix: it must be the deterministic first
-    32 hex characters of a full SHA-256 supplied on its dedicated argument.
-    """
-
-    if binding_sha256 is None:
-        return canonical_run_id
-    if _SHA256_RE.fullmatch(binding_sha256) is None:
-        raise LearnerError("W&B run binding must be a lowercase SHA-256")
-    run_id = f"{canonical_run_id}-b{binding_sha256[:32]}"
-    if len(run_id) > 128:
-        raise LearnerError("binding-qualified W&B run ID exceeds 128 characters")
-    return run_id
+    source_digest = sha256_file(source)
+    try:
+        descriptor = os.open(destination, flags, 0o444)
+    except FileExistsError:
+        if (
+            destination.is_symlink()
+            or not destination.is_file()
+            or sha256_file(destination) != source_digest
+        ):
+            raise LearnerError("validation frontier path already contains different bytes")
+        return source_digest
+    try:
+        with source.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
+            while chunk := reader.read(1024 * 1024):
+                writer.write(chunk)
+            writer.flush()
+            os.fchmod(writer.fileno(), stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+            os.fsync(writer.fileno())
+    except BaseException:
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return source_digest
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -165,13 +169,8 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "campaign/projection root used to resolve producer-absolute replay "
-            "paths after an RTX-to-H200 handoff"
+            "paths after replay materialization"
         ),
-    )
-    parser.add_argument(
-        "--heldout-snapshot",
-        type=Path,
-        help="immutable purpose=eval replay snapshot pinned by the learner bundle",
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model-factory", required=True)
@@ -186,75 +185,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-container-sha256")
     parser.add_argument("--learner-contract-sha256")
     parser.add_argument(
-        "--max-steps",
+        "--target-optimizer-examples",
+        required=True,
         type=int,
-        help="must match the immutable learner bundle (defaults to its value)",
+        help="global optimizer-example frontier pinned by the learner bundle",
     )
     parser.add_argument(
-        "--save-every",
+        "--checkpoint-every-optimizer-examples",
+        required=True,
         type=int,
-        help="must match the immutable learner bundle (defaults to its value)",
-    )
-    parser.add_argument(
-        "--heldout-eval-interval",
-        type=int,
-        help=(
-            "must match heldout_eval_interval in the immutable learner bundle "
-            "(production target: 100)"
-        ),
+        help="global optimizer-example interval pinned by the learner bundle",
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--telemetry-jsonl", type=Path)
-    parser.add_argument("--heldout-telemetry-jsonl", type=Path)
-    parser.add_argument("--training-quality-telemetry-jsonl", type=Path)
     parser.add_argument(
-        "--dagger-wandb-dashboard",
-        action="store_true",
-        help=(
-            "publish the sampled-scene, training-quality, and OOD-validation "
-            "W&B namespaces"
-        ),
-    )
-    parser.add_argument(
-        "--scene-sample-manifest",
+        "--frontier-output",
+        required=True,
         type=Path,
-        help="immutable sampled condition/render contact-sheet manifest",
-    )
-    parser.add_argument(
-        "--dagger-beta",
-        type=float,
-        help="scheduled expert-behavior probability bound by the replay contract",
-    )
-    parser.add_argument("--wandb-project")
-    parser.add_argument("--wandb-entity")
-    parser.add_argument("--wandb-run-id")
-    parser.add_argument(
-        "--wandb-run-binding-sha256",
-        help=(
-            "validation-only full SHA-256 used to derive the exact -b<32hex> "
-            "suffix on the canonical learner W&B run ID"
-        ),
-    )
-    parser.add_argument(
-        "--wandb-resume-never",
-        action="store_true",
-        help=(
-            "fail if the canonical W&B run ID already exists; validation-only "
-            "first-invocation protection against stale deterministic history"
-        ),
+        help="generation-local immutable checkpoint evaluated at this frontier",
     )
     parser.add_argument(
         "--no-publish-result",
         action="store_true",
         help="write only restart.pt (useful for an intentional restart smoke)",
-    )
-    parser.add_argument(
-        "--validation-stop-at-step",
-        type=int,
-        help=(
-            "validation-only absolute optimizer frontier; must be below max_steps "
-            "and requires --no-publish-result"
-        ),
     )
     return parser
 
@@ -273,78 +226,50 @@ def main(argv: list[str] | None = None) -> int:
         if requested_device.type == "cuda":
             configure_deterministic_runtime(requested_device)
     config = LearnerBundleConfig.load(arguments.bundle)
-    max_steps = config.max_steps if arguments.max_steps is None else arguments.max_steps
-    save_every = (
-        config.save_every if arguments.save_every is None else arguments.save_every
+    generation_root = (
+        CANONICAL_CAMPAIGN_ROOT / train_round_relative_root(config.generation_id)
+    ).resolve(strict=True)
+    if arguments.artifact_root is None or arguments.artifact_root.resolve(strict=True) != CANONICAL_CAMPAIGN_ROOT.resolve(strict=True):
+        raise LearnerError("--artifact-root must be the canonical H200 data root")
+    for path, label in (
+        (arguments.bundle, "learner bundle"),
+        (arguments.snapshot, "train replay snapshot"),
+        (arguments.output_dir, "learner output"),
+        (arguments.frontier_output, "validation frontier checkpoint"),
+    ):
+        _require_campaign_path(path, label, current_generation=generation_root)
+    for path, label in (
+        (arguments.initial_checkpoint, "initial checkpoint"),
+        (arguments.resume_from, "restart checkpoint"),
+    ):
+        if path is not None:
+            _require_campaign_path(path, label)
+    if arguments.target_optimizer_examples > config.target_optimizer_examples:
+        raise LearnerError(
+            "--target-optimizer-examples exceeds the immutable stage maximum"
+        )
+    if (
+        arguments.checkpoint_every_optimizer_examples
+        != config.checkpoint_every_optimizer_examples
+    ):
+        raise LearnerError(
+            "--checkpoint-every-optimizer-examples differs from the immutable bundle"
+        )
+    identity_arguments = (
+        arguments.learner_identity_sha256,
+        arguments.runtime_container_sha256,
+        arguments.learner_contract_sha256,
     )
-    if max_steps != config.max_steps:
-        raise LearnerError("--max-steps differs from the immutable learner bundle")
-    if save_every != config.save_every:
-        raise LearnerError("--save-every differs from the immutable learner bundle")
-    if config.heldout_evaluation_enabled != (
-        arguments.heldout_snapshot is not None
+    if any(value is not None for value in identity_arguments) and any(
+        value is None for value in identity_arguments
+    ):
+        raise LearnerError("learner semantic identity arguments are incomplete")
+    if not arguments.no_publish_result and any(
+        value is None for value in identity_arguments
     ):
         raise LearnerError(
-            "--heldout-snapshot and immutable held-out bundle fields must be "
-            "supplied together"
-        )
-    if arguments.heldout_eval_interval is not None and (
-        arguments.heldout_eval_interval != config.heldout_eval_interval
-    ):
-        raise LearnerError(
-            "--heldout-eval-interval differs from the immutable learner bundle"
-        )
-    if (
-        arguments.heldout_telemetry_jsonl is not None
-        and not config.heldout_evaluation_enabled
-    ):
-        raise LearnerError(
-            "--heldout-telemetry-jsonl requires held-out evaluation"
-        )
-    if arguments.dagger_wandb_dashboard and (
-        not config.heldout_evaluation_enabled
-        or arguments.training_quality_telemetry_jsonl is None
-        or arguments.scene_sample_manifest is None
-        or arguments.dagger_beta is None
-        or arguments.wandb_project is None
-    ):
-        raise LearnerError(
-            "--dagger-wandb-dashboard requires held-out evaluation, W&B, "
-            "--training-quality-telemetry-jsonl, --scene-sample-manifest, "
-            "and --dagger-beta"
-        )
-    if (
-        not arguments.dagger_wandb_dashboard
-        and (
-            arguments.training_quality_telemetry_jsonl is not None
-            or arguments.scene_sample_manifest is not None
-            or arguments.dagger_beta is not None
-        )
-    ):
-        raise LearnerError(
-            "training-quality telemetry and scene samples require "
-            "--dagger-wandb-dashboard"
-        )
-    if (
-        arguments.validation_stop_at_step is not None
-        and not arguments.no_publish_result
-    ):
-        raise LearnerError(
-            "--validation-stop-at-step requires --no-publish-result"
-        )
-    if arguments.validation_stop_at_step is not None and not (
-        1 <= arguments.validation_stop_at_step < max_steps
-    ):
-        raise LearnerError(
-            "--validation-stop-at-step must be in [1, max_steps)"
-        )
-    wandb_resume_must, wandb_resume_never = _wandb_resume_modes(arguments)
-    if arguments.wandb_run_binding_sha256 is not None and (
-        arguments.wandb_project is None or arguments.wandb_run_id is None
-    ):
-        raise LearnerError(
-            "--wandb-run-binding-sha256 requires --wandb-project and "
-            "--wandb-run-id"
+            "published learner results require --learner-identity-sha256, "
+            "--runtime-container-sha256, and --learner-contract-sha256"
         )
     bundle_mapping = config.to_mapping()
     if (
@@ -389,76 +314,20 @@ def main(argv: list[str] | None = None) -> int:
 
     device = _distributed_device(arguments.device)
     rank = _rank()
-    wandb_config = {
-        "campaign_id": config.campaign_id,
-        "round_dagger/campaign_id": config.campaign_id,
-        "macro_round": config.macro_round,
-        "learner_code_sha256": config.code_sha256,
-        "learner_config_sha256": config.sha256,
-        "model_lineage_sha256": config.model_lineage_sha256,
-    }
-    if arguments.dagger_wandb_dashboard:
-        wandb_config.update(
-            {
-                "dashboard_schema": "fast_roborender.dagger_wandb.v2",
-                "validation_distribution": (
-                    "motion_trajectory_ood_same_task_scene_renderer"
-                ),
-                "validation_is_closed_loop": False,
-                "validation_is_unseen_task_or_scene": False,
-                "scheduled_dagger_beta": arguments.dagger_beta,
-            }
-        )
-    if arguments.heldout_snapshot is not None:
-        heldout_identity = load_heldout_snapshot(
-            arguments.heldout_snapshot,
-            expected_file_sha256=config.heldout_snapshot_file_sha256,
-            artifact_root=arguments.artifact_root,
-        )
-        if heldout_identity["snapshot_sha256"] != config.heldout_snapshot_sha256:
-            raise LearnerError("held-out replay snapshot semantic digest mismatch")
-        if heldout_identity["campaign_id"] != config.campaign_id:
-            raise LearnerError("held-out replay campaign differs from learner bundle")
-        wandb_config.update(
-            heldout_snapshot_file_sha256=heldout_identity["file_sha256"],
-            heldout_snapshot_sha256=heldout_identity["snapshot_sha256"],
-            heldout_eval_interval=config.heldout_eval_interval,
-            heldout_transitions=heldout_identity["transition_count"],
-        )
-    identity_arguments = (
-        arguments.learner_identity_sha256,
-        arguments.runtime_container_sha256,
-        arguments.learner_contract_sha256,
+    snapshot_identity = load_snapshot(
+        arguments.snapshot,
+        expected_file_sha256=arguments.expected_snapshot_file_sha256,
+        artifact_root=arguments.artifact_root,
     )
-    if any(value is not None for value in identity_arguments) and any(
-        value is None for value in identity_arguments
+    if (
+        snapshot_identity["campaign_id"] != config.campaign_id
+        or snapshot_identity["through_macro_round"] != config.macro_round
     ):
-        raise LearnerError("learner semantic identity arguments are incomplete")
-    snapshot_identity = None
-    parent_runtime_sha256 = None
-    if arguments.wandb_project or all(
-        value is not None for value in identity_arguments
-    ):
-        snapshot_identity = load_snapshot(
-            arguments.snapshot,
-            expected_file_sha256=arguments.expected_snapshot_file_sha256,
-            artifact_root=arguments.artifact_root,
-        )
-        if (
-            snapshot_identity["campaign_id"] != config.campaign_id
-            or snapshot_identity["through_macro_round"] != config.macro_round
-        ):
-            raise LearnerError("replay snapshot lineage differs from learner bundle")
-        parent_runtime_sha256 = config.to_mapping()["model_config"][
-            "runtime_policy_sha256"
-        ]
-        wandb_config.update(
-            parent_runtime_policy_sha256=parent_runtime_sha256,
-            replay_snapshot_file_sha256=snapshot_identity["file_sha256"],
-            replay_snapshot_sha256=snapshot_identity["snapshot_sha256"],
-        )
+        raise LearnerError("replay snapshot lineage differs from learner bundle")
+    parent_runtime_sha256 = config.to_mapping()["model_config"][
+        "runtime_policy_sha256"
+    ]
     if all(value is not None for value in identity_arguments):
-        assert snapshot_identity is not None and parent_runtime_sha256 is not None
         identity_sha256 = learner_identity_sha256(
             campaign_id=config.campaign_id,
             macro_round=config.macro_round,
@@ -475,39 +344,9 @@ def main(argv: list[str] | None = None) -> int:
             raise LearnerError(
                 "learner identity SHA-256 does not bind the exact semantic run"
             )
-        if arguments.wandb_project:
-            expected_run_id = _expected_wandb_run_id(
-                learner_wandb_run_id(
-                    campaign_id=config.campaign_id,
-                    macro_round=config.macro_round,
-                    learner_identity_sha256=identity_sha256,
-                ),
-                arguments.wandb_run_binding_sha256,
-            )
-            if arguments.wandb_run_id != expected_run_id:
-                raise LearnerError("W&B run ID is not bound to learner identity")
-        wandb_config.update(
-            learner_identity_sha256=identity_sha256,
-            runtime_container_sha256=arguments.runtime_container_sha256,
-            learner_contract_sha256=arguments.learner_contract_sha256,
-        )
-        if arguments.wandb_run_binding_sha256 is not None:
-            wandb_config["wandb_run_binding_sha256"] = (
-                arguments.wandb_run_binding_sha256
-            )
     telemetry = JsonlTelemetry(
         arguments.telemetry_jsonl,
         enabled=rank == 0,
-        heldout_path=arguments.heldout_telemetry_jsonl,
-        training_quality_path=arguments.training_quality_telemetry_jsonl,
-        dagger_dashboard=arguments.dagger_wandb_dashboard,
-        scene_sample_manifest=arguments.scene_sample_manifest,
-        wandb_project=arguments.wandb_project,
-        wandb_entity=arguments.wandb_entity,
-        wandb_run_id=arguments.wandb_run_id,
-        wandb_resume_must=wandb_resume_must,
-        wandb_resume_never=wandb_resume_never,
-        wandb_config=wandb_config,
     )
     result = None
     telemetry_exit_code = 2
@@ -517,29 +356,23 @@ def main(argv: list[str] | None = None) -> int:
             snapshot_path=arguments.snapshot,
             config=config,
             output_dir=arguments.output_dir,
-            max_steps=max_steps,
+            target_optimizer_examples=arguments.target_optimizer_examples,
             adapter=adapter,
             device=device,
             resume_from=arguments.resume_from,
             expected_snapshot_file_sha256=arguments.expected_snapshot_file_sha256,
-            heldout_snapshot_path=arguments.heldout_snapshot,
             artifact_root=arguments.artifact_root,
-            save_every=save_every,
+            checkpoint_every_optimizer_examples=(
+                arguments.checkpoint_every_optimizer_examples
+            ),
             telemetry=telemetry,
-            validation_stop_at_step=arguments.validation_stop_at_step,
             learner_identity_sha256=arguments.learner_identity_sha256,
             runtime_container_sha256=arguments.runtime_container_sha256,
             learner_contract_sha256=arguments.learner_contract_sha256,
-            dagger_beta=arguments.dagger_beta,
         )
         telemetry_exit_code = 0
     finally:
-        # A canonical learner result is the recovery commit point.  Close and
-        # flush the authenticated W&B run before publishing it so a process
-        # killed during telemetry finalization can leave only restart state,
-        # never a result that falsely implies telemetry completion.  Always
-        # enter the distributed barrier even if rank-zero W&B finalization
-        # raises, otherwise the other ranks can hang indefinitely.
+        # Close local telemetry before the distributed ranks leave together.
         try:
             telemetry.close(exit_code=telemetry_exit_code)
         finally:
@@ -548,9 +381,19 @@ def main(argv: list[str] | None = None) -> int:
                 torch.distributed.destroy_process_group()
     if result is None:
         raise LearnerError("learner returned without a training result")
+    frontier_sha256 = None
+    if rank == 0:
+        frontier_sha256 = _publish_frontier(
+            Path(result.restart_checkpoint), arguments.frontier_output
+        )
     if rank == 0 and not arguments.no_publish_result:
         report = publish_learner_result(
-            output_dir=arguments.output_dir, result=result, config=config
+            output_dir=arguments.output_dir,
+            result=result,
+            config=config,
+            learner_identity_sha256=arguments.learner_identity_sha256,
+            runtime_container_sha256=arguments.runtime_container_sha256,
+            learner_contract_sha256=arguments.learner_contract_sha256,
         )
         print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
     elif rank == 0:
@@ -559,8 +402,10 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "completed_steps": result.completed_steps,
                     "target_steps": result.target_steps,
-                    "validation_stopped": result.validation_stopped,
+                    **dict(result.exposure),
                     "restart_checkpoint": result.restart_checkpoint,
+                    "frontier_checkpoint": str(arguments.frontier_output),
+                    "frontier_checkpoint_sha256": frontier_sha256,
                     "replay_snapshot_sha256": result.replay_snapshot_sha256,
                 },
                 indent=2,

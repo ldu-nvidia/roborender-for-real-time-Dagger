@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Portable, camera-free construction contract for the GR00T DAgger student.
 
-The RTX collector exports this small resolved specification beside the bootstrap
-checkpoint.  The H100 learner reconstructs the exact policy architecture from
-the specification, initializes the ResNet without pretrained weights (and
-therefore without any network access), then strictly loads the checkpoint.
+The native H200 collector exports this small resolved specification beside the
+bootstrap checkpoint.  The distributed learner reconstructs the exact policy
+architecture from the specification, initializes the ResNet without pretrained
+weights (and therefore without any network access), then strictly loads the
+checkpoint.
 
 Heavy runtime dependencies are intentionally imported only inside construction
 and checkpoint functions.  Specification validation and export remain usable
@@ -675,8 +676,8 @@ def load_checkpoint_strict(
 ) -> dict[str, Any]:
     """Load one exact GR00T policy state and reject missing/unexpected keys.
 
-    Auxiliary RTX trainer objects embedded beside the policy are deserialized
-    only as inert, discarded compatibility values.  The returned document is
+    Auxiliary trainer objects embedded beside the policy are deserialized only
+    as inert, discarded compatibility values.  The returned document is
     intentionally sanitized to contain no trainer state.
     """
 

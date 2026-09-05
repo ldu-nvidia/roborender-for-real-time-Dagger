@@ -1,4 +1,4 @@
-"""Unit tests for the narrow RTX NumPy-2 actor warm-start bridge."""
+"""Unit tests for the native H200 NumPy-2 actor warm-start bridge."""
 
 from __future__ import annotations
 

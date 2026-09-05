@@ -11,8 +11,16 @@ from unittest import mock
 import numpy as np
 
 from round_dagger import artifacts
+from round_dagger.conditioning_artifacts import (
+    derive_sparse_image_schedule,
+    load_raw_conditioning_artifact,
+    validate_conditioning_contract,
+)
 from round_dagger.actor import (
     ActorExportError,
+    _native_generation_shard_ids_from_environment,
+    _native_rank_motion_ids,
+    _validate_native_export_role,
     denormalize_policy_rgb,
     export_trainer_rollout,
     runtime_policy_sha256,
@@ -141,6 +149,43 @@ def fake_trainer(*, steps=3, envs=4):
     return trainer, rgb
 
 
+def native_conditioning_slice(
+    *, global_env_ids, episode_ids, episode_steps, **_kwargs
+):
+    schedule = derive_sparse_image_schedule(
+        global_env_ids, episode_ids, episode_steps
+    )
+    image_count = int(schedule["image_global_env_ids"].size)
+    episodes = sorted(
+        {
+            (int(global_env_ids[t, b]), int(episode_ids[t, b]))
+            for t in range(global_env_ids.shape[0])
+            for b in range(global_env_ids.shape[1])
+        }
+    )
+    result = {
+        "anchor_valid": episode_steps == 0,
+        "anchor_global_env_ids": np.asarray([row[0] for row in episodes], np.int64),
+        "anchor_episode_ids": np.asarray([row[1] for row in episodes], np.int64),
+        **schedule,
+    }
+    depth = np.broadcast_to(
+        np.arange(416, dtype=np.uint8)[None, None, :],
+        (image_count, 240, 416),
+    ).copy()
+    robot = np.zeros((image_count, 240, 416, 3), dtype=np.uint8)
+    robot[:, 40:120, 80:200] = 100
+    anchor = np.broadcast_to(
+        np.arange(416, dtype=np.uint8)[None, None, :, None],
+        (len(episodes), 240, 416, 3),
+    ).copy()
+    for view in ("head_color", "hand_left", "hand_right"):
+        result[f"depth_ctrl__{view}"] = depth.copy()
+        result[f"rgb_robot__{view}"] = robot.copy()
+        result[f"rgb_anchor__{view}"] = anchor.copy()
+    return result
+
+
 class ActorConversionTest(unittest.TestCase):
     def test_denormalization_recovers_uint8_policy_observation(self):
         trainer, expected = fake_trainer()
@@ -165,6 +210,43 @@ class ActorConversionTest(unittest.TestCase):
         trainer.storage.step -= 1
         with self.assertRaisesRegex(ActorExportError, "incomplete"):
             trainer_rollout_arrays(trainer)
+
+    def test_native_replay_keeps_student_actor_obs_and_excludes_privileged_obs(self):
+        trainer, _ = fake_trainer()
+        trainer.observation_source = "native"
+        trainer.algo_obs_dim_dict["teacher_obs"] = 7
+        trainer.storage.values["teacher_obs"] = np.ones((3, 4, 7), dtype=np.float32)
+        trainer.roborender_conditioning_slice = native_conditioning_slice
+        arrays = trainer_rollout_arrays(trainer)
+        self.assertIn("obs__actor_obs", arrays)
+        self.assertNotIn("policy_rgb", arrays)
+        self.assertIn("depth_ctrl__head_color", arrays)
+        self.assertIn("rgb_robot__hand_left", arrays)
+        self.assertIn("rgb_anchor__hand_right", arrays)
+        self.assertNotIn("obs__teacher_obs", arrays)
+        self.assertNotIn("observation_is_raytraced", arrays)
+        self.assertIn("image_reference_indices", arrays)
+
+    def test_validation_collection_is_confined_to_heldout_conditioning_root(self):
+        trainer = SimpleNamespace(
+            observation_source="native", native_role="validation_collect"
+        )
+        environment = {
+            "ROUND_DAGGER_PURPOSE": "validation",
+            "ROUND_DAGGER_VALIDATION_CONDITIONING_ROOT": "/heldout/validation",
+        }
+        _validate_native_export_role(
+            trainer, environment, Path("/heldout/validation/panel-001")
+        )
+        with self.assertRaisesRegex(ActorExportError, "heldout validation root"):
+            _validate_native_export_role(
+                trainer, environment, Path("/campaign/train/cohort")
+            )
+        wrong = dict(environment, ROUND_DAGGER_PURPOSE="train")
+        with self.assertRaisesRegex(ActorExportError, "purpose disagree"):
+            _validate_native_export_role(
+                trainer, wrong, Path("/heldout/validation/panel-001")
+            )
 
     def test_runtime_digest_is_stable_and_parameter_sensitive(self):
         policy = NumpyPolicy()
@@ -295,6 +377,91 @@ class ActorConversionTest(unittest.TestCase):
             self.assertIn("symlink", rejected_link.stderr)
 
 
+class NativeGenerationTopologyTest(unittest.TestCase):
+    def test_generation_shards_use_one_actor_across_two_waves(self):
+        campaign = Path("/workspace/project/roborender/data")
+        generation = campaign / "BC/collection"
+        part_count = 32
+        expected_names = []
+        for part_index in range(part_count):
+            shard_id = (
+                "gen-000-bc__wave-001__gpu-00"
+                f"__shard-{part_count + part_index:06d}"
+            )
+            expected_names.extend((f"{shard_id}.npz", f"{shard_id}.json"))
+        environment = {
+            "ROUND_DAGGER_CAMPAIGN_ROOT": str(campaign),
+            "ROUND_DAGGER_GENERATION_ROOT": str(generation),
+            "ROUND_DAGGER_GENERATION_ID": "gen-000-bc",
+            "ROUND_DAGGER_MACRO_ROUND": "0",
+            "ROUND_DAGGER_ACTOR_ROLE": "bc_collect",
+            "ROUND_DAGGER_BETA": "1.0",
+            "ROUND_DAGGER_SATURATION_PHASE": "collect",
+            "ROUND_DAGGER_SATURATION_WAVE_INDEX": "1",
+            "ROUND_DAGGER_EXPECTED_SHARD_NAMES_JSON": json.dumps(expected_names),
+            "ROUND_DAGGER_OBSERVATION_SOURCE": "native",
+            "ROUND_DAGGER_PURPOSE": "train",
+            "ROUND_DAGGER_COHORT_DIR": str(
+                generation / "conditioning/waves/wave-001"
+            ),
+            "ROUND_DAGGER_ACTOR_RANK": "0",
+            "ROUND_DAGGER_ACTOR_WORLD_SIZE": "1",
+        }
+        observed = _native_generation_shard_ids_from_environment(
+            environment,
+            rank=0,
+            batch_size=128,
+            environments_per_shard=4,
+        )
+        self.assertEqual(len(observed), 32)
+        self.assertEqual(observed[0], "gen-000-bc__wave-001__gpu-00__shard-000032")
+        self.assertEqual(observed[-1], "gen-000-bc__wave-001__gpu-00__shard-000063")
+
+        wrong_world = {**environment, "ROUND_DAGGER_ACTOR_WORLD_SIZE": "8"}
+        with self.assertRaisesRegex(ActorExportError, "world-1/rank-0"):
+            _native_generation_shard_ids_from_environment(
+                wrong_world,
+                rank=0,
+                batch_size=128,
+                environments_per_shard=4,
+            )
+
+    def test_motion_offsets_follow_declared_world_size(self):
+        trainer = SimpleNamespace(native_group_ids=("a", "b", "c"))
+        production = {
+            "ROUND_DAGGER_ACTOR_RANK": "0",
+            "ROUND_DAGGER_ACTOR_WORLD_SIZE": "1",
+            "ROUND_DAGGER_GROUP_ROTATION_JSON": json.dumps(
+                {
+                    "start_group_offset": 0,
+                    "rank_group_offsets": [1],
+                    "counts": {"a": 1, "b": 2, "c": 1},
+                }
+            ),
+        }
+        self.assertEqual(
+            _native_rank_motion_ids(trainer, production, rank=0, batch_size=4),
+            ("b", "c", "a", "b"),
+        )
+
+        heldout = {
+            **production,
+            "ROUND_DAGGER_ACTOR_RANK": "1",
+            "ROUND_DAGGER_ACTOR_WORLD_SIZE": "2",
+            "ROUND_DAGGER_GROUP_ROTATION_JSON": json.dumps(
+                {
+                    "start_group_offset": 0,
+                    "rank_group_offsets": [0, 2],
+                    "counts": {"a": 1, "b": 1, "c": 1},
+                }
+            ),
+        }
+        self.assertEqual(
+            _native_rank_motion_ids(trainer, heldout, rank=1, batch_size=3),
+            ("c", "a", "b"),
+        )
+
+
 class ActorPublicationIntegrationTest(unittest.TestCase):
     def _cohort_environment(
         self,
@@ -417,6 +584,70 @@ class ActorPublicationIntegrationTest(unittest.TestCase):
             sealed = artifacts.seal_cohort(cohort)
             self.assertEqual(sealed["transition_count"], 12)
             self.assertEqual(sealed["global_env_ids"], [10, 11, 12, 13])
+
+    def test_native_export_publishes_raw_conditioning_not_learner_replay(self):
+        trainer, _ = fake_trainer(steps=3, envs=2)
+        trainer.observation_source = "native"
+        trainer.native_role = "bc_collect"
+        trainer.native_split_manifest_sha256 = "7" * 64
+        trainer.native_split_sha256 = "8" * 64
+        trainer.native_group_ids = ("train-group",)
+        trainer.native_panel_sha256 = None
+        trainer.roborender_conditioning_contract = validate_conditioning_contract()
+        trainer.roborender_prompt = "a robot moves a bottle into a tray"
+        trainer.roborender_seed = 42
+        trainer.roborender_reference_lag = 256
+        trainer.env.config.simulator.config.cameras.conditioning_views = [
+            {"name": name, "link": f"{name}_link", "pos": [0, 0, 0], "rot": [1, 0, 0, 0]}
+            for name in ("head_color", "hand_left", "hand_right")
+        ]
+
+        trainer.roborender_conditioning_slice = native_conditioning_slice
+        policy = NumpyPolicy()
+        runtime_sha = runtime_policy_sha256(
+            policy, homie_controller_sha256=HOMIE_CONTROLLER_SHA256
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            cohort = Path(temporary) / "conditioning/waves/wave-000"
+            environment = {
+                "ROUND_DAGGER_COHORT_DIR": str(cohort),
+                "ROUND_DAGGER_CAMPAIGN_ID": "dagger-redo-v001",
+                "ROUND_DAGGER_MACRO_ROUND": "0",
+                "ROUND_DAGGER_COHORT_INDEX": "0",
+                "ROUND_DAGGER_POLICY_SHA256": "1" * 64,
+                "ROUND_DAGGER_RUNTIME_POLICY_SHA256": runtime_sha,
+                "ROUND_DAGGER_TEACHER_SHA256": "3" * 64,
+                "ROUND_DAGGER_BETA_SHA256": "5" * 64,
+                "ROUND_DAGGER_CONFIG_SHA256": "6" * 64,
+                "ROUND_DAGGER_ENVS_PER_SHARD": "1",
+                "ROUND_DAGGER_ROLLOUT_ID": "0",
+                "ROUND_DAGGER_PURPOSE": "train",
+                "ROUND_DAGGER_OBSERVATION_SOURCE": "native",
+                "ROUND_DAGGER_OBSERVATION_RUNTIME_SHA256": "9" * 64,
+                "ROUND_DAGGER_ISAAC_RUNTIME_SHA256": "a" * 64,
+                "ROUND_DAGGER_ACTOR_PYTHON_FREEZE_SHA256": "b" * 64,
+                "ROUND_DAGGER_ACTOR_SOURCE_INVENTORY_SHA256": "c" * 64,
+                "ROUND_DAGGER_GR00T_REVISION": "d" * 40,
+                "ROUND_DAGGER_GR00T_SOURCE_TREE_SHA256": "e" * 64,
+                "ROUND_DAGGER_GPU_NAME": "NVIDIA H200",
+                "ROUND_DAGGER_COMPUTE_CAPABILITY": "9.0",
+                "ROUND_DAGGER_GPU_COUNT": "8",
+                "ROUND_DAGGER_PHYSICAL_GPU_INVENTORY_JSON": "[]",
+                "ROUND_DAGGER_PHYSICAL_GPU_INVENTORY_SHA256": "f" * 64,
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                reports = export_trainer_rollout(
+                    trainer,
+                    policy_module=policy,
+                    initial_runtime_policy_sha256=runtime_sha,
+                )
+            self.assertEqual(len(reports), 2)
+            self.assertTrue(all(report["learner_replay_ready"] is False for report in reports))
+            sidecars = sorted((cohort / "shards").glob("*.json"))
+            self.assertEqual(len(sidecars), 2)
+            _, arrays = load_raw_conditioning_artifact(sidecars[0])
+            self.assertNotIn("policy_rgb", arrays)
+            self.assertIn("depth_ctrl__head_color", arrays)
 
     def test_export_slices_each_environment_part_before_host_transfer(self):
         trainer, _ = fake_trainer(steps=3, envs=5)

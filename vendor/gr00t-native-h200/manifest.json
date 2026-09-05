@@ -1,0 +1,324 @@
+{
+  "base_revision": "9dd746d7fe86cbc09f20546695ab46bec609a3ea",
+  "file_count": 61,
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "cca3285793498214185bb804468056fc60337eeeeae028deb634c32df5d95c91",
+      "size_bytes": 12365,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/apps/isaaclab.python.headless.rendering.kit",
+      "sha256": "ecaaf90b6467be25bc87827332fa10d7b27390662e2e887abd28e50ece39b359",
+      "size_bytes": 7531,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/apps/phc.isaaclab.python.headless.rendering.kit",
+      "sha256": "ecaaf90b6467be25bc87827332fa10d7b27390662e2e887abd28e50ece39b359",
+      "size_bytes": 7531,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/apps/phc.isaaclab.python.rendering.kit",
+      "sha256": "905c9daf77a4be68978c5fb6d7525811b9f1e0d2223af69385585d7a857a93aa",
+      "size_bytes": 7132,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_round_actor_3view.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_round_actor_native_3view.yaml",
+      "sha256": "7da174216c3059dc44a1a01dea6de7d8711b8e7c5a44696eb654790f3ea3b750",
+      "size_bytes": 7000,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_student_videogen.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/config/trainer/trl_distill_videogen.yaml",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/data/robots/g1/g1_43dof_native_local.usda",
+      "sha256": "b8d7e71f20e95990e46f4fe735c843b4772afa33e609596d270543cc2c9db988",
+      "size_bytes": 1632,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/data/tasks/walk_stand_place_grasp_turn_homie/scenario_cfg/isaacsim.py",
+      "sha256": "5945e8924b9033a643737804be82aaa7d0fde86158ea080e5d8e546478c4f9cf",
+      "size_bytes": 18018,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/data/terrain/isaac_5_1_grid/Materials/Textures/WireframeBlur_basecolor.png",
+      "sha256": "deab39088eaf39ed7be951966c5e6bd5e58b90ab64743b0cdc8e5579fd5a99d9",
+      "size_bytes": 436257,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/data/terrain/isaac_5_1_grid/Materials/Textures/WireframeBlur_blue.png",
+      "sha256": "44fc0e82007bb0bd94631cd7ec45986a71ed74b9413899fbffac13efe151be4b",
+      "size_bytes": 1474958,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/data/terrain/isaac_5_1_grid/Materials/Textures/Wireframe_blue.png",
+      "sha256": "940b96ee8c8e53bd1acbc770d4ca0ac98bed9c96439ab386d1b27dbc9790cc4e",
+      "size_bytes": 111895,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/data/terrain/isaac_5_1_grid/default_environment.usd",
+      "sha256": "8a21c317d638d33a4e6c20c958a7ed8f4d8c5195efd7e20f1b85178b4a15638a",
+      "size_bytes": 13622,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/envs/legged_base_task/legged_robot_base.py",
+      "sha256": "3f8b52ff0c2382e6feb2ff636c67f7b6db27617ad43b9c6309712c5238098f58",
+      "size_bytes": 108745,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/simulator/isaacsim/isaacsim.py",
+      "sha256": "aeb2212379756f7efc9886a0ae13cf4a0d5ba1c8fb70fb23e1a75a249be47532",
+      "size_bytes": 155127,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/train_agent_trl.py",
+      "sha256": "8735b61cfcc203c4d4c4102d9f813ef9452b5d635b0879de2e90d97bbea287e4",
+      "size_bytes": 36877,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/trl/callbacks/autoresume_callback.py",
+      "sha256": "ee8da223a501f66b0c88fb72d36236213c626e953efe1d18a5de4ed3533e2f86",
+      "size_bytes": 2765,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/trl/trainer/anchor_io.py",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/trl/trainer/distill_trainer.py",
+      "sha256": "c54671c71678d71a5697d7535f8197fa9bebcf6cf72173718b5e93b10fff93c8",
+      "size_bytes": 25307,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/trl/trainer/distill_trainer_native_dagger.py",
+      "sha256": "71927a597433dde9081932957730903e0519d7e6b9bcf4e15f47201b650d2157",
+      "size_bytes": 34793,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
+      "sha256": "22a2886ea5a80e9d454e0f67a1e7193e85e3d33bd3a88185b7cb32c21b069af1",
+      "size_bytes": 46329,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/trl/trainer/ppo_trainer.py",
+      "sha256": "98c71a9b1de3e54828c6baa99544d75e6d28198649ef37f420c750292f45998d",
+      "size_bytes": 103263,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/trl/trainer/ppo_trainer_homie_api.py",
+      "sha256": "013d3807dce86728734e35eb510f1f640903f9b9fe7c8838a17dcce48d09a150",
+      "size_bytes": 104892,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/trl/utils/common.py",
+      "sha256": "5750604ca496aa373804e550486f8ecd8e41ca8cb09897b1f142dc79aa364aa0",
+      "size_bytes": 2032,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/utils/dagger_telemetry.py",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/utils/image3f_frame_client.py",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/utils/native_dagger_contract.py",
+      "sha256": "3d34e1f4d1201e8f6136c1d9c2e2c6efda804717d61e3a51cf8c11ef4ee5c626",
+      "size_bytes": 12240,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/utils/native_local_assets.py",
+      "sha256": "0fe2878afae6df759d00685b452989ce2c17fe5b44f92e9a225ec965124dcafd",
+      "size_bytes": 1187,
+      "status": "added"
+    },
+    {
+      "path": "gr00t/rl/utils/policy_view_contract.py",
+      "sha256": "3082b16664e20727b66cbbce54e7b254ac8cc0485187a720ff89985c770f0514",
+      "size_bytes": 7214,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/utils/round_dagger_paired_eval.py",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/utils/simulation_app_lifecycle.py",
+      "sha256": "3a0cb5c2eb73afc3b5406c0fd3fe45d826de5d93ae2e2c05dbeffbef276865ec",
+      "size_bytes": 7108,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/utils/simulator_rgb_anchor.py",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/utils/teleop_reset_lib/motion_split.py",
+      "sha256": "d2a00c2bd81fb203a67e5bc469aad9cc83b79c99613b800affd2d6bcd15d7b22",
+      "size_bytes": 17957,
+      "status": "modified"
+    },
+    {
+      "path": "gr00t/rl/utils/videogen_client.py",
+      "status": "deleted"
+    },
+    {
+      "path": "gr00t/rl/utils/videogen_prompts.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_anchor_io.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_dagger_telemetry_permissions.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_fail_closed_production_gate_parsing.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_first_condition_replay.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_homie_trainer_lineage.py",
+      "sha256": "b65a3d061ff2a6a9b7d221eef3b413e93e2acabd4d6b1d20d18066f9ac9df755",
+      "size_bytes": 4450,
+      "status": "modified"
+    },
+    {
+      "path": "tests/test_image3f_retry_accounting.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_motion_split.py",
+      "sha256": "eb47ecf57c2790a6c0d091c9ea300c65dc87cd235a92e9481ec82d485d7fc313",
+      "size_bytes": 17348,
+      "status": "modified"
+    },
+    {
+      "path": "tests/test_native_local_assets.py",
+      "sha256": "87a55f73ceb2f3f949eea6808900653d962d4526726bac390fe7ceb350b407b2",
+      "size_bytes": 8578,
+      "status": "added"
+    },
+    {
+      "path": "tests/test_native_observation_source.py",
+      "sha256": "aa13c2468542ce138285d385c92a85d5b6140929e75bd438869c43a5179fa06e",
+      "size_bytes": 54965,
+      "status": "added"
+    },
+    {
+      "path": "tests/test_paired_scenario_binding.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_policy_checkpoint_consumer.py",
+      "sha256": "dbd2f9506d36c50c752e6418946f02b850e0ecb535502270f4f434992f00e429",
+      "size_bytes": 1432,
+      "status": "modified"
+    },
+    {
+      "path": "tests/test_policy_view_contract.py",
+      "sha256": "da3bce53d7f1f7fa01ec55fdb804c1ac9ee205f5cbd9f9ea4a82b1ea70057624",
+      "size_bytes": 5105,
+      "status": "modified"
+    },
+    {
+      "path": "tests/test_runtime_shadow_integration.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_scenario_capture_control_flow.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_simulation_app_lifecycle.py",
+      "sha256": "162dd4417db6d9b0461a28d5956f9498ced2dc31d2fc3e40033702fed6dba067",
+      "size_bytes": 5088,
+      "status": "modified"
+    },
+    {
+      "path": "tests/test_simulator_rgb_anchor.py",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_teacher_checkpoint_device.py",
+      "sha256": "e02bf6a615610dc673732a15a5634b07e3f9c69479466357b899004bd020b19a",
+      "size_bytes": 2341,
+      "status": "modified"
+    },
+    {
+      "path": "tests/test_tray_material_randomization.py",
+      "sha256": "e16cfd26c4c49e7913a27625002ce51fefe707095d8a5736cd9865a721fec6b9",
+      "size_bytes": 2863,
+      "status": "added"
+    },
+    {
+      "path": "tests/test_videogen_rollout_buffering.py",
+      "status": "deleted"
+    }
+  ],
+  "patch_file": "changes.patch",
+  "patch_sha256": "431d37dccec3a020213619cb0e96b0d23533c90d8f3a4821262abf5c739fda64",
+  "schema": "fast_roborender.vendor.gr00t_native_h200_patch.v1",
+  "upstream_repository": "https://github.com/NVlabs/GR00T-VisualSim2Real.git"
+}

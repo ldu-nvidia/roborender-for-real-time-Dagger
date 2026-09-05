@@ -2,7 +2,7 @@
 """Validate the real RoboRender GR00T student on one CUDA device.
 
 This is a model-bound gate, not a synthetic throughput benchmark.  It proves
-that the exact hash-pinned parent checkpoint can be restored without the RTX
+that the exact hash-pinned parent checkpoint can be restored without the actor
 trainer dependency stack, that its portable runtime identity matches, and that
 the production observation/action adapter supports a finite forward/backward
 optimizer step while the auxiliary heads remain frozen.

@@ -1,19 +1,3 @@
-"""Round-based RTX actor / H100 learner infrastructure for RoboRender DAgger."""
+"""Native eight-H200 behavior-cloning and DAgger pipeline."""
 
-from .state import (
-    StateError,
-    beta_for_round,
-    initialize_campaign,
-    load_campaign,
-    load_state,
-    open_round,
-)
-
-__all__ = [
-    "StateError",
-    "beta_for_round",
-    "initialize_campaign",
-    "load_campaign",
-    "load_state",
-    "open_round",
-]
+__all__: list[str] = []

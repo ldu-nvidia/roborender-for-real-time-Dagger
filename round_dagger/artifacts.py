@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Immutable actor-side artifacts for round-based RoboRender DAgger.
 
-The RTX actor publishes one deterministic NPZ payload followed by a small JSON
+The native H200 actor publishes one deterministic NPZ payload followed by a JSON
 sidecar.  Consumers discover sidecars, never bare payloads, so a process dying
 between those two publications cannot expose an incomplete shard.  A cohort is
 visible to the learner only after its immutable seal proves exact rank, logical
@@ -28,6 +28,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
 import numpy as np
+
+from .native_actor_protocol import NATIVE_SHARD_ID, native_actor_generation
 
 from round_dagger.seed_policy import ActorSeedError, validate_actor_seed_contract
 from round_dagger.production_data_lineage import (
@@ -56,20 +58,53 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ARRAY_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 
-# Actor containers commonly run as root while the transfer and learner stages
-# run as the submitting user.  mkstemp(3) deliberately creates mode 0600
-# files, which made otherwise valid cohorts unreadable after the container
-# exited.  Published artifacts are content-addressed and create-only, so make
-# their final inode read-only and readable by every handoff stage.
+# Actor ranks run as root while later local stages may run as the submitting
+# user.  mkstemp(3) deliberately creates mode 0600 files.  Published artifacts
+# are content-addressed and create-only, so make their final inode read-only and
+# readable by every local pipeline stage.
 _PUBLISHED_FILE_MODE = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
 
 _DIGEST_FIELDS = (
     "policy_sha256",
     "runtime_policy_sha256",
     "teacher_sha256",
-    "renderer_sha256",
     "beta_sha256",
     "config_sha256",
+)
+_LEGACY_RENDERER_FIELD = "renderer_sha256"
+
+# Additive observation provenance.  Historical Image3F artifacts predate this
+# bundle and remain readable.  Once a source discriminator is present the
+# complete source-specific bundle is mandatory, is copied into every shard and
+# seal, and must match the immutable cohort contract exactly.
+_OBSERVATION_SOURCE_FIELDS = (
+    "observation_source",
+    "observation_runtime_sha256",
+)
+_NATIVE_RUNTIME_FIELDS = (
+    "isaac_runtime_sha256",
+    "actor_python_freeze_sha256",
+    "actor_source_inventory_sha256",
+    "gr00t_revision",
+    "gr00t_source_tree_sha256",
+    "gpu_name",
+    "compute_capability",
+    "gpu_count",
+    "physical_gpu_inventory",
+    "physical_gpu_inventory_sha256",
+)
+_OBSERVATION_PROVENANCE_FIELDS = (
+    *_OBSERVATION_SOURCE_FIELDS,
+    *_NATIVE_RUNTIME_FIELDS,
+)
+_REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
+_GPU_UUID_RE = re.compile(
+    r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+_PCI_BUS_ID_RE = re.compile(r"[0-9A-F]{8}:[0-9A-F]{2}:[0-9A-F]{2}\.[0-7]\Z")
+
+_NATIVE_OBSERVATION_RUNTIME_SCHEMA = (
+    "fast_roborender.round_dagger.native_h200_observation_runtime.v1"
 )
 
 _REQUIRED_ARRAYS = {
@@ -84,6 +119,9 @@ _REQUIRED_ARRAYS = {
     "episode_ids",
     "episode_steps",
 }
+_NATIVE_REQUIRED_ARRAYS = (
+    _REQUIRED_ARRAYS - {"observation_is_raytraced"}
+) | {"obs__actor_obs"}
 
 # Added without changing the v1 shard schema so historical round-0 replay
 # remains readable. New actors publish this complete bundle; partial evidence
@@ -107,6 +145,7 @@ _DATA_LINEAGE_SHA_FIELD = "data_lineage_sha256"
 _MOTION_ASSIGNMENT_FIELD = "motion_assignment"
 _MOTION_ASSIGNMENT_SHA_FIELD = "motion_assignment_sha256"
 _RANK_MOTION_ASSIGNMENT_FIELD = "rank_motion_assignment"
+_NATIVE_GENERATION_SHARD_ID = NATIVE_SHARD_ID
 
 _CONTRACT_KEYS = {
     "schema",
@@ -486,6 +525,176 @@ def _require_sha256(value: Any, label: str) -> str:
     return value
 
 
+def _require_revision(value: Any, label: str) -> str:
+    if not isinstance(value, str) or _REVISION_RE.fullmatch(value) is None:
+        raise ArtifactError(f"{label} must be an exact lowercase 40-hex revision")
+    return value
+
+
+def _require_canonical_absolute_path(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ArtifactError(f"{label} must be a canonical absolute path")
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or os.path.abspath(value) != value
+        or os.path.expanduser(value) != value
+        or any(part in {".", ".."} for part in path.parts)
+    ):
+        raise ArtifactError(f"{label} must be a canonical absolute path")
+    return value
+
+
+def validate_physical_gpu_inventory(value: Any) -> list[dict[str, Any]]:
+    """Validate the exact physical 8xH200 rank-to-CUDA mapping."""
+
+    if not isinstance(value, list) or len(value) != 8:
+        raise ArtifactError("physical_gpu_inventory must contain exactly eight rows")
+    rows: list[dict[str, Any]] = []
+    uuids: set[str] = set()
+    expected_keys = {
+        "rank",
+        "physical_index",
+        "uuid",
+        "pci_bus_id",
+        "name",
+        "compute_capability",
+        "total_memory_mib",
+        "mig_mode",
+    }
+    for expected_rank, raw in enumerate(value):
+        row = _require_exact_keys(
+            raw, expected_keys, f"physical_gpu_inventory[{expected_rank}]"
+        )
+        rank = _require_int(row["rank"], "physical_gpu_inventory[].rank")
+        physical_index = _require_int(
+            row["physical_index"], "physical_gpu_inventory[].physical_index"
+        )
+        uuid = row["uuid"]
+        if rank != expected_rank or physical_index != expected_rank:
+            raise ArtifactError(
+                "physical GPU inventory must map ordered ranks 0..7 to physical indices 0..7"
+            )
+        if not isinstance(uuid, str) or _GPU_UUID_RE.fullmatch(uuid) is None:
+            raise ArtifactError("physical GPU UUID must be canonical lowercase NVIDIA UUID")
+        if uuid in uuids:
+            raise ArtifactError("physical GPU inventory contains duplicate UUIDs")
+        uuids.add(uuid)
+        if (
+            not isinstance(row["pci_bus_id"], str)
+            or _PCI_BUS_ID_RE.fullmatch(row["pci_bus_id"]) is None
+        ):
+            raise ArtifactError("physical GPU PCI bus ID is malformed")
+        if row["name"] != "NVIDIA H200" or row["compute_capability"] != "9.0":
+            raise ArtifactError("physical GPU inventory requires exact NVIDIA H200/SM90 rows")
+        _require_int(
+            row["total_memory_mib"],
+            "physical_gpu_inventory[].total_memory_mib",
+            minimum=140_000,
+        )
+        if row["mig_mode"] != "Disabled":
+            raise ArtifactError("physical GPU inventory requires MIG disabled")
+        rows.append(row)
+    return rows
+
+
+def _observation_provenance_fields(document: Mapping[str, Any]) -> tuple[str, ...]:
+    """Validate the source-specific, direct-runtime provenance bundle."""
+
+    present = {
+        field for field in _OBSERVATION_PROVENANCE_FIELDS if field in document
+    }
+    if not present:
+        return ()
+    source_fields = set(_OBSERVATION_SOURCE_FIELDS)
+    native_fields = set(_NATIVE_RUNTIME_FIELDS)
+    if not source_fields <= present:
+        raise ArtifactError(
+            "observation source provenance requires observation_source and "
+            "observation_runtime_sha256"
+        )
+    source = document["observation_source"]
+    if source not in {"image3f", "native"}:
+        raise ArtifactError("observation_source must be exactly 'image3f' or 'native'")
+    _require_sha256(
+        document["observation_runtime_sha256"], "observation_runtime_sha256"
+    )
+    if source == "native":
+        expected = source_fields | native_fields
+        if present != expected:
+            raise ArtifactError(
+                "native observation provenance requires the complete direct-runtime bundle"
+            )
+        for field in (
+            "isaac_runtime_sha256",
+            "actor_python_freeze_sha256",
+            "actor_source_inventory_sha256",
+            "gr00t_source_tree_sha256",
+        ):
+            _require_sha256(document[field], field)
+        _require_revision(document["gr00t_revision"], "gr00t_revision")
+        if (
+            document["gpu_name"] != "NVIDIA H200"
+            or document["compute_capability"] != "9.0"
+            or document["gpu_count"] != 8
+        ):
+            raise ArtifactError("native observation provenance requires exact 8xH200 identity")
+        inventory = validate_physical_gpu_inventory(
+            document["physical_gpu_inventory"]
+        )
+        _require_sha256(
+            document["physical_gpu_inventory_sha256"],
+            "physical_gpu_inventory_sha256",
+        )
+        if document["physical_gpu_inventory_sha256"] != canonical_json_sha256(
+            inventory
+        ):
+            raise ArtifactError("physical GPU inventory SHA-256 mismatch")
+        _require_sha256(document.get("config_sha256"), "config_sha256")
+        runtime = {
+            "schema": _NATIVE_OBSERVATION_RUNTIME_SCHEMA,
+            "observation_source": "native",
+            "isaac_runtime_sha256": document["isaac_runtime_sha256"],
+            "actor_python_freeze_sha256": document["actor_python_freeze_sha256"],
+            "config_sha256": document["config_sha256"],
+            "actor_source_inventory_sha256": document[
+                "actor_source_inventory_sha256"
+            ],
+            "gr00t_revision": document["gr00t_revision"],
+            "gr00t_source_tree_sha256": document["gr00t_source_tree_sha256"],
+            "gpu_name": document["gpu_name"],
+            "compute_capability": document["compute_capability"],
+            "gpu_count": document["gpu_count"],
+            "physical_gpu_inventory": inventory,
+            "physical_gpu_inventory_sha256": document[
+                "physical_gpu_inventory_sha256"
+            ],
+        }
+        if document["observation_runtime_sha256"] != canonical_json_sha256(runtime):
+            raise ArtifactError("native observation runtime SHA-256 does not match its bundle")
+        if _LEGACY_RENDERER_FIELD in document:
+            raise ArtifactError("native observation provenance forbids renderer_sha256")
+    elif present != source_fields:
+        raise ArtifactError(
+            "Image3F observation provenance cannot claim native actor runtime fields"
+        )
+    return tuple(
+        field for field in _OBSERVATION_PROVENANCE_FIELDS if field in present
+    )
+
+
+def _verify_native_observation_binding(document: Mapping[str, Any]) -> None:
+    """Recompute the direct native runtime identity at every artifact boundary."""
+
+    _observation_provenance_fields(document)
+
+
+def _artifact_digest_fields(document: Mapping[str, Any]) -> tuple[str, ...]:
+    if document.get("observation_source") == "native":
+        return _DIGEST_FIELDS
+    return (*_DIGEST_FIELDS, _LEGACY_RENDERER_FIELD)
+
+
 def _require_sorted_unique_ints(value: Any, label: str) -> list[int]:
     if not isinstance(value, list) or not value:
         raise ArtifactError(f"{label} must be a non-empty list")
@@ -560,15 +769,20 @@ def _validate_contract(document: Any) -> dict[str, Any]:
         _MOTION_ASSIGNMENT_FIELD,
         _MOTION_ASSIGNMENT_SHA_FIELD,
     }
-    keys = _CONTRACT_KEYS | (production_keys if production else set()) | (
+    observation_fields = set(_observation_provenance_fields(document))
+    legacy_renderer = (
+        set() if document.get("observation_source") == "native"
+        else {_LEGACY_RENDERER_FIELD}
+    )
+    keys = _CONTRACT_KEYS | legacy_renderer | observation_fields | (production_keys if production else set()) | (
         {_ACTOR_SEED_FIELD} if _ACTOR_SEED_FIELD in document else set()
     )
     contract = _require_exact_keys(document, keys, "cohort contract")
     _require_token(contract["campaign_id"], "campaign_id")
     _require_int(contract["macro_round"], "macro_round")
     _require_int(contract["cohort_index"], "cohort_index")
-    if contract["purpose"] not in {"train", "eval"}:
-        raise ArtifactError("purpose must be exactly 'train' or 'eval'")
+    if contract["purpose"] not in {"train", "validation", "test"}:
+        raise ArtifactError("purpose must be exactly train, validation, or test")
     ranks = _require_sorted_unique_ints(contract["expected_ranks"], "expected_ranks")
     envs = _require_sorted_unique_ints(
         contract["expected_global_env_ids"], "expected_global_env_ids"
@@ -587,7 +801,7 @@ def _validate_contract(document: Any) -> dict[str, Any]:
         raise ArtifactError("expected_ranks cannot be empty")
     _validate_view_contract(contract["view_contract"])
     _validate_action_contract(contract["action_contract"])
-    for field in _DIGEST_FIELDS:
+    for field in _artifact_digest_fields(contract):
         _require_sha256(contract[field], field)
     if _ACTOR_SEED_FIELD in contract:
         try:
@@ -638,9 +852,21 @@ def create_cohort(
     policy_sha256: str,
     runtime_policy_sha256: str,
     teacher_sha256: str,
-    renderer_sha256: str,
     beta_sha256: str,
     config_sha256: str,
+    renderer_sha256: str | None = None,
+    observation_source: str | None = None,
+    observation_runtime_sha256: str | None = None,
+    isaac_runtime_sha256: str | None = None,
+    actor_python_freeze_sha256: str | None = None,
+    actor_source_inventory_sha256: str | None = None,
+    gr00t_revision: str | None = None,
+    gr00t_source_tree_sha256: str | None = None,
+    gpu_name: str | None = None,
+    compute_capability: str | None = None,
+    gpu_count: int | None = None,
+    physical_gpu_inventory: Sequence[Mapping[str, Any]] | None = None,
+    physical_gpu_inventory_sha256: str | None = None,
     actor_seed_contract: Mapping[str, Any] | None = None,
     data_lineage: Mapping[str, Any] | None = None,
     motion_assignment: Mapping[str, Any] | None = None,
@@ -686,10 +912,32 @@ def create_cohort(
         "policy_sha256": policy_sha256,
         "runtime_policy_sha256": runtime_policy_sha256,
         "teacher_sha256": teacher_sha256,
-        "renderer_sha256": renderer_sha256,
         "beta_sha256": beta_sha256,
         "config_sha256": config_sha256,
     }
+    if renderer_sha256 is not None:
+        contract[_LEGACY_RENDERER_FIELD] = renderer_sha256
+    optional_observation_provenance = {
+        "observation_source": observation_source,
+        "observation_runtime_sha256": observation_runtime_sha256,
+        "isaac_runtime_sha256": isaac_runtime_sha256,
+        "actor_python_freeze_sha256": actor_python_freeze_sha256,
+        "actor_source_inventory_sha256": actor_source_inventory_sha256,
+        "gr00t_revision": gr00t_revision,
+        "gr00t_source_tree_sha256": gr00t_source_tree_sha256,
+        "gpu_name": gpu_name,
+        "compute_capability": compute_capability,
+        "gpu_count": gpu_count,
+        "physical_gpu_inventory": physical_gpu_inventory,
+        "physical_gpu_inventory_sha256": physical_gpu_inventory_sha256,
+    }
+    contract.update(
+        {
+            key: value
+            for key, value in optional_observation_provenance.items()
+            if value is not None
+        }
+    )
     if actor_seed_contract is not None:
         contract[_ACTOR_SEED_FIELD] = dict(actor_seed_contract)
     if production:
@@ -712,6 +960,7 @@ def create_cohort(
             normalized_assignment
         )
     contract = _validate_contract(contract)
+    _verify_native_observation_binding(contract)
     publish_immutable_json(cohort_dir / CONTRACT_FILENAME, contract)
     _ensure_directory(cohort_dir / SHARD_DIRECTORY)
     return contract
@@ -810,13 +1059,20 @@ def _validate_arrays(
     if not isinstance(arrays, Mapping):
         raise ArtifactError("arrays must be a mapping")
     keys = set(arrays)
-    missing = sorted(_REQUIRED_ARRAYS - keys)
+    native = contract.get("observation_source") == "native"
+    required_arrays = _NATIVE_REQUIRED_ARRAYS if native else _REQUIRED_ARRAYS
+    missing = sorted(required_arrays - keys)
     unknown = sorted(
         key
         for key in keys
-        if key not in _REQUIRED_ARRAYS
-        and key not in _REFERENCE_PROVENANCE_ARRAYS
-        and not (isinstance(key, str) and key.startswith("obs__"))
+        if key not in required_arrays
+        and (
+            native
+            or (
+                key not in _REFERENCE_PROVENANCE_ARRAYS
+                and not (isinstance(key, str) and key.startswith("obs__"))
+            )
+        )
     )
     if missing or unknown:
         raise ArtifactError(f"rollout arrays have missing={missing} unknown={unknown}")
@@ -860,10 +1116,14 @@ def _validate_arrays(
         if not np.isfinite(array).all():
             raise ArtifactError(f"{key} contains non-finite values")
 
-    for key in ("expert_mask", "dones", "observation_is_raytraced"):
+    for key in ("expert_mask", "dones"):
         array = canonical[key]
         if array.dtype != np.bool_ or tuple(array.shape) != (steps, envs):
             raise ArtifactError(f"{key} must be bool [T,B]")
+    if not native:
+        raytraced_array = canonical["observation_is_raytraced"]
+        if raytraced_array.dtype != np.bool_ or tuple(raytraced_array.shape) != (steps, envs):
+            raise ArtifactError("observation_is_raytraced must be bool [T,B]")
 
     expected_behavior = np.where(
         canonical["expert_mask"][..., None],
@@ -887,7 +1147,7 @@ def _validate_arrays(
         if tuple(canonical[key].shape) != (steps, envs):
             raise ArtifactError(f"{key} must have shape [T,B]")
 
-    raytraced = canonical["observation_is_raytraced"]
+    raytraced = canonical.get("observation_is_raytraced")
     episodes = canonical["episode_ids"]
     dones = canonical["dones"]
     episode_steps = canonical["episode_steps"]
@@ -895,12 +1155,13 @@ def _validate_arrays(
         values_by_episode: dict[int, bool] = {}
         for time_index in range(steps):
             episode = int(episodes[time_index, env_index])
-            value = bool(raytraced[time_index, env_index])
-            if episode in values_by_episode and values_by_episode[episode] != value:
-                raise ArtifactError(
-                    "observation_is_raytraced must be constant within each episode"
-                )
-            values_by_episode[episode] = value
+            if raytraced is not None:
+                value = bool(raytraced[time_index, env_index])
+                if episode in values_by_episode and values_by_episode[episode] != value:
+                    raise ArtifactError(
+                        "observation_is_raytraced must be constant within each episode"
+                    )
+                values_by_episode[episode] = value
 
         if int(episode_steps[0, env_index]) != 0:
             raise ArtifactError("every actor rollout must begin at episode step 0")
@@ -1115,7 +1376,8 @@ def _provenance_from_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             "macro_round",
             "cohort_index",
             "purpose",
-            *_DIGEST_FIELDS,
+            *_artifact_digest_fields(contract),
+            *_observation_provenance_fields(contract),
         )
     }
 
@@ -1123,11 +1385,35 @@ def _provenance_from_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
 def _require_exact_provenance(contract: Mapping[str, Any], supplied: Mapping[str, Any]) -> None:
     expected = _provenance_from_contract(contract)
     if dict(supplied) != expected:
-        mismatches = sorted(key for key in expected if supplied.get(key) != expected[key])
+        mismatches = sorted(
+            key
+            for key in set(expected) | set(supplied)
+            if supplied.get(key) != expected.get(key)
+        )
         raise ArtifactError(f"rollout provenance does not match cohort contract: {mismatches}")
 
 
-def _shard_id(rank: int, rollout_id: int, part_index: int) -> str:
+def _shard_id(
+    rank: int,
+    rollout_id: int,
+    part_index: int,
+    *,
+    native_shard_id: str | None = None,
+) -> str:
+    if native_shard_id is not None:
+        if type(native_shard_id) is not str:
+            raise ArtifactError("native shard ID must be a string")
+        match = _NATIVE_GENERATION_SHARD_ID.fullmatch(native_shard_id)
+        if (
+            match is None
+            or rank < 0
+            or rank >= 8
+            or int(match.group("gpu")) != rank
+        ):
+            raise ArtifactError(
+                "native shard ID does not match a protocol generation and actor rank"
+            )
+        return native_shard_id
     return f"rank-{rank:04d}_rollout-{rollout_id:08d}_part-{part_index:04d}"
 
 
@@ -1145,9 +1431,22 @@ def publish_rollout_shard(
     policy_sha256: str,
     runtime_policy_sha256: str,
     teacher_sha256: str,
-    renderer_sha256: str,
     beta_sha256: str,
     config_sha256: str,
+    renderer_sha256: str | None = None,
+    observation_source: str | None = None,
+    observation_runtime_sha256: str | None = None,
+    isaac_runtime_sha256: str | None = None,
+    actor_python_freeze_sha256: str | None = None,
+    actor_source_inventory_sha256: str | None = None,
+    gr00t_revision: str | None = None,
+    gr00t_source_tree_sha256: str | None = None,
+    gpu_name: str | None = None,
+    compute_capability: str | None = None,
+    gpu_count: int | None = None,
+    physical_gpu_inventory: Sequence[Mapping[str, Any]] | None = None,
+    physical_gpu_inventory_sha256: str | None = None,
+    native_shard_id: str | None = None,
 ) -> dict[str, Any]:
     """Publish one immutable rollout part, payload first and sidecar second."""
 
@@ -1164,16 +1463,45 @@ def publish_rollout_shard(
         "policy_sha256": policy_sha256,
         "runtime_policy_sha256": runtime_policy_sha256,
         "teacher_sha256": teacher_sha256,
-        "renderer_sha256": renderer_sha256,
         "beta_sha256": beta_sha256,
         "config_sha256": config_sha256,
     }
-    shard_id = _shard_id(rank, rollout_id, part_index)
+    if renderer_sha256 is not None:
+        supplied[_LEGACY_RENDERER_FIELD] = renderer_sha256
+    optional_observation_provenance = {
+        "observation_source": observation_source,
+        "observation_runtime_sha256": observation_runtime_sha256,
+        "isaac_runtime_sha256": isaac_runtime_sha256,
+        "actor_python_freeze_sha256": actor_python_freeze_sha256,
+        "actor_source_inventory_sha256": actor_source_inventory_sha256,
+        "gr00t_revision": gr00t_revision,
+        "gr00t_source_tree_sha256": gr00t_source_tree_sha256,
+        "gpu_name": gpu_name,
+        "compute_capability": compute_capability,
+        "gpu_count": gpu_count,
+        "physical_gpu_inventory": physical_gpu_inventory,
+        "physical_gpu_inventory_sha256": physical_gpu_inventory_sha256,
+    }
+    supplied.update(
+        {
+            key: value
+            for key, value in optional_observation_provenance.items()
+            if value is not None
+        }
+    )
+    if native_shard_id is not None and (
+        observation_source != "native" or purpose != "train"
+    ):
+        raise ArtifactError("explicit generation shard naming is native train-only")
+    shard_id = _shard_id(
+        rank, rollout_id, part_index, native_shard_id=native_shard_id
+    )
     with _cohort_contract_lock(root, exclusive=False) as contract_handle:
         contract, contract_sha = _load_locked_contract(contract_handle, root)
         if rank not in contract["expected_ranks"]:
             raise ArtifactError("rank is not listed in the cohort contract")
         _require_exact_provenance(contract, supplied)
+        _verify_native_observation_binding(supplied)
         validated = _validate_arrays(arrays, contract)
 
         shard_dir = _ensure_directory(root / SHARD_DIRECTORY)
@@ -1269,20 +1597,45 @@ def _validate_shard_manifest(document: Any) -> dict[str, Any]:
         _MOTION_ASSIGNMENT_SHA_FIELD,
         _RANK_MOTION_ASSIGNMENT_FIELD,
     }
+    observation_fields = set(_observation_provenance_fields(document))
+    legacy_renderer = (
+        set() if document.get("observation_source") == "native"
+        else {_LEGACY_RENDERER_FIELD}
+    )
     manifest = _require_exact_keys(
         document,
-        _SHARD_KEYS | (production_keys if production else set()),
+        _SHARD_KEYS | legacy_renderer | observation_fields
+        | (production_keys if production else set()),
         "rollout shard manifest",
     )
     shard_id = _require_token(manifest["shard_id"], "shard_id")
     _require_token(manifest["campaign_id"], "campaign_id")
     for field in ("macro_round", "cohort_index", "rank", "rollout_id", "part_index"):
         _require_int(manifest[field], field)
-    if shard_id != _shard_id(manifest["rank"], manifest["rollout_id"], manifest["part_index"]):
-        raise ArtifactError("shard_id does not match rank/rollout_id/part_index")
-    if manifest["purpose"] not in {"train", "eval"}:
-        raise ArtifactError("shard purpose must be exactly 'train' or 'eval'")
-    for field in (*_DIGEST_FIELDS, "cohort_contract_sha256"):
+    legacy_shard_id = _shard_id(
+        manifest["rank"], manifest["rollout_id"], manifest["part_index"]
+    )
+    native_match = _NATIVE_GENERATION_SHARD_ID.fullmatch(shard_id)
+    if shard_id != legacy_shard_id:
+        if (
+            native_match is None
+            or int(native_match.group("gpu")) != manifest["rank"]
+            or manifest.get("observation_source") != "native"
+            or manifest["purpose"] != "train"
+        ):
+            raise ArtifactError("shard_id does not match its native or legacy identity")
+        generation = native_actor_generation(native_match.group("generation"))
+        if (
+            generation.macro_round != manifest["macro_round"]
+            or int(native_match.group("wave")) != manifest["cohort_index"]
+            or int(native_match.group("wave")) != manifest["rollout_id"]
+        ):
+            raise ArtifactError(
+                "native shard generation/wave differs from its artifact identity"
+            )
+    if manifest["purpose"] not in {"train", "validation", "test"}:
+        raise ArtifactError("shard purpose must be train, validation, or test")
+    for field in (*_artifact_digest_fields(manifest), "cohort_contract_sha256"):
         _require_sha256(manifest[field], field)
     if production:
         _require_sha256(
@@ -1309,17 +1662,21 @@ def _validate_shard_manifest(document: Any) -> dict[str, Any]:
     _validate_action_contract(manifest["action_contract"])
     metadata = _validate_array_metadata(manifest["arrays"])
     metadata_keys = set(metadata)
+    native = manifest.get("observation_source") == "native"
+    required_arrays = _NATIVE_REQUIRED_ARRAYS if native else _REQUIRED_ARRAYS
     supplied_reference_metadata = metadata_keys & _REFERENCE_PROVENANCE_ARRAYS
     if (
-        not _REQUIRED_ARRAYS <= metadata_keys
+        not required_arrays <= metadata_keys
         or (
             supplied_reference_metadata
             and supplied_reference_metadata != _REFERENCE_PROVENANCE_ARRAYS
         )
         or any(
-            key not in _REQUIRED_ARRAYS
-            and key not in _REFERENCE_PROVENANCE_ARRAYS
-            and not key.startswith("obs__")
+            key not in required_arrays
+            and (
+                native
+                or (key not in _REFERENCE_PROVENANCE_ARRAYS and not key.startswith("obs__"))
+            )
             for key in metadata
         )
     ):
@@ -1649,8 +2006,14 @@ def _build_seal(
         "global_env_ids": envs,
         "contract_sha256": contract_sha,
         "shards": [dict(shard) for shard in shards],
-        **{field: contract[field] for field in _DIGEST_FIELDS},
+        **{field: contract[field] for field in _artifact_digest_fields(contract)},
     }
+    seal.update(
+        {
+            field: contract[field]
+            for field in _observation_provenance_fields(contract)
+        }
+    )
     if _ACTOR_SEED_FIELD in contract:
         seal[_ACTOR_SEED_FIELD] = dict(contract[_ACTOR_SEED_FIELD])
         seal[_TRAJECTORY_FINGERPRINT_FIELD] = dict(trajectory_fingerprints)
@@ -1683,7 +2046,12 @@ def _validate_seal(document: Any) -> dict[str, Any]:
         _MOTION_ASSIGNMENT_FIELD,
         _MOTION_ASSIGNMENT_SHA_FIELD,
     }
-    keys = _SEAL_KEYS | (production_keys if production else set()) | (
+    observation_fields = set(_observation_provenance_fields(document))
+    legacy_renderer = (
+        set() if document.get("observation_source") == "native"
+        else {_LEGACY_RENDERER_FIELD}
+    )
+    keys = _SEAL_KEYS | legacy_renderer | observation_fields | (production_keys if production else set()) | (
         {_ACTOR_SEED_FIELD, _TRAJECTORY_FINGERPRINT_FIELD}
         if has_seed
         else set()
@@ -1694,7 +2062,7 @@ def _validate_seal(document: Any) -> dict[str, Any]:
     _require_token(seal["campaign_id"], "campaign_id")
     _require_int(seal["macro_round"], "macro_round")
     _require_int(seal["cohort_index"], "cohort_index")
-    if seal["purpose"] not in {"train", "eval"}:
+    if seal["purpose"] not in {"train", "validation", "test"}:
         raise ArtifactError("cohort seal purpose is invalid")
     if seal["logical_id"] != (
         f"{seal['campaign_id']}:r{seal['macro_round']:09d}:"
@@ -1704,7 +2072,7 @@ def _validate_seal(document: Any) -> dict[str, Any]:
     _require_int(seal["transition_count"], "transition_count", minimum=1)
     _validate_view_contract(seal["view_contract"])
     _validate_action_contract(seal["action_contract"])
-    for field in (*_DIGEST_FIELDS, "contract_sha256"):
+    for field in (*_artifact_digest_fields(seal), "contract_sha256"):
         _require_sha256(seal[field], field)
     _require_sorted_unique_ints(seal["expected_ranks"], "expected_ranks")
     _require_sorted_unique_ints(

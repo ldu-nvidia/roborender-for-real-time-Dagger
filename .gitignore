@@ -1,16 +1,9 @@
-# ---- vendored / nested repositories (each has its own git history) ----
+# Upstream source trees are installed separately and patched from vendor/.
 GR00T-VisualSim2Real/
 IsaacLab/
 roborender-acceleration/
-Sim2RealGen_Video_Model/
-image3f
 
-# ---- model bundles, datasets, rendered artifacts ----
-videogen_dataset/
-teacher_fullres/
-step_ab_out*/
-image3f_reproduction/
-anchor_pool*/
+# Large immutable model, replay, and evaluation artifacts.
 *.npz
 *.pt
 *.pth
@@ -20,10 +13,19 @@ anchor_pool*/
 *.mp4
 *.png
 
-# ---- run-time state ----
-image3f_queue*/
-*_endpoint*.txt
-diag_*/
+# Canonical experiment data remain local; only its layout documentation is
+# versioned with the source tree.
+data/**
+!data/README.md
+
+# Renderer assets and generated builds are local, checksum-pinned artifacts.
+renderer/incoming/
+renderer/envs/
+renderer/releases/
+renderer/active
+renderer/validation/artifacts/
+
+# Local runtime state; canonical campaign artifacts live outside this checkout.
 runtime/
 runs/
 outputs/
@@ -32,23 +34,21 @@ checkpoints/
 replay_cache/
 .round_dagger/
 
-# ---- logs ----
+# Logs and telemetry.
 *.log
-logs_archive/
 logs_rl/
 logs_eval/
-wandb/
-slurm-*.out
 
-# ---- python ----
+# Python environments and caches.
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+envs/
 *.egg-info/
 .ipynb_checkpoints/
 
-# ---- local credentials and deployment identity ----
+# Local credentials.
 .env
 .env.*
 !.env.example
@@ -65,6 +65,6 @@ service-account*.json
 *_credentials.json
 *_secrets.json
 
-# ---- editor / os ----
+# Editor and OS metadata.
 .vscode/
 .DS_Store

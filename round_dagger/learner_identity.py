@@ -64,22 +64,6 @@ def learner_identity_sha256(
     return hashlib.sha256(payload).hexdigest()
 
 
-def learner_wandb_run_id(
-    *, campaign_id: str, macro_round: int, learner_identity_sha256: str
-) -> str:
-    if not isinstance(campaign_id, str) or _TOKEN_RE.fullmatch(campaign_id) is None:
-        raise LearnerIdentityError("campaign ID is malformed")
-    if type(macro_round) is not int or macro_round < 0:
-        raise LearnerIdentityError("macro round must be a non-negative integer")
-    identity = _sha(learner_identity_sha256, "learner identity SHA-256")
-    # The full identity already binds campaign and round.  Keep the external
-    # run ID bounded even when the accepted campaign token is 128 characters.
-    run_id = f"rrd-m{macro_round:06d}-id{identity}"
-    if _TOKEN_RE.fullmatch(run_id) is None:
-        raise LearnerIdentityError("derived W&B run ID is malformed or too long")
-    return run_id
-
-
 def _main(argv=None) -> int:
     """Derive an identity without importing the :mod:`round_dagger` package.
 
@@ -117,13 +101,6 @@ def _main(argv=None) -> int:
         learner_contract_sha256=arguments.learner_contract_sha256,
     )
     print(identity)
-    print(
-        learner_wandb_run_id(
-            campaign_id=arguments.campaign_id,
-            macro_round=arguments.macro_round,
-            learner_identity_sha256=identity,
-        )
-    )
     return 0
 
 
@@ -131,7 +108,6 @@ __all__ = [
     "IDENTITY_SCHEMA",
     "LearnerIdentityError",
     "learner_identity_sha256",
-    "learner_wandb_run_id",
 ]
 
 

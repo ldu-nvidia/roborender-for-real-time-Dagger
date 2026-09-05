@@ -6,7 +6,6 @@ import unittest
 
 from round_dagger.learner_identity import (
     learner_identity_sha256,
-    learner_wandb_run_id,
 )
 
 
@@ -25,20 +24,12 @@ class LearnerIdentityTest(unittest.TestCase):
             "learner_contract_sha256": "8" * 64,
         }
 
-    def test_exact_retry_reuses_identity_namespace_and_external_ids(self) -> None:
+    def test_exact_retry_reuses_identity_namespace(self) -> None:
         inputs = self._inputs()
         first = learner_identity_sha256(**inputs)
         retry = learner_identity_sha256(**inputs)
         self.assertEqual(first, retry)
         self.assertEqual(f"identity_{first}", f"identity_{retry}")
-        self.assertEqual(
-            learner_wandb_run_id(
-                campaign_id=str(inputs["campaign_id"]),
-                macro_round=int(inputs["macro_round"]),
-                learner_identity_sha256=first,
-            ),
-            f"rrd-m000007-id{first}",
-        )
         self.assertEqual(f"rr-rd-{first}", f"rr-rd-{retry}")
 
     def test_snapshot_parent_runtime_container_and_contract_each_separate(self) -> None:
@@ -93,17 +84,11 @@ printf '%s\n' \
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), expected)
 
-    def test_maximum_campaign_token_does_not_expand_wandb_id(self) -> None:
+    def test_maximum_campaign_token_is_accepted(self) -> None:
         inputs = self._inputs()
         inputs["campaign_id"] = "c" * 128
         identity = learner_identity_sha256(**inputs)
-        run_id = learner_wandb_run_id(
-            campaign_id=str(inputs["campaign_id"]),
-            macro_round=int(inputs["macro_round"]),
-            learner_identity_sha256=identity,
-        )
-        self.assertEqual(run_id, f"rrd-m000007-id{identity}")
-        self.assertLessEqual(len(run_id), 128)
+        self.assertRegex(identity, r"[0-9a-f]{64}")
 
 
 if __name__ == "__main__":

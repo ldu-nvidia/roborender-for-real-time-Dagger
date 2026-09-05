@@ -25,7 +25,6 @@ from round_dagger.policy_identity import runtime_policy_identity_sha256
 
 ROOT = Path(__file__).resolve().parents[1]
 GR00T_ROOT = ROOT / "GR00T-VisualSim2Real"
-TRAINER = GR00T_ROOT / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
 POLICY_STATE_SHA256 = "2" * 64
 HOMIE_CONTROLLER_SHA256 = {"walk": "3" * 64, "stand": "4" * 64}
 
@@ -299,7 +298,7 @@ class PortablePolicySpecTest(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(GR00TPolicyError):
                 create_vision_actor_obj_pred(bundle)
 
-    def test_h100_module_has_no_simulator_import_and_initialize_skips_image3f(self):
+    def test_learner_module_has_no_simulator_import(self):
         source = (ROOT / "round_dagger/gr00t_policy.py").read_text()
         tree = ast.parse(source)
         forbidden = []
@@ -315,26 +314,6 @@ class PortablePolicySpecTest(unittest.TestCase):
             ):
                 forbidden.append(node.module)
         self.assertEqual(forbidden, [])
-        trainer = TRAINER.read_text()
-        self.assertIn("and not self._round_initialize_only", trainer)
-        self.assertIn("build_portable_policy_spec", trainer)
-        self.assertIn('destination.suffix + ".policy_spec.json"', trainer)
-        self.assertIn(
-            "homie_action_dim=int(self.homie_walk_model.num_actions)", trainer
-        )
-        self.assertIn("replay_action_dim=int(self.num_act)", trainer)
-        self.assertIn("str(staged_checkpoint)", trainer)
-        self.assertIn("staged.chmod(0o444)", trainer)
-        checkpoint_stage = trainer.index("(staged_checkpoint, destination)")
-        spec_stage = trainer.index("(staged_spec, policy_spec_path)")
-        manifest_commit = trainer.index("(staged_manifest, manifest_path)")
-        self.assertLess(checkpoint_stage, spec_stage)
-        self.assertLess(spec_stage, manifest_commit)
-        image3f_block = trainer.index("from gr00t.rl.utils.image3f_frame_client")
-        initialize_guard = trainer.rfind(
-            "not self._round_initialize_only", 0, image3f_block
-        )
-        self.assertGreater(initialize_guard, 0)
 
 
 try:

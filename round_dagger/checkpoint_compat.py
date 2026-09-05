@@ -1,7 +1,7 @@
 """Fail-closed loading for the hash-pinned RoboRender bootstrap policy.
 
-The original RTX bootstrap checkpoint contains a valid ``policy_state_dict``
-plus trainer bookkeeping objects from TRL, Transformers, and Accelerate.  The
+The pinned bootstrap checkpoint contains a valid ``policy_state_dict`` plus
+trainer bookkeeping objects from TRL, Transformers, and Accelerate.  The
 camera-free learner intentionally does not install those training stacks.  A
 normal ``torch.load(..., weights_only=False)`` therefore either fails on the
 missing imports or, if used on an untrusted file, permits arbitrary pickle
@@ -69,7 +69,8 @@ _DISCARDED_AUXILIARY_GLOBALS = frozenset(
         ("numpy", "ndarray"),
         # NumPy 1.x and 2.x serialize the same ndarray reconstruction helper
         # under these two module aliases respectively.  Both are emitted by
-        # supported RTX/H200 learner runtimes and are discarded identically.
+        # supported producer/consumer NumPy runtimes and are discarded
+        # identically.
         ("numpy.core.multiarray", "_reconstruct"),
         ("numpy._core.multiarray", "_reconstruct"),
         ("transformers.trainer_pt_utils", "AcceleratorConfig"),
@@ -159,10 +160,10 @@ class _RestrictedRestartUnpickler(pickle.Unpickler):
 
     def find_class(self, module: str, name: str) -> Any:
         # NumPy 2 writes this helper under ``numpy._core`` while the validated
-        # RTX Isaac runtime intentionally carries NumPy 1.26, where the exact
-        # same ABI helper lives under ``numpy.core``.  Resolve only this one
-        # reviewed reconstruction primitive; do not install a process-global
-        # module alias or broaden the checkpoint pickle surface.
+        # The native H200 Isaac runtime intentionally carries NumPy 1.26, where
+        # the exact same ABI helper lives under ``numpy.core``.  Resolve only
+        # this one reviewed reconstruction primitive; do not install a
+        # process-global module alias or broaden the checkpoint pickle surface.
         if (module, name) == ("numpy._core.multiarray", "_reconstruct"):
             from numpy.core.multiarray import _reconstruct
 

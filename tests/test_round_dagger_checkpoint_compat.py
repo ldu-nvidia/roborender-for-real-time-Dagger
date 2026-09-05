@@ -174,7 +174,7 @@ class HashPinnedCheckpointCompatibilityTest(unittest.TestCase):
         self.assertEqual(checkpoint.read_bytes(), original)
 
     def test_hash_pinned_restart_document_retains_actor_provenance(self):
-        """RTX warm-start needs controller provenance, not just model weights."""
+        """Actor warm-start needs controller provenance, not just model weights."""
 
         checkpoint = self.root / "candidate_with_controller.pt"
         state = {"weight": torch.arange(4, dtype=torch.float32)}

@@ -41,7 +41,7 @@ class SimulationAppLifecycleTest(unittest.TestCase):
         self.module = _load_lifecycle_module()
         self.environment = mock.patch.dict(
             self.module.os.environ,
-            {"IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "0"},
+            {"ROUND_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "0"},
         )
         self.previous_handler = object()
         self.installed_handlers = []
@@ -78,7 +78,7 @@ class SimulationAppLifecycleTest(unittest.TestCase):
         app = _FakeApp()
         with mock.patch.dict(
             self.module.os.environ,
-            {"IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "1"},
+            {"ROUND_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "1"},
         ):
             with self.module.SimulationAppLifecycle() as lifecycle:
                 lifecycle.attach(app)
@@ -89,11 +89,11 @@ class SimulationAppLifecycleTest(unittest.TestCase):
     def test_invalid_opt_in_value_fails_closed_before_app_launch(self):
         with mock.patch.dict(
             self.module.os.environ,
-            {"IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "true"},
+            {"ROUND_DAGGER_SIMULATION_APP_SKIP_CLEANUP": "true"},
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                "IMAGE_DAGGER_SIMULATION_APP_SKIP_CLEANUP must be exactly 0 or 1",
+                "ROUND_DAGGER_SIMULATION_APP_SKIP_CLEANUP must be exactly 0 or 1",
             ):
                 self.module.SimulationAppLifecycle()
 
@@ -118,6 +118,24 @@ class SimulationAppLifecycleTest(unittest.TestCase):
 
         self.assertEqual(app.close_calls, 1)
         self.assertIs(self.installed_handlers[-1], self.previous_handler)
+
+    def test_fail_closed_mode_exits_nonzero_after_closing_on_body_error(self):
+        app = _FakeApp()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                with self.module.SimulationAppLifecycle(
+                    exit_on_body_failure=True
+                ) as lifecycle:
+                    lifecycle.attach(app)
+                    raise RuntimeError("training failed")
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertEqual(str(raised.exception.__cause__), "training failed")
+        self.assertEqual(app.close_calls, 1)
+        self.assertIs(self.installed_handlers[-1], self.previous_handler)
+        self.assertIn("training failed", stderr.getvalue())
 
     def test_sigterm_unwinds_through_close_and_preserves_exit_status(self):
         app = _FakeApp()
@@ -158,11 +176,22 @@ class TrainEntrypointLifecycleContractTest(unittest.TestCase):
         hydra_main_source = ast.get_source_segment(source, functions["_hydra_main"])
         training_source = ast.get_source_segment(source, functions["_run_training"])
         self.assertIn(
-            "with SimulationAppLifecycle() as simulation_lifecycle",
+            "with SimulationAppLifecycle(exit_on_body_failure=True) as simulation_lifecycle",
             hydra_main_source,
         )
         self.assertIn(
-            "return _run_training(config, simulation_lifecycle)", hydra_main_source
+            "result = _run_training(config, simulation_lifecycle)", hydra_main_source
+        )
+        self.assertIn(
+            "_publish_native_actor_trainer_success_marker()", hydra_main_source
+        )
+        self.assertLess(
+            hydra_main_source.index("result = _run_training"),
+            hydra_main_source.index("_publish_native_actor_trainer_success_marker()"),
+        )
+        self.assertLess(
+            hydra_main_source.index("_publish_native_actor_trainer_success_marker()"),
+            hydra_main_source.index("return result"),
         )
         self.assertIn("simulation_lifecycle.attach(simulation_app)", training_source)
         self.assertIn("trainer.train()", training_source)

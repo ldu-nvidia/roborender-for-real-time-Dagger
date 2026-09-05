@@ -30,6 +30,7 @@ from round_dagger.checkpoint_compat import (  # noqa: E402
 )
 from round_dagger.learner import (  # noqa: E402
     CHECKPOINT_SCHEMA,
+    LEGACY_RESULT_SCHEMA,
     ORDERED_ALLGATHER_GRADIENT_REDUCTION,
     RESULT_SCHEMA,
     SINGLE_PROCESS_GRADIENT_REDUCTION,
@@ -71,7 +72,7 @@ _CHECKPOINT_FIELDS = {
     "value_state_dict",
     "rng_states",
 }
-_RESULT_FIELDS = {
+_LEGACY_RESULT_FIELDS = {
     "schema",
     "campaign_id",
     "macro_round",
@@ -90,7 +91,12 @@ _RESULT_FIELDS = {
     "initial_loss",
     "final_loss",
 }
-_RESULT_EQUIVALENCE_FIELDS = {
+_RESULT_FIELDS = _LEGACY_RESULT_FIELDS | {
+    "learner_identity_sha256",
+    "runtime_container_sha256",
+    "learner_contract_sha256",
+}
+_LEGACY_RESULT_EQUIVALENCE_FIELDS = {
     "campaign_id",
     "macro_round",
     "model_lineage_sha256",
@@ -103,6 +109,11 @@ _RESULT_EQUIVALENCE_FIELDS = {
     "runtime_policy_sha256",
     "policy_spec_sha256",
     "policy_bundle_manifest_sha256",
+}
+_RESULT_EQUIVALENCE_FIELDS = _LEGACY_RESULT_EQUIVALENCE_FIELDS | {
+    "learner_identity_sha256",
+    "runtime_container_sha256",
+    "learner_contract_sha256",
 }
 
 
@@ -233,10 +244,19 @@ def _validate_internal_policy_aliases(document: Mapping[str, Any], label: str) -
 def _load_result(path: Path, label: str) -> tuple[Path, Mapping[str, Any]]:
     path = _absolute_regular_file(path, label)
     document = load_strict_json(path)
-    if not isinstance(document, Mapping) or set(document) != _RESULT_FIELDS:
+    if not isinstance(document, Mapping):
         raise RestartEquivalenceError(f"{label} has unexpected or missing fields")
-    if document.get("schema") != RESULT_SCHEMA:
+    expected_fields = (
+        _RESULT_FIELDS
+        if document.get("schema") == RESULT_SCHEMA
+        else _LEGACY_RESULT_FIELDS
+        if document.get("schema") == LEGACY_RESULT_SCHEMA
+        else None
+    )
+    if expected_fields is None:
         raise RestartEquivalenceError(f"{label} schema mismatch")
+    if set(document) != expected_fields:
+        raise RestartEquivalenceError(f"{label} has unexpected or missing fields")
     checkpoint_name = document["checkpoint_path"]
     if (
         not isinstance(checkpoint_name, str)
@@ -247,6 +267,19 @@ def _load_result(path: Path, label: str) -> tuple[Path, Mapping[str, Any]]:
     checkpoint = _absolute_regular_file(path.parent / checkpoint_name, f"{label} candidate")
     if sha256_file(checkpoint) != document["checkpoint_sha256"]:
         raise RestartEquivalenceError(f"{label} candidate digest mismatch")
+    if document["schema"] == RESULT_SCHEMA:
+        _, candidate_document = _load_checkpoint(
+            checkpoint, f"{label} candidate"
+        )
+        for field in (
+            "learner_identity_sha256",
+            "runtime_container_sha256",
+            "learner_contract_sha256",
+        ):
+            if document[field] != candidate_document[field]:
+                raise RestartEquivalenceError(
+                    f"{label} candidate/result {field} differs"
+                )
     spec = _absolute_regular_file(
         path.parent / document["policy_spec_path"], f"{label} policy spec"
     )
@@ -316,7 +349,14 @@ def verify(
         resumed_result_path, resumed_result_document = _load_result(
             resumed_result, "resumed result"
         )
-        for field in sorted(_RESULT_EQUIVALENCE_FIELDS):
+        if full_result["schema"] != resumed_result_document["schema"]:
+            raise RestartEquivalenceError("learner result schemas differ")
+        equivalence_fields = (
+            _RESULT_EQUIVALENCE_FIELDS
+            if full_result["schema"] == RESULT_SCHEMA
+            else _LEGACY_RESULT_EQUIVALENCE_FIELDS
+        )
+        for field in sorted(equivalence_fields):
             _assert_equal(
                 full_result[field],
                 resumed_result_document[field],

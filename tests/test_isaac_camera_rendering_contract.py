@@ -119,6 +119,25 @@ class IsaacCameraRenderingContractTest(unittest.TestCase):
         for path in self.contract.EARLY_DISABLED_CARB_SETTINGS:
             self.assertEqual(tokens.count(f"--{path}=false"), 1, path)
 
+    def test_headless_camera_launch_preserves_portable_runtime_flags(self):
+        preserved = (
+            "--portable",
+            "--portable-root",
+            "/sealed/cache",
+            "--/log/file=/sealed/log/kit.log",
+            "--/crashreporter/enabled=false",
+        )
+        args = SimpleNamespace(
+            enable_cameras=True,
+            headless=True,
+            rendering_mode="balanced",
+            kit_args=" ".join(preserved),
+        )
+        self.assertTrue(self.contract.configure_headless_camera_rendering(args))
+        tokens = args.kit_args.split()
+        for token in preserved:
+            self.assertEqual(tokens.count(token), 1)
+
     def test_non_headless_camera_launch_preserves_requested_mode(self):
         args = SimpleNamespace(
             enable_cameras=True,

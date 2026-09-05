@@ -1,4 +1,4 @@
-"""Narrow NumPy-2 learner-checkpoint bridge for the RTX GR00T actor.
+"""Narrow NumPy-2 learner-checkpoint bridge for the native H200 GR00T actor.
 
 The accepted nested GR00T checkout is intentionally immutable.  Its generic
 checkpoint reader uses the Isaac runtime's normal ``torch.load`` path, which

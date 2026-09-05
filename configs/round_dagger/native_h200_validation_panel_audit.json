@@ -1,0 +1,403 @@
+{
+  "schema": "fast_roborender.round_dagger.validation_panel_audit.v1",
+  "protocol_id": "dagger_redo_v001",
+  "group_registry_sha256": "d77602c69874cd21f612b46be90fe3da9b16bc0716c487369e399e4b350b7813",
+  "split_sha256": "ddb5d8ac9157d0ecb4eb89f966fef4d17bf73157c8b63be0571f389318b34bdf",
+  "validation_registry_sha256": "2d9561f3a157116aee706473a58582b808dd61a8888d52eab1aa44acb7b071e7",
+  "sampling": {
+    "paired_seeds": [
+      1103,
+      2207,
+      3301,
+      4409
+    ],
+    "cases_per_seed": 64,
+    "total_episode_count": 256,
+    "case_order_policy": "group_id ascending; reset_index ascending within group",
+    "group_allocation_policy": "first four sorted validation groups receive 13 cases per seed; fifth receives 12",
+    "case_id_format": "<exact_group_id>__reset_<two_digit_within_group_index>",
+    "candidate_reuse_policy": "the identical ordered 64 cases and four paired seeds are reused for every candidate checkpoint"
+  },
+  "group_episode_counts": [
+    {
+      "group_id": "record_2025-10-14_21-29-22_0.675m.npz",
+      "cases_per_seed": 13,
+      "episode_count": 52,
+      "strata": {
+        "table_height": "675mm",
+        "initial_planar_distance_bin": "q3_far",
+        "initial_world_bearing_bin": "q2_middle",
+        "trajectory_length_bin": "q3_long"
+      }
+    },
+    {
+      "group_id": "record_2025-10-14_21-46-10_0.700m.npz",
+      "cases_per_seed": 13,
+      "episode_count": 52,
+      "strata": {
+        "table_height": "700mm",
+        "initial_planar_distance_bin": "q3_far",
+        "initial_world_bearing_bin": "q3_high",
+        "trajectory_length_bin": "q1_short"
+      }
+    },
+    {
+      "group_id": "record_2025-10-14_21-52-25_0.725m.npz",
+      "cases_per_seed": 13,
+      "episode_count": 52,
+      "strata": {
+        "table_height": "725mm",
+        "initial_planar_distance_bin": "q1_near",
+        "initial_world_bearing_bin": "q2_middle",
+        "trajectory_length_bin": "q1_short"
+      }
+    },
+    {
+      "group_id": "record_2025-10-14_22-00-53_0.750m.npz",
+      "cases_per_seed": 13,
+      "episode_count": 52,
+      "strata": {
+        "table_height": "750mm",
+        "initial_planar_distance_bin": "q2_middle",
+        "initial_world_bearing_bin": "q1_low",
+        "trajectory_length_bin": "q2_middle"
+      }
+    },
+    {
+      "group_id": "record_2025-10-14_22-18-36_0.775m.npz",
+      "cases_per_seed": 12,
+      "episode_count": 48,
+      "strata": {
+        "table_height": "775mm",
+        "initial_planar_distance_bin": "q2_middle",
+        "initial_world_bearing_bin": "q1_low",
+        "trajectory_length_bin": "q2_middle"
+      }
+    }
+  ],
+  "per_stratum_episode_counts": {
+    "table_height": {
+      "675mm": 52,
+      "700mm": 52,
+      "725mm": 52,
+      "750mm": 52,
+      "775mm": 48
+    },
+    "initial_planar_distance_bin": {
+      "q1_near": 52,
+      "q2_middle": 100,
+      "q3_far": 104
+    },
+    "initial_world_bearing_bin": {
+      "q1_low": 100,
+      "q2_middle": 104,
+      "q3_high": 52
+    },
+    "trajectory_length_bin": {
+      "q1_short": 104,
+      "q2_middle": 100,
+      "q3_long": 52
+    }
+  },
+  "split_balance_report": {
+    "target_proportions": {
+      "train": 0.696969696969697,
+      "validation": 0.15151515151515152,
+      "test": 0.15151515151515152
+    },
+    "strata": [
+      {
+        "field": "table_height",
+        "value": "675mm",
+        "total": 6,
+        "by_split": {
+          "train": 4,
+          "validation": 1,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.6666666666666666,
+          "validation": 0.16666666666666666,
+          "test": 0.16666666666666666
+        },
+        "residuals": {
+          "train": -0.18181818181818166,
+          "validation": 0.09090909090909083,
+          "test": 0.09090909090909083
+        }
+      },
+      {
+        "field": "table_height",
+        "value": "700mm",
+        "total": 6,
+        "by_split": {
+          "train": 4,
+          "validation": 1,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.6666666666666666,
+          "validation": 0.16666666666666666,
+          "test": 0.16666666666666666
+        },
+        "residuals": {
+          "train": -0.18181818181818166,
+          "validation": 0.09090909090909083,
+          "test": 0.09090909090909083
+        }
+      },
+      {
+        "field": "table_height",
+        "value": "725mm",
+        "total": 6,
+        "by_split": {
+          "train": 4,
+          "validation": 1,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.6666666666666666,
+          "validation": 0.16666666666666666,
+          "test": 0.16666666666666666
+        },
+        "residuals": {
+          "train": -0.18181818181818166,
+          "validation": 0.09090909090909083,
+          "test": 0.09090909090909083
+        }
+      },
+      {
+        "field": "table_height",
+        "value": "750mm",
+        "total": 7,
+        "by_split": {
+          "train": 5,
+          "validation": 1,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.7142857142857143,
+          "validation": 0.14285714285714285,
+          "test": 0.14285714285714285
+        },
+        "residuals": {
+          "train": 0.1212121212121211,
+          "validation": -0.06060606060606055,
+          "test": -0.06060606060606055
+        }
+      },
+      {
+        "field": "table_height",
+        "value": "775mm",
+        "total": 8,
+        "by_split": {
+          "train": 6,
+          "validation": 1,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.75,
+          "validation": 0.125,
+          "test": 0.125
+        },
+        "residuals": {
+          "train": 0.42424242424242387,
+          "validation": -0.21212121212121215,
+          "test": -0.21212121212121215
+        }
+      },
+      {
+        "field": "initial_planar_distance_bin",
+        "value": "q1_near",
+        "total": 11,
+        "by_split": {
+          "train": 8,
+          "validation": 1,
+          "test": 2
+        },
+        "proportions": {
+          "train": 0.7272727272727273,
+          "validation": 0.09090909090909091,
+          "test": 0.18181818181818182
+        },
+        "residuals": {
+          "train": 0.33333333333333304,
+          "validation": -0.6666666666666667,
+          "test": 0.33333333333333326
+        }
+      },
+      {
+        "field": "initial_planar_distance_bin",
+        "value": "q2_middle",
+        "total": 11,
+        "by_split": {
+          "train": 7,
+          "validation": 2,
+          "test": 2
+        },
+        "proportions": {
+          "train": 0.6363636363636364,
+          "validation": 0.18181818181818182,
+          "test": 0.18181818181818182
+        },
+        "residuals": {
+          "train": -0.666666666666667,
+          "validation": 0.33333333333333326,
+          "test": 0.33333333333333326
+        }
+      },
+      {
+        "field": "initial_planar_distance_bin",
+        "value": "q3_far",
+        "total": 11,
+        "by_split": {
+          "train": 8,
+          "validation": 2,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.7272727272727273,
+          "validation": 0.18181818181818182,
+          "test": 0.09090909090909091
+        },
+        "residuals": {
+          "train": 0.33333333333333304,
+          "validation": 0.33333333333333326,
+          "test": -0.6666666666666667
+        }
+      },
+      {
+        "field": "initial_world_bearing_bin",
+        "value": "q1_low",
+        "total": 11,
+        "by_split": {
+          "train": 8,
+          "validation": 2,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.7272727272727273,
+          "validation": 0.18181818181818182,
+          "test": 0.09090909090909091
+        },
+        "residuals": {
+          "train": 0.33333333333333304,
+          "validation": 0.33333333333333326,
+          "test": -0.6666666666666667
+        }
+      },
+      {
+        "field": "initial_world_bearing_bin",
+        "value": "q2_middle",
+        "total": 11,
+        "by_split": {
+          "train": 7,
+          "validation": 2,
+          "test": 2
+        },
+        "proportions": {
+          "train": 0.6363636363636364,
+          "validation": 0.18181818181818182,
+          "test": 0.18181818181818182
+        },
+        "residuals": {
+          "train": -0.666666666666667,
+          "validation": 0.33333333333333326,
+          "test": 0.33333333333333326
+        }
+      },
+      {
+        "field": "initial_world_bearing_bin",
+        "value": "q3_high",
+        "total": 11,
+        "by_split": {
+          "train": 8,
+          "validation": 1,
+          "test": 2
+        },
+        "proportions": {
+          "train": 0.7272727272727273,
+          "validation": 0.09090909090909091,
+          "test": 0.18181818181818182
+        },
+        "residuals": {
+          "train": 0.33333333333333304,
+          "validation": -0.6666666666666667,
+          "test": 0.33333333333333326
+        }
+      },
+      {
+        "field": "trajectory_length_bin",
+        "value": "q1_short",
+        "total": 11,
+        "by_split": {
+          "train": 7,
+          "validation": 2,
+          "test": 2
+        },
+        "proportions": {
+          "train": 0.6363636363636364,
+          "validation": 0.18181818181818182,
+          "test": 0.18181818181818182
+        },
+        "residuals": {
+          "train": -0.666666666666667,
+          "validation": 0.33333333333333326,
+          "test": 0.33333333333333326
+        }
+      },
+      {
+        "field": "trajectory_length_bin",
+        "value": "q2_middle",
+        "total": 11,
+        "by_split": {
+          "train": 8,
+          "validation": 2,
+          "test": 1
+        },
+        "proportions": {
+          "train": 0.7272727272727273,
+          "validation": 0.18181818181818182,
+          "test": 0.09090909090909091
+        },
+        "residuals": {
+          "train": 0.33333333333333304,
+          "validation": 0.33333333333333326,
+          "test": -0.6666666666666667
+        }
+      },
+      {
+        "field": "trajectory_length_bin",
+        "value": "q3_long",
+        "total": 11,
+        "by_split": {
+          "train": 8,
+          "validation": 1,
+          "test": 2
+        },
+        "proportions": {
+          "train": 0.7272727272727273,
+          "validation": 0.09090909090909091,
+          "test": 0.18181818181818182
+        },
+        "residuals": {
+          "train": 0.33333333333333304,
+          "validation": -0.6666666666666667,
+          "test": 0.33333333333333326
+        }
+      }
+    ],
+    "max_absolute_residual": 0.666666666666667
+  },
+  "limitations": [
+    "Five validation groups cannot allocate 64 cases exactly equally; four groups have 52 episodes and one has 48 across four seeds.",
+    "Uniform-by-group sampling does not equalize every three-bin marginal: bins represented by two validation groups receive about twice the episodes of bins represented by one.",
+    "The 33 source motions cover one recording date and no audited lighting, material, friction, outcome, or difficulty labels."
+  ],
+  "test_boundary": {
+    "checked_in_test_registry": false,
+    "checked_in_test_case_ids": false,
+    "checked_in_test_seeds": false,
+    "commitment_mechanism": "Pass only the externally computed canonical test-registry SHA-256 to controller initialize; keep the registry outside source and unreadable to training; reveal it only after final checkpoint selection."
+  }
+}
