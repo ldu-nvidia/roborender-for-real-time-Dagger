@@ -1,0 +1,21 @@
+{
+  "schema": "roborender.renderer.hf_anchor_pool.v1",
+  "role": "online_image3f_photorealistic_reference_pool",
+  "repository": "Ravenh97/roborender_anchors",
+  "repository_type": "dataset",
+  "revision": "6f640067a7d6799297d4226cb633e239d341bda5",
+  "relative_root": "anchors/roborender_online_anchor_pool_teacher50_2048",
+  "anchor_files": 2048,
+  "anchor_bytes": 2133788410,
+  "filename_range": ["anchor_00000.npz", "anchor_02047.npz"],
+  "frames_per_view": [0, 40],
+  "production_anchor_index": 0,
+  "views": ["head_color", "hand_left", "hand_right"],
+  "shape_per_view": [2, 240, 416, 3],
+  "dtype": "uint8",
+  "all_hub_hashes_verified": true,
+  "all_npz_schemas_verified": true,
+  "unique_prompts": 2048,
+  "unique_source_chunks": 2000,
+  "verified_utc_date": "2026-09-06"
+}

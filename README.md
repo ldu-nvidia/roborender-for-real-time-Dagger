@@ -1,65 +1,88 @@
-# RoboRender native-H200 BC + DAgger
+# RoboRender Raven-equivalent H200 pipeline
 
-The supported repository is `/workspace/project/roborender`; its only project
-data root is `/workspace/project/roborender/data`. The native protocol covers
-BC followed by five DAgger rounds at 20%, 40%, 60%, 80%, and 100% student
-rollout actions. Collection, learning, offline validation MSE, and the one-shot
-final success test are local H200 phases.
+This repository ports Raven's `qingh097/fast_roborender` `videogen-pipeline`
+implementation to the local H200 node. The scientific reference is the supplied
+GR00T patch stack at commit `94d7985`. The only intended scientific scale change
+is the total number of Isaac environments. Absolute paths, process/server
+placement, and the locally built SM90 TensorRT engine are hardware portability
+changes, not experiment changes.
 
-## Canonical controls
+The selected policy contract is Raven's three-view extension: `head_color`,
+`hand_left`, and `hand_right`, vertically stacked at 108x192 per view. Raven
+smoke-tested this extension but her published 57.3% BC and 69.3% DAgger results
+were produced by the older single-head-view policy. Therefore those percentages
+are provenance baselines, not a numerically comparable three-view target.
 
-- `configs/round_dagger/native_h200_bc_dagger5_protocol.v1.json` defines the
-  six train stages, shared plateau rule, launch topology, validation commitment,
-  and final-test boundary.
-- `configs/round_dagger/native_h200_experiment_protocol.json` is retained
-  byte-for-byte only to verify the completed BC collection provenance.
-- `configs/round_dagger/native_h200_group_registry.json` identifies the 33
-  source motions; its reproducibility evidence is in the adjacent audit file.
-- `configs/round_dagger/native_h200_validation_panel.json` binds the committed
-  validation panel; its balance evidence is in the adjacent audit file.
-- `configs/round_dagger/production_learner_local_h200_8rank_1200.json` is the
-  direct eight-rank learner contract and pins
-  `/workspace/project/roborender/envs/h200_learner/bin/python`.
-- `scripts/round_dagger/run_native_h200_experiment.py` is the experiment
-  controller entrypoint.
-- `renderer/manifests/h200_sm90_image3f_rgb030_depth030_step5000.v1.json`
-  is the checksum-bound receipt for the local H200 RoboRender engine and its
-  end-to-end throughput validation.
+## Canonical stages
 
-The historical identifiers `dagger-redo-v001` and `dagger_redo_v001` remain
-only as immutable lineage keys for the already-sealed BC split and held-out
-commitments. They are not directory names or live path selectors. Changing
-either value would invalidate the existing SHA-bound provenance; a future
-rename must be introduced as an explicit source-to-active lineage alias.
+| Stage | Entrypoint | Raven-equivalent behavior |
+|---|---|---|
+| BC collection | `pipeline/bc_collection/run_raven_bc_collection_8gpu.sh` | Privileged teacher drives Isaac; emit flat 81-frame three-view depth/mask/action chunks. |
+| Offline BC rendering | `pipeline/bc_rendering/render_bc_teacher_8gpu.py` | Raven-parameter-equivalent direct H200 worker: 50-step teacher LoRA, CFG 5, seed 42, fixed prompt, left/right/head order; preserve all supervision. |
+| Offline BC training | `pipeline/bc_training/train_raven_bc_h200.sh` | Flat cyclic rendered dataset, three-view ResNet18 policy, one 81-step minibatch/update, uniform action MSE. |
+| DAgger round | `pipeline/dagger/run_raven_dagger_round_h200.sh` | Online Image3F relabel before action; 50% ray-traced episode mix; teacher drives and labels; current rollout only. |
+| Four-round sequence | `pipeline/dagger/run_raven_four_rounds_h200.sh` | Four full Raven-style warm-start jobs; each restores the immediately preceding full checkpoint. |
+| Evaluation | `pipeline/evaluation/run_raven_raytraced_300_eval_h200.sh` | Closed-loop success over 300 episodes, using the saved offline-BC baseline environment config. |
 
-The completed BC source collection is in `data/BC/collection`: two disjoint
-128-environment waves, 512 steps per environment, 256 streams, and 131,072
-transitions. Its sealed whole-stream projections are `data/BC/train` (178),
-`data/validation/BC` (39), and `data/test/BC` (39). See `data/README.md` for
-the full layout and access boundary.
+Raven did **not** use a 75/50/25/0 teacher-beta schedule in the reported runs.
+Every recorded DAgger round used `rollout_action_source: teacher` (beta 1), and
+`raytraced_mix_prob: 0.5` means half of environment episodes retain ray-traced
+RGB while half are relabelled by Image3F. These are different concepts. Raven
+also did not use validation-MSE saturation or a separate sealed test split.
 
-Native Isaac conditioning is converted to photorealistic observations in a
-later offline RoboRender stage. The pinned Image3F adapter and foundation model
-are installed under `renderer/releases/`, and the H200-native SM90 TensorRT
-engine is built, numerically validated, and active. Its persistent 50-frame RGB
-benchmark passed the 5 fps gate at 149.59 ms p90. Learner-ready rendered replay
-does not yet exist; BC training starts only after the sealed train and
-validation inputs are projected offline into their respective `rendered/`
-roots without exposing test data.
+## Fixed scientific contract
 
-## Contract checks
+- Isaac/GR00T seed 0; distributed ranks receive Raven's existing rank offset.
+- 81 rollout steps, one learning epoch, one minibatch, seed 42 for rendering.
+- Privileged robot teacher `model_step_044500`; Isaac supplies state/dynamics,
+  not ground-truth actions.
+- Three cameras and Raven's exact extrinsics/resolutions/depth conversion.
+- Offline renderer: `step-5294`, 50 denoising steps, CFG 5, no RGB reference.
+- BC learner: ImageNet-pretrained trainable ResNet18, feature width 128, SiLU
+  MLP `[512,256,128]`, LR `2e-4`, constant schedule, uniform MSE on the first
+  11 dimensions of the 26-D teacher label, value/entropy/object losses zero.
+- Online renderer: `rgb030-depth030-step-5000`, 5 steps, CFG 1, TeaCache 0.3,
+  untiled VAE, one uniformly sampled anchor file per environment episode, with
+  frame index 0 of that file held fixed for the episode.
+- DAgger: teacher-driven actions, 50% ray-traced episode assignment, fresh
+  current 81-step rollout only, no replay dataset, full-state warm start.
+- Evaluation: native ray-traced observations, 300 closed-loop episodes, success
+  rate, candidate checkpoint staged beside the offline-BC saved `config.yaml`.
+
+See [the equivalence audit](pipeline/RAVEN_EQUIVALENCE_AUDIT.md) for the exact
+parameter/source matrix and the distinction between strict scientific identity
+and H200 portability.
+
+## Repository ownership
+
+| Path | Responsibility |
+|---|---|
+| `pipeline/bc_collection/` | Exact Isaac collection port and dataset seal. |
+| `pipeline/bc_rendering/` | Parameter-equivalent offline teacher rendering and alignment validation. |
+| `pipeline/bc_training/` | Exact offline BC loader/trainer and launcher. |
+| `pipeline/dagger/` | Exact online Image3F service, round launchers, and contract validator. |
+| `pipeline/evaluation/` | Raven's 300-episode headline evaluation. |
+| `pipeline/vendor/raven-fast-roborender-reference/` | Immutable supplied Raven source used for comparison. |
+| `pipeline/GR00T-VisualSim2Real/` | Clean detached Raven GR00T checkout at `94d7985`; active execution source. |
+| `pipeline/archive/GR00T-VisualSim2Real-custom-provenance/` | Superseded custom checkout, retained read-only for provenance. |
+| `renderer/` | Foundation model, LoRAs, anchors, SM90 engine/runtime, and render contracts. |
+| `checkpoints/` | Robot/locomotion teachers and student checkpoints. |
+| `data/BC/isaac/` | Flat collected 81-frame NPZ chunks and seal. |
+| `data/BC/rendered/` | Flat rendered NPZ chunks consumed by offline BC. |
+| `runtime/` | Environments, endpoint files, logs, previews, and run receipts. |
+
+`pipeline/round_dagger/`, `pipeline/scripts/round_dagger/`, and
+`pipeline/configs/round_dagger/` contain the superseded custom saturation/beta
+experiment retained only for provenance. They are not production entrypoints.
+
+## Preflight
 
 ```bash
-python scripts/round_dagger/build_native_h200_group_registry.py --check
-python scripts/round_dagger/run_native_h200_experiment.py validate-contract \
-  --contract configs/round_dagger/native_h200_bc_dagger5_protocol.v1.json
-python scripts/round_dagger/run_native_h200_experiment.py build-split \
-  --contract configs/round_dagger/native_h200_bc_dagger5_protocol.v1.json \
-  --registry configs/round_dagger/native_h200_group_registry.json
+bash pipeline/bootstrap_raven_gr00t.sh
+python pipeline/bc_collection/validate_raven_bc_collection_contract.py
+python pipeline/dagger/validate_raven_image3f_contract.py
 ```
 
-Train, validation, and test groups must be disjoint. Actor and learner launches
-may access only train inputs and cumulative train replay. The shared validation
-MSE rule selects stage checkpoints and detects saturation. The sealed test is
-opened once, after final checkpoint selection, and reports closed-loop success;
-it cannot affect training, stopping, tuning, selection, or retries.
+Large binaries and datasets remain outside Git. Every accepted model/engine is
+identified by its byte count and SHA-256 in `checkpoints/manifest.json` or
+`renderer/manifests/registry.v1.json`.

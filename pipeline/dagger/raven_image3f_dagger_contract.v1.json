@@ -1,0 +1,132 @@
+{
+  "schema": "roborender.raven_image3f_dagger_contract.v1",
+  "reference": {
+    "repository": "qingh097/fast_roborender",
+    "gr00t_commit": "94d7985",
+    "trainer_sha256": "cc7f8aa3de2a9d60324b9294ba5db7ce15f339d59fa168ef1ccab7484d11890b",
+    "client_sha256": "2b5154001066ac6a1d1409016f7972d51bd8b12f702ce0b1bcac9c00a73c943a",
+    "config_sha256": "787c461bb96f9e7f2116322c457b0c944ca12c124094b7f08afe9a3cb2a50b6f"
+  },
+  "allowed_differences": [
+    "num_envs",
+    "gpu_and_server_topology",
+    "absolute_paths",
+    "sm90_h200_engine"
+  ],
+  "rounds": {
+    "count": 4,
+    "warm_start_previous_round": true,
+    "restore": [
+      "policy",
+      "value",
+      "optimizer",
+      "lr_scheduler",
+      "environment",
+      "trainer_state"
+    ],
+    "updates_are_additional_per_round": true,
+    "replay": "current_live_81_step_rollout_only"
+  },
+  "rollout": {
+    "action_source": "teacher",
+    "beta": 1.0,
+    "teacher_labels_every_state": true,
+    "num_steps_per_env": 81,
+    "num_mini_batches": 1,
+    "value_loss_coef": 0.0,
+    "entropy_coef": 0.0,
+    "raytraced_mix_prob": 0.5,
+    "raytraced_mix_sampling": "per_environment_episode",
+    "image3f_relabel_before_student_action": true,
+    "seed": 42
+  },
+  "policy": {
+    "views": [
+      "head_color",
+      "hand_left",
+      "hand_right"
+    ],
+    "layout": "vertical",
+    "per_view_resolution": [
+      108,
+      192
+    ],
+    "stacked_resolution": [
+      324,
+      192
+    ],
+    "view_count": 3
+  },
+  "conditioning": {
+    "capture_resolution": [
+      480,
+      832
+    ],
+    "control_resolution": [
+      240,
+      416
+    ],
+    "depth_mode": "h5_v4",
+    "view_order": [
+      "head_color",
+      "hand_left",
+      "hand_right"
+    ],
+    "image3f_slots": {
+      "ext1": "head_color",
+      "ext2": "hand_left",
+      "wrist": "hand_right"
+    },
+    "anchor": {
+      "mode": "FT-FIXED",
+      "frame_index_within_anchor_file": 0,
+      "anchor_file_sample": "uniform_from_2048_pool_per_episode",
+      "resample_on_done": true
+    }
+  },
+  "depth_h5_v4": {
+    "head_color": {
+      "raw_clip": [0.05, 10.0],
+      "inv_clip": [1.0, 40.0],
+      "norm_range": [0.05, 2.6]
+    },
+    "hand_left": {
+      "raw_clip": [0.0, 1.5],
+      "inv_clip": [0.7, 100.0],
+      "raw_pct": [1, 99]
+    },
+    "hand_right": {
+      "raw_clip": [0.0, 1.5],
+      "inv_clip": [0.7, 100.0],
+      "raw_pct": [1, 99]
+    }
+  },
+  "image3f": {
+    "steps": 5,
+    "cfg_scale": 1.0,
+    "timestep_schedule": [
+      1.0,
+      0.7539682388305664,
+      0.6122448446350098,
+      0.44871795177459717,
+      0.24193546175956726,
+      0.0
+    ],
+    "tea_cache_threshold": 0.3,
+    "tea_cache_model_id": "Image3FJoint-5step",
+    "vae_mode": "untiled",
+    "frames_per_request": 1,
+    "views_per_request": 3,
+    "adapter_sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588",
+    "engine_architecture": "SM90",
+    "engine_sha256": "9a11777c62e9d8ceb8bc380e4933353de2bd472e8b94716d29a4d1c39c3a70a5"
+  },
+  "evaluation": {
+    "observation_source": "raytraced",
+    "episodes": 300,
+    "metric": "closed_loop_task_success_rate",
+    "config_source": "offline_bc_baseline_saved_config",
+    "checkpoint_staged_as": "last.pt",
+    "config_staged_as": "config.yaml"
+  }
+}

@@ -1,0 +1,115 @@
+{
+  "schema": "roborender.raven_bc_collection_contract.v1",
+  "source": {
+    "repository": "qingh097/fast_roborender",
+    "branch": "videogen-pipeline",
+    "gr00t_commit": "94d7985",
+    "trainer_path": "gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+    "trainer_sha256": "cc7f8aa3de2a9d60324b9294ba5db7ce15f339d59fa168ef1ccab7484d11890b",
+    "config_path": "gr00t/rl/config/exp/loco_manip/wsdpt_videogen_collect.yaml",
+    "config_sha256": "c483a32b5a1810dd7abcedfb425b86c939d45e02a0ea43d448f8b0b226f21e5c"
+  },
+  "allowed_portability_differences": [
+    "num_envs",
+        "gpu_process_topology_and_existing_rank_seed_offset",
+        "rank_unique_output_path_and_filename_via_slurm_job_id",
+    "absolute_checkpoint_paths",
+    "absolute_output_and_runtime_paths",
+    "architecture_local_H200_runtime"
+  ],
+  "rollout": {
+    "simulator_seed": 0,
+    "teacher_drives_environment": true,
+    "rollout_action_source": "teacher",
+    "steps_per_batch": 81,
+    "emit_length": 81,
+    "emit_before_done": true,
+    "discard_partial_episode_tail": true,
+    "sequence_increment_after_emit": 1,
+    "additional_sequence_increment_after_done": 2
+  },
+  "cameras": {
+    "policy_resolution": [108, 192],
+    "conditioning_resolution": [480, 832],
+    "control_resolution": [240, 416],
+    "camera_types": [{"rgb": true}, {"depth": true}],
+    "stack_depth_image": false,
+    "depth_hi_robot_rgb": true,
+    "conditioning_views_in_order": [
+      {
+        "name": "hand_left",
+        "link": "left_wrist_yaw_link",
+        "pos": [-0.08, 0.0, -0.06],
+        "rot": [1.0, 0.0, 0.0, 0.0]
+      },
+      {
+        "name": "hand_right",
+        "link": "right_wrist_yaw_link",
+        "pos": [-0.08, 0.0, -0.06],
+        "rot": [1.0, 0.0, 0.0, 0.0]
+      },
+      {
+        "name": "head_color",
+        "link": "d435_link",
+        "pos": [0.0, 0.035, 0.0],
+        "rot": [0.99955, 0.0, 0.0299955, 0.0]
+      }
+    ]
+  },
+  "conditioning": {
+    "prompt": "This video shows in the background, a bright minimalist room with light gray walls and a light wooden floor. In the foreground, on the white table, there is a plastic bottle and a shallow gray tray. The robot is instructed to pick up the bottle and place it into the tray.",
+    "renderer_seed": 42,
+    "depth_mode": "h5_v4",
+    "invalid_fill": "far",
+    "depth_h5v4_per_view": {
+      "head_color": {
+        "raw_clip": [0.05, 10.0],
+        "inv_clip": [1.0, 40.0],
+        "norm_range": [0.05, 2.6]
+      },
+      "hand_left": {
+        "raw_clip": [0.0, 1.5],
+        "inv_clip": [0.7, 100.0],
+        "raw_pct": [1, 99]
+      },
+      "hand_right": {
+        "raw_clip": [0.0, 1.5],
+        "inv_clip": [0.7, 100.0],
+        "raw_pct": [1, 99]
+      }
+    },
+    "raw_depth_native": {
+      "dtype": "uint16",
+      "quantization_bits": 14,
+      "log_shift_m": 3.5,
+      "clip_m": [0.0, 10.0]
+    },
+    "raw_depth_resized": {
+      "dtype": "float16",
+      "interpolation": "nearest"
+    },
+    "depth_control": {
+      "dtype": "uint8",
+      "interpolation": "area"
+    },
+    "robot_rgb_control": {
+      "dtype": "uint8",
+      "interpolation": "area"
+    }
+  },
+  "saved_chunk": {
+    "gt_action_width": 26,
+    "required_scalar_fields": ["prompt", "env_id", "seq"],
+    "required_temporal_fields": ["gt_actions", "dones"],
+    "required_view_field_prefixes": [
+      "depth_rawq__",
+      "depth_raw__",
+      "depth_ctrl__",
+      "rgb_robot__"
+    ],
+    "observation_prefix": "obs_",
+    "excluded_observation": "vision_obs",
+    "stored_dones_are_all_false": true,
+    "save_sim_rgb": false
+  }
+}

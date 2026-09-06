@@ -1,0 +1,140 @@
+From a01fd8f2ef82d12ac0f2c67b801256557b9726eb Mon Sep 17 00:00:00 2001
+From: qingh097 <qingh097@gmail.com>
+Date: Tue, 18 Aug 2026 00:59:23 -0700
+Subject: [PATCH 3/3] Add DAgger beta schedule for the training rollout
+
+The rollout could only be fully teacher-driven or fully student-driven. Ross et al. 2011
+define the rollout policy as a stochastic mixture
+
+    pi_i = beta_i * pi_expert + (1 - beta_i) * pi_student
+
+sampled per decision, with beta_1 = 1 and beta annealed toward 0, so the student
+progressively visits -- and gets corrected on -- its own state distribution. Every run so
+far used beta = 1 permanently, which is DAgger's first iteration repeated.
+
+videogen.rollout_action_source now also accepts beta:
+
+  beta_schedule    constant | linear | exponential
+  beta_start/end   mixture endpoints, default 1.0 -> 0.0
+  beta_decay_iters linear horizon (default 500)
+  beta_decay_rate  exponential rate, floored at beta_end (default 0.99)
+
+Each env independently follows the teacher with probability beta at each step, matching
+the paper's per-decision sampling rather than splitting whole trajectories. beta advances
+once per rollout iteration from _rollout_step's finally block, so annealing continues even
+if a rollout raises, and is logged every 25 iterations.
+
+Defaults are unchanged (teacher), so existing configs and the 69.3% result are unaffected.
+Only training rollouts are affected; evaluation always runs the student.
+
+Tested: schedule values (linear clamps past its horizon, exponential decays to its floor,
+constant holds, endpoints exact) and the empirical teacher fraction over 4096 envs
+(beta 0.25 -> 0.246, beta 0.5 -> 0.488).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../trl/trainer/distill_trainer_videogen.py   | 62 +++++++++++++++++--
+ 1 file changed, 58 insertions(+), 4 deletions(-)
+
+diff --git a/gr00t/rl/trl/trainer/distill_trainer_videogen.py b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
+index d45d0cb..8db4235 100644
+--- a/gr00t/rl/trl/trainer/distill_trainer_videogen.py
++++ b/gr00t/rl/trl/trainer/distill_trainer_videogen.py
+@@ -79,6 +79,16 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         # resolution at save time for antialiased edges. [H, W] or [] = off.
+         self.vg_control_res = [int(v) for v in vg.get("control_resolution", [])]
+         self.vg_rollout_action_source = vg.get("rollout_action_source", "teacher")
++        # DAgger mixture: fraction of decisions taken by the teacher during the training
++        # rollout. beta=1 is teacher-driven (BC on teacher states), beta=0 is
++        # student-driven (classic DAgger). "beta" anneals between them.
++        self.vg_beta_schedule = vg.get("beta_schedule", "linear")
++        self.vg_beta_start = float(vg.get("beta_start", 1.0))
++        self.vg_beta_end = float(vg.get("beta_end", 0.0))
++        self.vg_beta_decay_iters = int(vg.get("beta_decay_iters", 500))
++        self.vg_beta_decay_rate = float(vg.get("beta_decay_rate", 0.99))
++        self._beta_iter = 0
++        self._beta_value = None
+         # Views the POLICY consumes, tiled into vision_obs. Defaults to the single
+         # primary view, i.e. the historical single-camera behaviour.
+         _cams = getattr(getattr(self.env.config.simulator, "config", None), "cameras", None)
+@@ -86,7 +96,11 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         self._policy_views = _pv or [vg.get("primary_view", "head_color")]
+         self.vg_view_names = list(vg.get("view_names", ["ext1", "wrist"]))
+         self.vg_primary_view = vg.get("primary_view", self.vg_view_names[0])
+-        assert self.vg_rollout_action_source in ("teacher", "student")
++        assert self.vg_rollout_action_source in ("teacher", "student", "beta")
++        assert self.vg_beta_schedule in ("constant", "linear", "exponential")
++        for _n, _v in (("beta_start", self.vg_beta_start), ("beta_end", self.vg_beta_end)):
++            assert 0.0 <= _v <= 1.0, f"videogen.{_n} must be in [0,1], got {_v}"
++        assert self.vg_beta_decay_iters > 0, "videogen.beta_decay_iters must be > 0"
+ 
+         self.vg_save_sim_rgb = bool(vg.get("save_sim_rgb", False))
+         # Save raw metric depth (float16, downsized to control_resolution) so
+@@ -237,14 +251,53 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+         if (
+             self._in_train_rollout
+             and self.vg_enabled
+-            and self.vg_rollout_action_source == "teacher"
+             and "gt_actions" in policy_state_dict
+         ):
+-            policy_state_dict = dict(policy_state_dict)
+-            policy_state_dict["actions"] = policy_state_dict["gt_actions"].clone()
++            beta = self._dagger_beta()
++            self._beta_value = beta
++            if beta >= 1.0:
++                policy_state_dict = dict(policy_state_dict)
++                policy_state_dict["actions"] = policy_state_dict["gt_actions"].clone()
++            elif beta > 0.0:
++                # Per-decision Bernoulli mixture, as in Ross et al.: each env independently
++                # follows the teacher this step with probability beta.
++                acts = policy_state_dict["actions"]
++                gt = policy_state_dict["gt_actions"]
++                take_teacher = torch.rand(acts.shape[0], device=acts.device) < beta
++                mixed = torch.where(
++                    take_teacher.view(-1, *([1] * (acts.dim() - 1))), gt, acts)
++                policy_state_dict = dict(policy_state_dict)
++                policy_state_dict["actions"] = mixed
++            # beta == 0: the student drives, nothing to replace
+ 
+         return policy_state_dict
+ 
++    def _dagger_beta(self) -> float:
++        """Teacher fraction for the current rollout iteration."""
++        src = self.vg_rollout_action_source
++        if src == "teacher":
++            return 1.0
++        if src == "student":
++            return 0.0
++        i = self._beta_iter
++        b0, b1 = self.vg_beta_start, self.vg_beta_end
++        if self.vg_beta_schedule == "constant":
++            beta = b0
++        elif self.vg_beta_schedule == "linear":
++            frac = min(1.0, i / float(self.vg_beta_decay_iters))
++            beta = b0 + (b1 - b0) * frac
++        else:  # exponential, beta_i = beta_start * rate^i, floored at beta_end
++            beta = max(b1, b0 * (self.vg_beta_decay_rate ** i))
++        return float(min(1.0, max(0.0, beta)))
++
++    def _advance_dagger_beta(self):
++        """Called once per rollout iteration; drives the annealing."""
++        self._beta_iter += 1
++        if self.vg_rollout_action_source == "beta" and self._beta_iter % 25 == 0:
++            logger.info(
++                f"dagger beta={self._dagger_beta():.3f} "
++                f"(iter {self._beta_iter}, schedule {self.vg_beta_schedule})")
++
+     def _id_sample_anchor(self, env_i: int):
+         f = self._id_anchor_files[self._id_rng.randint(len(self._id_anchor_files))]
+         with np.load(f, allow_pickle=True) as z:
+@@ -376,6 +429,7 @@ class TRLDistillTrainerVideoGen(TRLDistillTrainerObjPredHomieAPI):
+             out_obs = super()._rollout_step(model, obs_dict)
+         finally:
+             self._in_train_rollout = False
++            self._advance_dagger_beta()
+ 
+         if self.vg_enabled and self._depth_chunk:
+             if self.vg_mode == "online":
+-- 
+2.43.0
+

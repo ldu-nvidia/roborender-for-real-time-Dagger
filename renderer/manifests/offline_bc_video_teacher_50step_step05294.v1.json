@@ -1,0 +1,19 @@
+{
+  "schema": "roborender.renderer.hf_asset.v1",
+  "role": "offline_bc_three_view_video_renderer_and_anchor_generator",
+  "repository": "Ravenh97/roborender_teacher_lora",
+  "repository_type": "model",
+  "revision": "80d6901a1a5ebaee3b8dd488ef4c2d97b474e5c3",
+  "relative_path": "offline_teacher/checkpoints/roborender_offline_bc_video_teacher_50step_lora_step05294.safetensors",
+  "original_filename": "step-5294.safetensors",
+  "original_training_path": "/vision/u/ravenh/renderscale/Sim2RealGen_Video_Model/lora_ckpts/Wan2.1-Fun-V1.1-1.3B-Mixed-DROID-AGIBOT-3View-DualControl-PrevFrame-droidnew_continue_lora/step-5294.safetensors",
+  "bytes": 699995040,
+  "sha256": "3f09aa23a26ddb2da32d027dc5e883c992c820854bc07020d6d254c806afb01b",
+  "foundation_model": "models/wan21_fun_control_1p3b_foundation",
+  "inference_steps": 50,
+  "cfg_scale": 5.0,
+  "tensor_rt": false,
+  "views": ["hand_left", "hand_right", "head_color"],
+  "current_offline_dataset_role_since": "2026-09-03",
+  "verified_utc_date": "2026-09-06"
+}

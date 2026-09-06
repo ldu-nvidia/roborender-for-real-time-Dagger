@@ -1,5 +1,5 @@
 # Upstream source trees are installed separately and patched from vendor/.
-GR00T-VisualSim2Real/
+pipeline/GR00T-VisualSim2Real/
 IsaacLab/
 roborender-acceleration/
 
@@ -17,22 +17,45 @@ roborender-acceleration/
 # versioned with the source tree.
 data/**
 !data/README.md
+!data/DATA_LAYOUT.md
 
 # Renderer assets and generated builds are local, checksum-pinned artifacts.
 renderer/incoming/
+renderer/anchors/
 renderer/envs/
 renderer/releases/
+renderer/models/
+renderer/artifacts/
+renderer/offline_teacher/source
+renderer/online_image3f/runtime/
+renderer/online_image3f/source/
+renderer/online_image3f/teacache/
+renderer/orchestration/fast_roborender/
 renderer/active
-renderer/validation/artifacts/
+renderer/validation/
 
 # Local runtime state; canonical campaign artifacts live outside this checkout.
 runtime/
+containers/images/
+containers/logs/
+containers/state/
+containers/tools/
 runs/
 outputs/
 artifacts/
-checkpoints/
+checkpoints/**
+!checkpoints/
+!checkpoints/README.md
+!checkpoints/**/
+!checkpoints/**/*.md
+!checkpoints/**/*.json
+# The root checkpoint layout above is versioned; renderer adapters are not.
+renderer/artifacts/adapters/**
 replay_cache/
 .round_dagger/
+
+# Superseded local source checkout retained only as read-only provenance.
+pipeline/archive/GR00T-VisualSim2Real-custom-provenance/
 
 # Logs and telemetry.
 *.log

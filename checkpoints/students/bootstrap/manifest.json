@@ -1,0 +1,13 @@
+{
+  "schema": "roborender.student_bootstrap.v2",
+  "status": "active_immutable_bootstrap",
+  "checkpoint_path": "g1_3view_student_bootstrap_v1.pt",
+  "checkpoint_bytes": 46526015,
+  "checkpoint_sha256": "720a975812f6083192234d650033511c821b6902da2ef7734d87943f6c0a359a",
+  "policy_spec_path": "g1_3view_student_bootstrap_v1.policy_spec.json",
+  "policy_spec_sha256": "3e903c55218ca2aae4c970fab6aeb820de0a35d8965a34262b8206fd62f74dee",
+  "runtime_policy_sha256": "cd6f70aa9d589e810b7ab22999941930742a94621870457aadd068d2394deb9a",
+  "parent_checkpoint": null,
+  "training_stage": "bootstrap",
+  "verified_utc_date": "2026-09-06"
+}

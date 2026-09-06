@@ -1,0 +1,69 @@
+{
+  "schema": "roborender.policy_checkpoint_registry.v1",
+  "canonical_root": "/workspace/project/roborender/checkpoints",
+  "verified_utc_date": "2026-09-06",
+  "provenance_rules": "PROVENANCE.md",
+  "artifacts": [
+    {
+      "id": "g1_privileged_action_teacher_wsdpt_step044500",
+      "status": "active",
+      "role": "privileged_robot_action_teacher",
+      "relative_path": "teachers/robot_policy/g1_privileged_action_teacher_wsdpt_step044500.pt",
+      "original_filename": "model_step_044500.pt",
+      "original_relative_path": "pipeline/GR00T-VisualSim2Real/logs_rl/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q9_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--3500.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251105_004910/model_step_044500.pt",
+      "bytes": 6805725,
+      "sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38",
+      "md5": "d14dd7bda9292a6f148c7d0a68d60f75"
+    },
+    {
+      "id": "g1_locomotion_walk_controller",
+      "status": "active",
+      "role": "low_level_walk_controller",
+      "relative_path": "teachers/locomotion/g1_locomotion_walk_controller.pt",
+      "original_filename": "model_walk.pt",
+      "bytes": 9785586,
+      "sha256": "2efa9d39c6ace247d6d68b43452f591cd5b22fb2f5e58dcfd3b6c5d1b30df77e",
+      "md5": "556dda04493332fdaf83385c93218169"
+    },
+    {
+      "id": "g1_locomotion_stand_controller",
+      "status": "active",
+      "role": "low_level_stand_controller",
+      "relative_path": "teachers/locomotion/g1_locomotion_stand_controller.pt",
+      "original_filename": "model_stand.pt",
+      "bytes": 9785586,
+      "sha256": "ceb976d2745bdaa99e51ba7141e441dc7a140638ff8e2b0efaf50efd20290054",
+      "md5": "31edd14f666173d583218b5fac24e671"
+    },
+    {
+      "id": "g1_3view_student_bootstrap_v1",
+      "status": "active_immutable_bootstrap",
+      "role": "three_view_student_initialization",
+      "relative_path": "students/bootstrap/g1_3view_student_bootstrap_v1.pt",
+      "bytes": 46526015,
+      "sha256": "720a975812f6083192234d650033511c821b6902da2ef7734d87943f6c0a359a",
+      "md5": "36b57ab107fb3df9a28c5ab4a5cfe3d9",
+      "policy_spec": "students/bootstrap/g1_3view_student_bootstrap_v1.policy_spec.json"
+    },
+    {
+      "id": "g1_privileged_action_teacher_btfv7t2_step043900",
+      "status": "archived_not_for_production",
+      "role": "legacy_robot_action_teacher",
+      "relative_path": "archive/legacy_robot_teacher/g1_privileged_action_teacher_btfv7t2_step043900.pt",
+      "original_filename": "model_step_043900.pt",
+      "bytes": 6805789,
+      "sha256": "fe1ef4bafa74cbfe18b08c4facddcbbb00f82e850399b8b4b751424f24fcc72e",
+      "md5": "3dd4aae9260ff63e5dd4a316d66109a3"
+    },
+    {
+      "id": "g1_singleview_student_rgbdelay_step023000",
+      "status": "archived_incompatible_single_view",
+      "role": "legacy_student_policy",
+      "relative_path": "archive/legacy_student/g1_singleview_student_rgbdelay_step023000.pt",
+      "original_filename": "model_step_023000.pt",
+      "bytes": 139453091,
+      "sha256": "406093135501f9841553b5e0984d15726626d75fc9bd07ff52719d10e465bb76",
+      "md5": "a359e4a6a0fd728ef6d755562c98180a"
+    }
+  ]
+}

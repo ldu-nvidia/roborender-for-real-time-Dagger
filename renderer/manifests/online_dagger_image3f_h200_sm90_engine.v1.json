@@ -1,0 +1,59 @@
+{
+  "schema": "roborender.h200_sm90_engine.v1",
+  "status": "active_built_and_correctness_checked",
+  "created_utc": "2026-09-06T00:57:42.524634+00:00",
+  "role": "online_dagger_image3f_dit_block_stack",
+  "adapter": {
+    "relative_path": "online_image3f/checkpoints/roborender_online_dagger_image3f_5step_lora_step05000.safetensors",
+    "bytes": 699995040,
+    "sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588"
+  },
+  "hardware": {
+    "gpu": "NVIDIA H200",
+    "compute_capability": "9.0",
+    "architecture": "SM90",
+    "driver": "570.211.01"
+  },
+  "software": {
+    "python": "3.13.12",
+    "torch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "tensorrt": "10.13.3.9"
+  },
+  "build": {
+    "engine_key": "028945bead2e23054ca00f1ca3b7ee41a05b4f24c4599d7eb0ab75c5fce28a14",
+    "onnx_export_key": "15f4dc82f4bf8dfeb1784713d33a1731fd7b42a0ad3c9e4d72c25bd0777c5a68",
+    "onnx_export_manifest_sha256": "98198f4e34df4916347964f7528df2d47648d28ea7d5cb8916eb468d82d20bea",
+    "precision": "bf16_fp16",
+    "workspace_gib": 64.0,
+    "builder_optimization_level": 5,
+    "cuda_graph_active": false,
+    "scope": "30-block DiT transformer stack"
+  },
+  "engine": {
+    "relative_path": "online_image3f/engines/sm90/roborender_online_dagger_image3f_sm90_bf16_3view.engine",
+    "physical_relative_path": "online_image3f/runtime/assets/generated/engines/sm90_028945bead2e2305/image3f_dit_block_stack_reference_bf16.engine",
+    "bytes": 3086893788,
+    "sha256": "9a11777c62e9d8ceb8bc380e4933353de2bd472e8b94716d29a4d1c39c3a70a5"
+  },
+  "timing_cache": {
+    "relative_path": "online_image3f/teacache/sm90/roborender_online_dagger_image3f_sm90_timing.cache",
+    "physical_relative_path": "online_image3f/runtime/assets/generated/timing/sm90_028945bead2e2305.cache",
+    "bytes": 13187763,
+    "sha256": "600c1d878002573381c21e6d097d5a46a71706c3401dbc0c9c60a8d31f6fb9aa"
+  },
+  "validation": {
+    "warmup_iterations": 10,
+    "measured_iterations": 50,
+    "all_finite": true,
+    "relative_rms_error_vs_pytorch": 0.011119924485683441,
+    "maximum_allowed_relative_rms_error": 0.05,
+    "mean_block_latency_ms": 18.847897369414567,
+    "p90_block_latency_ms": 18.972531892359257
+  },
+  "policy": {
+    "foreign_sm120_engine_reused": false,
+    "allowed_gpu_architecture": "SM90",
+    "descriptive_paths_are_symlinks_to_single_physical_artifacts": true
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "schema": "roborender.repository_layout.v1",
+  "canonical_project_root": "/workspace/project/roborender",
+  "canonical_data_root": "/workspace/project/roborender/data",
+  "effective_utc_date": "2026-09-06",
+  "active_contracts": {
+    "bc_collection": {
+      "path": "pipeline/bc_collection/raven_bc_collection_contract.v1.json",
+      "file_sha256": "348e81c93267090ac8416c2857c7c7e051449b3bd9f9b96266f82e52778dd107",
+      "canonical_json_sha256": "bd0e5bdaaae622ff74fc5169a2f8f82450c6c3c04682b65003253e1148d00962"
+    },
+    "dagger_and_evaluation": {
+      "path": "pipeline/dagger/raven_image3f_dagger_contract.v1.json",
+      "file_sha256": "7aa1eaab0548c528c286c15e576355f0e30ddf4314fb5ac7ac61d9b1dcf0f617",
+      "canonical_json_sha256": "9cb3652a75dd9f18acce75f12fb931b5255857dca457434c4417b867ab8ff9dd"
+    }
+  },
+  "source_revisions": {
+    "project_revision": "the Git commit containing this manifest",
+    "active_gr00t_path": "pipeline/GR00T-VisualSim2Real",
+    "active_gr00t_git_head": "94d79851d9c471b1210be81c75116d9bea835a4d",
+    "active_gr00t_worktree": "clean_detached_exact_raven",
+    "archived_custom_gr00t_path": "pipeline/archive/GR00T-VisualSim2Real-custom-provenance",
+    "archived_custom_gr00t_git_head": "9dd746d7fe86cbc09f20546695ab46bec609a3ea",
+    "archived_custom_gr00t_worktree": "modified_provenance_only_not_active"
+  },
+  "stages": ["BC", "dagger_1", "dagger_2", "dagger_3", "dagger_4"],
+  "teacher_execution_betas": [1.0, 1.0, 1.0, 1.0, 1.0],
+  "raytraced_observation_mix_each_dagger_round": 0.5,
+  "phase_roots": {
+    "bc_collection": "pipeline/bc_collection",
+    "bc_rendering": "pipeline/bc_rendering",
+    "bc_training": "pipeline/bc_training",
+    "dagger": "pipeline/dagger",
+    "evaluation": "pipeline/evaluation",
+    "testing": "pipeline/testing",
+    "renderer": "renderer",
+    "checkpoints": "checkpoints",
+    "data": "data",
+    "isaac_actor_runtime": "runtime/isaac_actor/qualified_h200_v1"
+  },
+  "student_checkpoint_outputs": {
+    "bootstrap": "checkpoints/students/bootstrap",
+    "raven_experiment_template": "checkpoints/students/{BC|dagger_1|dagger_2|dagger_3|dagger_4}/<experiment-run>/",
+    "checkpoint_names": ["model_step_NNNNNN.pt", "last.pt"],
+    "selection": "explicit_digest_registered_handoff_no_frontier_stage",
+    "checkpoints_below_data_root": "forbidden"
+  },
+  "dataset_state": {
+    "status": "layout_prepared_payloads_absent_pending_raven_contract_recollection",
+    "bc_isaac": "data/BC/isaac",
+    "bc_rendered": "data/BC/rendered",
+    "dagger_storage": "live_81_step_rollout_only_not_persisted",
+    "inactive_custom_protocol_layout": ["data/dagger_1", "data/dagger_2", "data/dagger_3", "data/dagger_4", "data/validation", "data/test", "data/splits"]
+  },
+  "canonical_moves": [
+    {
+      "original": "pipeline/GR00T-VisualSim2Real/logs_rl/<wsdpt-teacher-experiment>/model_step_044500.pt",
+      "canonical": "checkpoints/teachers/robot_policy/g1_privileged_action_teacher_wsdpt_step044500.pt",
+      "sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38"
+    },
+    {
+      "original": "checkpoints/original/checkpoint.pt",
+      "canonical": "checkpoints/students/bootstrap/g1_3view_student_bootstrap_v1.pt",
+      "sha256": "720a975812f6083192234d650033511c821b6902da2ef7734d87943f6c0a359a"
+    },
+    {
+      "original": "renderer/artifacts/adapters/teacher_50step/step-5294.safetensors",
+      "canonical": "renderer/offline_teacher/checkpoints/roborender_offline_bc_video_teacher_50step_lora_step05294.safetensors",
+      "sha256": "3f09aa23a26ddb2da32d027dc5e883c992c820854bc07020d6d254c806afb01b"
+    },
+    {
+      "original": "renderer/artifacts/adapters/online_image3f/rgb030-depth030-step-5000.safetensors",
+      "canonical": "renderer/online_image3f/checkpoints/roborender_online_dagger_image3f_5step_lora_step05000.safetensors",
+      "sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588"
+    }
+  ],
+  "compatibility_symlinks": [
+    {
+      "path": "pipeline/GR00T-VisualSim2Real/models/model_walk.pt",
+      "target": "checkpoints/teachers/locomotion/g1_locomotion_walk_controller.pt",
+      "reason": "upstream locomotion loader"
+    },
+    {
+      "path": "pipeline/GR00T-VisualSim2Real/models/model_stand.pt",
+      "target": "checkpoints/teachers/locomotion/g1_locomotion_stand_controller.pt",
+      "reason": "upstream locomotion loader"
+    },
+    {
+      "path": "renderer/models/PAI/Wan2.1-Fun-V1.1-1.3B-Control",
+      "target": "renderer/models/wan21_fun_control_1p3b_foundation",
+      "reason": "upstream Wan-Fun model identifier"
+    },
+    {
+      "path": "/workspace/codex/roborender-agent/runs/h200_rollout_qualification_20260903T201136Z",
+      "target": "runtime/isaac_actor/qualified_h200_v1",
+      "reason": "historical absolute runtime-manifest compatibility"
+    }
+  ],
+  "runtime_attestation": {
+    "path": "runtime/isaac_actor/qualified_h200_v1/qualification_report.json",
+    "bytes": 3047,
+    "sha256": "c39d505f4326e9d580de01c2ab2b5bc95e8e0b7f3e71352a19ea3923942781ad",
+    "scope": "bounded hardware/runtime qualification only; not a production collection seal"
+  },
+  "rules": {
+    "large_binary_physical_copies": 1,
+    "sealed_artifact_mutation": "forbidden",
+    "evaluation": "raytraced_closed_loop_success_300_episodes_under_offline_bc_saved_config",
+    "foreign_gpu_engine_use": "forbidden",
+    "compatibility_symlink_scope": "hard_coded_upstream_paths_only"
+  }
+}
