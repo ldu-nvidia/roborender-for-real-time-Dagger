@@ -14,14 +14,15 @@ scientific contract is Raven commit `94d7985`, production launcher
   rendering does not call it because all `obs_*`, `gt_actions`, and `dones`
   remain in the exact rendered NPZ.
 
-Inputs come from Raven's flat `../../data/BC/isaac`; learner-ready archives go
-to the flat `../../data/BC/rendered/chunk_*.npz`. MP4s and render manifests are
-diagnostic sidecars in a same-stem directory. Runtime plans/logs go to
-`../../runtime/outputs/bc_rendering`, not into the renderer asset tree.
+Inputs come from the sealed unified pool `../../data/BC/isaac/*.npz`;
+learner-ready archives go directly to `../../data/BC/rendered/*.npz`.
+`../../data/BC/manifest.json` preserves original collection lineage and the
+one-to-one source/rendered hashes. Preview videos and per-chunk sidecars are not
+production outputs; visual samples can be regenerated from the RGB arrays when
+needed. Runtime plans/logs go to `../../runtime/outputs/bc_rendering`.
 
-The active parity path deliberately has no split selector: Raven rendered and
-cycled one flat `videogen_dataset`. Any later held-out partition must be an
-inactive evaluation projection and must not remove chunks from this learner.
+The active parity path deliberately has no batch or train/validation/test
+selector: Raven rendered and cycled one logical `videogen_dataset`.
 
 The production Raven prompt is loaded from the vendored `render_prompt.txt`,
 matching Raven's `--prompt_override`. Inference steps, CFG, seed, input and

@@ -11,15 +11,20 @@
   },
   "allowed_portability_differences": [
     "num_envs",
-        "gpu_process_topology_and_existing_rank_seed_offset",
-        "rank_unique_output_path_and_filename_via_slurm_job_id",
+    "gpu_process_topology_and_existing_rank_seed_offset",
+    "rank_unique_output_path_and_filename_via_slurm_job_id",
+    "zero_learner_epochs_in_collect_only_mode",
     "absolute_checkpoint_paths",
     "absolute_output_and_runtime_paths",
     "architecture_local_H200_runtime"
   ],
   "rollout": {
     "simulator_seed": 0,
+    "physics_frequency_hz": 200,
+    "control_decimation": 4,
+    "policy_frequency_hz": 50,
     "teacher_drives_environment": true,
+    "learner_updates_during_collection": false,
     "rollout_action_source": "teacher",
     "steps_per_batch": 81,
     "emit_length": 81,

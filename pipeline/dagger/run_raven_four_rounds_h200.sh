@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Execute Raven's four independent warm-started Image3F DAgger jobs in order.
+# Execute the canonical 25/50/75/100%-student Image3F DAgger rounds in order.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)

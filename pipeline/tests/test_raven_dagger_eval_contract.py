@@ -27,7 +27,7 @@ def test_raven_image3f_contract_is_complete_and_static():
     assert result["anchors"] == 2048
 
 
-def test_only_environment_count_is_exposed_as_experiment_scale_input():
+def test_canonical_round_schedule_is_fixed_and_legacy_override_is_disabled():
     launcher = (DAGGER / "run_raven_dagger_round_h200.sh").read_text()
     assert "NUM_ENVS=${3:-16}" in launcher
     for fixed in (
@@ -35,14 +35,44 @@ def test_only_environment_count_is_exposed_as_experiment_scale_input():
         "algo.config.num_mini_batches=1",
         "algo.config.value_loss_coef=0.0",
         "algo.config.entropy_coef=0.0",
-        "algo.config.videogen.rollout_action_source=teacher",
+        "algo.config.rollout_with_teacher_num_steps=0",
+        "algo.config.enforce_teacher_rollout=false",
+        "algo.config.ratio_teacher_rollout=0.0",
+        "algo.config.videogen.rollout_action_source=beta",
+        "algo.config.videogen.beta_schedule=constant",
+        'algo.config.videogen.beta_start="$BETA"',
+        'algo.config.videogen.beta_end="$BETA"',
         "algo.config.videogen.raytraced_mix_prob=0.5",
         "algo.config.videogen.seed=42",
         "algo.config.videogen.anchor_index=0",
     ):
         assert fixed in launcher
-    for forbidden in ("MIX=${", "BETA=${", "STEPS=${", "CFG=${", "SEED=${"):
+    for forbidden in ("MIX=${", "STEPS=${", "CFG=${", "SEED=${"):
         assert forbidden not in launcher
+
+    schedule = json.loads((DAGGER / "canonical_round_schedule.v1.json").read_text())
+    assert schedule["selection"] == "per_decision_per_environment_bernoulli"
+    assert schedule["teacher_labels_every_visited_state"] is True
+    assert schedule["legacy_teacher_override"] is False
+    assert [row["teacher_probability"] for row in schedule["rounds"]] == [
+        0.75,
+        0.5,
+        0.25,
+        0.0,
+    ]
+    assert [row["student_probability"] for row in schedule["rounds"]] == [
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+    ]
+    for shell_row in (
+        "1) BETA=0.75",
+        "2) BETA=0.50",
+        "3) BETA=0.25",
+        "4) BETA=0.00",
+    ):
+        assert shell_row in launcher
 
     four_rounds = (DAGGER / "run_raven_four_rounds_h200.sh").read_text()
     assert "for round in 1 2 3 4" in four_rounds
@@ -70,6 +100,23 @@ def test_raven_checkpoint_and_additional_round_semantics_are_exact():
     launcher = (DAGGER / "run_raven_dagger_round_h200.sh").read_text()
     assert "raven_exact_image_dagger" not in launcher
     assert "resume=false" not in launcher
+
+
+def test_live_action_order_relabels_then_selects_then_steps_isaac():
+    trainer = (
+        GR00T / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
+    ).read_text()
+    relabel = 'obs_dict = self._image_dagger_relabel(obs_dict, cur_dones)'
+    policy = 'policy_state_dict = super().policy_step(policy_model, obs_dict, cur_dones=cur_dones)'
+    beta = 'beta = self._dagger_beta()'
+    selection = 'policy_state_dict["actions"] = mixed'
+    assert trainer.index(relabel, trainer.index("def policy_step")) < trainer.index(policy)
+    assert trainer.index(policy) < trainer.index(beta) < trainer.index(selection)
+
+    ppo = (GR00T / "gr00t/rl/trl/trainer/ppo_trainer_homie_api.py").read_text()
+    package = 'actor_state = {"actions": policy_state_dict["actions"]}'
+    step = "obs_dict, rewards, dones, infos = self.env.step(actor_state)"
+    assert ppo.index(package) < ppo.index(step, ppo.index(package))
 
 
 def test_online_server_preserves_raven_generation_contract():

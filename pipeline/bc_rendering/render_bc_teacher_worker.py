@@ -8,7 +8,6 @@ import gc
 import hashlib
 import json
 import os
-import shutil
 import time
 from pathlib import Path
 
@@ -35,7 +34,39 @@ def sha256_file(path: Path) -> str:
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".partial")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def write_lane_progress(
+    plan: dict,
+    *,
+    status: str,
+    done: int,
+    rendered_this_run: int,
+    skipped_preexisting: int,
+    current_job: dict | None = None,
+    error: str | None = None,
+) -> None:
+    value = {
+        "schema": "roborender.bc_teacher_lane_progress.v1",
+        "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "physical_gpu": int(plan["physical_gpu"]),
+        "lane": int(plan["lane"]),
+        "status": status,
+        "assigned": len(plan["jobs"]),
+        "done": done,
+        "rendered_this_run": rendered_this_run,
+        "skipped_preexisting": skipped_preexisting,
+        "remaining": len(plan["jobs"]) - done,
+        "current_job": current_job,
+        "error": error,
+    }
+    write_json(Path(plan["progress_path"]), value)
 
 
 def next_wan_frame_count(frame_count: int) -> int:
@@ -129,17 +160,6 @@ def validate_completed_chunk(path: Path, frame_count: int) -> bool:
         return False
 
 
-def join_three_views(frames: tuple[Image.Image, Image.Image, Image.Image]) -> Image.Image:
-    width = sum(frame.width for frame in frames)
-    height = max(frame.height for frame in frames)
-    output = Image.new("RGB", (width, height))
-    x = 0
-    for frame in frames:
-        output.paste(frame, (x, 0))
-        x += frame.width
-    return output
-
-
 def load_pipeline(config: dict):
     from diffsynth.core.loader import load_state_dict
     from diffsynth.pipelines.wan_video import ModelConfig, WanVideoPipeline
@@ -181,23 +201,14 @@ def load_pipeline(config: dict):
 
 
 def render_episode(pipe, job: dict, config: dict) -> dict:
-    from diffsynth.utils.data import save_video
     from sim2realgen.inference_long_video import split_video_vertical
 
     source_npz = Path(job["source_npz"]).resolve()
     output_npz = Path(job["output_npz"]).resolve()
-    output_dir = Path(job["output_dir"]).resolve()
-    partial_dir = output_dir.with_name(output_dir.name + ".partial")
-
     if validate_completed_chunk(output_npz, job["frame_count"]):
         return {"status": "skipped_complete", "output_npz": str(output_npz)}
     if output_npz.exists():
         raise FileExistsError(f"refusing to overwrite invalid output: {output_npz}")
-    if output_dir.exists():
-        raise FileExistsError(f"refusing to overwrite incomplete output: {output_dir}")
-    if partial_dir.exists():
-        shutil.rmtree(partial_dir)
-    partial_dir.mkdir(parents=True)
 
     started = time.monotonic()
     with np.load(source_npz, allow_pickle=False) as payload:
@@ -261,82 +272,14 @@ def render_episode(pipe, job: dict, config: dict) -> dict:
         student_width=config["student_width"],
     )
 
-    video_paths = {
-        camera: partial_dir / f"rgb_gen__{camera}.mp4" for camera in by_camera
-    }
-    for camera, frames in by_camera.items():
-        save_video(frames, str(video_paths[camera]), fps=config["preview_fps"], quality=5)
-
-    primary_path = partial_dir / "rgb_gen.mp4"
-    os.link(video_paths["head_color"], primary_path)
-    combined_path = partial_dir / "rendered_3view.mp4"
-    combined_frames = [
-        join_three_views((left, right, head))
-        for left, right, head in zip(
-            by_camera["hand_left"],
-            by_camera["hand_right"],
-            by_camera["head_color"],
-            strict=True,
-        )
-    ]
-    save_video(combined_frames, str(combined_path), fps=config["preview_fps"], quality=5)
-
-    output_files = [
-        output_npz,
-        primary_path,
-        video_paths["head_color"],
-        video_paths["hand_left"],
-        video_paths["hand_right"],
-        combined_path,
-    ]
-    output_hashes = {path.name: sha256_file(path) for path in output_files}
-    manifest = {
-        "schema": "roborender.bc_teacher_render.v1",
-        "status": "complete",
-        "global_env_id": job["global_env_id"],
-        "env_id": job["env_id"],
-        "episode_id": job["episode_id"],
-        "source_npz": str(source_npz),
-        "source_payload_sha256": job["source_payload_sha256"],
-        "frame_count": job["frame_count"],
-        "model_frame_count": model_frame_count,
-        "prompt": job["prompt"],
-        "seed": job["seed"],
-        "renderer": {
-            "role": "offline_bc_50step_teacher",
-            "foundation": "PAI/Wan2.1-Fun-V1.1-1.3B-Control",
-            "adapter_path": config["adapter_path"],
-            "adapter_sha256": config["adapter_sha256"],
-            "num_inference_steps": config["num_inference_steps"],
-            "cfg_scale": config["cfg_scale"],
-            "view_mapping": {slot: camera for slot, camera in VIEW_SLOTS},
-        },
-        "learner_archive": str(output_npz),
-        "learner_archive_sha256": sha256_file(output_npz),
-        "rgb_gen_shape": [job["frame_count"], config["student_height"], config["student_width"], 3],
-        "rgb_gen_dtype": "uint8",
-        "alignment": "rgb_gen[t] -> obs_*[t] -> gt_actions[t]",
-        "state_dim": 113,
-        "action_dim": 26,
-        "wall_seconds": time.monotonic() - started,
-        "outputs": output_hashes,
-    }
-    manifest_path = partial_dir / "render_manifest.json"
-    write_json(manifest_path, manifest)
-    checksum_paths = output_files + [manifest_path]
-    checksum_lines = [f"{sha256_file(path)}  {path.name}" for path in checksum_paths]
-    (partial_dir / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
-
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    partial_dir.replace(output_dir)
-    del generated, split, by_camera, combined_frames, depth_views, mask_views
+    wall_seconds = time.monotonic() - started
+    del generated, split, by_camera, depth_views, mask_views
     gc.collect()
     torch.cuda.empty_cache()
     return {
         "status": "complete",
-        "output_dir": str(output_dir),
         "output_npz": str(output_npz),
-        "wall_seconds": manifest["wall_seconds"],
+        "wall_seconds": wall_seconds,
     }
 
 
@@ -354,21 +297,79 @@ def main() -> None:
     if sha256_file(Path(config["adapter_path"])) != config["adapter_sha256"]:
         raise RuntimeError("teacher adapter hash mismatch")
 
+    done = 0
+    rendered_this_run = 0
+    skipped_preexisting = 0
+    current_job = None
+    write_lane_progress(
+        plan,
+        status="loading",
+        done=done,
+        rendered_this_run=rendered_this_run,
+        skipped_preexisting=skipped_preexisting,
+    )
     print(
         f"loading teacher for physical_gpu={plan['physical_gpu']} lane={plan['lane']} "
         f"jobs={len(plan['jobs'])}",
         flush=True,
     )
-    pipe = load_pipeline(config)
-    for index, job in enumerate(plan["jobs"], start=1):
-        print(
-            f"job {index}/{len(plan['jobs'])}: "
-            f"env={job['global_env_id']} episode={job['episode_id']} "
-            f"frames={job['frame_count']}",
-            flush=True,
+    try:
+        pipe = load_pipeline(config)
+        for index, job in enumerate(plan["jobs"], start=1):
+            current_job = {
+                "index": index,
+                "global_env_id": job["global_env_id"],
+                "sequence_id": job["sequence_id"],
+                "source_npz": job["source_npz"],
+            }
+            write_lane_progress(
+                plan,
+                status="rendering",
+                done=done,
+                rendered_this_run=rendered_this_run,
+                skipped_preexisting=skipped_preexisting,
+                current_job=current_job,
+            )
+            print(
+                f"job {index}/{len(plan['jobs'])}: "
+                f"env={job['global_env_id']} episode={job['episode_id']} "
+                f"frames={job['frame_count']}",
+                flush=True,
+            )
+            result = render_episode(pipe, job, config)
+            if result["status"] == "complete":
+                rendered_this_run += 1
+            elif result["status"] == "skipped_complete":
+                skipped_preexisting += 1
+            else:
+                raise RuntimeError(f"unexpected render result: {result}")
+            done += 1
+            write_lane_progress(
+                plan,
+                status="rendering",
+                done=done,
+                rendered_this_run=rendered_this_run,
+                skipped_preexisting=skipped_preexisting,
+            )
+            print(json.dumps(result, sort_keys=True), flush=True)
+        write_lane_progress(
+            plan,
+            status="complete",
+            done=done,
+            rendered_this_run=rendered_this_run,
+            skipped_preexisting=skipped_preexisting,
         )
-        result = render_episode(pipe, job, config)
-        print(json.dumps(result, sort_keys=True), flush=True)
+    except Exception as error:
+        write_lane_progress(
+            plan,
+            status="failed",
+            done=done,
+            rendered_this_run=rendered_this_run,
+            skipped_preexisting=skipped_preexisting,
+            current_job=current_job,
+            error=f"{type(error).__name__}: {error}",
+        )
+        raise
 
 
 if __name__ == "__main__":

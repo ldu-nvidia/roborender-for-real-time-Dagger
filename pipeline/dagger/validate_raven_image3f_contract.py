@@ -42,6 +42,20 @@ ENGINE = (
     / "renderer/online_image3f/engines/sm90/"
     "roborender_online_dagger_image3f_sm90_bf16_3view.engine"
 )
+SCHEDULE = Path(__file__).with_name("canonical_round_schedule.v1.json")
+LAUNCHER = Path(__file__).with_name("run_raven_dagger_round_h200.sh")
+ONLINE_TRAINER_METHODS = (
+    "policy_step",
+    "_dagger_beta",
+    "_advance_dagger_beta",
+    "_id_sample_anchor",
+    "_image_dagger_relabel",
+    "_rollout_step",
+    "_depth_to_control_video",
+    "_h5v4_control",
+    "_resize_seq",
+    "_normalize_like_env",
+)
 
 
 class ContractError(RuntimeError):
@@ -59,6 +73,26 @@ def sha256(path: Path) -> str:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ContractError(message)
+
+
+def _git_blob(relative_path: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(GR00T), "show", f"HEAD:{relative_path}"],
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def _function_ast(source: str, names: tuple[str, ...]) -> dict[str, str]:
+    tree = ast.parse(source)
+    found = {
+        node.name: ast.dump(node, include_attributes=False)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in names
+    }
+    require(set(found) == set(names), "online trainer method inventory differs")
+    return found
 
 
 def _literal_assignment(path: Path, name: str):
@@ -90,10 +124,16 @@ def validate(*, full_assets: bool = False) -> dict:
         check=True,
         capture_output=True,
         text=True,
-    ).stdout
-    require(not drift, "active Raven GR00T source tree has local drift")
+    ).stdout.splitlines()
+    allowed_bc_drift = {
+        " M gr00t/rl/config/exp/loco_manip/wsdpt_videogen_offline_bc_3view.yaml",
+        " M gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+    }
+    require(
+        set(drift).issubset(allowed_bc_drift),
+        "active Raven GR00T tree has drift outside the pinned offline-BC extension",
+    )
     exact_sources = {
-        "trainer_sha256": RAVEN_TRAINER,
         "client_sha256": RAVEN_CLIENT,
         "config_sha256": RAVEN_CONFIG,
     }
@@ -102,6 +142,22 @@ def validate(*, full_assets: bool = False) -> dict:
         require(
             sha256(path) == reference[key],
             f"Raven source drift: {path}",
+        )
+
+    reference_trainer = _git_blob(
+        "gr00t/rl/trl/trainer/distill_trainer_videogen.py"
+    )
+    require(
+        hashlib.sha256(reference_trainer).hexdigest()
+        == reference["trainer_sha256"],
+        "Raven trainer Git blob differs from the pinned reference",
+    )
+    trainer_digest = sha256(RAVEN_TRAINER)
+    if trainer_digest != reference["trainer_sha256"]:
+        require(
+            _function_ast(RAVEN_TRAINER.read_text(encoding="utf-8"), ONLINE_TRAINER_METHODS)
+            == _function_ast(reference_trainer.decode("utf-8"), ONLINE_TRAINER_METHODS),
+            "online Image3F trainer methods differ from Raven 94d7985",
         )
 
     config = yaml.safe_load(RAVEN_CONFIG.read_text(encoding="utf-8"))
@@ -165,6 +221,17 @@ def validate(*, full_assets: bool = False) -> dict:
         'for key, value in checkpoint["state"].__dict__.items()',
     ):
         require(fragment in ppo, f"Raven checkpoint/update semantics missing: {fragment}")
+    homie_ppo = (
+        GR00T / "gr00t/rl/trl/trainer/ppo_trainer_homie_api.py"
+    ).read_text(encoding="utf-8")
+    behavior_package = 'actor_state = {"actions": policy_state_dict["actions"]}'
+    isaac_step = "obs_dict, rewards, dones, infos = self.env.step(actor_state)"
+    require(behavior_package in homie_ppo, "selected behavior action is not packaged")
+    require(isaac_step in homie_ppo, "Isaac environment step is missing")
+    require(
+        homie_ppo.index(behavior_package) < homie_ppo.index(isaac_step),
+        "Isaac is stepped before the selected behavior action is packaged",
+    )
 
     view_map = _literal_assignment(SERVER, "VIEW_MAP")
     require(
@@ -221,6 +288,33 @@ def validate(*, full_assets: bool = False) -> dict:
         require(sha256(ADAPTER) == image3f["adapter_sha256"], "adapter SHA drift")
         require(sha256(ENGINE) == image3f["engine_sha256"], "SM90 engine SHA drift")
 
+    schedule = json.loads(SCHEDULE.read_text(encoding="utf-8"))
+    require(
+        schedule.get("schema") == "roborender.canonical_dagger_round_schedule.v1",
+        "canonical DAgger schedule schema differs",
+    )
+    require(
+        [row["teacher_probability"] for row in schedule["rounds"]]
+        == [0.75, 0.5, 0.25, 0.0],
+        "canonical DAgger teacher schedule differs",
+    )
+    require(
+        [row["student_probability"] for row in schedule["rounds"]]
+        == [0.25, 0.5, 0.75, 1.0],
+        "canonical DAgger student schedule differs",
+    )
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    for fragment in (
+        "algo.config.rollout_with_teacher_num_steps=0",
+        "algo.config.enforce_teacher_rollout=false",
+        "algo.config.ratio_teacher_rollout=0.0",
+        "algo.config.videogen.rollout_action_source=beta",
+        "algo.config.videogen.beta_schedule=constant",
+        'algo.config.videogen.beta_start="$BETA"',
+        'algo.config.videogen.beta_end="$BETA"',
+    ):
+        require(fragment in launcher, f"active action-selection override missing: {fragment}")
+
     return {
         "status": "raven_image3f_dagger_contract_valid",
         "raven_commit": reference["gr00t_commit"],
@@ -228,6 +322,8 @@ def validate(*, full_assets: bool = False) -> dict:
         "allowed_runtime_overrides": contract["allowed_differences"],
         "anchors": len(anchors),
         "full_asset_hashes_verified": full_assets,
+        "online_trainer_matches_raven_ast": True,
+        "canonical_teacher_betas": [0.75, 0.5, 0.25, 0.0],
     }
 
 

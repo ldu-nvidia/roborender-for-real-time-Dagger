@@ -1,34 +1,60 @@
 #!/bin/bash
-# Raven-equivalent three-view offline BC. Only NUM_ENVS and execution topology
-# are exposed; scientific hyperparameters remain in the pinned Hydra config.
+# Raven-equivalent three-view offline BC, without starting Isaac or a renderer.
 set -Eeuo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-GR00T_ROOT=$PROJECT_ROOT/pipeline/GR00T-VisualSim2Real
-QUALIFIED_ROOT=$PROJECT_ROOT/runtime/isaac_actor/qualified_h200_v1
 source "$PROJECT_ROOT/pipeline/common/setup_h200_isaac_runtime.sh"
-NUM_ENVS=${NUM_ENVS:-16}
+CHUNK_BATCH_SIZE=${CHUNK_BATCH_SIZE:-4}
+TRAIN_SPLIT=$PROJECT_ROOT/data/BC/splits/train.json
+VALIDATION_SPLIT=$PROJECT_ROOT/data/BC/splits/validation.json
+STUDENT_BOOTSTRAP=$PROJECT_ROOT/checkpoints/students/bootstrap/g1_3view_student_bootstrap_v1.pt
+POLICY_SPEC=$PROJECT_ROOT/checkpoints/students/bootstrap/g1_3view_student_bootstrap_v1.policy_spec.json
+export WANDB_MODE=${WANDB_MODE:-online}
 
-[[ $NUM_ENVS =~ ^[1-9][0-9]*$ ]] || { echo "NUM_ENVS must be positive" >&2; exit 2; }
+[[ $CHUNK_BATCH_SIZE =~ ^[1-9][0-9]*$ ]] || { echo "CHUNK_BATCH_SIZE must be positive" >&2; exit 2; }
 [[ -x $GR00T_PYTHON ]] || { echo "GR00T_PYTHON is not executable" >&2; exit 2; }
-"$GR00T_PYTHON" -c 'import accelerate, trl' 2>/dev/null || {
-    echo "qualified runtime lacks Raven training dependencies: accelerate and/or trl" >&2
+for required in \
+    "$TRAIN_SPLIT" \
+    "$VALIDATION_SPLIT" \
+    "$STUDENT_BOOTSTRAP" \
+    "$POLICY_SPEC"; do
+    [[ -f $required ]] || { echo "required BC input is missing: $required" >&2; exit 2; }
+done
+"$GR00T_PYTHON" -c 'import torch, hydra, wandb' 2>/dev/null || {
+    echo "qualified runtime lacks BC training dependencies" >&2
     exit 2
 }
+"$GR00T_PYTHON" - "$TRAIN_SPLIT" "$VALIDATION_SPLIT" "$CHUNK_BATCH_SIZE" <<'PY'
+import json, sys
+from pathlib import Path
 
-cd "$GR00T_ROOT"
-exec "$GR00T_PYTHON" -m accelerate.commands.launch \
-    --num_processes 1 \
-    gr00t/rl/train_agent_trl.py \
-    +exp=loco_manip/wsdpt_videogen_offline_bc_3view \
-    num_envs="$NUM_ENVS" \
-    headless=True \
-    use_wandb=false \
-    teacher_actor_path="$PROJECT_ROOT/checkpoints/teachers/robot_policy/g1_privileged_action_teacher_wsdpt_step044500.pt" \
-    algo.config.homie_walk_model_path="$PROJECT_ROOT/checkpoints/teachers/locomotion/g1_locomotion_walk_controller.pt" \
-    algo.config.homie_stand_model_path="$PROJECT_ROOT/checkpoints/teachers/locomotion/g1_locomotion_stand_controller.pt" \
-    algo.config.videogen.dataset_dir="$PROJECT_ROOT/data/BC/rendered" \
-    algo.config.videogen.dump_dir="$PROJECT_ROOT/runtime/outputs/bc_training/videogen_frames" \
-    base_dir="$PROJECT_ROOT/checkpoints/students/BC" \
-    experiment_name=videogen_offline_bc \
-    project_name=videogen_offline_bc
+train_path, validation_path, batch = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+train = json.loads(train_path.read_text())
+validation = json.loads(validation_path.read_text())
+assert train["split"] == "train" and train["chunk_count"] == len(train["items"])
+assert validation["split"] == "validation" and validation["chunk_count"] == len(validation["items"])
+assert not ({item["stream_id"] for item in train["items"]}
+            & {item["stream_id"] for item in validation["items"]})
+print(f"BC preflight PASS: train={train['chunk_count']} validation={validation['chunk_count']} "
+      f"batch_chunks={batch} steps_per_epoch={(train['chunk_count'] + batch - 1) // batch}")
+PY
+if [[ $WANDB_MODE == online ]]; then
+    "$GR00T_PYTHON" -c 'import wandb; assert wandb.api.api_key, "run wandb login first"' || {
+        echo "W&B online logging requested but no API key is configured" >&2
+        exit 2
+    }
+fi
+
+exec "$GR00T_PYTHON" "$PROJECT_ROOT/pipeline/bc_training/train_bc_h200.py" \
+    --dataset-root "$PROJECT_ROOT/data/BC" \
+    --train-split "$TRAIN_SPLIT" \
+    --validation-split "$VALIDATION_SPLIT" \
+    --bootstrap "$STUDENT_BOOTSTRAP" \
+    --policy-spec "$POLICY_SPEC" \
+    --output-root "$PROJECT_ROOT/checkpoints/students/BC" \
+    --chunk-batch-size "$CHUNK_BATCH_SIZE" \
+    --wandb-mode "$WANDB_MODE" \
+    --wandb-project dagger \
+    --wandb-group BC \
+    --wandb-run-name BC \
+    "$@"

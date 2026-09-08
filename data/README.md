@@ -1,21 +1,28 @@
 # Dataset root
 
-This is the only RoboRender data root. The Raven-equivalent active datasets are
-flat, not pre-split:
+This is the only RoboRender data root. Behavioral cloning uses one sealed pool,
+not collection-batch or train/validation/test wrappers:
 
-- `BC/isaac/chunk_*.npz`: sealed 81-frame teacher demonstrations containing
+- `BC/isaac/bc_chunk_NNNNNN.npz`: sealed 81-frame teacher demonstrations containing
   three-view renderer controls, non-vision observations, and 26-D teacher labels.
-- `BC/isaac/manifest.json`: immutable inventory, hashes, shapes, and rank/global
-  environment lineage for those chunks.
-- `BC/rendered/chunk_*.npz`: the same chunks with `rgb_gen` and all three
+- `BC/rendered/bc_chunk_NNNNNN.npz`: the same chunks with `rgb_gen` and all three
   `rgb_gen__<view>` arrays added by the 50-step offline teacher.
+- `BC/manifest.json`: unified one-to-one inventory, hashes, original collection
+  lineage, teacher identity, and renderer identity.
+- `BC/SEALED.json`: exact 2,000-source/2,000-rendered pairing seal.
+- `BC/splits/{train,validation,test}.json`: non-overlapping 80/10/10 indexes;
+  files remain in the unified pool and are not duplicated.
+- `BC/splits/manifest.json`: split seed, grouping/stratification contract,
+  counts, hashes, and leakage checks.
 
-Raven's offline learner cycles the complete flat rendered dataset. Her DAgger
+The identical basename maps each Isaac archive to its rendered counterpart.
+Batch, rank, host, seed, and timestamp are provenance fields in the manifest,
+not parts of the canonical filename.
+
+The BC launcher cycles only the indexed training subset. Raven's DAgger
 learner trains directly from each current 81-step live rollout and does not
 write, reload, or mix a persisted round replay dataset. Consequently
-`dagger_1` through `dagger_4`, `validation`, `test`, and `splits` are inactive
-empty layout remnants of the superseded custom protocol, not inputs to any
-canonical launcher.
+no inactive batch directories or duplicated split archives are retained.
 
 Runtime plans, logs, previews, and renderer endpoint files belong under
 `../runtime`, not here.

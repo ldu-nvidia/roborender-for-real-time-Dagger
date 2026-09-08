@@ -6,13 +6,18 @@
   "active_contracts": {
     "bc_collection": {
       "path": "pipeline/bc_collection/raven_bc_collection_contract.v1.json",
-      "file_sha256": "348e81c93267090ac8416c2857c7c7e051449b3bd9f9b96266f82e52778dd107",
-      "canonical_json_sha256": "bd0e5bdaaae622ff74fc5169a2f8f82450c6c3c04682b65003253e1148d00962"
+      "file_sha256": "91db24f61a72f4109ad549e3fcd5a43b74a7c5feb319b70119c8b84a0d9a64d8",
+      "canonical_json_sha256": "9e68006367c4132377eb2c104ab0f9e533fbad7f8a15e47db470090eb1c93287"
     },
     "dagger_and_evaluation": {
       "path": "pipeline/dagger/raven_image3f_dagger_contract.v1.json",
       "file_sha256": "7aa1eaab0548c528c286c15e576355f0e30ddf4314fb5ac7ac61d9b1dcf0f617",
       "canonical_json_sha256": "9cb3652a75dd9f18acce75f12fb931b5255857dca457434c4417b867ab8ff9dd"
+    },
+    "dagger_action_schedule": {
+      "path": "pipeline/dagger/canonical_round_schedule.v1.json",
+      "file_sha256": "a6b10010a602350614176c530dfd3c906455b3fc62bf5df9abc7d59c56926e0d",
+      "canonical_json_sha256": "6748b6c9b65e1d7719f33d36ab66c606452a7e0a680bc97665ad9131cddb7a0f"
     }
   },
   "source_revisions": {
@@ -25,7 +30,7 @@
     "archived_custom_gr00t_worktree": "modified_provenance_only_not_active"
   },
   "stages": ["BC", "dagger_1", "dagger_2", "dagger_3", "dagger_4"],
-  "teacher_execution_betas": [1.0, 1.0, 1.0, 1.0, 1.0],
+  "teacher_execution_betas": [1.0, 0.75, 0.5, 0.25, 0.0],
   "raytraced_observation_mix_each_dagger_round": 0.5,
   "phase_roots": {
     "bc_collection": "pipeline/bc_collection",

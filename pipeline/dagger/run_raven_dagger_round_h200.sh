@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Run one of four warm-started Raven-equivalent three-view Image3F DAgger rounds.
+# Run one canonical warm-started three-view Image3F DAgger round.
+#
+# Raven's Image3F observation/teacher/trainer implementation is preserved.  The
+# action schedule is the project's explicit canonical DAgger experiment:
+# D1..D4 execute 25%, 50%, 75%, then 100% student decisions.  Raven's reported
+# runs used beta=1 throughout; that reference result remains documented in
+# raven_image3f_dagger_contract.v1.json and is not mislabelled as this schedule.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
@@ -15,6 +21,12 @@ OUTPUT=$ROOT/checkpoints/students/dagger_${ROUND}
 
 [[ $ROUND =~ ^[1-4]$ ]] || { echo "ROUND must be 1..4" >&2; exit 2; }
 [[ $NUM_ENVS =~ ^[1-9][0-9]*$ ]] || { echo "NUM_ENVS must be positive" >&2; exit 2; }
+case "$ROUND" in
+    1) BETA=0.75 ;;
+    2) BETA=0.50 ;;
+    3) BETA=0.25 ;;
+    4) BETA=0.00 ;;
+esac
 for path in "$PYTHON" "$CHECKPOINT" "$TEACHER"; do
     [[ -f $path || -L $path ]] || { echo "missing required input: $path" >&2; exit 2; }
 done
@@ -43,6 +55,7 @@ EP_LIST+="]"
 
 /usr/bin/python3 "$ROOT/pipeline/dagger/validate_raven_image3f_contract.py"
 mkdir -p "$OUTPUT"
+echo "dagger_round=$ROUND teacher_probability=$BETA student_probability=$(awk -v b="$BETA" 'BEGIN { printf "%.2f", 1-b }')"
 
 # Rehydrate the already-qualified Isaac Sim 5.1 runtime. These paths relocate
 # Raven's environment; they do not alter policy or DAgger parameters.
@@ -66,7 +79,13 @@ exec "$PYTHON" -m accelerate.commands.launch --num_processes 1 \
     algo.config.num_mini_batches=1 \
     algo.config.value_loss_coef=0.0 \
     algo.config.entropy_coef=0.0 \
-    algo.config.videogen.rollout_action_source=teacher \
+    algo.config.rollout_with_teacher_num_steps=0 \
+    algo.config.enforce_teacher_rollout=false \
+    algo.config.ratio_teacher_rollout=0.0 \
+    algo.config.videogen.rollout_action_source=beta \
+    +algo.config.videogen.beta_schedule=constant \
+    +algo.config.videogen.beta_start="$BETA" \
+    +algo.config.videogen.beta_end="$BETA" \
     algo.config.videogen.raytraced_mix_prob=0.5 \
     algo.config.videogen.seed=42 \
     algo.config.videogen.anchor_index=0 \

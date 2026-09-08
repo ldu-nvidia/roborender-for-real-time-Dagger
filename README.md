@@ -1,11 +1,13 @@
-# RoboRender Raven-equivalent H200 pipeline
+# RoboRender Raven-derived RTX–H200 pipeline
 
 This repository ports Raven's `qingh097/fast_roborender` `videogen-pipeline`
-implementation to the local H200 node. The scientific reference is the supplied
-GR00T patch stack at commit `94d7985`. The only intended scientific scale change
-is the total number of Isaac environments. Absolute paths, process/server
+implementation to a distributed RTX–H200 deployment. The scientific reference is the supplied
+GR00T patch stack at commit `94d7985`. The renderer, policy, teacher, loss, and
+rollout ordering follow that source. The deliberate experiment changes are the
+three-view policy, the number of Isaac environments, and the canonical DAgger
+teacher-beta schedule 0.75/0.50/0.25/0.00. Absolute paths, process/server
 placement, and the locally built SM90 TensorRT engine are hardware portability
-changes, not experiment changes.
+changes.
 
 The selected policy contract is Raven's three-view extension: `head_color`,
 `hand_left`, and `hand_right`, vertically stacked at 108x192 per view. Raven
@@ -20,12 +22,14 @@ are provenance baselines, not a numerically comparable three-view target.
 | BC collection | `pipeline/bc_collection/run_raven_bc_collection_8gpu.sh` | Privileged teacher drives Isaac; emit flat 81-frame three-view depth/mask/action chunks. |
 | Offline BC rendering | `pipeline/bc_rendering/render_bc_teacher_8gpu.py` | Raven-parameter-equivalent direct H200 worker: 50-step teacher LoRA, CFG 5, seed 42, fixed prompt, left/right/head order; preserve all supervision. |
 | Offline BC training | `pipeline/bc_training/train_raven_bc_h200.sh` | Flat cyclic rendered dataset, three-view ResNet18 policy, one 81-step minibatch/update, uniform action MSE. |
-| DAgger round | `pipeline/dagger/run_raven_dagger_round_h200.sh` | Online Image3F relabel before action; 50% ray-traced episode mix; teacher drives and labels; current rollout only. |
-| Four-round sequence | `pipeline/dagger/run_raven_four_rounds_h200.sh` | Four full Raven-style warm-start jobs; each restores the immediately preceding full checkpoint. |
+| DAgger round | `pipeline/dagger/services/` | RTX Isaac/teacher actor exchanges data with H200 Image3F/student/learner services; canonical per-decision teacher/student action mixture; teacher labels every state; current rollout only. |
+| Four-round sequence | `pipeline/dagger/run_raven_four_rounds_h200.sh` | Fixed 25/50/75/100%-student warm-start rounds; each restores the immediately preceding full checkpoint. |
 | Evaluation | `pipeline/evaluation/run_raven_raytraced_300_eval_h200.sh` | Closed-loop success over 300 episodes, using the saved offline-BC baseline environment config. |
 
-Raven did **not** use a 75/50/25/0 teacher-beta schedule in the reported runs.
-Every recorded DAgger round used `rollout_action_source: teacher` (beta 1), and
+Raven did **not** use a 0.75/0.50/0.25/0.00 teacher-beta schedule in the reported
+runs. Every recorded Raven DAgger round used `rollout_action_source: teacher`
+(beta 1). Our active four-round experiment intentionally uses the canonical
+schedule above. In both cases,
 `raytraced_mix_prob: 0.5` means half of environment episodes retain ray-traced
 RGB while half are relabelled by Image3F. These are different concepts. Raven
 also did not use validation-MSE saturation or a separate sealed test split.
@@ -44,8 +48,9 @@ also did not use validation-MSE saturation or a separate sealed test split.
 - Online renderer: `rgb030-depth030-step-5000`, 5 steps, CFG 1, TeaCache 0.3,
   untiled VAE, one uniformly sampled anchor file per environment episode, with
   frame index 0 of that file held fixed for the episode.
-- DAgger: teacher-driven actions, 50% ray-traced episode assignment, fresh
-  current 81-step rollout only, no replay dataset, full-state warm start.
+- DAgger: per-decision teacher betas `[0.75, 0.50, 0.25, 0.00]`, teacher labels
+  every visited state, 50% ray-traced episode assignment, fresh current
+  81-step rollout only, no replay dataset, full-state warm start.
 - Evaluation: native ray-traced observations, 300 closed-loop episodes, success
   rate, candidate checkpoint staged beside the offline-BC saved `config.yaml`.
 
