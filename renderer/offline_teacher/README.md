@@ -7,7 +7,7 @@ This is the canonical offline BC renderer and anchor generator.
 - Foundation: `../models/wan21_fun_control_1p3b_foundation`.
 - Recipe: 50 diffusion steps, CFG 5.0, PyTorch DiT, three synchronized views.
 - Production launcher: `../../pipeline/bc_rendering/render_bc_teacher_8gpu.py`.
-- Dataset outputs: flat `../../data/BC/rendered/chunk_*.npz`.
+- Dataset outputs: flat `../../data/BC/rendered/bc_chunk_*.npz`.
 - Plans/logs: `../../runtime/outputs/bc_rendering`.
 
 This adapter does not use the Image3F TensorRT engine because the engine fuses

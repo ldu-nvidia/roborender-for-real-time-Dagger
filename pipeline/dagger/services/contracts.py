@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 
-IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+IDENTIFIER = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VIEWS = ("head_color", "hand_left", "hand_right")
 ROLLOUT_STEPS = 81
@@ -67,27 +67,27 @@ class ChunkReservation:
     round_id: int
     actor_id: str
     environment_id: int
-    episode_id: int
+    rollout_window_id: str
     first_step_id: int
     last_step_id: int
     checkpoint_sha256: str
     teacher_checkpoint_sha256: str
-    anchor_sha256: str
+    sealed_window_sha256: str
 
     @classmethod
     def parse(cls, payload: dict[str, Any]) -> "ChunkReservation":
         fields = {
             "chunk_id", "sha256", "size_bytes", "run_id", "round_id",
-            "actor_id", "environment_id", "episode_id", "first_step_id",
+            "actor_id", "environment_id", "rollout_window_id", "first_step_id",
             "last_step_id", "checkpoint_sha256", "teacher_checkpoint_sha256",
-            "anchor_sha256",
+            "sealed_window_sha256",
         }
         exact_keys(payload, fields)
         round_id = payload["round_id"]
         if not isinstance(round_id, int) or round_id not in CANONICAL_BETA:
             raise ContractError("round_id must be 1..4")
         integer_fields = (
-            "size_bytes", "environment_id", "episode_id", "first_step_id", "last_step_id"
+            "size_bytes", "environment_id", "first_step_id", "last_step_id"
         )
         for field in integer_fields:
             if not isinstance(payload[field], int) or payload[field] < 0:
@@ -104,14 +104,16 @@ class ChunkReservation:
             round_id=round_id,
             actor_id=identifier(payload["actor_id"], "actor_id"),
             environment_id=payload["environment_id"],
-            episode_id=payload["episode_id"],
+            rollout_window_id=identifier(payload["rollout_window_id"], "rollout_window_id"),
             first_step_id=payload["first_step_id"],
             last_step_id=payload["last_step_id"],
             checkpoint_sha256=sha256_digest(payload["checkpoint_sha256"], "checkpoint_sha256"),
             teacher_checkpoint_sha256=sha256_digest(
                 payload["teacher_checkpoint_sha256"], "teacher_checkpoint_sha256"
             ),
-            anchor_sha256=sha256_digest(payload["anchor_sha256"], "anchor_sha256"),
+            sealed_window_sha256=sha256_digest(
+                payload["sealed_window_sha256"], "sealed_window_sha256"
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -124,13 +126,51 @@ def _shape(array: np.ndarray, expected: tuple[int, ...], name: str) -> None:
 
 
 def validate_dagger_chunk(path: Path) -> dict[str, Any]:
-    """Validate one complete, per-environment, synchronized Raven DAgger chunk."""
+    """Validate one complete synchronized Raven DAgger rollout window."""
     try:
         with np.load(path, allow_pickle=False) as chunk:
+            if "learner_chunk_format" in chunk.files:
+                marker = str(chunk["learner_chunk_format"].item())
+                if marker != "roborender.dagger.learner.v1":
+                    raise ContractError(f"unknown learner chunk format: {marker}")
+                required = {
+                    "learner_chunk_format", "gt_actions", "obs_actor_obs",
+                    *(f"rgb_gen__{view}" for view in VIEWS),
+                }
+                if set(chunk.files) != required:
+                    raise ContractError(
+                        "lean learner chunk arrays differ; "
+                        f"missing={sorted(required - set(chunk.files))}, "
+                        f"unknown={sorted(set(chunk.files) - required)}"
+                    )
+                _shape(chunk["gt_actions"], (ROLLOUT_STEPS, 26), "gt_actions")
+                _shape(chunk["obs_actor_obs"], (ROLLOUT_STEPS, 113), "obs_actor_obs")
+                for name in ("gt_actions", "obs_actor_obs"):
+                    array = chunk[name]
+                    if array.dtype != np.float32 or not np.isfinite(array).all():
+                        raise ContractError(f"{name} must contain finite float32 values")
+                for view in VIEWS:
+                    name = f"rgb_gen__{view}"
+                    rgb = chunk[name]
+                    _shape(rgb, (ROLLOUT_STEPS, 108, 192, 3), name)
+                    if rgb.dtype != np.float32 or not np.isfinite(rgb).all():
+                        raise ContractError(f"{name} must contain finite float32 values")
+                    if np.any(rgb < 0.0) or np.any(rgb > 1.0):
+                        raise ContractError(f"{name} must be RGB in [0,1]")
+                return {
+                    "format": marker,
+                    "steps": ROLLOUT_STEPS,
+                    "views": list(VIEWS),
+                    "teacher_fraction": None,
+                    "beta_min": None,
+                    "beta_max": None,
+                }
             required = {
                 "gt_actions", "student_actions", "behavior_actions",
                 "behavior_is_teacher", "beta", "dones", "obs_actor_obs",
-                "obs_teacher_obs",
+                "obs_teacher_obs", "homie_actions", "timeouts", "episode_ids",
+                "episode_step_indices", "rollout_step_indices", "env_id_per_step",
+                "seq_per_step", "observation_source",
             }
             required.update(f"rgb_gen__{view}" for view in VIEWS)
             required.update(f"depth_ctrl__{view}" for view in VIEWS)
@@ -151,11 +191,21 @@ def validate_dagger_chunk(path: Path) -> dict[str, Any]:
             _shape(chunk["dones"], (ROLLOUT_STEPS,), "dones")
             _shape(chunk["obs_actor_obs"], (ROLLOUT_STEPS, 113), "obs_actor_obs")
             _shape(chunk["obs_teacher_obs"], (ROLLOUT_STEPS, 226), "obs_teacher_obs")
+            _shape(chunk["homie_actions"], (ROLLOUT_STEPS, 15), "homie_actions")
+            _shape(chunk["timeouts"], (ROLLOUT_STEPS,), "timeouts")
+            _shape(chunk["episode_ids"], (ROLLOUT_STEPS,), "episode_ids")
+            _shape(chunk["episode_step_indices"], (ROLLOUT_STEPS,), "episode_step_indices")
+            _shape(chunk["rollout_step_indices"], (ROLLOUT_STEPS,), "rollout_step_indices")
+            _shape(chunk["env_id_per_step"], (ROLLOUT_STEPS,), "env_id_per_step")
+            _shape(chunk["seq_per_step"], (ROLLOUT_STEPS,), "seq_per_step")
+            _shape(chunk["observation_source"], (ROLLOUT_STEPS,), "observation_source")
 
             if chunk["behavior_is_teacher"].dtype != np.bool_:
                 raise ContractError("behavior_is_teacher must be bool")
+            if chunk["dones"].dtype != np.bool_ or chunk["timeouts"].dtype != np.bool_:
+                raise ContractError("dones and timeouts must be bool")
             for name in ("gt_actions", "student_actions", "behavior_actions", "beta",
-                         "obs_actor_obs", "obs_teacher_obs"):
+                         "obs_actor_obs", "obs_teacher_obs", "homie_actions"):
                 array = chunk[name]
                 if not np.issubdtype(array.dtype, np.floating) or not np.isfinite(array).all():
                     raise ContractError(f"{name} must contain finite floating-point values")
@@ -170,9 +220,25 @@ def validate_dagger_chunk(path: Path) -> dict[str, Any]:
                 raise ContractError(
                     "behavior_actions do not match the recorded teacher/student selector"
                 )
+            if not np.array_equal(chunk["gt_actions"][:, 11:], chunk["homie_actions"]):
+                raise ContractError("teacher action tail differs from Homie action")
+            if not np.array_equal(chunk["student_actions"][:, 11:], chunk["homie_actions"]):
+                raise ContractError("student action tail differs from Homie action")
+            if not np.array_equal(
+                chunk["rollout_step_indices"], np.arange(ROLLOUT_STEPS, dtype=np.int64)
+            ):
+                raise ContractError("rollout_step_indices must be exactly 0..80")
+            if np.any(chunk["episode_step_indices"] < 0):
+                raise ContractError("episode_step_indices must be non-negative")
+            sources = set(str(item) for item in chunk["observation_source"].tolist())
+            if not sources <= {"raytraced", "generated_controls"}:
+                raise ContractError("observation_source contains an unknown value")
             for view in VIEWS:
-                if chunk[f"rgb_gen__{view}"].dtype != np.uint8:
-                    raise ContractError(f"rgb_gen__{view} must be uint8")
+                rgb = chunk[f"rgb_gen__{view}"]
+                if rgb.dtype != np.float32 or not np.isfinite(rgb).all():
+                    raise ContractError(f"rgb_gen__{view} must be finite float32")
+                if np.any(rgb < 0.0) or np.any(rgb > 1.0):
+                    raise ContractError(f"rgb_gen__{view} must be RGB in [0,1]")
                 if chunk[f"depth_ctrl__{view}"].dtype != np.uint8:
                     raise ContractError(f"depth_ctrl__{view} must be uint8")
                 if chunk[f"rgb_robot__{view}"].dtype != np.uint8:

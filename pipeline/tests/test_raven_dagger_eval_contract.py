@@ -124,6 +124,8 @@ def test_online_server_preserves_raven_generation_contract():
     assert 'VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]' in server
     assert 'Image3FSession(memory_mode="auto", vae_mode="untiled"' in server
     assert 'seed=int(req.get("seed", 42))' in server
+    assert "MAX_TCP_REQUEST_BYTES = 64 * 1024 * 1024" in server
+    assert "if not 0 < n <= MAX_TCP_REQUEST_BYTES:" in server
 
     contract = json.loads(
         (DAGGER / "raven_image3f_dagger_contract.v1.json").read_text()

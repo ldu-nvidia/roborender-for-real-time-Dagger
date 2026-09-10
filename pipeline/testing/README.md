@@ -1,11 +1,11 @@
 # Final testing
 
-Raven did not define a separate sealed test-dataset stage. Her final comparison
-used the same fixed evaluation procedure documented in `../evaluation`: the
-offline-BC baseline environment configuration, ray-traced observations, and
-closed-loop success over 300 episodes.
+Checkpoint validation and final testing are distinct. During training, every
+configured boundary reuses the sealed 256-case panel and Raven's closed-loop
+goal-reached metric. After all checkpoint choices are frozen, run the separate
+final test once; do not tune against its outcomes.
 
-For exact replication, use
-`../evaluation/run_raven_raytraced_300_eval_h200.sh` once for the selected BC
-checkpoint and each warm-started DAgger-round checkpoint. Additional sealed
-splits or validation-MSE stopping would be new experiments, not Raven's flow.
+`../evaluation/run_raven_raytraced_300_eval_h200.sh` preserves Raven's
+ray-traced completed-episode evaluation procedure for the final reporting run.
+The fixed 256-case validation panel is a documented local experimental-control
+extension. Neither path computes validation MSE or performs backpropagation.

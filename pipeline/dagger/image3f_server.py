@@ -32,6 +32,7 @@ from runtime import Image3FRequest, Image3FSession  # noqa: E402
 QUEUE = Path(os.environ.get("IMAGE3F_QUEUE", "/workspace/project/roborender/runtime/image3f_queue"))
 VIEW_MAP = [("ext1", "head_color"), ("ext2", "hand_left"), ("wrist", "hand_right")]
 W, H = 416, 240
+MAX_TCP_REQUEST_BYTES = 64 * 1024 * 1024
 
 DROID_PARAMS = {
     "head_color": dict(raw_clip=(0.0, 10.0), inv_clip=(1.0, 20.0)),
@@ -61,7 +62,7 @@ def to_pil(a):
     return Image.fromarray(a).convert("RGB").resize((W, H), Image.BILINEAR)
 
 
-def run_request(session, req):
+def run_request(session, req, session_lock):
     mode = req.get("prev_mode", "fixed")
     if mode == "zero":
         raise ValueError("zero mode not supported in persistent server (global patch)")
@@ -103,7 +104,8 @@ def run_request(session, req):
                 seed=seed,
             )
             t0 = time.perf_counter()
-            imgs, timing = session.generate(r, output_type="rgb")
+            with session_lock:
+                imgs, timing = session.generate(r, output_type="rgb")
             wall = (time.perf_counter() - t0) * 1000
             stacked = np.asarray(imgs[0])
             for vi, (_, view) in enumerate(VIEW_MAP):
@@ -153,10 +155,14 @@ def _send_msg(sock, obj):
 
 def _recv_msg(sock):
     n = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    if not 0 < n <= MAX_TCP_REQUEST_BYTES:
+        raise ValueError(
+            f"invalid Image3F request size {n}; maximum is {MAX_TCP_REQUEST_BYTES}"
+        )
     return pickle.loads(_recv_exact(sock, n))
 
 
-def handle_conn(sock, addr, session):
+def handle_conn(sock, addr, session, session_lock):
     print(f"tcp client {addr}", flush=True)
     try:
         while True:
@@ -178,21 +184,41 @@ def handle_conn(sock, addr, session):
                     previous_rgb=tuple(to_pil(prev[v]) for v in order),
                     seed=int(req.get("seed", 42)),
                 )
-                imgs, timing = session.generate(r, output_type="rgb")
+                with session_lock:
+                    imgs, timing = session.generate(r, output_type="rgb")
                 stacked = np.asarray(imgs[0])
                 out = {v: encode_array(stacked[i * H:(i + 1) * H]) for i, v in enumerate(order)}
-                ms = (time.perf_counter() - t0) * 1000
-                _send_msg(sock, {"ok": True, "views": out, "ms": ms})
+                total_ms = (time.perf_counter() - t0) * 1000
+                runtime_ms = (
+                    float(timing.get("pipeline_ms", total_ms))
+                    if isinstance(timing, dict) else total_ms
+                )
+                _send_msg(sock, {
+                    "ok": True,
+                    "views": out,
+                    # Private loopback telemetry only; this does not alter the
+                    # frozen RTX<->H200 JSON boundary.
+                    "ms": total_ms,
+                    "runtime_ms": runtime_ms,
+                    "total_ms": total_ms,
+                })
             except Exception as exc:
                 _send_msg(sock, {"ok": False, "error": f"{exc}"})
-    except (ConnectionError, ConnectionResetError, struct.error):
+    except (
+        ConnectionError,
+        ConnectionResetError,
+        EOFError,
+        ValueError,
+        pickle.UnpicklingError,
+        struct.error,
+    ):
         pass
     finally:
         sock.close()
         print(f"tcp client {addr} gone", flush=True)
 
 
-def tcp_listener(session, port):
+def tcp_listener(session, session_lock, port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
@@ -201,7 +227,9 @@ def tcp_listener(session, port):
     while True:
         sock, addr = srv.accept()
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        threading.Thread(target=handle_conn, args=(sock, addr, session), daemon=True).start()
+        threading.Thread(
+            target=handle_conn, args=(sock, addr, session, session_lock), daemon=True
+        ).start()
 
 
 def main():
@@ -211,9 +239,15 @@ def main():
     t0 = time.time()
     session = Image3FSession(memory_mode="auto", vae_mode="untiled",
                              model_root=os.environ["ROBORENDER_MODEL_BASE"])
+    # Image3FSession owns one CUDA/TensorRT execution context.  Both the TCP
+    # production path and the legacy file queue share it, so all generate
+    # calls must pass through one exclusive slot.
+    session_lock = threading.Lock()
     print(f"SESSION_READY in {time.time()-t0:.0f}s", flush=True)
     port = int(os.environ.get("IMAGE3F_PORT", 18500 + int(os.environ.get("SLURM_JOB_ID", "0")) % 1000))
-    threading.Thread(target=tcp_listener, args=(session, port), daemon=True).start()
+    threading.Thread(
+        target=tcp_listener, args=(session, session_lock, port), daemon=True
+    ).start()
     import subprocess
     host = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
     Path(os.environ.get("ENDPOINT_FILE", "/workspace/project/roborender/runtime/image3f_server_endpoint.txt")).write_text(f"{host} {port}\n")
@@ -234,13 +268,13 @@ def main():
                 g = {"session": session, "np": np, "Image": Image,
                      "Image3FRequest": Image3FRequest, "RESULT": {}}
                 buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
+                with session_lock, contextlib.redirect_stdout(buf):
                     exec(compile(rp.read_text(), rp.name, "exec"), g)
                 result["stdout"] = buf.getvalue()[-20000:]
                 result["result"] = g.get("RESULT", {})
             else:
                 req = json.loads(rp.read_text())
-                result.update(run_request(session, req))
+                result.update(run_request(session, req, session_lock))
             result["seconds"] = time.time() - t0
         except Exception as exc:
             result["status"] = "error"

@@ -10,7 +10,8 @@ renderer/checkpoints
 renderer/envs
 renderer/models
 renderer/validation
-containers/images
-containers/logs
-containers/state
-containers/tools
+wandb
+logs_rl
+logs_eval
+*.tar.gz
+*.zip

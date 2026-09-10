@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -51,6 +52,75 @@ def _now() -> float:
     return time.time()
 
 
+# The same success-rate stopping rule is used for every DAgger macro-round.
+# One iteration is exactly one fresh 81 x B rollout followed by one optimizer
+# update.  A run's immutable validation_interval_iterations controls which
+# candidates receive the expensive fixed-panel closed-loop evaluation.
+VALIDATION_MIN_EPOCHS = 10
+VALIDATION_MAX_EPOCHS = 40
+VALIDATION_PATIENCE = 4
+VALIDATION_MIN_DELTA = 0.01
+
+
+def _current_iteration(db, run_id: str, round_id: int):
+    return db.execute(
+        "SELECT * FROM round_iterations WHERE run_id=? AND round_id=? "
+        "ORDER BY iteration_id DESC LIMIT 1",
+        (run_id, round_id),
+    ).fetchone()
+
+
+def _validation_due(iteration_id: int, interval: int) -> bool:
+    if not isinstance(iteration_id, int) or iteration_id < 1:
+        raise ValueError("iteration_id must be positive")
+    if not isinstance(interval, int) or interval < 1:
+        raise ValueError("validation interval must be positive")
+    return iteration_id % interval == 0
+
+
+def _validation_plateau(rows) -> dict[str, Any]:
+    """Derive the immutable maximize-success stopping decision from history."""
+    best_rate = -math.inf
+    best_checkpoint = None
+    best_iteration = None
+    bad = 0
+    history = []
+    for row in rows:
+        rate = float(row["validation_goal_reached_rate"])
+        improved = rate >= best_rate + VALIDATION_MIN_DELTA
+        if improved:
+            best_rate = rate
+            best_checkpoint = row["candidate_checkpoint_sha256"]
+            best_iteration = row["iteration_id"]
+            bad = 0
+        else:
+            bad += 1
+        history.append({
+            "iteration_id": row["iteration_id"],
+            "checkpoint_sha256": row["candidate_checkpoint_sha256"],
+            "evaluation_id": row["evaluation_id"],
+            "goal_reached_rate": rate,
+            "improved": improved,
+            "bad_validations": bad,
+        })
+    count = len(history)
+    plateau = count >= VALIDATION_MIN_EPOCHS and bad >= VALIDATION_PATIENCE
+    maximum = count >= VALIDATION_MAX_EPOCHS
+    return {
+        "history": history,
+        "best_goal_reached_rate": None if not history else best_rate,
+        "best_checkpoint_sha256": best_checkpoint,
+        "best_iteration_id": best_iteration,
+        "bad_validations": bad,
+        "saturated": plateau or maximum,
+        "stop_reason": (
+            "success_rate_plateau" if plateau
+            else "maximum_validation_epochs" if maximum
+            else None
+        ),
+    }
+
+
 class DaggerHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -77,6 +147,11 @@ class DaggerHTTPServer(ThreadingHTTPServer):
                 for row in interrupted:
                     db.execute(
                         "UPDATE runs SET status='learner_failed',updated_at=? WHERE run_id=?",
+                        (_now(), row["run_id"]),
+                    )
+                    db.execute(
+                        "UPDATE round_iterations SET status='learner_failed',updated_at=? "
+                        "WHERE run_id=? AND status IN ('ready_for_learning','learning')",
                         (_now(), row["run_id"]),
                     )
 
@@ -157,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._coordinator(method, path)
         if role == "learner":
             return self._learner(method, path)
+        if role == "evaluation":
+            return self._evaluation(method, path)
         raise NotFoundError(path)
 
     def do_GET(self) -> None:
@@ -282,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
         validation = validate_dagger_chunk(partial)
         metadata = json.loads(row["metadata_json"])
         expected_beta = CANONICAL_BETA[metadata["round_id"]]
-        if (
+        if validation["beta_min"] is not None and (
             abs(validation["beta_min"] - expected_beta) > 1e-6
             or abs(validation["beta_max"] - expected_beta) > 1e-6
         ):
@@ -354,44 +431,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(HTTPStatus.CREATED, {"ok": True, "sha256": digest, "size_bytes": final.stat().st_size})
 
         if method == "POST" and path == "/v1/promotions":
+            # A learner receipt proves only that optimization completed. It is
+            # deliberately insufficient to activate a policy. The coordinator
+            # advances through /v1/iterations/advance only after the candidate's
+            # fixed-panel Raven success evaluation is complete.
             payload = self._read_json()
             exact_keys(payload, {"run_id", "round_id", "checkpoint_sha256"})
-            run_id = identifier(payload["run_id"], "run_id")
-            digest = sha256_digest(payload["checkpoint_sha256"], "checkpoint_sha256")
-            round_id = payload["round_id"]
-            if not isinstance(round_id, int) or round_id not in CANONICAL_BETA:
-                raise ContractError("round_id must be 1..4")
-            with self.server.store.transaction() as db:
-                checkpoint = db.execute("SELECT 1 FROM checkpoints WHERE sha256=?", (digest,)).fetchone()
-                run = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
-                if checkpoint is None:
-                    raise NotReadyError("checkpoint is not registered")
-                if run is None or run["current_round"] != round_id or run["status"] != "ready_for_promotion":
-                    raise NotReadyError("coordinator has not approved this round for promotion")
-                jobs = db.execute(
-                    "SELECT result_json FROM learner_jobs "
-                    "WHERE run_id=? AND round_id=? AND status='succeeded'",
-                    (run_id, round_id),
-                )
-                produced = {
-                    json.loads(row["result_json"])["output_checkpoint_sha256"]
-                    for row in jobs
-                    if row["result_json"] is not None
-                }
-                if digest not in produced:
-                    raise NotReadyError(
-                        "checkpoint was not produced by this round's successful learner job"
-                    )
-                now = _now()
-                db.execute(
-                    "INSERT INTO promotions VALUES (?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET round_id=excluded.round_id,checkpoint_sha256=excluded.checkpoint_sha256,updated_at=excluded.updated_at",
-                    (run_id, round_id, digest, now),
-                )
-                db.execute(
-                    "UPDATE runs SET active_checkpoint_sha256=?,status='round_complete',updated_at=? WHERE run_id=?",
-                    (digest, now, run_id),
-                )
-            return self._json(HTTPStatus.OK, {"ok": True, "run_id": run_id, "round_id": round_id, "checkpoint_sha256": digest})
+            raise NotReadyError(
+                "direct promotion is disabled; complete success validation and "
+                "use /v1/iterations/advance"
+            )
 
         if method == "GET" and path.startswith("/v1/active/"):
             run_id = identifier(path.removeprefix("/v1/active/"), "run_id")
@@ -416,7 +465,14 @@ class Handler(BaseHTTPRequestHandler):
     def _coordinator(self, method: str, path: str) -> None:
         if method == "POST" and path == "/v1/runs":
             payload = self._read_json()
-            exact_keys(payload, {"run_id", "actor_ids", "rollout_steps", "config_sha256", "initial_checkpoint_sha256"})
+            exact_keys(
+                payload,
+                {
+                    "run_id", "actor_ids", "rollout_steps", "config_sha256",
+                    "initial_checkpoint_sha256",
+                },
+                {"validation_interval_iterations"},
+            )
             run_id = identifier(payload["run_id"], "run_id")
             actors = payload["actor_ids"]
             if not isinstance(actors, list) or not actors:
@@ -428,6 +484,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise ContractError(f"rollout_steps must equal {ROLLOUT_STEPS}")
             config_sha = sha256_digest(payload["config_sha256"], "config_sha256")
             initial = sha256_digest(payload["initial_checkpoint_sha256"], "initial_checkpoint_sha256")
+            validation_interval = payload.get("validation_interval_iterations", 1)
+            if (
+                not isinstance(validation_interval, int)
+                or isinstance(validation_interval, bool)
+                or validation_interval < 1
+            ):
+                raise ContractError("validation_interval_iterations must be a positive integer")
             now = _now()
             actor_json = canonical_json(sorted(actors))
             with self.server.store.transaction() as db:
@@ -435,13 +498,31 @@ class Handler(BaseHTTPRequestHandler):
                     raise NotReadyError("initial checkpoint is not registered")
                 old = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if old:
-                    same = old["actor_ids_json"] == actor_json and old["config_sha256"] == config_sha and old["active_checkpoint_sha256"] == initial
+                    same = (
+                        old["actor_ids_json"] == actor_json
+                        and old["config_sha256"] == config_sha
+                        and old["initial_checkpoint_sha256"] == initial
+                        and old["validation_interval_iterations"] == validation_interval
+                    )
                     if not same:
                         raise ConflictError("run_id already exists with a different contract")
                     return self._json(HTTPStatus.OK, {"ok": True, "run_id": run_id, "idempotent": True})
-                db.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?)",
-                           (run_id, actor_json, ROLLOUT_STEPS, config_sha, initial, 0, None, "created", now, now))
-            return self._json(HTTPStatus.CREATED, {"ok": True, "run_id": run_id, "status": "created"})
+                db.execute(
+                    "INSERT INTO runs "
+                    "(run_id,actor_ids_json,rollout_steps,config_sha256,"
+                    "initial_checkpoint_sha256,active_checkpoint_sha256,"
+                    "current_round,beta,status,"
+                    "validation_interval_iterations,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        run_id, actor_json, ROLLOUT_STEPS, config_sha, initial,
+                        initial, 0, None, "created", validation_interval, now, now,
+                    ),
+                )
+            return self._json(HTTPStatus.CREATED, {
+                "ok": True, "run_id": run_id, "status": "created",
+                "validation_interval_iterations": validation_interval,
+            })
 
         if method == "POST" and path == "/v1/rounds/start":
             payload = self._read_json()
@@ -468,9 +549,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise NotReadyError(f"run is {run['status']}")
                 if digest != run["active_checkpoint_sha256"]:
                     raise ConflictError("actor checkpoint differs from promoted checkpoint")
+                now = _now()
                 db.execute("UPDATE runs SET current_round=?,beta=?,status='collecting',updated_at=? WHERE run_id=?",
-                           (round_id, beta, _now(), run_id))
-            return self._json(HTTPStatus.OK, {"ok": True, "run_id": run_id, "round_id": round_id, "beta": beta})
+                           (round_id, beta, now, run_id))
+                db.execute(
+                    "INSERT INTO round_iterations VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (run_id, round_id, 1, digest, None, None, None,
+                     "collecting", now, now),
+                )
+            return self._json(HTTPStatus.OK, {
+                "ok": True, "run_id": run_id, "round_id": round_id,
+                "iteration_id": 1, "beta": beta,
+            })
 
         if method == "POST" and path == "/v1/barriers":
             payload = self._read_json()
@@ -488,13 +578,39 @@ class Handler(BaseHTTPRequestHandler):
             chunk_json = canonical_json(sorted(chunk_ids))
             with self.server.store.transaction() as db:
                 run = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
-                if run is None or run["status"] != "collecting" or run["current_round"] != round_id:
-                    raise NotReadyError("run is not collecting this round")
+                if run is None or run["current_round"] != round_id:
+                    raise NotReadyError("run is not in this round")
                 actors = json.loads(run["actor_ids_json"])
                 if actor_id not in actors:
                     raise ContractError("actor_id is not admitted to this run")
+                prior = db.execute(
+                    "SELECT * FROM iteration_barriers WHERE run_id=? AND round_id=? "
+                    "AND actor_id=? ORDER BY iteration_id DESC LIMIT 1",
+                    (run_id, round_id, actor_id),
+                ).fetchone()
+                if prior is not None and prior["chunk_ids_json"] == chunk_json:
+                    if prior["checkpoint_sha256"] != digest:
+                        raise ConflictError("actor barrier retry changed its checkpoint")
+                    arrived = db.execute(
+                        "SELECT COUNT(*) FROM iteration_barriers WHERE run_id=? "
+                        "AND round_id=? AND iteration_id=?",
+                        (run_id, round_id, prior["iteration_id"]),
+                    ).fetchone()[0]
+                    return self._json(HTTPStatus.OK, {
+                        "ok": True, "idempotent": True,
+                        "iteration_id": prior["iteration_id"],
+                        "arrived": arrived, "expected": len(actors),
+                        "ready_for_learning": arrived == len(actors),
+                    })
+                if run["status"] != "collecting":
+                    raise NotReadyError("run is not collecting this round")
                 if digest != run["active_checkpoint_sha256"]:
                     raise ConflictError("actor used a different checkpoint")
+                iteration = _current_iteration(db, run_id, round_id)
+                if iteration is None or iteration["status"] != "collecting":
+                    raise NotReadyError("DAgger iteration is not collecting")
+                if iteration["input_checkpoint_sha256"] != digest:
+                    raise ConflictError("actor checkpoint differs from iteration checkpoint")
                 for chunk_id in chunk_ids:
                     row = db.execute("SELECT status,metadata_json FROM chunk_reservations WHERE chunk_id=?", (chunk_id,)).fetchone()
                     if row is None or row["status"] != "committed":
@@ -506,16 +622,160 @@ class Handler(BaseHTTPRequestHandler):
                         raise ConflictError(
                             f"chunk {chunk_id} was generated by a different checkpoint"
                         )
-                old = db.execute("SELECT * FROM barriers WHERE run_id=? AND round_id=? AND actor_id=?",
-                                 (run_id, round_id, actor_id)).fetchone()
+                old = db.execute(
+                    "SELECT * FROM iteration_barriers WHERE run_id=? AND round_id=? "
+                    "AND iteration_id=? AND actor_id=?",
+                    (run_id, round_id, iteration["iteration_id"], actor_id),
+                ).fetchone()
                 if old and (old["checkpoint_sha256"] != digest or old["chunk_ids_json"] != chunk_json):
                     raise ConflictError("actor barrier already contains different chunks")
-                db.execute("INSERT OR IGNORE INTO barriers VALUES (?,?,?,?,?,?)",
-                           (run_id, round_id, actor_id, digest, chunk_json, _now()))
-                count = db.execute("SELECT COUNT(*) FROM barriers WHERE run_id=? AND round_id=?", (run_id, round_id)).fetchone()[0]
+                db.execute(
+                    "INSERT OR IGNORE INTO iteration_barriers VALUES (?,?,?,?,?,?,?)",
+                    (run_id, round_id, iteration["iteration_id"], actor_id,
+                     digest, chunk_json, _now()),
+                )
+                count = db.execute(
+                    "SELECT COUNT(*) FROM iteration_barriers WHERE run_id=? "
+                    "AND round_id=? AND iteration_id=?",
+                    (run_id, round_id, iteration["iteration_id"]),
+                ).fetchone()[0]
                 if count == len(actors):
-                    db.execute("UPDATE runs SET status='ready_for_learning',updated_at=? WHERE run_id=?", (_now(), run_id))
-            return self._json(HTTPStatus.OK, {"ok": True, "arrived": count, "expected": len(actors), "ready_for_learning": count == len(actors)})
+                    now = _now()
+                    db.execute(
+                        "UPDATE round_iterations SET status='ready_for_learning',updated_at=? "
+                        "WHERE run_id=? AND round_id=? AND iteration_id=?",
+                        (now, run_id, round_id, iteration["iteration_id"]),
+                    )
+                    db.execute("UPDATE runs SET status='ready_for_learning',updated_at=? WHERE run_id=?", (now, run_id))
+            return self._json(HTTPStatus.OK, {
+                "ok": True, "iteration_id": iteration["iteration_id"],
+                "arrived": count, "expected": len(actors),
+                "ready_for_learning": count == len(actors),
+            })
+
+        if method == "POST" and path == "/v1/iterations/advance":
+            payload = self._read_json()
+            exact_keys(payload, {"run_id", "round_id", "evaluation_id"})
+            run_id = identifier(payload["run_id"], "run_id")
+            evaluation_id = identifier(payload["evaluation_id"], "evaluation_id")
+            round_id = payload["round_id"]
+            if not isinstance(round_id, int) or round_id not in CANONICAL_BETA:
+                raise ContractError("round_id must be 1..4")
+            with self.server.store.transaction() as db:
+                run = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if run is None or run["current_round"] != round_id:
+                    raise NotReadyError("run is not in the requested DAgger round")
+                link = db.execute(
+                    "SELECT * FROM success_evaluation_iterations WHERE evaluation_id=?",
+                    (evaluation_id,),
+                ).fetchone()
+                evaluation = db.execute(
+                    "SELECT * FROM success_evaluations WHERE evaluation_id=?",
+                    (evaluation_id,),
+                ).fetchone()
+                if (
+                    link is None or evaluation is None
+                    or (link["run_id"], link["round_id"]) != (run_id, round_id)
+                ):
+                    raise ConflictError("evaluation is not bound to this DAgger round")
+                iteration = db.execute(
+                    "SELECT * FROM round_iterations WHERE run_id=? AND round_id=? "
+                    "AND iteration_id=?",
+                    (run_id, round_id, link["iteration_id"]),
+                ).fetchone()
+                if iteration is None:
+                    raise NotReadyError("evaluation iteration does not exist")
+                if iteration["evaluation_id"] == evaluation_id and iteration["status"] in {
+                    "complete", "advanced"
+                }:
+                    state = _validation_plateau(list(db.execute(
+                        "SELECT * FROM round_iterations WHERE run_id=? AND round_id=? "
+                        "AND validation_goal_reached_rate IS NOT NULL ORDER BY iteration_id",
+                        (run_id, round_id),
+                    )))
+                    return self._json(HTTPStatus.OK, {
+                        "ok": True, "idempotent": True,
+                        "run_id": run_id, "round_id": round_id,
+                        "completed_iteration_id": iteration["iteration_id"],
+                        "next_iteration_id": (
+                            iteration["iteration_id"] + 1
+                            if iteration["status"] == "advanced" else None
+                        ),
+                        **state,
+                    })
+                current = _current_iteration(db, run_id, round_id)
+                if current is None or current["iteration_id"] != iteration["iteration_id"]:
+                    raise ConflictError("evaluation is not bound to the current iteration")
+                if evaluation["status"] != "complete":
+                    raise NotReadyError("fixed-panel success validation is incomplete")
+                if evaluation["checkpoint_sha256"] != iteration["candidate_checkpoint_sha256"]:
+                    raise ConflictError("validation did not evaluate the iteration candidate")
+                completed = db.execute(
+                    "SELECT COUNT(*) FROM success_evaluation_outcomes WHERE evaluation_id=?",
+                    (evaluation_id,),
+                ).fetchone()[0]
+                total = len(json.loads(evaluation["scenario_ids_json"]))
+                if completed != total:
+                    raise NotReadyError("fixed-panel success validation outcomes are incomplete")
+                successes = db.execute(
+                    "SELECT COALESCE(SUM(goal_reached),0) FROM success_evaluation_outcomes "
+                    "WHERE evaluation_id=?", (evaluation_id,),
+                ).fetchone()[0]
+                rate = float(successes) / completed
+                now = _now()
+                db.execute(
+                    "UPDATE round_iterations SET evaluation_id=?,"
+                    "validation_goal_reached_rate=?,status='validated',updated_at=? "
+                    "WHERE run_id=? AND round_id=? AND iteration_id=?",
+                    (evaluation_id, rate, now, run_id, round_id, iteration["iteration_id"]),
+                )
+                rows = list(db.execute(
+                    "SELECT * FROM round_iterations WHERE run_id=? AND round_id=? "
+                    "AND validation_goal_reached_rate IS NOT NULL ORDER BY iteration_id",
+                    (run_id, round_id),
+                ))
+                state = _validation_plateau(rows)
+                if state["saturated"]:
+                    best = state["best_checkpoint_sha256"]
+                    db.execute(
+                        "UPDATE round_iterations SET status='complete',updated_at=? "
+                        "WHERE run_id=? AND round_id=? AND iteration_id=?",
+                        (now, run_id, round_id, iteration["iteration_id"]),
+                    )
+                    db.execute(
+                        "INSERT INTO promotions VALUES (?,?,?,?) "
+                        "ON CONFLICT(run_id) DO UPDATE SET round_id=excluded.round_id,"
+                        "checkpoint_sha256=excluded.checkpoint_sha256,updated_at=excluded.updated_at",
+                        (run_id, round_id, best, now),
+                    )
+                    db.execute(
+                        "UPDATE runs SET active_checkpoint_sha256=?,status='round_complete',"
+                        "updated_at=? WHERE run_id=?", (best, now, run_id),
+                    )
+                    next_iteration = None
+                else:
+                    candidate = iteration["candidate_checkpoint_sha256"]
+                    next_iteration = iteration["iteration_id"] + 1
+                    db.execute(
+                        "UPDATE round_iterations SET status='advanced',updated_at=? "
+                        "WHERE run_id=? AND round_id=? AND iteration_id=?",
+                        (now, run_id, round_id, iteration["iteration_id"]),
+                    )
+                    db.execute(
+                        "INSERT INTO round_iterations VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (run_id, round_id, next_iteration, candidate, None, None,
+                         None, "collecting", now, now),
+                    )
+                    db.execute(
+                        "UPDATE runs SET active_checkpoint_sha256=?,status='collecting',"
+                        "updated_at=? WHERE run_id=?", (candidate, now, run_id),
+                    )
+            return self._json(HTTPStatus.OK, {
+                "ok": True, "run_id": run_id, "round_id": round_id,
+                "completed_iteration_id": iteration["iteration_id"],
+                "next_iteration_id": next_iteration,
+                **state,
+            })
 
         if method == "GET" and path.startswith("/v1/status/"):
             run_id = identifier(path.removeprefix("/v1/status/"), "run_id")
@@ -523,12 +783,283 @@ class Handler(BaseHTTPRequestHandler):
                 run = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if run is None:
                     raise NotFoundError(run_id)
-                barriers = [dict(row) for row in db.execute("SELECT * FROM barriers WHERE run_id=? ORDER BY round_id,actor_id", (run_id,))]
+                iterations = [dict(row) for row in db.execute(
+                    "SELECT * FROM round_iterations WHERE run_id=? ORDER BY round_id,iteration_id",
+                    (run_id,),
+                )]
+                barriers = [dict(row) for row in db.execute(
+                    "SELECT * FROM iteration_barriers WHERE run_id=? "
+                    "ORDER BY round_id,iteration_id,actor_id", (run_id,),
+                )]
             result = dict(run)
             result["actor_ids"] = json.loads(result.pop("actor_ids_json"))
             for barrier in barriers:
                 barrier["chunk_ids"] = json.loads(barrier.pop("chunk_ids_json"))
-            return self._json(HTTPStatus.OK, {"ok": True, "run": result, "barriers": barriers})
+            return self._json(HTTPStatus.OK, {
+                "ok": True, "run": result, "iterations": iterations,
+                "barriers": barriers,
+            })
+        raise NotFoundError(path)
+
+    # -------------------------------------------------------------- evaluation
+    def _evaluation(self, method: str, path: str) -> None:
+        if method == "POST" and path == "/v2/evaluations":
+            payload = self._read_json()
+            exact_keys(payload, {
+                "evaluation_id", "run_id", "round_id", "purpose",
+                "checkpoint_sha256", "scenario_manifest_sha256", "scenario_ids",
+                "observation_mode", "metric",
+            })
+            evaluation_id = identifier(payload["evaluation_id"], "evaluation_id")
+            run_id = identifier(payload["run_id"], "run_id")
+            round_id = payload["round_id"]
+            if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id not in range(5):
+                raise ContractError("round_id must be 0..4")
+            purpose = payload["purpose"]
+            if purpose not in {"validation", "test"}:
+                raise ContractError("purpose must be validation or test")
+            observation_mode = payload["observation_mode"]
+            if observation_mode not in {"raytraced", "generated"}:
+                raise ContractError("observation_mode must be raytraced or generated")
+            if payload["metric"] != "raven_goal_reached_rate":
+                raise ContractError("metric must be raven_goal_reached_rate")
+            checkpoint = sha256_digest(payload["checkpoint_sha256"], "checkpoint_sha256")
+            manifest = sha256_digest(
+                payload["scenario_manifest_sha256"], "scenario_manifest_sha256"
+            )
+            scenarios = payload["scenario_ids"]
+            if not isinstance(scenarios, list) or not scenarios:
+                raise ContractError("scenario_ids must be a non-empty list")
+            scenarios = [identifier(item, "scenario_id") for item in scenarios]
+            if len(scenarios) != len(set(scenarios)):
+                raise ContractError("scenario_ids must be unique")
+            request_json = canonical_json(payload)
+            now = _now()
+            with self.server.store.transaction() as db:
+                old = db.execute(
+                    "SELECT * FROM success_evaluations WHERE evaluation_id=?",
+                    (evaluation_id,),
+                ).fetchone()
+                if old:
+                    same = (
+                        old["run_id"] == run_id
+                        and old["round_id"] == round_id
+                        and old["purpose"] == purpose
+                        and old["checkpoint_sha256"] == checkpoint
+                        and old["scenario_manifest_sha256"] == manifest
+                        and old["scenario_ids_json"] == canonical_json(scenarios)
+                        and old["observation_mode"] == observation_mode
+                        and old["metric"] == payload["metric"]
+                    )
+                    if not same:
+                        raise ConflictError("evaluation_id already has different immutable inputs")
+                    return self._json(HTTPStatus.OK, {
+                        "ok": True, "evaluation_id": evaluation_id,
+                        "status": old["status"], "idempotent": True,
+                    })
+                registered = db.execute(
+                    "SELECT path FROM checkpoints WHERE sha256=?", (checkpoint,)
+                ).fetchone()
+                if registered is None:
+                    raise NotReadyError("evaluation checkpoint is not registered")
+                checkpoint_path = Path(registered["path"])
+                if not checkpoint_path.is_file() or file_sha256(checkpoint_path) != checkpoint:
+                    raise NotReadyError("registered evaluation checkpoint bytes are unavailable")
+                iteration = None
+                if purpose == "validation" and round_id > 0:
+                    run = db.execute(
+                        "SELECT * FROM runs WHERE run_id=?", (run_id,)
+                    ).fetchone()
+                    if (
+                        run is None or run["current_round"] != round_id
+                        or run["status"] != "awaiting_validation"
+                    ):
+                        raise NotReadyError(
+                            "run is not awaiting validation for this DAgger round"
+                        )
+                    iteration = _current_iteration(db, run_id, round_id)
+                    if (
+                        iteration is None
+                        or iteration["status"] != "awaiting_validation"
+                        or iteration["candidate_checkpoint_sha256"] != checkpoint
+                    ):
+                        raise ConflictError(
+                            "validation checkpoint is not the current learner candidate"
+                        )
+                db.execute(
+                    "INSERT INTO success_evaluations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        evaluation_id, run_id, round_id, purpose, checkpoint, manifest,
+                        canonical_json(scenarios), observation_mode, payload["metric"],
+                        "collecting", now, now,
+                    ),
+                )
+                if iteration is not None:
+                    db.execute(
+                        "INSERT INTO success_evaluation_iterations VALUES (?,?,?,?)",
+                        (evaluation_id, run_id, round_id, iteration["iteration_id"]),
+                    )
+                    db.execute(
+                        "UPDATE round_iterations SET evaluation_id=?,status='validating',"
+                        "updated_at=? WHERE run_id=? AND round_id=? AND iteration_id=?",
+                        (evaluation_id, now, run_id, round_id, iteration["iteration_id"]),
+                    )
+                    db.execute(
+                        "UPDATE runs SET status='validating',updated_at=? WHERE run_id=?",
+                        (now, run_id),
+                    )
+            return self._json(HTTPStatus.CREATED, {
+                "ok": True, "evaluation_id": evaluation_id,
+                "status": "collecting", "scenario_count": len(scenarios),
+            })
+
+        v2_prefix = "/v2/evaluations/"
+        if path.startswith(v2_prefix):
+            suffix = path.removeprefix(v2_prefix)
+            if method == "POST" and suffix.endswith("/outcomes"):
+                evaluation_id = identifier(suffix.removesuffix("/outcomes"), "evaluation_id")
+                payload = self._read_json()
+                exact_keys(payload, {
+                    "idempotency_key", "scenario_id", "episode_id", "goal_reached",
+                    "reward", "steps", "termination", "safety_violation",
+                    "checkpoint_sha256", "scenario_manifest_sha256",
+                })
+                idempotency_key = identifier(payload["idempotency_key"], "idempotency_key")
+                scenario_id = identifier(payload["scenario_id"], "scenario_id")
+                identifier(payload["episode_id"], "episode_id")
+                if not isinstance(payload["goal_reached"], bool):
+                    raise ContractError("goal_reached must be boolean")
+                if not isinstance(payload["safety_violation"], bool):
+                    raise ContractError("safety_violation must be boolean")
+                reward = payload["reward"]
+                if isinstance(reward, bool) or not isinstance(reward, (int, float)) or not math.isfinite(reward):
+                    raise ContractError("reward must be finite")
+                steps = payload["steps"]
+                if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+                    raise ContractError("steps must be a positive integer")
+                termination = payload["termination"]
+                if termination not in {"success", "failure", "timeout", "safety_violation"}:
+                    raise ContractError("termination is invalid")
+                checkpoint = sha256_digest(payload["checkpoint_sha256"], "checkpoint_sha256")
+                manifest = sha256_digest(
+                    payload["scenario_manifest_sha256"], "scenario_manifest_sha256"
+                )
+                request_json = canonical_json(payload)
+                with self.server.store.transaction() as db:
+                    evaluation = db.execute(
+                        "SELECT * FROM success_evaluations WHERE evaluation_id=?",
+                        (evaluation_id,),
+                    ).fetchone()
+                    if evaluation is None:
+                        raise NotFoundError(evaluation_id)
+                    existing = db.execute(
+                        "SELECT request_json FROM success_evaluation_outcomes WHERE idempotency_key=?",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        if existing["request_json"] != request_json:
+                            raise ConflictError("outcome idempotency key was reused with different data")
+                        return self._json(HTTPStatus.OK, {
+                            "ok": True, "evaluation_id": evaluation_id,
+                            "scenario_id": scenario_id, "status": evaluation["status"],
+                            "idempotent": True,
+                        })
+                    if evaluation["status"] == "complete":
+                        raise ConflictError("evaluation is already complete")
+                    if (
+                        checkpoint != evaluation["checkpoint_sha256"]
+                        or manifest != evaluation["scenario_manifest_sha256"]
+                    ):
+                        raise ConflictError("outcome checkpoint/scenario manifest identity mismatch")
+                    scenarios = json.loads(evaluation["scenario_ids_json"])
+                    if scenario_id not in scenarios:
+                        raise ConflictError("scenario is not part of the sealed evaluation panel")
+                    prior = db.execute(
+                        "SELECT idempotency_key FROM success_evaluation_outcomes "
+                        "WHERE evaluation_id=? AND scenario_id=?",
+                        (evaluation_id, scenario_id),
+                    ).fetchone()
+                    if prior:
+                        raise ConflictError("scenario already has an outcome under another key")
+                    db.execute(
+                        "INSERT INTO success_evaluation_outcomes VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            evaluation_id, scenario_id, idempotency_key, request_json,
+                            int(payload["goal_reached"]), float(reward), steps, termination,
+                            int(payload["safety_violation"]), _now(),
+                        ),
+                    )
+                    count = db.execute(
+                        "SELECT COUNT(*) FROM success_evaluation_outcomes WHERE evaluation_id=?",
+                        (evaluation_id,),
+                    ).fetchone()[0]
+                    status = "complete" if count == len(scenarios) else "collecting"
+                    db.execute(
+                        "UPDATE success_evaluations SET status=?,updated_at=? WHERE evaluation_id=?",
+                        (status, _now(), evaluation_id),
+                    )
+                return self._json(HTTPStatus.CREATED, {
+                    "ok": True, "evaluation_id": evaluation_id,
+                    "scenario_id": scenario_id, "status": status,
+                    "completed": count, "total": len(scenarios),
+                })
+            if method == "GET" and "/" not in suffix:
+                evaluation_id = identifier(suffix, "evaluation_id")
+                with self.server.store.connection() as db:
+                    evaluation = db.execute(
+                        "SELECT * FROM success_evaluations WHERE evaluation_id=?",
+                        (evaluation_id,),
+                    ).fetchone()
+                    if evaluation is None:
+                        raise NotFoundError(evaluation_id)
+                    outcomes = list(db.execute(
+                        "SELECT scenario_id,goal_reached,reward,steps,termination,safety_violation "
+                        "FROM success_evaluation_outcomes WHERE evaluation_id=? ORDER BY scenario_id",
+                        (evaluation_id,),
+                    ))
+                total = len(json.loads(evaluation["scenario_ids_json"]))
+                completed = len(outcomes)
+                successes = sum(row["goal_reached"] for row in outcomes)
+                rate = successes / completed if completed else None
+                interval = None
+                if completed:
+                    z = 1.959963984540054
+                    denominator = 1.0 + z * z / completed
+                    center = (rate + z * z / (2 * completed)) / denominator
+                    half = z * math.sqrt(
+                        rate * (1 - rate) / completed + z * z / (4 * completed * completed)
+                    ) / denominator
+                    interval = [max(0.0, center - half), min(1.0, center + half)]
+                return self._json(HTTPStatus.OK, {
+                    "ok": True,
+                    "evaluation": {
+                        "evaluation_id": evaluation_id,
+                        "run_id": evaluation["run_id"],
+                        "round_id": evaluation["round_id"],
+                        "purpose": evaluation["purpose"],
+                        "checkpoint_sha256": evaluation["checkpoint_sha256"],
+                        "scenario_manifest_sha256": evaluation["scenario_manifest_sha256"],
+                        "observation_mode": evaluation["observation_mode"],
+                        "metric": evaluation["metric"],
+                        "status": evaluation["status"],
+                        "completed": completed,
+                        "total": total,
+                        "successes": successes,
+                        "failures": completed - successes,
+                        "goal_reached_rate": rate,
+                        "wilson_95_interval": interval,
+                        "safety_violations": sum(row["safety_violation"] for row in outcomes),
+                        "mean_reward": (
+                            sum(row["reward"] for row in outcomes) / completed if completed else None
+                        ),
+                        "mean_steps": (
+                            sum(row["steps"] for row in outcomes) / completed if completed else None
+                        ),
+                        "outcomes": [dict(row) for row in outcomes],
+                    },
+                })
+            raise NotFoundError(path)
+
         raise NotFoundError(path)
 
     # ---------------------------------------------------------------- learner
@@ -555,19 +1086,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.worker is None or not self.server.worker.is_file():
             raise NotReadyError("learner worker is not configured")
         payload = self._read_json()
-        exact_keys(payload, {"job_id", "run_id", "round_id", "input_checkpoint_sha256", "chunk_ids", "parameters"})
+        exact_keys(payload, {
+            "job_id", "run_id", "round_id", "input_checkpoint_sha256",
+            "train_chunk_ids", "parameters",
+        })
         job_id = identifier(payload["job_id"], "job_id")
         run_id = identifier(payload["run_id"], "run_id")
         digest = sha256_digest(payload["input_checkpoint_sha256"], "input_checkpoint_sha256")
         round_id = payload["round_id"]
-        chunks = payload["chunk_ids"]
         if not isinstance(round_id, int) or round_id not in CANONICAL_BETA:
             raise ContractError("round_id must be 1..4")
-        if not isinstance(chunks, list) or not chunks:
-            raise ContractError("chunk_ids must be a non-empty list")
-        chunks = sorted(identifier(value, "chunk_id") for value in chunks)
+        values = payload["train_chunk_ids"]
+        if not isinstance(values, list) or not values:
+            raise ContractError("train_chunk_ids must be a non-empty list")
+        chunks = sorted(identifier(value, "chunk_id") for value in values)
         if len(chunks) != len(set(chunks)):
-            raise ContractError("chunk_ids must be unique")
+            raise ContractError("train_chunk_ids must be unique")
         if not isinstance(payload["parameters"], dict):
             raise ContractError("parameters must be an object")
         with self.server.store.transaction() as db:
@@ -582,11 +1116,24 @@ class Handler(BaseHTTPRequestHandler):
                 raise NotReadyError("run has not reached its learner barrier")
             if run["active_checkpoint_sha256"] != digest:
                 raise ConflictError("learner input differs from active checkpoint")
+            iteration = _current_iteration(db, run_id, round_id)
+            if iteration is None or iteration["status"] != "ready_for_learning":
+                raise NotReadyError("current iteration has not reached its learner barrier")
+            if iteration["input_checkpoint_sha256"] != digest:
+                raise ConflictError("learner input differs from iteration checkpoint")
+            if payload["parameters"].get("iteration_id") != iteration["iteration_id"]:
+                raise ConflictError("learner iteration_id differs from the current iteration")
             admitted = []
-            for row in db.execute("SELECT chunk_ids_json FROM barriers WHERE run_id=? AND round_id=?", (run_id, round_id)):
+            for row in db.execute(
+                "SELECT chunk_ids_json FROM iteration_barriers WHERE run_id=? "
+                "AND round_id=? AND iteration_id=?",
+                (run_id, round_id, iteration["iteration_id"]),
+            ):
                 admitted.extend(json.loads(row[0]))
             if chunks != sorted(admitted):
-                raise ConflictError("learner job must consume exactly the barrier-admitted chunks")
+                raise ConflictError(
+                    "learner train chunks must equal all barrier-admitted current-iteration chunks"
+                )
             job_dir = self.server.root / "jobs" / job_id
             job_dir.mkdir(parents=True, exist_ok=False)
             job_path = job_dir / "request.json"
@@ -597,6 +1144,15 @@ class Handler(BaseHTTPRequestHandler):
             db.execute("INSERT INTO learner_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                        (job_id, run_id, round_id, digest, canonical_json(chunks), "queued",
                         request_json, None, str(log_path), None, now, now))
+            db.execute(
+                "INSERT INTO learner_job_iterations VALUES (?,?,?,?)",
+                (job_id, run_id, round_id, iteration["iteration_id"]),
+            )
+            db.execute(
+                "UPDATE round_iterations SET status='learning',updated_at=? "
+                "WHERE run_id=? AND round_id=? AND iteration_id=?",
+                (now, run_id, round_id, iteration["iteration_id"]),
+            )
             db.execute("UPDATE runs SET status='learning',updated_at=? WHERE run_id=?", (now, run_id))
 
         thread = threading.Thread(
@@ -631,21 +1187,137 @@ class Handler(BaseHTTPRequestHandler):
                     output_path = Path(result.get("output_checkpoint_path", "")).resolve()
                     if not output_path.is_file() or file_sha256(output_path) != output_sha:
                         raise ContractError("worker output checkpoint receipt is invalid")
+                    # The render/student service resolves active policies from
+                    # this content-addressed directory.  Publish by hard link
+                    # before advancing the coordinator; otherwise the next
+                    # rollout can observe an activated digest whose bytes are
+                    # still only inside the learner job directory.
+                    checkpoint_root = self.server.root / "checkpoints"
+                    checkpoint_root.mkdir(parents=True, exist_ok=True)
+                    checkpoint_blob = checkpoint_root / f"{output_sha}.pt"
+                    if not checkpoint_blob.exists():
+                        temporary = checkpoint_root / (
+                            f".{output_sha}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.part"
+                        )
+                        os.link(output_path, temporary)
+                        os.replace(temporary, checkpoint_blob)
+                    elif checkpoint_blob.stat().st_size != output_path.stat().st_size:
+                        raise ContractError("content-addressed checkpoint size collision")
                     status = "succeeded"
                 except (ContractError, OSError):
                     status = "failed"
             with self.server.store.transaction() as db:
                 db.execute("UPDATE learner_jobs SET status=?,result_json=?,updated_at=? WHERE job_id=?",
                            (status, canonical_json(result) if result is not None else None, _now(), job_id))
-                job = db.execute("SELECT run_id FROM learner_jobs WHERE job_id=?", (job_id,)).fetchone()
-                db.execute("UPDATE runs SET status=?,updated_at=? WHERE run_id=?",
-                           ("ready_for_promotion" if status == "succeeded" else "learner_failed", _now(), job["run_id"]))
+                job = db.execute(
+                    "SELECT j.run_id,j.round_id,i.iteration_id FROM learner_jobs j "
+                    "JOIN learner_job_iterations i ON i.job_id=j.job_id WHERE j.job_id=?",
+                    (job_id,),
+                ).fetchone()
+                now = _now()
+                if status == "succeeded":
+                    output_sha = result["output_checkpoint_sha256"]
+                    output_path = self.server.root / "checkpoints" / f"{output_sha}.pt"
+                    cadence = db.execute(
+                        "SELECT validation_interval_iterations FROM runs WHERE run_id=?",
+                        (job["run_id"],),
+                    ).fetchone()
+                    if cadence is None:
+                        raise RuntimeError("learner job run disappeared")
+                    validation_due = _validation_due(
+                        job["iteration_id"], cadence["validation_interval_iterations"]
+                    )
+                    checkpoint_metadata = canonical_json({
+                        "schema": "roborender.dagger_candidate_registration.v1",
+                        "run_id": job["run_id"],
+                        "round_id": job["round_id"],
+                        "iteration_id": job["iteration_id"],
+                        "parent_checkpoint_sha256": db.execute(
+                            "SELECT input_checkpoint_sha256 FROM learner_jobs WHERE job_id=?",
+                            (job_id,),
+                        ).fetchone()[0],
+                        "learner_job_id": job_id,
+                        "selection": (
+                            "pending_fixed_panel_success_validation"
+                            if validation_due else "next_rollout_intermediate"
+                        ),
+                    })
+                    existing_checkpoint = db.execute(
+                        "SELECT metadata_json FROM checkpoints WHERE sha256=?", (output_sha,)
+                    ).fetchone()
+                    if (
+                        existing_checkpoint is not None
+                        and existing_checkpoint["metadata_json"] != checkpoint_metadata
+                    ):
+                        status = "failed"
+                        db.execute(
+                            "UPDATE learner_jobs SET status='failed',updated_at=? WHERE job_id=?",
+                            (now, job_id),
+                        )
+                    else:
+                        db.execute(
+                            "INSERT OR IGNORE INTO checkpoints VALUES (?,?,?,?,?)",
+                            (
+                                output_sha, output_path.stat().st_size,
+                                checkpoint_metadata, str(output_path), now,
+                            ),
+                        )
+                if status == "succeeded":
+                    output_sha = result["output_checkpoint_sha256"]
+                    if validation_due:
+                        db.execute(
+                            "UPDATE round_iterations SET candidate_checkpoint_sha256=?,"
+                            "status='awaiting_validation',updated_at=? WHERE run_id=? "
+                            "AND round_id=? AND iteration_id=?",
+                            (output_sha, now, job["run_id"], job["round_id"],
+                             job["iteration_id"]),
+                        )
+                        run_status = "awaiting_validation"
+                    else:
+                        next_iteration = job["iteration_id"] + 1
+                        db.execute(
+                            "UPDATE round_iterations SET candidate_checkpoint_sha256=?,"
+                            "status='advanced',updated_at=? WHERE run_id=? AND round_id=? "
+                            "AND iteration_id=?",
+                            (
+                                output_sha, now, job["run_id"], job["round_id"],
+                                job["iteration_id"],
+                            ),
+                        )
+                        db.execute(
+                            "INSERT INTO round_iterations VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                job["run_id"], job["round_id"], next_iteration,
+                                output_sha, None, None, None, "collecting", now, now,
+                            ),
+                        )
+                        db.execute(
+                            "UPDATE runs SET active_checkpoint_sha256=?,updated_at=? "
+                            "WHERE run_id=?",
+                            (output_sha, now, job["run_id"]),
+                        )
+                        run_status = "collecting"
+                else:
+                    db.execute(
+                        "UPDATE round_iterations SET status='learner_failed',updated_at=? "
+                        "WHERE run_id=? AND round_id=? AND iteration_id=?",
+                        (now, job["run_id"], job["round_id"], job["iteration_id"]),
+                    )
+                    run_status = "learner_failed"
+                db.execute(
+                    "UPDATE runs SET status=?,updated_at=? WHERE run_id=?",
+                    (run_status, now, job["run_id"]),
+                )
 
 
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser()
-    parser.add_argument("--role", choices=("coordinator", "trajectory", "registry", "learner"), required=True)
+    parser.add_argument(
+        "--role",
+        choices=("coordinator", "trajectory", "registry", "learner", "evaluation"),
+        required=True,
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--state-root", type=Path, default=root / "runtime/dagger_services")

@@ -9,14 +9,16 @@ checkpoint and renderer identities are further pinned by
 
 - Robot policy: `<robot>_privileged_action_teacher_<task>_stepNNNNNN.pt`.
 - Student bootstrap: `<robot>_3view_student_bootstrap_vN.pt`.
-- Student checkpoint: Raven's fixed-cadence `model_step_NNNNNN.pt` or job-end
-  `last.pt`, stored under the owning `checkpoints/students/<stage>/<run>/`
-  experiment directory and registered by digest before handoff.
+- Student checkpoint: immutable, content-addressed candidate beneath the owning
+  `checkpoints/students/<stage>/<run>/` experiment directory, registered by
+  parent/run/iteration identity before handoff. Compatibility `last.pt` links
+  are allowed only for an upstream loader that requires that name.
 - Renderer adapter: `roborender_<offline|online>_<role>_<steps>_lora_stepNNNNN.safetensors`.
 - TensorRT plan: `roborender_<role>_sm90_<precision>_<view-contract>.engine`.
 - Student-checkpoint stages are `BC`, `dagger_1`, `dagger_2`, `dagger_3`, and
-  `dagger_4`. DAgger round names describe sequential warm starts, not different
-  beta values: Raven used teacher-driven beta 1 in every reproduced round.
+  `dagger_4`. The active rounds are sequential warm starts with student-action
+  probabilities 25%, 50%, 75%, and 100%. Raven's recorded beta-1 behavior is
+  retained as reference provenance, not used as the active experiment schedule.
 
 Original filenames are provenance fields, never production identifiers.
 Changing the architecture, view order, action schema, preprocessing, adapter,
@@ -29,8 +31,8 @@ relative path, byte count, SHA-256, original source/path, and source revision.
 A derived artifact additionally records all parent hashes and build/runtime
 parameters. A dataset seal records source and code-contract hashes, complete
 chunk/environment IDs, frame count, state/action shapes, view order, alignment
-map, and payload inventory. A split is recorded only for a separately declared
-non-Raven evaluation projection; the active Raven BC dataset is flat.
+map, and payload inventory. The active BC pool remains flat while its 80/10/10
+train/validation/test membership is stored as non-copying index manifests.
 
 Paths are locators; hashes are identity. A path without a matching manifest and
 digest must not be used by an active launcher.
@@ -44,9 +46,10 @@ digest must not be used by an active launcher.
 4. Fsync payloads and the containing directory.
 5. Atomically rename to the final versioned path and publish a read-only
    manifest. An existing final name is an error, even if a retry appears valid.
-6. Raven checkpointing follows the fixed 200-update save cadence and job-end
-   `last.pt`; it does not perform validation-MSE promotion. Reported evaluation
-   uses the explicit 300-episode closed-loop success procedure.
+6. Each distributed DAgger update registers an immutable candidate. At the
+   configured boundary, the sealed 256-case closed-loop goal-reached rate—not
+   validation MSE—selects the best checkpoint. Final test remains separately
+   sealed and reporting-only.
 
 Sealed artifacts are append-only. Corrections create a new version whose
 manifest cites the superseded manifest; they never edit old bytes in place.
@@ -71,6 +74,6 @@ verified.
 `data/` contains datasets only, `checkpoints/` contains policy weights only,
 and `renderer/` contains renderer weights, engines, contracts, and render
 evidence only. Runtime environments, caches, logs, and run receipts belong in
-`runtime/` or ignored container state. The active Raven path uses one flat BC
-dataset and live, non-persisted DAgger storage; held-out split directories from
-the custom protocol are inactive.
+`runtime/` or ignored container state. The active path uses one flat BC pool
+with index-only splits and live, current-iteration DAgger storage. Historical
+runtime receipts must not be promoted into source-controlled dataset trees.

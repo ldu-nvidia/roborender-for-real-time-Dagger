@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed static audit of the Raven-equivalent Image3F DAgger stage."""
+"""Fail-closed static audit of Raven Image3F settings and reference launcher."""
 
 from __future__ import annotations
 

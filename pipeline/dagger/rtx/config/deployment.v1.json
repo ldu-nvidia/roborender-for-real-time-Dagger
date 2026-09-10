@@ -1,0 +1,60 @@
+{
+  "schema": "roborender.dagger.rtx.deployment.v1",
+  "native_execution": {
+    "owner": "in_process_IsaacBatchTransitionOwner",
+    "physical_gpu_index": 1,
+    "certified_num_envs": 28,
+    "maximum_launcher_num_envs": 32,
+    "physical_step": "exactly_one_env.step_with_Bx26_after_all_B_prepares_validate",
+    "partial_prepare_failure": "zero_environment_steps",
+    "ambiguous_post_intent_failure": "CRASH_UNCERTAIN_no_automatic_replay",
+    "done_reset_scope": "per_lane",
+    "launcher": "scripts/launch_native_raven.sh"
+  },
+  "active_boundary": {
+    "contract_version": "roborender.dagger.rtx.v4",
+    "content_type": "application/vnd.roborender.ndarray-batch.v4",
+    "gateway_urls": [
+      "http://127.0.0.1:18620",
+      "http://127.0.0.1:18621",
+      "http://127.0.0.1:18622",
+      "http://127.0.0.1:18623",
+      "http://127.0.0.1:18624",
+      "http://127.0.0.1:18625",
+      "http://127.0.0.1:18626",
+      "http://127.0.0.1:18627"
+    ],
+    "bearer_token_env": "DAGGER_H200_TOKEN_FILE",
+    "wire": "RDB4_canonical_header_zlib_level_1_blob",
+    "anchor_registration": "once_per_content_digest",
+    "step_exchange": "previous_commit_plus_current_prepare",
+    "lane_assignment": "lane_index_modulo_8",
+    "hot_path_persistence": "ephemeral_H200_window_cache_no_per_lane_fsync"
+  },
+  "control_forwards": {
+    "18610": "coordinator",
+    "18611": "trajectory",
+    "18612": "registry",
+    "18613": "learner",
+    "18614": "evaluation"
+  },
+  "optional_test_scalar_owner_http": {
+    "status": "TEST_ONLY_NOT_USED_BY_NATIVE_VECTOR_LAUNCHER",
+    "isaac_owner_host": "127.0.0.1",
+    "isaac_owner_port": 18619,
+    "max_json_body_bytes": 67108864,
+    "bearer_token_env": "DAGGER_RTX_OWNER_TOKEN_FILE"
+  },
+  "round_betas": {
+    "1": 0.75,
+    "2": 0.5,
+    "3": 0.25,
+    "4": 0.0
+  },
+  "rollout_window_length": 81,
+  "no_previous_round_replay": true,
+  "sealed_artifact_ownership": {
+    "rtx": "compact_identity_and_outcome_audit_only",
+    "h200": "authoritative_learner_chunk_assembly_and_trajectory_publication"
+  }
+}

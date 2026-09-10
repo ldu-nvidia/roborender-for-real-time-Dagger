@@ -1,47 +1,60 @@
-# Raven-derived pipeline stages
+# Pipeline stages
 
-The active execution graph is:
+The project has one staged execution graph:
 
 ```text
-BC teacher collection -> 50-step offline rendering -> offline BC training
-                                                    -> Image3F DAgger round 1
-                                                    -> Image3F DAgger round 2
-                                                    -> Image3F DAgger round 3
-                                                    -> Image3F DAgger round 4
-                                                    -> 300-episode evaluation
+BC Isaac collection
+  -> 50-step offline teacher rendering
+  -> three-view BC training
+  -> DAgger 1 (25% student)
+  -> DAgger 2 (50% student)
+  -> DAgger 3 (75% student)
+  -> DAgger 4 (100% student)
+  -> final closed-loop test
 ```
 
-Each named stage owns its code, contract, launcher, and README. The executable
-reference is Raven's supplied patch stack at GR00T commit `94d7985`, preserved
-under `vendor/raven-fast-roborender-reference/`. The active DAgger action
-schedule is separately pinned in `dagger/canonical_round_schedule.v1.json`.
-GPU/process/server placement and absolute H200 paths are operational portability
-settings.
+| Directory | Responsibility |
+|---|---|
+| `bc_collection/` | Raven-derived Isaac/teacher capture and 81-row seals |
+| `bc_rendering/` | 50-step offline photorealistic rendering |
+| `bc_training/` | three-view student BC optimization |
+| `dagger/` | H200 services, Image3F, learning, orchestration, and contracts |
+| `dagger/rtx/` | RTX Isaac owner, vector barrier, transport, and fixed-panel executor |
+| `evaluation/` | Raven success metric, fixed validation, and final test |
+| `common/` | shared runtime/bootstrap helpers only |
+| `vendor/` | immutable Raven reference and patch provenance |
+| `tests/` | shared/H200 contract and regression tests |
 
-The active GR00T checkout is intentionally not duplicated in this repository.
-On a fresh clone, run `pipeline/bootstrap_raven_gr00t.sh`. It clones NVIDIA's
-public revision `92bf0863`, applies Raven's three vendored patches in order, and
-refuses the result unless its commit is exactly `94d79851d9c471b1210be81c75116d9bea835a4d`.
+`GR00T-VisualSim2Real/` is a locally materialized external dependency, not a
+second maintained repo. `bootstrap_raven_gr00t.sh` reconstructs the pinned
+Raven source at commit `94d79851d9c471b1210be81c75116d9bea835a4d` from the
+public base and vendored patches.
 
-The GR00T checkout reconstructed by the bootstrap script is byte-identical to
-Raven's source. Sealed BC split loading, validation, and early stopping live in
-the standalone `bc_training/train_bc_h200.py` entry point rather than modifying
-that nested checkout. Offline rendering
-uses a direct local worker because Raven's render-server wrapper was not in the
-shared assets; its model request and learner-output contracts are pinned, but
-the orchestration source itself is not byte-identical.
+## Scientific boundary
 
-DAgger training is live and does not publish or replay a round dataset. Each
-update consumes only the current 81-step rollout. The four rounds execute
-25/50/75/100% student decisions using per-decision Bernoulli selection, retain
-a 50% per-episode ray-traced observation mix, and warm-start the complete
-previous checkpoint. Raven's reported runs used beta 1 throughout; the
-canonical student-action schedule is our explicit experimental extension.
+The exact Raven teacher, camera/depth preprocessing, Image3F settings,
+current-window learner, and goal-reached success latch are retained. The active
+experiment deliberately differs from Raven's reported historical run in four
+important ways:
 
-Offline rendering, policy optimization, Image3F inference, and coordination run
-on H200. Live DAgger Isaac/privileged-teacher actors run on RTX and communicate
-through the versioned service boundary in `dagger/services/`. Non-SM90
-TensorRT engines are excluded from H200 execution. See
-`RAVEN_EQUIVALENCE_AUDIT.md` for the audited values and known
-scope boundary: three-view is Raven's verified extension, not the single-view
-configuration behind her published percentages.
+- three policy views rather than the reported single view;
+- the requested 25/50/75/100%-student DAgger schedule rather than teacher-only
+  recorded behavior;
+- distributed RTX/H200 v4 execution and B=28 vector capacity; and
+- a sealed 256-case repeated validation panel.
+
+These differences are configuration/protocol extensions, not silently folded
+into the Raven reference. See `RAVEN_EQUIVALENCE_AUDIT.md`.
+
+## Training semantics
+
+BC learns from the sealed offline rendered split. DAgger does not replay BC or
+earlier DAgger windows: each optimizer update consumes only the current
+81-step × 28-environment rollout. The privileged teacher labels every visited
+state regardless of which action moved Isaac. Every successful update emits an
+immutable checkpoint; validation promotion uses closed-loop task success, not
+MSE.
+
+Large inputs and outputs stay outside Git. Source-tree paths must remain
+portable; deployment-specific absolute paths belong only in explicit asset
+manifests or ignored runtime configs.

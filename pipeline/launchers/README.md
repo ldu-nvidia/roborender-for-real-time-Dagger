@@ -1,10 +1,12 @@
 # Launchers
 
-Canonical H200 launchers live inside their owning phase directories:
-`../bc_collection`, `../bc_rendering`, `../bc_training`, `../dagger`, and
-`../evaluation`. This directory is documentation-only. New launchers must be
-thin, contain no algorithmic logic, and bind only canonical `data/`,
-`renderer/`, `checkpoints/`, and `runtime/` paths.
+Canonical launchers live inside their owning phase directories:
+`../bc_collection`, `../bc_rendering`, `../bc_training`, `../dagger`,
+`../dagger/rtx`, and `../evaluation`. This directory is documentation-only.
+New launchers must be thin, contain no algorithmic logic, and resolve source
+relative to the common Git checkout.
 
-Foreign GPU engines, RTX hostnames, transfer staging, alternate project roots,
-and archived custom-protocol controllers are forbidden in active launchers.
+Foreign GPU engines, embedded credentials, transfer staging, alternate project
+roots, and archived controllers are forbidden. Deployment hostnames, asset
+roots, and SSH proxy details must be explicit environment/config bindings, not
+copied source trees.

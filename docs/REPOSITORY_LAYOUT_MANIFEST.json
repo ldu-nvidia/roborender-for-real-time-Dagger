@@ -1,118 +1,126 @@
 {
-  "schema": "roborender.repository_layout.v1",
-  "canonical_project_root": "/workspace/project/roborender",
-  "canonical_data_root": "/workspace/project/roborender/data",
-  "effective_utc_date": "2026-09-06",
+  "schema": "roborender.repository_layout.v2",
+  "effective_utc_date": "2026-09-10",
+  "source_of_truth": {
+    "repository": "ldu-nvidia/roborender-for-real-time-Dagger",
+    "policy": "identical Git commit on RTX and H200",
+    "intended_push_host": "RTX PRO 6000",
+    "canonical_h200_checkout": "/workspace/project/roborender",
+    "canonical_rtx_checkout": "/home/ldu/roborender"
+  },
+  "external_dependency": {
+    "path": "pipeline/GR00T-VisualSim2Real",
+    "git_commit": "94d79851d9c471b1210be81c75116d9bea835a4d",
+    "materialization": "pipeline/bootstrap_raven_gr00t.sh",
+    "tracked_in_parent_repo": false
+  },
   "active_contracts": {
     "bc_collection": {
       "path": "pipeline/bc_collection/raven_bc_collection_contract.v1.json",
       "file_sha256": "91db24f61a72f4109ad549e3fcd5a43b74a7c5feb319b70119c8b84a0d9a64d8",
       "canonical_json_sha256": "9e68006367c4132377eb2c104ab0f9e533fbad7f8a15e47db470090eb1c93287"
     },
-    "dagger_and_evaluation": {
+    "raven_image3f_reference": {
       "path": "pipeline/dagger/raven_image3f_dagger_contract.v1.json",
       "file_sha256": "7aa1eaab0548c528c286c15e576355f0e30ddf4314fb5ac7ac61d9b1dcf0f617",
       "canonical_json_sha256": "9cb3652a75dd9f18acce75f12fb931b5255857dca457434c4417b867ab8ff9dd"
     },
-    "dagger_action_schedule": {
+    "experiment_round_schedule": {
       "path": "pipeline/dagger/canonical_round_schedule.v1.json",
       "file_sha256": "a6b10010a602350614176c530dfd3c906455b3fc62bf5df9abc7d59c56926e0d",
       "canonical_json_sha256": "6748b6c9b65e1d7719f33d36ab66c606452a7e0a680bc97665ad9131cddb7a0f"
-    }
+    },
+    "fixed_validation_panel": {
+      "path": "pipeline/dagger/config/fixed_validation_panel.v1.json",
+      "file_sha256": "ad1c3a57896e01f19e260ecb0daead8b508031326e217e134793627df5af8ace",
+      "case_count": 256
+    },
+    "active_cross_host_protocol": "roborender.dagger.rtx.v4"
   },
-  "source_revisions": {
-    "project_revision": "the Git commit containing this manifest",
-    "active_gr00t_path": "pipeline/GR00T-VisualSim2Real",
-    "active_gr00t_git_head": "94d79851d9c471b1210be81c75116d9bea835a4d",
-    "active_gr00t_worktree": "clean_detached_exact_raven",
-    "archived_custom_gr00t_path": "pipeline/archive/GR00T-VisualSim2Real-custom-provenance",
-    "archived_custom_gr00t_git_head": "9dd746d7fe86cbc09f20546695ab46bec609a3ea",
-    "archived_custom_gr00t_worktree": "modified_provenance_only_not_active"
-  },
-  "stages": ["BC", "dagger_1", "dagger_2", "dagger_3", "dagger_4"],
-  "teacher_execution_betas": [1.0, 0.75, 0.5, 0.25, 0.0],
-  "raytraced_observation_mix_each_dagger_round": 0.5,
   "phase_roots": {
     "bc_collection": "pipeline/bc_collection",
     "bc_rendering": "pipeline/bc_rendering",
     "bc_training": "pipeline/bc_training",
-    "dagger": "pipeline/dagger",
+    "dagger_h200": "pipeline/dagger",
+    "dagger_rtx": "pipeline/dagger/rtx",
     "evaluation": "pipeline/evaluation",
-    "testing": "pipeline/testing",
     "renderer": "renderer",
     "checkpoints": "checkpoints",
     "data": "data",
-    "isaac_actor_runtime": "runtime/isaac_actor/qualified_h200_v1"
+    "runtime": "runtime"
   },
-  "student_checkpoint_outputs": {
-    "bootstrap": "checkpoints/students/bootstrap",
-    "raven_experiment_template": "checkpoints/students/{BC|dagger_1|dagger_2|dagger_3|dagger_4}/<experiment-run>/",
-    "checkpoint_names": ["model_step_NNNNNN.pt", "last.pt"],
-    "selection": "explicit_digest_registered_handoff_no_frontier_stage",
-    "checkpoints_below_data_root": "forbidden"
+  "experiment_stages": [
+    "BC",
+    "dagger_1",
+    "dagger_2",
+    "dagger_3",
+    "dagger_4"
+  ],
+  "dagger_teacher_betas": [
+    0.75,
+    0.5,
+    0.25,
+    0.0
+  ],
+  "dagger_student_probabilities": [
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "dagger_runtime": {
+    "rtx_physical_gpu": 1,
+    "concurrent_environments": 28,
+    "steps_per_iteration": 81,
+    "transitions_per_iteration": 2268,
+    "chunks_per_iteration": 28,
+    "image3f_h200_workers": 8,
+    "raytraced_episode_probability": 0.5,
+    "replay": "current_iteration_only",
+    "validation_interval_iterations": 40,
+    "validation_metric": "raven_goal_reached_rate",
+    "validation_cases": 256
+  },
+  "services": {
+    "coordinator": 18610,
+    "trajectory": 18611,
+    "registry": 18612,
+    "learner": 18613,
+    "evaluation": 18614,
+    "image3f_workers": "18500-18507",
+    "render_student_gateways": "18620-18627"
   },
   "dataset_state": {
-    "status": "layout_prepared_payloads_absent_pending_raven_contract_recollection",
-    "bc_isaac": "data/BC/isaac",
-    "bc_rendered": "data/BC/rendered",
-    "dagger_storage": "live_81_step_rollout_only_not_persisted",
-    "inactive_custom_protocol_layout": ["data/dagger_1", "data/dagger_2", "data/dagger_3", "data/dagger_4", "data/validation", "data/test", "data/splits"]
+    "bc_root": "data/BC",
+    "isaac_chunks": 2000,
+    "rendered_chunks": 2000,
+    "frames_per_chunk": 81,
+    "paired_filenames": true,
+    "split_counts": {
+      "train": 1600,
+      "validation": 200,
+      "test": 200
+    },
+    "seal": "data/BC/SEALED.json",
+    "dagger_chunks": "runtime-only current-iteration learner chunks"
   },
-  "canonical_moves": [
-    {
-      "original": "pipeline/GR00T-VisualSim2Real/logs_rl/<wsdpt-teacher-experiment>/model_step_044500.pt",
-      "canonical": "checkpoints/teachers/robot_policy/g1_privileged_action_teacher_wsdpt_step044500.pt",
-      "sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38"
+  "artifact_registries": {
+    "checkpoints": {
+      "path": "checkpoints/manifest.json",
+      "sha256": "11ecd84b05bd92716ea5e3afe9b0b43956dbfdf5c77ccbadcd888432313c604e"
     },
-    {
-      "original": "checkpoints/original/checkpoint.pt",
-      "canonical": "checkpoints/students/bootstrap/g1_3view_student_bootstrap_v1.pt",
-      "sha256": "720a975812f6083192234d650033511c821b6902da2ef7734d87943f6c0a359a"
-    },
-    {
-      "original": "renderer/artifacts/adapters/teacher_50step/step-5294.safetensors",
-      "canonical": "renderer/offline_teacher/checkpoints/roborender_offline_bc_video_teacher_50step_lora_step05294.safetensors",
-      "sha256": "3f09aa23a26ddb2da32d027dc5e883c992c820854bc07020d6d254c806afb01b"
-    },
-    {
-      "original": "renderer/artifacts/adapters/online_image3f/rgb030-depth030-step-5000.safetensors",
-      "canonical": "renderer/online_image3f/checkpoints/roborender_online_dagger_image3f_5step_lora_step05000.safetensors",
-      "sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588"
+    "renderer": {
+      "path": "renderer/manifests/registry.v1.json",
+      "sha256": "ece714931818bd128da16b4ef513afc1c5dc46ef3c364b7ee0563c2b2dd12c1b"
     }
-  ],
-  "compatibility_symlinks": [
-    {
-      "path": "pipeline/GR00T-VisualSim2Real/models/model_walk.pt",
-      "target": "checkpoints/teachers/locomotion/g1_locomotion_walk_controller.pt",
-      "reason": "upstream locomotion loader"
-    },
-    {
-      "path": "pipeline/GR00T-VisualSim2Real/models/model_stand.pt",
-      "target": "checkpoints/teachers/locomotion/g1_locomotion_stand_controller.pt",
-      "reason": "upstream locomotion loader"
-    },
-    {
-      "path": "renderer/models/PAI/Wan2.1-Fun-V1.1-1.3B-Control",
-      "target": "renderer/models/wan21_fun_control_1p3b_foundation",
-      "reason": "upstream Wan-Fun model identifier"
-    },
-    {
-      "path": "/workspace/codex/roborender-agent/runs/h200_rollout_qualification_20260903T201136Z",
-      "target": "runtime/isaac_actor/qualified_h200_v1",
-      "reason": "historical absolute runtime-manifest compatibility"
-    }
-  ],
-  "runtime_attestation": {
-    "path": "runtime/isaac_actor/qualified_h200_v1/qualification_report.json",
-    "bytes": 3047,
-    "sha256": "c39d505f4326e9d580de01c2ab2b5bc95e8e0b7f3e71352a19ea3923942781ad",
-    "scope": "bounded hardware/runtime qualification only; not a production collection seal"
   },
   "rules": {
-    "large_binary_physical_copies": 1,
+    "source_tree_identity": "same Git commit on both hosts",
+    "host_local_assets": "excluded from Git and SHA-256 manifested",
     "sealed_artifact_mutation": "forbidden",
-    "evaluation": "raytraced_closed_loop_success_300_episodes_under_offline_bc_saved_config",
-    "foreign_gpu_engine_use": "forbidden",
-    "compatibility_symlink_scope": "hard_coded_upstream_paths_only"
+    "checkpoint_selection": "closed_loop_success_rate",
+    "validation_backpropagation": false,
+    "foreign_architecture_engine_use": "forbidden",
+    "compatibility_symlinks": "only for unavoidable pinned upstream loaders"
   }
 }

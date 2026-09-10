@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Execute the canonical 25/50/75/100%-student Image3F DAgger rounds in order.
+# REFERENCE/COMPONENT TEST ONLY: monolithic four-round H200 launcher.
+# Distributed production uses services/ plus rtx/scripts/launch_native_raven.sh.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)

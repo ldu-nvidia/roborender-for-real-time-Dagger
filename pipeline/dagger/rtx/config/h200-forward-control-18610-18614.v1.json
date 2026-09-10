@@ -1,0 +1,21 @@
+{
+  "schema": "roborender.dagger.rtx.ssh-forward.v1",
+  "local_bind": "127.0.0.1",
+  "remote_bind": "127.0.0.1",
+  "ports": {
+    "18610": "coordinator",
+    "18611": "trajectory",
+    "18612": "registry",
+    "18613": "learner",
+    "18614": "evaluation"
+  },
+  "remote_host": "root@cosmos-h200.lepton",
+  "proxy_target": "ldu-cosmos-h200-dev-2",
+  "proxy_port": 2222,
+  "bind_publicly": false,
+  "exit_on_forward_failure": true,
+  "server_alive_interval_seconds": 10,
+  "server_alive_count_max": 3,
+  "stores_bearer_token": false,
+  "ownership": "one foreground process, independent of the isolated 18620 forward"
+}

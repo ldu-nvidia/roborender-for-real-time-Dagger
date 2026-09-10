@@ -1,0 +1,544 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://roborender.internal/schemas/render_student_boundary.v2.schema.json",
+  "title": "RoboRender RTX-H200 lean batched DAgger boundary v2",
+  "description": "Schema for canonical binary headers and canonical JSON responses. Raw ndarray bytes follow the binary header and are validated by x-wire-framing.",
+  "oneOf": [
+    {"$ref": "#/$defs/anchorBatchHeader"},
+    {"$ref": "#/$defs/anchorBatchResponse"},
+    {"$ref": "#/$defs/prepareBatchHeader"},
+    {"$ref": "#/$defs/prepareBatchResponse"},
+    {"$ref": "#/$defs/commitBatch"},
+    {"$ref": "#/$defs/commitBatchResponse"}
+  ],
+  "x-http": {
+    "anchor_register": {
+      "method": "POST",
+      "path": "/v2/anchors/register-batch",
+      "content_type": "application/vnd.roborender.ndarray-batch.v2"
+    },
+    "prepare": {
+      "method": "POST",
+      "path": "/v2/steps/prepare-batch",
+      "content_type": "application/vnd.roborender.ndarray-batch.v2"
+    },
+    "commit": {
+      "method": "POST",
+      "path": "/v2/steps/commit-batch",
+      "content_type": "application/json"
+    },
+    "authentication": "Bearer token from a mode-0600 file over the loopback-only SSH forward",
+    "max_request_bytes": 67108864
+  },
+  "x-wire-framing": {
+    "magic_ascii": "RDB2",
+    "prefix_bytes": 12,
+    "header_length": "unsigned little-endian uint64 at bytes [4,12)",
+    "header": "UTF-8 canonical JSON: sort_keys=true,separators=(',',':'),allow_nan=false",
+    "blob": "no-padding concatenation of little-endian C-contiguous ndarray bytes",
+    "offsets": "relative to blob byte zero, globally contiguous across records in vector order",
+    "descriptors": "lexically sorted by array name within each record; no gaps, overlap, duplicate names, or trailer",
+    "item_count": "1..256"
+  },
+  "x-digests": {
+    "capture_digest": "Opaque RTX full-source attestation retained from v1; includes locally retained metric/raw depth and fixed anchor arrays and is not remotely recomputable from v2 lean bytes.",
+    "wire_digest": "SHA256(canonical_json(metadata) then, for each lean array name in lexical order, canonical_json({name,dtype,shape}) then raw C-order bytes). Offsets and nbytes are not in this digest.",
+    "anchor_sha256": "In semantic view order head_color,hand_left,hand_right: SHA256(canonical_json({view,dtype:'uint8',shape}) then raw C-order anchor bytes for each view). Descriptor order remains lexical.",
+    "selection_receipt": "SHA256(canonical lane selection response excluding selection_receipt).",
+    "remote_commit_receipt": "SHA256(canonical lane commit acknowledgement excluding remote_commit_receipt)."
+  },
+  "x-lean-array-contract": {
+    "fixed": {
+      "actor_obs": ["float32", [113]],
+      "teacher_obs": ["float32", [226]],
+      "critic_obs": ["float32", [226]],
+      "homie_obs": ["float32", [516]],
+      "gt_obj_pos": ["float32", [3]],
+      "teacher_action": ["float32", [26]],
+      "homie_action": ["float32", [15]]
+    },
+    "per_view_for_head_color_hand_left_hand_right": {
+      "depth_ctrl": ["uint8", [240, 416]],
+      "rgb_robot": ["uint8", [240, 416, 3]]
+    },
+    "raytraced_only_per_view": {
+      "raytraced_rgb": ["float32", [108, 192, 3], "finite [0,1]"]
+    },
+    "forbidden": ["depth_metric__*", "depth_rawq__*", "depth_raw__*", "anchor_rgb__* in prepare batches"],
+    "teacher_homie_invariant": "teacher_action[11:] equals homie_action byte-for-byte"
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "not": {"enum": [".", ".."]}
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "contractVersion": {
+      "const": "roborender.dagger.rtx.v2"
+    },
+    "beta": {
+      "enum": [0.75, 0.5, 0.25, 0.0]
+    },
+    "stepKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "round_id",
+        "actor_id",
+        "rollout_window_id",
+        "rollout_step_index",
+        "episode_id",
+        "episode_step_index"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/identifier"},
+        "round_id": {"type": "integer", "minimum": 1, "maximum": 4},
+        "actor_id": {"$ref": "#/$defs/identifier"},
+        "rollout_window_id": {"$ref": "#/$defs/identifier"},
+        "rollout_step_index": {"type": "integer", "minimum": 0, "maximum": 80},
+        "episode_id": {"$ref": "#/$defs/identifier"},
+        "episode_step_index": {"type": "integer", "minimum": 0}
+      }
+    },
+    "episodeAssignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "use_raytraced",
+        "observation_source",
+        "anchor_sha256",
+        "assignment_source",
+        "raven_source",
+        "raven_commit"
+      ],
+      "properties": {
+        "use_raytraced": {"type": "boolean"},
+        "observation_source": {"enum": ["generated_controls", "raytraced"]},
+        "anchor_sha256": {"$ref": "#/$defs/sha256"},
+        "assignment_source": {"const": "pinned_raven_id_sample_anchor"},
+        "raven_source": {"const": "/home/ldu/BC_render/rtx_BC_transfer"},
+        "raven_commit": {"const": "94d79851d9c471b1210be81c75116d9bea835a4d"}
+      },
+      "x-invariant": "use_raytraced iff observation_source is raytraced"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "view_order",
+        "model_view_map",
+        "observation_source",
+        "prompt",
+        "env_id",
+        "seq",
+        "depth_units",
+        "depth_control_encoding",
+        "robot_control_encoding",
+        "contract_version",
+        "step_key",
+        "beta",
+        "episode_assignment"
+      ],
+      "properties": {
+        "view_order": {"const": ["head_color", "hand_left", "hand_right"]},
+        "model_view_map": {
+          "const": {
+            "ext1": "head_color",
+            "ext2": "hand_left",
+            "wrist": "hand_right"
+          }
+        },
+        "observation_source": {"enum": ["generated_controls", "raytraced"]},
+        "prompt": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "env_id": {"type": "integer"},
+        "seq": {"type": "integer"},
+        "depth_units": {"const": "meter"},
+        "depth_control_encoding": {"const": "raven_h5_v4"},
+        "robot_control_encoding": {"const": "textured_robot_rgb_on_black"},
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "beta": {"$ref": "#/$defs/beta"},
+        "episode_assignment": {"$ref": "#/$defs/episodeAssignment"}
+      },
+      "x-invariants": [
+        "step_key equals the containing lane step_key",
+        "beta equals the containing lane beta and the canonical round beta",
+        "observation_source equals episode_assignment.observation_source"
+      ]
+    },
+    "arrayDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "dtype", "shape", "sha256", "offset", "nbytes"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "dtype": {
+          "enum": ["float16", "float32", "uint8", "uint16", "int64", "bool"]
+        },
+        "shape": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "offset": {"type": "integer", "minimum": 0},
+        "nbytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "ndarrayEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dtype", "shape", "sha256", "data_b64"],
+      "properties": {
+        "dtype": {"enum": ["float32"]},
+        "shape": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "data_b64": {"type": "string"}
+      },
+      "description": "Permitted only for tiny action arrays in JSON responses."
+    },
+    "anchorRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anchor_sha256", "arrays"],
+      "properties": {
+        "anchor_sha256": {"$ref": "#/$defs/sha256"},
+        "arrays": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"$ref": "#/$defs/arrayDescriptor"}
+        }
+      },
+      "x-exact-arrays": {
+        "anchor_rgb__head_color": ["uint8", [240, 416, 3]],
+        "anchor_rgb__hand_left": ["uint8", [240, 416, 3]],
+        "anchor_rgb__hand_right": ["uint8", [240, 416, 3]]
+      }
+    },
+    "anchorBatchHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "kind", "batch_id", "anchors"],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "kind": {"const": "anchor_batch"},
+        "batch_id": {"$ref": "#/$defs/identifier"},
+        "anchors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/anchorRecord"}
+        }
+      }
+    },
+    "anchorAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anchor_sha256", "status", "bytes"],
+      "properties": {
+        "anchor_sha256": {"$ref": "#/$defs/sha256"},
+        "status": {"enum": ["registered", "cached"]},
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Stored H200 NPZ artifact bytes, including container overhead."
+        }
+      }
+    },
+    "anchorBatchResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "kind", "batch_id", "anchors"],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "kind": {"const": "anchor_batch_response"},
+        "batch_id": {"$ref": "#/$defs/identifier"},
+        "anchors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/anchorAck"}
+        }
+      }
+    },
+    "prepareLane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "idempotency_key",
+        "step_key",
+        "prepare_receipt",
+        "capture_digest",
+        "wire_digest",
+        "beta",
+        "metadata",
+        "arrays"
+      ],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "prepare_receipt": {"$ref": "#/$defs/sha256"},
+        "capture_digest": {"$ref": "#/$defs/sha256"},
+        "wire_digest": {"$ref": "#/$defs/sha256"},
+        "beta": {"$ref": "#/$defs/beta"},
+        "metadata": {"$ref": "#/$defs/metadata"},
+        "arrays": {
+          "type": "array",
+          "minItems": 13,
+          "maxItems": 16,
+          "items": {"$ref": "#/$defs/arrayDescriptor"}
+        }
+      },
+      "x-invariants": [
+        "descriptor names equal the exact generated or raytraced lean set",
+        "descriptor order is lexical",
+        "wire_digest recomputes from metadata and the decoded arrays",
+        "capture_digest is syntax-checked but opaque to H200"
+      ]
+    },
+    "prepareBatchHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "kind", "batch_id", "lanes"],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "kind": {"const": "prepare_batch"},
+        "batch_id": {"$ref": "#/$defs/identifier"},
+        "lanes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/prepareLane"}
+        }
+      },
+      "x-invariants": [
+        "lanes preserve RTX vector order",
+        "lane idempotency keys and logical step identities are unique",
+        "all lanes share run_id, round_id, and rollout_step_index"
+      ]
+    },
+    "selectionLane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "idempotency_key",
+        "step_key",
+        "prepare_receipt",
+        "capture_digest",
+        "wire_digest",
+        "beta",
+        "selection_id",
+        "selection_draw",
+        "selected_source",
+        "student_action_11",
+        "selected_action",
+        "observation_digest",
+        "selection_receipt"
+      ],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "prepare_receipt": {"$ref": "#/$defs/sha256"},
+        "capture_digest": {"$ref": "#/$defs/sha256"},
+        "wire_digest": {"$ref": "#/$defs/sha256"},
+        "beta": {"$ref": "#/$defs/beta"},
+        "selection_id": {"$ref": "#/$defs/sha256"},
+        "selection_draw": {"type": "number", "minimum": 0, "exclusiveMaximum": 1},
+        "selected_source": {"enum": ["teacher", "student"]},
+        "student_action_11": {"$ref": "#/$defs/ndarrayEnvelope"},
+        "selected_action": {"$ref": "#/$defs/ndarrayEnvelope"},
+        "observation_digest": {"$ref": "#/$defs/sha256"},
+        "selection_receipt": {"$ref": "#/$defs/sha256"}
+      },
+      "x-invariants": [
+        "student_action_11 shape is [11]",
+        "selected_action shape is [26]",
+        "selected_source is teacher iff selection_draw < beta",
+        "student selected_action equals student_action_11 concatenated with RTX homie_action",
+        "teacher selected_action exactly equals RTX teacher_action"
+      ]
+    },
+    "prepareBatchResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "kind", "batch_id", "lanes"],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "kind": {"const": "prepare_batch_response"},
+        "batch_id": {"$ref": "#/$defs/identifier"},
+        "lanes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/selectionLane"}
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reward", "done", "timeout", "metadata"],
+      "properties": {
+        "reward": {"type": "number"},
+        "done": {"type": "boolean"},
+        "timeout": {"type": "boolean"},
+        "metadata": {"type": "object"}
+      }
+    },
+    "sealedWindowV2": {
+      "type": "object",
+      "required": [
+        "schema",
+        "contract_version",
+        "run_id",
+        "round_id",
+        "actor_id",
+        "rollout_window_id",
+        "row_count",
+        "artifact_role",
+        "learner_complete",
+        "contains_policy_rgb",
+        "authoritative_learner_chunk_owner",
+        "episode_ids_are_per_step",
+        "actual_dones_preserved",
+        "no_previous_round_replay",
+        "view_order",
+        "per_step_identity_fields",
+        "episode_ids",
+        "episode_step_indices",
+        "round_ids",
+        "env_ids",
+        "seqs",
+        "observation_sources",
+        "dones",
+        "timeouts",
+        "rewards",
+        "behavior_sources",
+        "prepare_receipts",
+        "capture_digests",
+        "selection_ids",
+        "commit_digests",
+        "commit_receipts",
+        "path",
+        "bytes",
+        "sha256",
+        "provenance"
+      ],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "run_id": {"$ref": "#/$defs/identifier"},
+        "round_id": {"type": "integer", "minimum": 1, "maximum": 4},
+        "actor_id": {"$ref": "#/$defs/identifier"},
+        "rollout_window_id": {"$ref": "#/$defs/identifier"},
+        "row_count": {"const": 81}
+      },
+      "x-invariant": "Exact v1 identity/outcome audit manifest key set and values, except contract_version is v2; all per-step arrays have 81 entries and final row binds the index-80 commit."
+    },
+    "commitLane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "idempotency_key",
+        "step_key",
+        "prepare_receipt",
+        "selection_id",
+        "selection_receipt",
+        "commit_receipt",
+        "transition",
+        "sealed_window"
+      ],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "prepare_receipt": {"$ref": "#/$defs/sha256"},
+        "selection_id": {"$ref": "#/$defs/sha256"},
+        "selection_receipt": {"$ref": "#/$defs/sha256"},
+        "commit_receipt": {"$ref": "#/$defs/sha256"},
+        "transition": {"$ref": "#/$defs/transition"},
+        "sealed_window": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/sealedWindowV2"}
+          ]
+        }
+      },
+      "x-invariant": "sealed_window is non-null exactly at rollout_step_index 80"
+    },
+    "commitBatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "kind", "batch_id", "lanes"],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "kind": {"const": "commit_batch"},
+        "batch_id": {"$ref": "#/$defs/identifier"},
+        "lanes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/commitLane"}
+        }
+      }
+    },
+    "commitAckLane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "idempotency_key",
+        "step_key",
+        "commit_receipt",
+        "remote_commit_receipt",
+        "status"
+      ],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "commit_receipt": {"$ref": "#/$defs/sha256"},
+        "remote_commit_receipt": {"$ref": "#/$defs/sha256"},
+        "status": {"const": "committed"}
+      }
+    },
+    "commitBatchResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "kind", "batch_id", "lanes"],
+      "properties": {
+        "contract_version": {"$ref": "#/$defs/contractVersion"},
+        "kind": {"const": "commit_batch_response"},
+        "batch_id": {"$ref": "#/$defs/identifier"},
+        "lanes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/commitAckLane"}
+        }
+      }
+    }
+  }
+}

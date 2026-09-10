@@ -1,0 +1,28 @@
+{
+  "schema": "roborender.dagger.rtx.ssh-forward.v1",
+  "local_endpoints": [
+    "127.0.0.1:18620",
+    "127.0.0.1:18621",
+    "127.0.0.1:18622",
+    "127.0.0.1:18623",
+    "127.0.0.1:18624",
+    "127.0.0.1:18625",
+    "127.0.0.1:18626",
+    "127.0.0.1:18627"
+  ],
+  "remote_endpoints": [
+    "127.0.0.1:18620",
+    "127.0.0.1:18621",
+    "127.0.0.1:18622",
+    "127.0.0.1:18623",
+    "127.0.0.1:18624",
+    "127.0.0.1:18625",
+    "127.0.0.1:18626",
+    "127.0.0.1:18627"
+  ],
+  "bind_publicly": false,
+  "connection_count": 8,
+  "lane_assignment": "gateway_index=vector_lane_index%8",
+  "stores_bearer_token": false,
+  "ownership": "one foreground supervisor with eight independent SSH child connections; independent of control ports 18610-18614"
+}

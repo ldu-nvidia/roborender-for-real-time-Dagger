@@ -36,10 +36,8 @@ renderer/validation/
 
 # Local runtime state; canonical campaign artifacts live outside this checkout.
 runtime/
-containers/images/
-containers/logs/
-containers/state/
-containers/tools/
+# Container images/build state are deployment products, not repository source.
+containers/
 runs/
 outputs/
 artifacts/
@@ -51,6 +49,10 @@ checkpoints/**
 !checkpoints/**/*.json
 # Per-run student outputs are local artifacts, including mutable metrics.
 checkpoints/students/BC/*/
+checkpoints/students/dagger_1/*/
+checkpoints/students/dagger_2/*/
+checkpoints/students/dagger_3/*/
+checkpoints/students/dagger_4/*/
 # The root checkpoint layout above is versioned; renderer adapters are not.
 renderer/artifacts/adapters/**
 replay_cache/
@@ -60,14 +62,16 @@ replay_cache/
 rtx_BC_transfer/
 rtx_BC_transfer.zip
 
-# Superseded local source checkout retained only as read-only provenance.
-pipeline/archive/GR00T-VisualSim2Real-custom-provenance/
-
 # Logs and telemetry.
 *.log
 logs_rl/
 logs_eval/
 wandb/
+
+# Source handoff/review archives are derived from a Git tree, never inputs.
+*.tar.gz
+*.tgz
+*.zip.part
 
 # Python environments and caches.
 __pycache__/

@@ -18,13 +18,14 @@
    optimizer exposure, and saved GR00T environment config.
 7. **Archive explicitly.** A superseded checkpoint moves under `archive/` with
    `status=archived`; it cannot be loaded by production defaults.
-8. **Raven evaluation is reporting-only.** The reproduction does not use
-   validation-MSE checkpoint promotion. The fixed 300-episode success result
-   never changes checkpoint identity.
+8. **Success controls promotion.** Training MSE is diagnostic. At a configured
+   boundary, a frozen candidate is evaluated on the sealed 256-case closed-loop
+   panel and best-checkpoint promotion uses goal-reached rate. The separately
+   sealed final test is reporting-only.
 9. **No ambiguous path inference.** Loaders resolve artifacts through a
-   manifest or one documented canonical constant. The sequential round wrapper
-   may discover the `last.pt` created after its own pre-launch timestamp inside
-   that round's unique output root, then must record its digest; ambient
-   `latest` links and unrestricted historical scans remain forbidden.
+   manifest or one documented canonical constant. Every candidate is returned
+   by the fixed learner worker, hashed, and registered against its parent and
+   run/iteration identity; ambient `latest` links and unrestricted historical
+   scans remain forbidden.
 10. **Version contract changes.** A changed view/action schema, architecture,
     or preprocessing rule creates a new functional name and manifest version.

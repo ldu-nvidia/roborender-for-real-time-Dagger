@@ -32,6 +32,14 @@ configured ImageNet-pretrained ResNet18 vision module. DAgger round 1 loads the
 resulting three-view BC checkpoint; later rounds load the immediately preceding
 round's complete checkpoint.
 
-Raven saves at the fixed 200-update cadence and writes `last.pt` on a clean job
-end. There is no validation-saturation promotion step in the reproduction. See
-`PROVENANCE.md` and `manifest.json` for identity and lifecycle rules.
+The distributed DAgger learner publishes an immutable candidate after every
+81-step × 28-environment update. Intermediate candidates advance the live
+student between validation boundaries. At the configured 40-update boundary,
+promotion is decided by fixed-panel closed-loop task success, not validation
+MSE. W&B and the runtime checkpoint registry record the parent digest, training
+MSE, gradient norm, candidate digest, and validation result.
+
+Large candidate files and per-run registries remain local and ignored. The
+tracked `manifest.json` identifies stable teacher/bootstrap inputs; accepted BC
+and DAgger outputs carry adjacent runtime manifests and content hashes. See
+`PROVENANCE.md` for lifecycle rules.

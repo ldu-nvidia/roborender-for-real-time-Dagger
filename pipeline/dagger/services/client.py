@@ -42,7 +42,17 @@ class ServiceClient:
         return self._request("GET", path)
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", path, json.dumps(payload).encode())
+        return self._request(
+            "POST", path,
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode(),
+        )
+
+    def post_bytes(self, path: str, body: bytes, content_type: str) -> dict[str, Any]:
+        """Post an already framed body, used by the lean ndarray batch protocol."""
+
+        return self._request("POST", path, body, content_type)
 
     def put_file(self, path: str, source: Path) -> dict[str, Any]:
         """Stream a large chunk without holding a second copy in actor RAM."""

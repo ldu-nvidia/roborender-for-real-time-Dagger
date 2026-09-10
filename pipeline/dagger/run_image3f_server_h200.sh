@@ -15,13 +15,15 @@ PORT=${3:-18500}
 }
 [[ -x $PYTHON ]] || { echo "Image3F Python missing: $PYTHON" >&2; exit 2; }
 
-"$PYTHON" "$ROOT/pipeline/dagger/validate_raven_image3f_contract.py" --full-assets
-mkdir -p "$(dirname "$ENDPOINT")" "$ROOT/runtime/image3f_queue/inbox" \
-    "$ROOT/runtime/image3f_queue/done"
+if [[ ${IMAGE3F_SKIP_ASSET_VALIDATION:-false} != true ]]; then
+    "$PYTHON" "$ROOT/pipeline/dagger/validate_raven_image3f_contract.py" --full-assets
+fi
+QUEUE=${IMAGE3F_QUEUE:-$ROOT/runtime/image3f_queue}
+mkdir -p "$(dirname "$ENDPOINT")" "$QUEUE/inbox" "$QUEUE/done"
 
 export CUDA_VISIBLE_DEVICES=$GPU
 export IMAGE3F_ROOT=$ROOT/renderer/online_image3f/runtime
-export IMAGE3F_QUEUE=$ROOT/runtime/image3f_queue
+export IMAGE3F_QUEUE=$QUEUE
 export IMAGE3F_PORT=$PORT
 export ENDPOINT_FILE=$ENDPOINT
 export ROBORENDER_MODEL_BASE=$ROOT/renderer/models

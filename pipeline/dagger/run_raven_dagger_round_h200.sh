@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run one canonical warm-started three-view Image3F DAgger round.
+# REFERENCE/COMPONENT TEST ONLY: monolithic H200 Isaac + Image3F DAgger.
+# Distributed production uses services/ plus rtx/scripts/launch_native_raven.sh.
 #
 # Raven's Image3F observation/teacher/trainer implementation is preserved.  The
 # action schedule is the project's explicit canonical DAgger experiment:
