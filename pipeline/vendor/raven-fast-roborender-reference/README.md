@@ -75,7 +75,6 @@ scripts/
             image3f_ft_setup.sbatch  image3f_ft_eval.sbatch
 
 tools/      benchmarks, sample/preview builders, the 5-vs-50-step A/B (step_ab*.py)
-archive/    superseded one-off diagnostics and earlier experiments
 
 GR00T-VisualSim2Real/         trainer, configs, simulator (own git repo, branch
                               videogen-image-dagger)
@@ -505,10 +504,11 @@ ROOT=/your/checkout IMAGE3F=/your/image3f_bundle VIRAL_PY=$CONDA_PREFIX/bin/pyth
 
 `python3 scripts/setup/check_paths.py` verifies no script references a file that moved.
 
-> Note for reviewers: `archive/` contains superseded one-off scripts, including the
-> `patch_*.py` snapshots that were applied once to produce the current code. **They are not
-> the integration** — read `distill_trainer_videogen.py` and the simulator's
-> `get_policy_view_stack` instead. See `archive/README.md`.
+> Note for reviewers: superseded one-off diagnostics and the historical
+> `patch_*.py` snapshots were intentionally omitted from this source-only snapshot.
+> **They are not the integration** — read `distill_trainer_videogen.py` and the
+> simulator's `get_policy_view_stack` instead. Their history remains in the upstream
+> repository lineage.
 
 ## Depth control recipe
 

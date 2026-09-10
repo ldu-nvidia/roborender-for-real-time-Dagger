@@ -241,7 +241,7 @@ class RenderStudentBoundaryTests(unittest.TestCase):
         self.assertGreater(first["response_bytes"], 0)
         self.assertGreaterEqual(first["queue_wait_ms"], 0.0)
 
-    def test_v2_lean_batch_registers_anchor_and_persists_one_uncompressed_barrier(self):
+    def test_v3_lean_batch_registers_anchor_and_persists_one_uncompressed_barrier(self):
         anchors = capture_arrays()
         anchor_arrays = {
             f"anchor_rgb__{view}": anchors[f"anchor_rgb__{view}"] for view in VIEWS

@@ -5,11 +5,13 @@ roborender-acceleration/
 
 # Large immutable model, replay, and evaluation artifacts.
 *.npz
+*.npy
 *.pt
 *.pth
 *.safetensors
 *.onnx
 *.engine
+*.plan
 *.mp4
 *.png
 
@@ -36,6 +38,11 @@ renderer/validation/
 
 # Local runtime state; canonical campaign artifacts live outside this checkout.
 runtime/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-*
 # Container images/build state are deployment products, not repository source.
 containers/
 runs/
@@ -71,6 +78,8 @@ wandb/
 # Source handoff/review archives are derived from a Git tree, never inputs.
 *.tar.gz
 *.tgz
+*.tar
+*.7z
 *.zip.part
 
 # Python environments and caches.
@@ -81,6 +90,21 @@ venv/
 envs/
 *.egg-info/
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.whl
+
+# Native crash and profiler output.
+/core
+/core.*
+*.prof
+*.trace
 
 # Local credentials.
 .env

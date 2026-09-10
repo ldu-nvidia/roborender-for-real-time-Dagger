@@ -4,10 +4,21 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DAGGER = ROOT / "pipeline/dagger"
 GR00T = ROOT / "pipeline/GR00T-VisualSim2Real"
+RUNTIME_DEPLOYMENT = ROOT / "renderer/online_image3f/runtime/config/deployment.json"
+requires_raven = pytest.mark.skipif(
+    not (GR00T / ".git").exists(),
+    reason="requires the ignored, pinned Raven checkout",
+)
+requires_full_static_contract = pytest.mark.skipif(
+    not (GR00T / ".git").exists() or not RUNTIME_DEPLOYMENT.is_file(),
+    reason="requires ignored Raven and renderer deployment materializations",
+)
 
 
 def _load_validator():
@@ -19,6 +30,7 @@ def _load_validator():
     return module
 
 
+@requires_full_static_contract
 def test_raven_image3f_contract_is_complete_and_static():
     result = _load_validator().validate(full_assets=False)
     assert result["status"] == "raven_image3f_dagger_contract_valid"
@@ -80,6 +92,7 @@ def test_canonical_round_schedule_is_fixed_and_legacy_override_is_disabled():
     assert 'CHECKPOINT=${candidates[0]#* }' in four_rounds
 
 
+@requires_raven
 def test_raven_checkpoint_and_additional_round_semantics_are_exact():
     assert (
         __import__("subprocess").check_output(
@@ -102,6 +115,7 @@ def test_raven_checkpoint_and_additional_round_semantics_are_exact():
     assert "resume=false" not in launcher
 
 
+@requires_raven
 def test_live_action_order_relabels_then_selects_then_steps_isaac():
     trainer = (
         GR00T / "gr00t/rl/trl/trainer/distill_trainer_videogen.py"

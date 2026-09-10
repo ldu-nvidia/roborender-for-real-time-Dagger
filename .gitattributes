@@ -1,2 +1,1 @@
-pipeline/vendor/gr00t-native-h200/changes.patch whitespace=-blank-at-eol
 pipeline/vendor/raven-fast-roborender-reference/transfer/*.patch whitespace=-trailing-space

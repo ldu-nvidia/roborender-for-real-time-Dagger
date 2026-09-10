@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from gr00t.rl.trl.trainer.distill_trainer_videogen import (  # type: ignore[import-not-found]
     TRLDistillTrainerVideoGen,
@@ -43,6 +44,8 @@ from .pipelined_window_v4 import (
     AggregateHotPathJournalV4,
     PipelinedBatchStepOrchestratorV4,
     PipelinedBatchWindowRunnerV4,
+    TransportTimingObserverV4,
+    prewarm_readiness_v4,
 )
 from .provenance import verify_assets
 from .production_control import CoordinatorHTTPControl
@@ -207,12 +210,20 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             )
         token_file = Path(_required_env("DAGGER_H200_TOKEN_FILE"))
         base_url = os.environ.get("DAGGER_H200_BASE_URL", "http://127.0.0.1:18620")
-        if base_url not in {
-            "http://127.0.0.1:18620",
-            "http://127.0.0.1:18720",
-        }:
+        parsed_base_url = urlsplit(base_url)
+        if (
+            parsed_base_url.scheme != "http"
+            or parsed_base_url.hostname != "127.0.0.1"
+            or parsed_base_url.path not in {"", "/"}
+            or parsed_base_url.query
+            or parsed_base_url.fragment
+            or parsed_base_url.username is not None
+            or parsed_base_url.password is not None
+            or parsed_base_url.port is None
+            or not 1024 <= parsed_base_url.port <= 65535
+        ):
             raise RuntimeError(
-                "native service permits only an attested loopback H200 boundary"
+                "native service permits only an uncredentialed loopback HTTP H200 boundary"
             )
         run_id = _required_env("DAGGER_RUN_ID")
         round_id = int(_required_env("DAGGER_ROUND_ID"))
@@ -263,13 +274,16 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             raise RuntimeError(
                 "parallel H200 RPC fanout is restricted to single-window or capacity-probe"
             )
-        if mode == "production" and wire_protocol not in {"v2", "v3", "v4"}:
-            raise RuntimeError("production requires a lean v2, v3, or v4 boundary")
+        if mode == "production" and wire_protocol not in {"v3", "v4"}:
+            raise RuntimeError("production requires a served lean v3 or v4 boundary")
         production_spec = None
         production_continuation = None
         production_stop_at_learner_barrier = False
         production_gateway_ports: tuple[int, ...] | None = None
         production_gateway_instance_ids: tuple[str, ...] | None = None
+        v4_sharding_strategy = "modulo"
+        v4_readiness_prewarm_probes = 0
+        v4_suppress_success_transport_events = False
         if mode == "production":
             production_config_path = Path(_required_env("DAGGER_PRODUCTION_CONFIG"))
             production_config_bytes = production_config_path.read_bytes()
@@ -279,6 +293,57 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             h200 = production_config.get("h200", {})
             student = production_config.get("student", {})
             execution = production_config.get("execution", {})
+            if wire_protocol == "v4":
+                configured_sharding = h200.get("sharding_strategy", "modulo")
+                configured_prewarm = h200.get("readiness_prewarm_probes", 0)
+                configured_suppression = h200.get(
+                    "suppress_success_transport_events", False
+                )
+                if configured_sharding not in {
+                    "modulo",
+                    "cost_aware_window_pinned",
+                }:
+                    raise RuntimeError(
+                        "h200.sharding_strategy must be modulo or "
+                        "cost_aware_window_pinned"
+                    )
+                if (
+                    isinstance(configured_prewarm, bool)
+                    or not isinstance(configured_prewarm, int)
+                    or not 0 <= configured_prewarm <= 16
+                ):
+                    raise RuntimeError(
+                        "h200.readiness_prewarm_probes must be an integer in [0,16]"
+                    )
+                if not isinstance(configured_suppression, bool):
+                    raise RuntimeError(
+                        "h200.suppress_success_transport_events must be boolean"
+                    )
+                v4_sharding_strategy = configured_sharding
+                v4_readiness_prewarm_probes = configured_prewarm
+                v4_suppress_success_transport_events = configured_suppression
+                environment_sharding = os.environ.get("DAGGER_V4_SHARDING_STRATEGY")
+                if (
+                    environment_sharding is not None
+                    and environment_sharding != v4_sharding_strategy
+                ):
+                    raise RuntimeError(
+                        "DAGGER_V4_SHARDING_STRATEGY differs from immutable config"
+                    )
+                environment_prewarm = os.environ.get(
+                    "DAGGER_V4_READINESS_PREWARM_PROBES"
+                )
+                if environment_prewarm is not None:
+                    try:
+                        parsed_environment_prewarm = int(environment_prewarm)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "DAGGER_V4_READINESS_PREWARM_PROBES must be an integer"
+                        ) from exc
+                    if parsed_environment_prewarm != v4_readiness_prewarm_probes:
+                        raise RuntimeError(
+                            "DAGGER_V4_READINESS_PREWARM_PROBES differs from immutable config"
+                        )
             production_stop_at_learner_barrier = execution == {
                 "window_count": 1,
                 "stop_after_actor_barriers": True,
@@ -292,11 +357,38 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 raise RuntimeError(
                     "bounded learner-barrier launch flag/config mismatch"
                 )
-            if production_stop_at_learner_barrier:
-                production_gateway_ports = tuple(h200.get("gateway_ports", ()))
-                production_gateway_instance_ids = tuple(
-                    h200.get("expected_gateway_instance_ids", ())
+            production_gateway_ports = tuple(h200.get("gateway_ports", ()))
+            if (
+                len(production_gateway_ports) != 8
+                or len(set(production_gateway_ports)) != 8
+                or any(
+                    isinstance(port, bool)
+                    or not isinstance(port, int)
+                    or not 1024 <= port <= 65535
+                    for port in production_gateway_ports
                 )
+            ):
+                raise RuntimeError(
+                    "production requires eight unique loopback gateway ports"
+                )
+            configured_gateway_instances = tuple(
+                h200.get("expected_gateway_instance_ids", ())
+            )
+            if wire_protocol == "v4":
+                if (
+                    len(configured_gateway_instances) != 8
+                    or len(set(configured_gateway_instances)) != 8
+                    or any(
+                        not isinstance(instance, str) or len(instance) != 64
+                        for instance in configured_gateway_instances
+                    )
+                ):
+                    raise RuntimeError(
+                        "v4 production requires eight unique gateway instance identities"
+                    )
+                production_gateway_instance_ids = configured_gateway_instances
+            else:
+                production_gateway_instance_ids = None
             initial_checkpoint_sha = require_sha256(
                 student.get("initial_checkpoint_sha256"),
                 "student.initial_checkpoint_sha256",
@@ -339,17 +431,11 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             if production_stop_at_learner_barrier:
                 if (
                     window_index != 0
-                    or production_config.get("seed") != 4242
-                    or actor.get("simulator_seed") != 4242
+                    or production_config.get("seed") != actor.get("simulator_seed")
                     or wire_protocol != "v4"
-                    or production_gateway_ports != tuple(range(18720, 18728))
-                    or len(production_gateway_instance_ids) != 8
-                    or len(set(production_gateway_instance_ids)) != 8
-                    or initial_checkpoint_sha
-                    != "36138c34d68378b26265a9ff1f0e854ca1f6bc4c4bb5e582a2a7a9301f9fea33"
                 ):
                     raise RuntimeError(
-                        "bounded v4 learner-barrier smoke identity/config gate failed"
+                        "bounded v4 learner-barrier config gate failed"
                     )
             continuation_path_raw = os.environ.get(
                 "DAGGER_PRODUCTION_CONTINUATION", ""
@@ -486,6 +572,14 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
         phase_telemetry = None
         batch_transport = None
         h200_ready_identity = None
+        v4_transport_timing = None
+        v4_readiness_prewarm = {
+            "enabled": False,
+            "mode": "readiness_only",
+            "probes": 0,
+            "ledger_mutations": 0,
+            "elapsed_ns": 0,
+        }
         try:
             if collection_wandb_enabled:
                 # train_agent_trl.py has already performed the sole wandb.init.
@@ -538,7 +632,7 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 if gateway_urls != expected_gateway_urls:
                     raise RuntimeError(
                         f"{wire_protocol} gateway URLs must be the ordered loopback "
-                        "ports 18620..18627"
+                        f"ports {gateway_ports}"
                     )
                 if wire_protocol == "v3":
                     gateway_transports = [
@@ -561,13 +655,19 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 else:
                     # V4 reuses the audited v3 content-addressed anchor cold
                     # path while all per-step traffic uses RDB4/exchange.
+                    v4_transport_timing = TransportTimingObserverV4(
+                        telemetry,
+                        delegate_success_events=(
+                            not v4_suppress_success_transport_events
+                        ),
+                    )
                     anchor_registrars = [
                         LeanH200BatchClientV3(
                             BoundedBearerBatchV3Transport(
                                 url,
                                 token_file,
                                 timeout_s=120.0,
-                                telemetry=telemetry,
+                                telemetry=v4_transport_timing,
                             ),
                             runtime_root / "h200-v4" / f"gateway-{index:02d}" / "anchors",
                         )
@@ -579,13 +679,18 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                                 url,
                                 token_file,
                                 timeout_s=120.0,
-                                telemetry=telemetry,
+                                telemetry=v4_transport_timing,
                             ),
                             anchor_registrar=anchor_registrars[index],
                         )
                         for index, url in enumerate(gateway_urls)
                     ]
-                    batch_transport = ShardedLeanH200BatchClientV4(gateway_clients)
+                    batch_transport = ShardedLeanH200BatchClientV4(
+                        gateway_clients,
+                        cost_aware_sharding=(
+                            v4_sharding_strategy == "cost_aware_window_pinned"
+                        ),
+                    )
                 transport = batch_transport
                 h200_ready_identity = transport.verify_ready()
                 expected_pids = tuple(
@@ -614,6 +719,20 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                             "H200 v4 gateway instance identities changed after "
                             "launcher attestation"
                         )
+                if wire_protocol == "v4":
+                    v4_readiness_prewarm = prewarm_readiness_v4(
+                        transport,
+                        probes=v4_readiness_prewarm_probes,
+                        expected_gateway_pids=expected_pids,
+                        expected_gateway_instance_ids=(
+                            production_gateway_instance_ids or ()
+                        ),
+                    )
+                    if telemetry is not None:
+                        telemetry.record(
+                            "v4_readiness_prewarm",
+                            **v4_readiness_prewarm,
+                        )
                 orchestrator_rpc_workers = 8
             else:
                 transport = BoundedBearerJsonTransport(
@@ -640,6 +759,7 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                         runtime_root / "v4-hot-path.jsonl"
                     ),
                     phase_telemetry=phase_telemetry,
+                    transport_timing=v4_transport_timing,
                 )
                 runner = PipelinedBatchWindowRunnerV4(
                     owner,
@@ -736,6 +856,21 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             "rpc_workers": rpc_workers,
             "wire_protocol": wire_protocol,
             "h200_ready_identity": h200_ready_identity,
+            "v4_sharding_strategy": (
+                v4_sharding_strategy if wire_protocol == "v4" else None
+            ),
+            "v4_readiness_prewarm": (
+                v4_readiness_prewarm if wire_protocol == "v4" else None
+            ),
+            "v4_transport_success_telemetry": (
+                (
+                    "aggregate_vector_step_no_fsync"
+                    if v4_suppress_success_transport_events
+                    else "durable_per_request_and_aggregate_vector_step"
+                )
+                if wire_protocol == "v4"
+                else None
+            ),
             "capacity_steps": capacity_steps if capacity_mode else None,
             "chunk_persistence": not capacity_mode,
             "restart_continuation_allowed": False if mode in {"capacity-probe", "production"} else None,

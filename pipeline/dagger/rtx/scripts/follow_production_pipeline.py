@@ -359,7 +359,7 @@ def build_view(
 
 def format_view(view: View) -> str:
     transitions = min(view.durable_steps * BATCH_SIZE, TOTAL_TRANSITIONS)
-    short = view.run_id.removeprefix("dagger-r1-production-gpu1-b28-20260910-v2-")
+    short = view.run_id
     line = (
         f"{utc_now()} | {short} | iter {view.iteration:02d}/{TOTAL_WINDOWS} | "
         f"window {view.window:02d}/{TOTAL_WINDOWS} | step {view.local_step:02d}/{WINDOW_STEPS} | "

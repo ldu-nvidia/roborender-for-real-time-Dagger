@@ -246,7 +246,7 @@ def test_capacity_group_container_attestation_requires_other_gpu_and_pinned_imag
         selected_gpu=1,
         expected_image_id=image,
         run=run,
-        read_cmdline=lambda _pid: b"bash\0/home/ldu/dagger_rtx_server/scripts/launch_native_raven.sh",
+        read_cmdline=lambda _pid: b"bash\0/home/ldu/roborender/pipeline/dagger/rtx/scripts/launch_native_raven.sh",
     )
     assert allowed == {1001, 1002}
     assert details[0]["physical_gpu"] == 0

@@ -39,13 +39,19 @@ scientific step contract while removing avoidable hot-path work:
 - no hot-path fsync; and
 - final publication only after the complete 81-step ledger is reconciled.
 
-The response remains per-lane and idempotent. H200 persists/replays the same
-selection for a repeated request identity and rejects a changed body. RTX does
+The response remains per-lane and idempotent. H200 caches/replays the same
+selection in memory for a repeated request identity and rejects a changed body. RTX does
 not step until every lane validates. At step 80, the compact RTX audit manifest
 is cross-checked against H200's rows before 28 learner chunks are published.
+Any gateway PID or instance-generation replacement before finalization
+invalidates the incomplete window and requires fail-closed abandonment; the
+simulator action sequence is never replayed.
 
-v1–v3 endpoints remain covered for conformance and recovery compatibility.
-They are not the recommended production data path.
+The v1 and v3 endpoints remain covered for conformance and recovery
+compatibility. The historical v2 implementation is retained on RTX as tested
+protocol provenance and as the transport foundation used by v3/v4, but this
+H200 server does not expose v2 routes. None of these older paths is the
+recommended production data path.
 
 ## Observation and action contract
 

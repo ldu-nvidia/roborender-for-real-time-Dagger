@@ -44,6 +44,10 @@ def _load_class_method(source: str, class_name: str, method_name: str):
     return namespace[method_name]
 
 
+@unittest.skipUnless(
+    (GR00T / ".git").exists(),
+    "requires the ignored, pinned Raven checkout",
+)
 class RavenBCCollectionContractTest(unittest.TestCase):
     def test_active_tree_and_yaml_are_exact_raven(self) -> None:
         result = validate(ROOT)

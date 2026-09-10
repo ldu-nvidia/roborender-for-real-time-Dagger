@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,7 @@ RUN_ID = "dagger-r1-production-gpu1-b28-20260910-v2"
 CONFIG_SHA = "42f6d681a565ffd9146a1787a61e0775d7546367eeeaa8d9f5b512142c570514"
 INITIAL_SHA = "4b7fbc3b10c5a3a6381fd6a89bd5ac779e045fcae8789769d2f0c084f4570a42"
 ACTOR_PREFIX = f"{RUN_ID}-g1"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _sha(text: str) -> str:
@@ -460,6 +462,7 @@ def test_post_validation_segment_preserves_global_iterations_41_through_80(tmp_p
 
 def test_production_spec_rejects_any_actor_or_gpu_substitution():
     spec = _spec()
+    assert spec.wire_contract_version == "roborender.dagger.rtx.v4"
     actors = list(spec.actor_ids)
     actors[-1] = f"{ACTOR_PREFIX}-lane-999"
     with pytest.raises(ValueError, match="actor_ids"):
@@ -479,3 +482,25 @@ def test_production_spec_rejects_any_actor_or_gpu_substitution():
             initial_checkpoint_sha256=INITIAL_SHA,
             physical_gpu_uuid="GPU-00000000-0000-0000-0000-000000000000",
         )
+    with pytest.raises(ValueError, match="served lean v3 or v4"):
+        ProductionRunSpec(
+            run_id=RUN_ID,
+            config_sha256=CONFIG_SHA,
+            actor_prefix=ACTOR_PREFIX,
+            actor_ids=spec.actor_ids,
+            initial_checkpoint_sha256=INITIAL_SHA,
+            wire_contract_version="roborender.dagger.rtx.v2",
+        )
+
+
+def test_generic_launcher_has_no_historical_one_run_identity_constants():
+    launcher = (PROJECT_ROOT / "scripts/launch_native_raven.sh").read_text(
+        encoding="utf-8"
+    )
+    trainer = (
+        PROJECT_ROOT / "code/src/dagger_rtx/native_service_trainer.py"
+    ).read_text(encoding="utf-8")
+    for source in (launcher, trainer):
+        assert "36138c34d68378b26265a9ff1f0e854ca1f6bc4c4bb5e582a2a7a9301f9fea33" not in source
+        assert "tuple(range(18720, 18728))" not in source
+        assert "production_config.get(\"seed\") != 4242" not in source

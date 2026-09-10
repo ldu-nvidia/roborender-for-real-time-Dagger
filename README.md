@@ -189,6 +189,22 @@ roborender/
 `94d79851d9c471b1210be81c75116d9bea835a4d` and remains ignored because it is
 an external materialized dependency, not a second project repository.
 
+## Documentation map and component status
+
+| Scope | Authoritative entry | Status |
+|---|---|---|
+| Pipeline stages and launcher ownership | `pipeline/README.md` | active |
+| Scientific parity and deliberate deviations | `pipeline/RAVEN_EQUIVALENCE_AUDIT.md` | required reference |
+| H200 DAgger services | `pipeline/dagger/services/README.md` | active |
+| RTX simulator owner and transport | `pipeline/dagger/rtx/README.md` | active |
+| Renderer preprocessing and view mapping | `renderer/contracts/CONDITIONING_CONTRACT.md` | active contract |
+| Success-rate evaluation | `pipeline/evaluation/SUCCESS_RATE_EVALUATION_CERTIFICATION.md` | certified with stated exclusions |
+| Artifact naming and repository layout | `docs/PROVENANCE_AND_NAMING.md`, `docs/REPOSITORY_LAYOUT_MANIFEST.json` | active policy |
+| Measured DAgger timing | `pipeline/dagger/PERFORMANCE_AUDIT.md` | reference evidence, not an SLA |
+| Pinned Raven snapshot and patches | `pipeline/vendor/raven-fast-roborender-reference/` | provenance/reference only |
+| Older wire protocols | `pipeline/dagger/rtx/code/src/dagger_rtx/` | v1/v3 compatibility-tested; v2 is tested transport provenance only; v4 is production |
+| Agent operating guide | `skills/roborender-distributed-pipeline/SKILL.md` | guidance |
+
 ## Services and ports
 
 All endpoints bind to loopback and cross hosts only through authenticated SSH
@@ -202,7 +218,7 @@ forwarding.
 | H200 | 18612 | content-addressed checkpoint registry |
 | H200 | 18613 | fixed learner worker control |
 | H200 | 18614 | fixed-panel evaluation ledger |
-| H200 → RTX loopback | 18620–18627 | eight render/student data gateways |
+| RTX loopback → H200 | 18620–18627 (default) | eight configurable forwarded render/student gateways |
 
 The bearer token is a mode-0600 runtime secret and is never committed.
 

@@ -1,5 +1,5 @@
 {
-  "schema": "roborender.repository_layout.v2",
+  "schema": "roborender.repository_layout.v3",
   "effective_utc_date": "2026-09-10",
   "source_of_truth": {
     "repository": "ldu-nvidia/roborender-for-real-time-Dagger",
@@ -35,7 +35,13 @@
       "file_sha256": "ad1c3a57896e01f19e260ecb0daead8b508031326e217e134793627df5af8ace",
       "case_count": 256
     },
-    "active_cross_host_protocol": "roborender.dagger.rtx.v4"
+    "active_cross_host_protocol": "roborender.dagger.rtx.v4",
+    "optional_rtx_v4_optimization": {
+      "path": "pipeline/dagger/rtx/config/v4_exchange_optimization.v1.fragment.json",
+      "file_sha256": "4f8ffc599110122381102c05bfd34f403c3d5243e86fe4802472c7d3663b6771",
+      "enabled_by_default": false,
+      "requires_h200_multisession_patch": false
+    }
   },
   "phase_roots": {
     "bc_collection": "pipeline/bc_collection",
@@ -48,6 +54,53 @@
     "checkpoints": "checkpoints",
     "data": "data",
     "runtime": "runtime"
+  },
+  "component_classification": {
+    "active": [
+      "pipeline/bc_collection",
+      "pipeline/bc_rendering",
+      "pipeline/bc_training",
+      "pipeline/dagger/services",
+      "pipeline/dagger/rtx",
+      "pipeline/evaluation",
+      "renderer/contracts"
+    ],
+    "compatibility_required": [
+      "RTX v1 per-step boundary",
+      "RTX/H200 v3 lean batch boundary",
+      "v2 binary codec and client tests retained as v3/v4 transport foundation and protocol provenance"
+    ],
+    "provenance_reference_required": [
+      "pipeline/RAVEN_EQUIVALENCE_AUDIT.md",
+      "pipeline/vendor/raven-fast-roborender-reference",
+      "checkpoints",
+      "renderer/manifests"
+    ],
+    "removed_as_superseded": [
+      "pipeline/dagger/rtx/scripts/live_progress_monitor.py",
+      "pipeline/dagger/rtx/scripts/hammer_h200_ready_v3.py",
+      "pipeline/dagger/rtx/scripts/recover_local_committed_batch.py",
+      "pipeline/bc_rendering/export_rendered_bc_supervision.py",
+      "pipeline/launchers",
+      "pipeline/testing"
+    ]
+  },
+  "deployment_bindings": {
+    "rtx_assets": "pipeline/dagger/rtx/config/assets.manifest.json",
+    "fixed_panel_external_assets": "explicit path plus SHA-256 bindings in pipeline/dagger/rtx/scripts/launch_fixed_panel_validation.sh",
+    "container_mount_root": "/workspace/dagger_rtx_server is a stable internal container ABI, not a host checkout",
+    "gateway_ports": "eight unique immutable-config ports; 18620-18627 is the default"
+  },
+  "source_only_policy": {
+    "excluded": [
+      "datasets",
+      "checkpoints and model weights",
+      "ONNX and TensorRT engines",
+      "runtime journals and logs",
+      "credentials and bearer tokens",
+      "generated caches"
+    ],
+    "h200_multisession_experiment": "not incorporated; requires independent validation"
   },
   "experiment_stages": [
     "BC",
@@ -88,7 +141,8 @@
     "learner": 18613,
     "evaluation": 18614,
     "image3f_workers": "18500-18507",
-    "render_student_gateways": "18620-18627"
+    "render_student_gateways_default": "18620-18627",
+    "render_student_gateway_count": 8
   },
   "dataset_state": {
     "bc_root": "data/BC",

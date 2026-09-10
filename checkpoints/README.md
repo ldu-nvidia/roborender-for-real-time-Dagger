@@ -26,11 +26,12 @@ that action by itself.
 The retained custom student bootstrap is
 `students/bootstrap/g1_3view_student_bootstrap_v1.pt`; its adjacent policy spec
 binds vertically stacked head/left-hand/right-hand RGB, 113 actor-state values,
-an 11-dimensional student output, and the action slice `[0,11]`. Raven-exact
-offline BC does **not** load it: the policy is constructed fresh with the
-configured ImageNet-pretrained ResNet18 vision module. DAgger round 1 loads the
-resulting three-view BC checkpoint; later rounds load the immediately preceding
-round's complete checkpoint.
+an 11-dimensional student output, and the action slice `[0,11]`. The offline BC
+trainer constructs that architecture without a network download and then
+strictly loads this bootstrap, whose ResNet18 already contains the pinned
+ImageNet initialization. DAgger round 1 loads the resulting three-view BC
+checkpoint; later rounds load the immediately preceding round's complete
+checkpoint.
 
 The distributed DAgger learner publishes an immutable candidate after every
 81-step × 28-environment update. Intermediate candidates advance the live

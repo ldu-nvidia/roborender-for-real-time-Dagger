@@ -293,6 +293,9 @@ class BcPhaseContractTest(unittest.TestCase):
 
     def test_bc_training_config_pins_raven_scientific_parameters(self) -> None:
         root = Path(__file__).resolve().parents[2]
+        materialized_raven = root / "pipeline/GR00T-VisualSim2Real/.git"
+        if not materialized_raven.exists():
+            self.skipTest("requires the ignored, pinned Raven checkout")
         launcher = (root / "pipeline/bc_training/train_raven_bc_h200.sh").read_text(
             encoding="utf-8"
         )

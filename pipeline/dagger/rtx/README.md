@@ -33,9 +33,19 @@ The production transport is `roborender.dagger.rtx.v4`:
 - no per-lane hot-path fsync or heavyweight local NPZ restacking; and
 - one compact RTX audit seal after all 81 vector steps.
 
-v1–v3 codecs and tests remain because v4 reuses their audited validation and
-backward-compatible conformance surfaces. They are not alternate production
-launch recommendations.
+The v1 and v3 implementations remain as tested compatibility surfaces. The v2
+codec/client is test- and provenance-only: v3/v4 reuse its protocol-neutral
+transport foundation, but the current H200 service exposes no v2 routes. None
+of these older paths is an alternate production launch recommendation.
+
+`config/v4_exchange_optimization.v1.fragment.json` documents optional,
+backward-compatible performance knobs. With no keys present, v4 retains modulo
+lane sharding, durable per-request success telemetry, and no readiness prewarm.
+The opt-in profile pins one cost-balanced lane assignment for the entire client
+process (including sequential finalized windows), aggregates successful
+transport telemetry, and performs only stateless `GET /ready` probes before
+stepping. It does not incorporate the separate, unvalidated H200 multisession
+experiment.
 
 ### Vector barrier
 
@@ -52,6 +62,10 @@ No subset of lanes may advance independently. A partial prepare performs zero
 environment steps. After a commit intent, an ambiguous local crash enters
 `CRASH_UNCERTAIN` and cannot automatically replay the action. Remote retries
 reuse stable idempotency keys and never repeat `env.step`.
+
+V4's incomplete-window state is intentionally process-local. Any gateway PID
+or instance-generation replacement before finalization invalidates that
+window; RTX fails closed and abandons it instead of replaying simulator state.
 
 An 81-row rollout window is distinct from an episode. A lane may terminate and
 reset within a window; the next row then has a new episode ID and episode step
@@ -102,8 +116,8 @@ ignored.
 The launchers establish loopback-only SSH forwarding to H200:
 
 - `scripts/forward_h200_control_ports.sh`: 18610–18614;
-- `scripts/forward_h200_gateways.sh`: eight independent connections for
-  18620–18627.
+- `scripts/forward_h200_gateways.sh`: eight independent connections for the
+  configured gateway ports (18620–18627 by default).
 
 Environment overrides beginning with `DAGGER_H200_` select the SSH identity,
 proxy, pod, port, and destination. A mode-0600 bearer-token file is mounted

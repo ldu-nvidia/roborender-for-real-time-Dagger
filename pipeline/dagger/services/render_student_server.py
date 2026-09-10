@@ -227,7 +227,7 @@ class RenderStudentHTTPServer(ThreadingHTTPServer):
         )
         self.operation_lock = threading.Lock()
         self.batch_prepare_lock = threading.Lock()
-        # A v2 commit request is one vector-environment barrier.  Serialize at
+        # A lean-batch commit request is one vector-environment barrier. Serialize at
         # that granularity so it can be persisted in one SQLite transaction;
         # expanding it into per-lane writer threads causes catastrophic WAL
         # lock convoying on the shared project filesystem.
@@ -2079,7 +2079,7 @@ def main() -> int:
                 device=device,
                 # The registry/learner verifies content before publishing a
                 # digest. V4 keeps checkpoint activation on the hot path lean;
-                # diagnostic v1/v3 retains independent per-gateway hashing.
+                # The diagnostic v1/v3 path retains independent per-gateway hashing.
                 verify_checkpoint_hash=not args.ephemeral_window_cache,
             )
             for device, port in worker_specs

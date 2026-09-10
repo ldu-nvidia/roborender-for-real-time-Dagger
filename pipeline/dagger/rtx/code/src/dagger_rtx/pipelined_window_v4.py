@@ -6,9 +6,11 @@ run configuration after all H200 gateway process generations are attested.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -39,6 +41,200 @@ class PendingStepV4:
     prepare_idempotency_keys: tuple[str, ...]
     commit_idempotency_keys: tuple[str, ...]
     timings_ns: Mapping[str, int]
+    transport_timing: Mapping[str, int | bool]
+
+
+@dataclass(frozen=True)
+class TransportTimingMarkerV4:
+    """Opaque cursor delimiting one synchronous sharded client call."""
+
+    sequence: int
+
+
+class TransportTimingObserverV4:
+    """Measure v4 HTTP time without changing the transport or wire contract.
+
+    ``BoundedBearerBatchV4Transport`` already reports one small event after
+    every HTTP request.  This sink retains only bounded scalar timing data and
+    optionally forwards the event to the existing audit sink.  A caller can
+    bracket a sharded client call with ``mark``/``summarize`` to distinguish
+    the slowest HTTP request from client-side framing, validation, executor,
+    and telemetry overhead.  No payload bytes, authorization values, or array
+    contents are retained.
+
+    The ``client_non_http_upper_bound_ns`` value is intentionally named an
+    upper bound: HTTP requests overlap across shards, so subtraction cannot
+    attribute all residual time uniquely without instrumenting each client.
+    """
+
+    schema = "roborender.dagger.rtx.v4-transport-timing.v1"
+    _EVENTS = {"http_batch_request_v3", "http_batch_request_v4"}
+
+    def __init__(
+        self,
+        delegate: Any | None = None,
+        *,
+        delegate_success_events: bool = True,
+        monotonic_ns: Callable[[], int] = time.perf_counter_ns,
+        max_events: int = 4096,
+    ) -> None:
+        if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events < 64:
+            raise ValueError("max_events must be an integer >= 64")
+        self.delegate = delegate
+        self.delegate_success_events = bool(delegate_success_events)
+        self.monotonic_ns = monotonic_ns
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._events: deque[dict[str, int | str]] = deque(maxlen=max_events)
+
+    def record(self, event: str, **detail: Any) -> None:
+        observed_ns = int(self.monotonic_ns())
+        delegate_started_ns = observed_ns
+        # Successful per-shard events are aggregated into the one vector-step
+        # hot-path row below.  Production v4 disables forwarding those events
+        # to the durable legacy sink, eliminating eight serialized file+dir
+        # fsync pairs from every exchange.  Failures/retries remain durable so
+        # fail-closed diagnosis is unchanged.
+        forward_to_delegate = (
+            self.delegate is not None
+            and (
+                self.delegate_success_events
+                or detail.get("outcome") != "success"
+            )
+        )
+        if forward_to_delegate:
+            self.delegate.record(event, **detail)
+        delegate_finished_ns = int(self.monotonic_ns())
+        if event not in self._EVENTS:
+            return
+        duration_ns = detail.get("duration_ns")
+        if isinstance(duration_ns, bool) or not isinstance(duration_ns, int):
+            return
+        row: dict[str, int | str] = {
+            "duration_ns": max(0, duration_ns),
+            "observed_ns": observed_ns,
+            "delegate_finished_ns": delegate_finished_ns,
+            "telemetry_emit_ns": max(0, delegate_finished_ns - delegate_started_ns),
+            "request_body_bytes": int(detail.get("request_body_bytes", 0)),
+            "response_body_bytes": int(detail.get("response_body_bytes", 0)),
+            "path": str(detail.get("path", ""))[:128],
+        }
+        with self._lock:
+            self._sequence += 1
+            row["sequence"] = self._sequence
+            self._events.append(row)
+
+    def mark(self) -> TransportTimingMarkerV4:
+        with self._lock:
+            return TransportTimingMarkerV4(self._sequence)
+
+    def summarize(
+        self,
+        marker: TransportTimingMarkerV4,
+        *,
+        call_started_ns: int,
+        call_finished_ns: int,
+    ) -> dict[str, int | bool]:
+        if call_finished_ns < call_started_ns:
+            raise ValueError("client timing interval is negative")
+        with self._lock:
+            rows = [
+                dict(row)
+                for row in self._events
+                if int(row["sequence"]) > marker.sequence
+            ]
+        wall_ns = call_finished_ns - call_started_ns
+        if not rows:
+            return {
+                "instrumented": False,
+                "client_call_wall_ns": wall_ns,
+                "http_request_count": 0,
+            }
+        durations = [int(row["duration_ns"]) for row in rows]
+        observed = [int(row["observed_ns"]) for row in rows]
+        finished = [int(row["delegate_finished_ns"]) for row in rows]
+        request_starts = [end - duration for end, duration in zip(observed, durations)]
+        critical_rtt_ns = max(durations)
+        http_timeline_ns = max(observed) - min(request_starts)
+        return {
+            "instrumented": True,
+            "client_call_wall_ns": wall_ns,
+            "http_request_count": len(rows),
+            "http_request_duration_sum_ns": sum(durations),
+            "http_rtt_critical_path_ns": critical_rtt_ns,
+            "http_timeline_span_ns": max(0, http_timeline_ns),
+            "client_non_http_upper_bound_ns": max(0, wall_ns - http_timeline_ns),
+            "first_http_start_lag_ns": max(0, min(request_starts) - call_started_ns),
+            "last_http_observed_tail_ns": max(0, call_finished_ns - max(observed)),
+            "last_telemetry_return_tail_ns": max(0, call_finished_ns - max(finished)),
+            "transport_telemetry_emit_sum_ns": sum(
+                int(row["telemetry_emit_ns"]) for row in rows
+            ),
+            "request_body_bytes": sum(int(row["request_body_bytes"]) for row in rows),
+            "response_body_bytes": sum(int(row["response_body_bytes"]) for row in rows),
+        }
+
+
+def prewarm_readiness_v4(
+    h200: Any,
+    *,
+    probes: int,
+    expected_gateway_pids: Sequence[int] = (),
+    expected_gateway_instance_ids: Sequence[str] = (),
+    monotonic_ns: Callable[[], int] = time.perf_counter_ns,
+) -> dict[str, Any]:
+    """Establish and re-attest persistent gateway connections without state.
+
+    This deliberately calls only ``GET /ready`` through the already-audited
+    client.  It never registers anchors, creates a prepare identity, performs
+    inference, or writes a production ledger row.  Consequently it is safe to
+    enable before an immutable window, but it must not be described as a CUDA
+    kernel warmup unless H200 later exposes a separate disposable contract.
+    """
+
+    if isinstance(probes, bool) or not isinstance(probes, int) or not 0 <= probes <= 16:
+        raise ValueError("v4 readiness prewarm probes must be an integer in [0,16]")
+    if probes == 0:
+        return {
+            "enabled": False,
+            "mode": "readiness_only",
+            "probes": 0,
+            "ledger_mutations": 0,
+            "elapsed_ns": 0,
+        }
+    expected_pids = tuple(int(value) for value in expected_gateway_pids)
+    expected_instances = tuple(str(value) for value in expected_gateway_instance_ids)
+    started_ns = int(monotonic_ns())
+    identities: tuple[str, ...] | None = None
+    pids: tuple[int, ...] | None = None
+    for _ in range(probes):
+        ready = h200.verify_ready()
+        rows = ready.get("gateways")
+        if not isinstance(rows, list) or not rows:
+            raise ContractError("v4 readiness prewarm requires sharded gateway identities")
+        current_pids = tuple(int(row.get("pid")) for row in rows)
+        current_instances = tuple(str(row.get("gateway_instance_id")) for row in rows)
+        if len(set(current_instances)) != len(current_instances):
+            raise ContractError("v4 readiness prewarm gateway generations are not unique")
+        if pids is None:
+            pids = current_pids
+            identities = current_instances
+        elif pids != current_pids or identities != current_instances:
+            raise ContractError("v4 gateway identity changed during readiness prewarm")
+        if expected_pids and current_pids != expected_pids:
+            raise ContractError("v4 readiness prewarm PID attestation mismatch")
+        if expected_instances and current_instances != expected_instances:
+            raise ContractError("v4 readiness prewarm instance attestation mismatch")
+    return {
+        "enabled": True,
+        "mode": "readiness_only",
+        "probes": probes,
+        "gateway_count": len(pids or ()),
+        "gateway_pids": list(pids or ()),
+        "gateway_instance_ids": list(identities or ()),
+        "ledger_mutations": 0,
+        "elapsed_ns": int(monotonic_ns()) - started_ns,
+    }
 
 
 class AggregateHotPathJournalV4:
@@ -73,6 +269,7 @@ class PipelinedBatchStepOrchestratorV4:
         num_envs: int,
         journal: AggregateHotPathJournalV4 | None = None,
         phase_telemetry: PhaseBoundaryTelemetry | None = None,
+        transport_timing: TransportTimingObserverV4 | None = None,
         monotonic_ns=time.perf_counter_ns,
     ) -> None:
         if num_envs != owner.num_envs or num_envs < 1:
@@ -85,7 +282,30 @@ class PipelinedBatchStepOrchestratorV4:
         self.remote_request_count = int(getattr(h200, "remote_request_count", 1))
         self.journal = journal
         self.phase_telemetry = phase_telemetry
+        self.transport_timing = transport_timing
         self.monotonic_ns = monotonic_ns
+
+    def _transport_marker(self) -> TransportTimingMarkerV4 | None:
+        return self.transport_timing.mark() if self.transport_timing is not None else None
+
+    def _transport_summary(
+        self,
+        marker: TransportTimingMarkerV4 | None,
+        *,
+        call_started_ns: int,
+        call_finished_ns: int,
+    ) -> dict[str, int | bool]:
+        if marker is None or self.transport_timing is None:
+            return {
+                "instrumented": False,
+                "client_call_wall_ns": call_finished_ns - call_started_ns,
+                "http_request_count": 0,
+            }
+        return self.transport_timing.summarize(
+            marker,
+            call_started_ns=call_started_ns,
+            call_finished_ns=call_finished_ns,
+        )
 
     def _phase_start(self, keys: Sequence[StepKey], phase: str) -> bool:
         if self.phase_telemetry is None:
@@ -222,13 +442,20 @@ class PipelinedBatchStepOrchestratorV4:
         prepare_ids = tuple(self._idem("h200-v4-prepare", key) for key in keys)
         phase = "prepare_or_exchange"
         phase_started = self._phase_start(keys, phase)
+        timing_marker = self._transport_marker()
         remote_started = self.monotonic_ns()
         try:
             raw = self.h200.prepare_batch(local, prepare_ids)
         except BaseException as exc:
             self._phase_error(keys, phase, phase_started, exc)
             raise
-        remote_ns = self.monotonic_ns() - remote_started
+        remote_finished = self.monotonic_ns()
+        remote_ns = remote_finished - remote_started
+        transport_timing = self._transport_summary(
+            timing_marker,
+            call_started_ns=remote_started,
+            call_finished_ns=remote_finished,
+        )
         selections = self._public_selections(raw)
         if len(selections) != self.num_envs:
             exc = ContractError("v4 H200 returned the wrong step-0 selection count")
@@ -256,6 +483,7 @@ class PipelinedBatchStepOrchestratorV4:
                 "h200_prepare_barrier": remote_ns,
                 "native_commit_and_env_step": commit_ns,
             },
+            transport_timing=transport_timing,
         )
         return pending
 
@@ -274,6 +502,7 @@ class PipelinedBatchStepOrchestratorV4:
         )
         phase = "prepare_or_exchange"
         phase_started = self._phase_start(current_keys, phase)
+        timing_marker = self._transport_marker()
         remote_started = self.monotonic_ns()
         try:
             acks, raw_selections = self.h200.exchange_batch(
@@ -286,7 +515,13 @@ class PipelinedBatchStepOrchestratorV4:
         except BaseException as exc:
             self._phase_error(current_keys, phase, phase_started, exc)
             raise
-        remote_ns = self.monotonic_ns() - remote_started
+        remote_finished = self.monotonic_ns()
+        remote_ns = remote_finished - remote_started
+        transport_timing = self._transport_summary(
+            timing_marker,
+            call_started_ns=remote_started,
+            call_finished_ns=remote_finished,
+        )
         if len(acks) != self.num_envs or len(raw_selections) != self.num_envs:
             exc = ContractError(
                 "v4 exchange did not return B acknowledgements and selections"
@@ -308,6 +543,7 @@ class PipelinedBatchStepOrchestratorV4:
             commit_acknowledgements=len(acks),
             remote_commit_barrier_ns=remote_ns,
             remote_commit_overlaps_next_prepare=True,
+            remote_transport_timing=transport_timing,
         )
         selections = self._public_selections(raw_selections)
         commits, commit_ns = self._local_commit(selections)
@@ -325,6 +561,7 @@ class PipelinedBatchStepOrchestratorV4:
                 "h200_commit_prepare_exchange": remote_ns,
                 "native_commit_and_env_step": commit_ns,
             },
+            transport_timing=transport_timing,
         )
         return pending, list(acks)
 
@@ -333,6 +570,7 @@ class PipelinedBatchStepOrchestratorV4:
             raise ContractError("v4 final flush requires rollout index 80")
         phase = "finalize"
         phase_started = self._phase_start(pending.keys, phase)
+        timing_marker = self._transport_marker()
         started = self.monotonic_ns()
         try:
             acknowledgements = self.h200.finalize_batch(
@@ -343,7 +581,13 @@ class PipelinedBatchStepOrchestratorV4:
         except BaseException as exc:
             self._phase_error(pending.keys, phase, phase_started, exc)
             raise
-        elapsed = self.monotonic_ns() - started
+        finished = self.monotonic_ns()
+        elapsed = finished - started
+        transport_timing = self._transport_summary(
+            timing_marker,
+            call_started_ns=started,
+            call_finished_ns=finished,
+        )
         if len(acknowledgements) != self.num_envs:
             exc = ContractError("v4 final flush lacks B commit acknowledgements")
             self._phase_error(pending.keys, phase, phase_started, exc)
@@ -359,6 +603,7 @@ class PipelinedBatchStepOrchestratorV4:
             commit_acknowledgements=len(acknowledgements),
             remote_commit_barrier_ns=elapsed,
             remote_commit_overlaps_next_prepare=False,
+            remote_transport_timing=transport_timing,
         )
         return list(acknowledgements)
 
@@ -369,6 +614,7 @@ class PipelinedBatchStepOrchestratorV4:
         commit_acknowledgements: int,
         remote_commit_barrier_ns: int,
         remote_commit_overlaps_next_prepare: bool,
+        remote_transport_timing: Mapping[str, int | bool],
     ) -> None:
         if self.journal is None:
             return
@@ -393,6 +639,8 @@ class PipelinedBatchStepOrchestratorV4:
                     **dict(pending.timings_ns),
                     "remote_commit_barrier": remote_commit_barrier_ns,
                 },
+                "selection_transport_timing": dict(pending.transport_timing),
+                "ack_or_exchange_transport_timing": dict(remote_transport_timing),
                 "remote_commit_overlaps_next_prepare": remote_commit_overlaps_next_prepare,
                 "status": "complete",
             }

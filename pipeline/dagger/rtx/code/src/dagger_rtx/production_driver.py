@@ -42,12 +42,11 @@ H200_ACTIVITY_ATTESTATION_SCHEMA = (
 )
 LEGACY_PRODUCTION_SEGMENT_SCHEMA = "roborender.dagger.rtx.production-segment.v1"
 EPISODE_NAMESPACE_MIN_WIDTH = 100_000
-PRODUCTION_WIRE_CONTRACT = "roborender.dagger.rtx.v2"
+PRODUCTION_WIRE_CONTRACT = "roborender.dagger.rtx.v4"
 PRODUCTION_WIRE_CONTRACTS = frozenset(
     {
-        PRODUCTION_WIRE_CONTRACT,
         "roborender.dagger.rtx.v3",
-        "roborender.dagger.rtx.v4",
+        PRODUCTION_WIRE_CONTRACT,
     }
 )
 PRODUCTION_WINDOW_COUNT = 40
@@ -632,7 +631,7 @@ class ProductionRunSpec:
         if self.rollout_steps != CHUNK_LENGTH:
             raise ContractError("each production window must contain exactly 81 steps")
         if self.wire_contract_version not in PRODUCTION_WIRE_CONTRACTS:
-            raise ContractError("production requires a lean v2, v3, or v4 boundary")
+            raise ContractError("production requires a served lean v3 or v4 boundary")
         if self.physical_gpu_uuid != RTX_PRO_6000_GPU1_UUID:
             raise ContractError("production is pinned to the dedicated physical RTX GPU1 UUID")
         expected = tuple(

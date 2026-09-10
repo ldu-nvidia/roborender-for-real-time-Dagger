@@ -28,7 +28,7 @@
     "wire": "RDB4_canonical_header_zlib_level_1_blob",
     "anchor_registration": "once_per_content_digest",
     "step_exchange": "previous_commit_plus_current_prepare",
-    "lane_assignment": "lane_index_modulo_8",
+    "lane_assignment": "lane_index_modulo_8_by_default; optional_cost_aware_process_pinned (configuration value remains cost_aware_window_pinned for compatibility)",
     "hot_path_persistence": "ephemeral_H200_window_cache_no_per_lane_fsync"
   },
   "control_forwards": {

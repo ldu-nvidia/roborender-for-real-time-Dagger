@@ -1,6 +1,7 @@
 # Provenance and naming standard
 
-This file governs every active artifact below `/workspace/project/roborender`.
+This file governs artifacts associated with both canonical checkouts:
+`/workspace/project/roborender` on H200 and `/home/ldu/roborender` on RTX.
 The machine-readable layout record is `REPOSITORY_LAYOUT_MANIFEST.json`;
 checkpoint and renderer identities are further pinned by
 `../checkpoints/manifest.json` and `../renderer/manifests/registry.v1.json`.

@@ -22,8 +22,9 @@ are not decompressed by training.
 
 The trainable student is the existing DAgger-compatible policy. Training starts
 from the immutable `g1_3view_student_bootstrap_v1.pt`, whose ResNet-18 contains
-the pinned ImageNet initialization; runtime construction disables downloading
-a second copy and then strictly loads that checkpoint. ResNet features are
+the pinned ImageNet initialization. Runtime construction sets the ResNet
+constructor's `pretrained=false` to prevent a second download, then strictly
+loads the pinned bootstrap before optimization. ResNet features are
 projected to 128 dimensions and concatenated
 with actor state, followed by the SiLU MLP `[512,256,128]` and an 11-D action
 head. Both ResNet and MLP are optimized with uniform elementwise MSE against

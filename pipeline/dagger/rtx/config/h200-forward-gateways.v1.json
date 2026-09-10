@@ -20,9 +20,10 @@
     "127.0.0.1:18626",
     "127.0.0.1:18627"
   ],
+  "ports_env_override": "DAGGER_H200_GATEWAY_PORTS",
   "bind_publicly": false,
   "connection_count": 8,
-  "lane_assignment": "gateway_index=vector_lane_index%8",
+  "lane_assignment": "modulo_by_default; immutable_config_may_opt_in_to_process-pinned cost-aware placement using compatibility value cost_aware_window_pinned",
   "stores_bearer_token": false,
   "ownership": "one foreground supervisor with eight independent SSH child connections; independent of control ports 18610-18614"
 }

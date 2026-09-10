@@ -58,3 +58,25 @@ MSE.
 Large inputs and outputs stay outside Git. Source-tree paths must remain
 portable; deployment-specific absolute paths belong only in explicit asset
 manifests or ignored runtime configs.
+
+## Launcher ownership
+
+Canonical launchers live inside their owning stage directories:
+`bc_collection`, `bc_rendering`, `bc_training`, `dagger`, `dagger/rtx`, and
+`evaluation`. Launchers must remain thin, keep algorithmic behavior in the
+owning source module, and resolve repository source relative to this checkout.
+Deployment hostnames, GPU-local asset roots, and SSH proxy details are explicit
+environment or manifest bindings; credentials, transfer staging, foreign GPU
+engines, and alternate source trees do not belong in launchers or Git.
+
+## Validation and final testing
+
+Checkpoint validation and final testing are separate. Training reuses the
+sealed 256-case panel and Raven's closed-loop goal-reached metric at each
+configured boundary. After checkpoint selection is frozen, the final test runs
+once and must not feed further tuning.
+
+`evaluation/run_raven_raytraced_300_eval_h200.sh` preserves Raven's ray-traced
+completed-episode procedure for final reporting. The repeated 256-case panel is
+a documented local experimental-control extension. Neither evaluation path
+computes validation MSE or performs backpropagation.

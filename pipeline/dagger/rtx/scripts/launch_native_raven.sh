@@ -18,7 +18,7 @@ usage: launch_native_raven.sh MODE NUM_ENVS RUN_ID ROUND_ID ACTOR_PREFIX WINDOW_
     --gpu 1                      physical RTX GPU (fixed: 1; GPU0 is forbidden)
     --capacity-group-id ID       exact coordinated capacity ownership group
     --rpc-workers 1..8           single-window/capacity H200 fanout (default: 8)
-    --wire-protocol v1|v2|v3|v4  H200 wire protocol (default: v1)
+    --wire-protocol v1|v2|v3|v4  H200 wire protocol (production: v3/v4)
     --probe-steps 3|10           bounded capacity steps (default: 10)
     --expected-h200-pid PID      bind pre-Isaac /ready to a confirmed live PID
     --expected-h200-pids CSV     ordered v3/v4 gateway PIDs
@@ -243,8 +243,8 @@ if [[ ( $wire_protocol == v3 || $wire_protocol == v4 ) && $rpc_workers != 8 ]]; 
   echo "$wire_protocol requires exactly eight gateway RPC workers" >&2
   exit 2
 fi
-if [[ $mode == production && $wire_protocol != v3 && $wire_protocol != v4 && $rpc_workers != 1 ]]; then
-  echo "production v1/v2 uses exactly one batched RPC" >&2
+if [[ $mode == production && $wire_protocol != v3 && $wire_protocol != v4 ]]; then
+  echo "production requires a served v3 or v4 boundary" >&2
   exit 2
 fi
 wandb_enabled=0
@@ -357,9 +357,29 @@ print("1" if execution == {
 } else "0")
 print("1" if logging.get("rtx_collection_wandb") is True else "0")
 print(logging.get("wandb_run_name", ""))
+ports = h200.get("gateway_ports", [])
+print("1" if (
+    isinstance(ports, list)
+    and len(ports) == 8
+    and all(type(port) is int and 1024 <= port <= 65535 for port in ports)
+    and len(set(ports)) == 8
+) else "0")
+instances = h200.get("expected_gateway_instance_ids", [])
+print("1" if (
+    isinstance(instances, list)
+    and len(instances) == 8
+    and all(isinstance(item, str) and len(item) == 64 for item in instances)
+    and len(set(instances)) == 8
+) else "0")
+print("1" if (
+    type(value.get("seed")) is int
+    and type(actor.get("simulator_seed")) is int
+    and value.get("seed") == actor.get("simulator_seed")
+    and type(actor.get("videogen_seed")) is int
+) else "0")
 PY
   )
-  [[ ${#production_fields[@]} -eq 13 ]] || {
+  [[ ${#production_fields[@]} -eq 16 ]] || {
     echo "could not parse immutable production config" >&2; exit 2;
   }
   [[ ${production_fields[0]} == "$run_id" && ${production_fields[1]} == "$round_id" ]] || {
@@ -376,23 +396,26 @@ PY
     echo "one-window learner-barrier policy differs from immutable config" >&2; exit 2;
   }
   if (( stop_at_learner_barrier )); then
-    [[ ${production_fields[2]} == 4242 && $simulator_seed == 4242 ]] || {
-      echo "bounded v4 smoke must use Isaac seed 4242" >&2; exit 2;
+    [[ $window_index == 0 && ${production_fields[15]} == 1 ]] || {
+      echo "bounded v4 smoke requires immutable integer seed bindings" >&2; exit 2;
     }
-    [[ $videogen_seed == 42 ]] || {
-      echo "bounded v4 smoke must preserve videogen assignment seed 42" >&2; exit 2;
-    }
-    [[ $gateway_ports_csv == 18720,18721,18722,18723,18724,18725,18726,18727 ]] || {
-      echo "bounded v4 smoke requires isolated gateway ports 18720..18727" >&2; exit 2;
+    [[ ${production_fields[13]} == 1 && ${production_fields[14]} == 1 ]] || {
+      echo "bounded v4 smoke requires eight unique ports and gateway identities" >&2; exit 2;
     }
     [[ ${production_fields[7]} == "$expected_h200_pids" ]] || {
       echo "H200 PID list differs from immutable config" >&2; exit 2;
     }
-    [[ ${production_fields[9]} == 36138c34d68378b26265a9ff1f0e854ca1f6bc4c4bb5e582a2a7a9301f9fea33 ]] || {
-      echo "bounded v4 smoke checkpoint is not the latest complete pre-stop student" >&2; exit 2;
+    [[ ${production_fields[9]} =~ ^[0-9a-f]{64}$ ]] || {
+      echo "bounded v4 smoke checkpoint identity is not a lowercase SHA-256" >&2; exit 2;
     }
-    [[ ${production_fields[11]} == 1 && $wandb_enabled == 1 && ${production_fields[12]} == "$run_id" ]] || {
-      echo "bounded v4 smoke requires exact-run RTX W&B collection logging" >&2; exit 2;
+    [[ ${production_fields[11]} == "$wandb_enabled" ]] || {
+      echo "bounded v4 smoke W&B flag differs from immutable config" >&2; exit 2;
+    }
+    if (( wandb_enabled )) && [[ ${production_fields[12]} != "$run_id" ]]; then
+      echo "bounded v4 smoke W&B run name must match run_id" >&2; exit 2;
+    fi
+    [[ $wire_protocol == v4 ]] || {
+      echo "bounded learner-barrier smoke requires v4" >&2; exit 2;
     }
   fi
   [[ $round_id == 1 && $num_envs == 28 ]] || {
@@ -548,19 +571,21 @@ fi
 if [[ $mode != capture-only ]]; then
   ready_json=$(curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${H200_BASE_PORT}/ready")
   READY_JSON="$ready_json" WIRE_PROTOCOL="$wire_protocol" \
+    H200_BASE_PORT="$H200_BASE_PORT" \
     EXPECTED_H200_PID="$expected_h200_pid" "$HOST_PYTHON" - <<'PY'
 import json, os
 value = json.loads(os.environ["READY_JSON"])
+port = os.environ["H200_BASE_PORT"]
 if value.get("ok") is not True or value.get("role") != "render_student":
-    raise SystemExit("H200 18620 readiness role mismatch")
+    raise SystemExit(f"H200 {port} readiness role mismatch")
 expected_pid = os.environ["EXPECTED_H200_PID"]
 if expected_pid and value.get("pid") != int(expected_pid):
-    raise SystemExit("H200 18620 readiness PID mismatch")
+    raise SystemExit(f"H200 {port} readiness PID mismatch")
 if value.get("schema") != "roborender.dagger.rtx.v1":
-    raise SystemExit("H200 18620 contract schema mismatch")
+    raise SystemExit(f"H200 {port} contract schema mismatch")
 if os.environ["WIRE_PROTOCOL"] == "v2":
     if "roborender.dagger.rtx.v2" not in value.get("supported_contract_versions", []):
-        raise SystemExit("H200 18620 does not advertise DAgger v2")
+        raise SystemExit(f"H200 {port} does not advertise DAgger v2")
     required = {
         "lean_binary_prepare_batch",
         "content_addressed_anchor_cache",
@@ -570,7 +595,7 @@ if os.environ["WIRE_PROTOCOL"] == "v2":
     features = value.get("features", {})
     missing = sorted(name for name in required if features.get(name) is not True)
     if missing:
-        raise SystemExit(f"H200 18620 lacks required v2 features: {missing}")
+        raise SystemExit(f"H200 {port} lacks required v2 features: {missing}")
 PY
   if [[ $wire_protocol == v3 || $wire_protocol == v4 ]]; then
     for gateway_index in {0..7}; do
@@ -614,7 +639,9 @@ required = (
 features = value.get("features", {})
 missing = sorted(name for name in required if features.get(name) is not True)
 if missing:
-    raise SystemExit(f"H200 {os.environ['GATEWAY_PORT']} lacks v3 features: {missing}")
+    raise SystemExit(
+        f"H200 {os.environ['GATEWAY_PORT']} lacks required {protocol} features: {missing}"
+    )
 # The service must explicitly advertise a live backend in one of its supported
 # identity fields.  Exact PID/cmdline provenance is independently supplied by
 # the H200 owner, but an explicit fake=true is always rejected here.
