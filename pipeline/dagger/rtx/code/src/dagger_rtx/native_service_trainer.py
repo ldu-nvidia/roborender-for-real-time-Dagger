@@ -28,6 +28,7 @@ from .capacity_telemetry import AppendOnlyTelemetry, RUN_TELEMETRY_SCHEMA
 from .contracts import (
     CONTRACT_VERSION,
     ROUND_BETAS,
+    ContractError,
     canonical_json,
     payload_digest,
     require_sha256,
@@ -51,17 +52,21 @@ from .provenance import verify_assets
 from .production_control import CoordinatorHTTPControl
 from .production_driver import (
     PRODUCTION_BATCH_SIZE,
-    PRODUCTION_WINDOW_COUNT,
+    PRODUCTION_VALIDATION_INTERVAL,
     RTX_PRO_6000_GPU1_UUID,
     ProductionContinuationSegment,
     ProductionMultiWindowDriver,
     ProductionRunSpec,
+    resolve_production_simulator_seed,
     verify_continuation_history,
     verify_episode_namespace_capacity,
     verify_h200_activity_evidence_file,
     verify_predecessor_state_file,
 )
-from .wandb_phase_mirror import active_raven_wandb_mirror
+from .wandb_phase_mirror import (
+    active_raven_wandb_mirror,
+    authorize_collection_wandb,
+)
 from .window_runner import BatchWindowRunner, RolloutLifecycle
 
 
@@ -195,16 +200,10 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 if capacity_steps == 3
                 else "I_ACKNOWLEDGE_TEN_NATIVE_VECTOR_STEPS"
             ),
-            "production": (
-                "I_ACKNOWLEDGE_ONE_NATIVE_81_STEP_WINDOW_TO_LEARNER_BARRIER"
-                if os.environ.get("DAGGER_STOP_AT_LEARNER_BARRIER", "0") == "1"
-                else "I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_VALIDATION"
-                if os.environ.get("DAGGER_PRODUCTION_CONTINUATION", "")
-                else "I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS"
-            ),
         }
-        acknowledgement = acknowledgements[mode]
-        if os.environ.get("DAGGER_NATIVE_STEP_ACK") != acknowledgement:
+        if mode != "production" and os.environ.get(
+            "DAGGER_NATIVE_STEP_ACK"
+        ) != acknowledgements[mode]:
             raise RuntimeError(
                 "native stepping is fail-closed; DAGGER_NATIVE_STEP_ACK lacks the exact mode acknowledgement"
             )
@@ -281,6 +280,9 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
         production_stop_at_learner_barrier = False
         production_gateway_ports: tuple[int, ...] | None = None
         production_gateway_instance_ids: tuple[str, ...] | None = None
+        production_logging: dict[str, Any] | None = None
+        production_total_windows = PRODUCTION_VALIDATION_INTERVAL
+        production_segment_end_window = PRODUCTION_VALIDATION_INTERVAL
         v4_sharding_strategy = "modulo"
         v4_readiness_prewarm_probes = 0
         v4_suppress_success_transport_events = False
@@ -293,6 +295,7 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             h200 = production_config.get("h200", {})
             student = production_config.get("student", {})
             execution = production_config.get("execution", {})
+            production_logging = production_config.get("logging")
             if wire_protocol == "v4":
                 configured_sharding = h200.get("sharding_strategy", "modulo")
                 configured_prewarm = h200.get("readiness_prewarm_probes", 0)
@@ -351,6 +354,38 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 "learner_submission_authorized": False,
                 "validation_authorized": False,
             }
+            if production_stop_at_learner_barrier:
+                production_total_windows = 1
+            else:
+                expected_execution_keys = {
+                    "window_count",
+                    "stop_after_actor_barriers",
+                    "wait_for_checkpoint_advance",
+                    "learner_submission_authorized",
+                    "validation_authorized",
+                }
+                configured_total_windows = execution.get("window_count")
+                if (
+                    set(execution) != expected_execution_keys
+                    or isinstance(configured_total_windows, bool)
+                    or not isinstance(configured_total_windows, int)
+                    or configured_total_windows < PRODUCTION_VALIDATION_INTERVAL
+                    or execution.get("stop_after_actor_barriers") is not False
+                    or execution.get("wait_for_checkpoint_advance") is not True
+                    or execution.get("learner_submission_authorized") is not True
+                    or execution.get("validation_authorized") is not True
+                ):
+                    raise RuntimeError(
+                        "production execution must authorize learning/validation and "
+                        "request an integer window_count >= 40"
+                    )
+                if production_config.get("validation", {}).get(
+                    "interval_iterations"
+                ) != PRODUCTION_VALIDATION_INTERVAL:
+                    raise RuntimeError(
+                        "production validation interval must remain exactly 40"
+                    )
+                production_total_windows = configured_total_windows
             if production_stop_at_learner_barrier != (
                 os.environ.get("DAGGER_STOP_AT_LEARNER_BARRIER", "0") == "1"
             ):
@@ -389,6 +424,47 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 production_gateway_instance_ids = configured_gateway_instances
             else:
                 production_gateway_instance_ids = None
+            continuation_path_raw = os.environ.get(
+                "DAGGER_PRODUCTION_CONTINUATION", ""
+            )
+            launched_simulator_seed = int(
+                _required_env("DAGGER_SIMULATOR_SEED")
+            )
+            if continuation_path_raw:
+                continuation_path = Path(continuation_path_raw)
+                continuation_bytes = continuation_path.read_bytes()
+                continuation_sha = hashlib.sha256(continuation_bytes).hexdigest()
+                if continuation_sha != _required_env(
+                    "DAGGER_PRODUCTION_CONTINUATION_SHA256"
+                ):
+                    raise RuntimeError(
+                        "production continuation manifest SHA-256 mismatch"
+                    )
+                production_continuation = ProductionContinuationSegment.from_mapping(
+                    json.loads(continuation_bytes)
+                )
+                if (
+                    production_continuation.run_id != run_id
+                    or production_continuation.config_sha256 != production_config_sha
+                    or production_continuation.start_global_window != window_index
+                ):
+                    raise RuntimeError(
+                        "production continuation manifest/run/window identity mismatch"
+                    )
+            elif window_index != 0:
+                raise RuntimeError(
+                    "nonzero production window requires an immutable continuation manifest"
+                )
+            try:
+                resolve_production_simulator_seed(
+                    actor.get("simulator_seed"),
+                    launched_simulator_seed,
+                    production_continuation,
+                    window_index,
+                )
+            except (ContractError, ValueError) as exc:
+                raise RuntimeError("production simulator seed gate failed") from exc
+
             initial_checkpoint_sha = require_sha256(
                 student.get("initial_checkpoint_sha256"),
                 "student.initial_checkpoint_sha256",
@@ -405,8 +481,7 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 or actor.get("concurrent_environments") != PRODUCTION_BATCH_SIZE
                 or actor.get("rollout_steps_per_iteration") != 81
                 or actor.get("transitions_per_iteration") != PRODUCTION_BATCH_SIZE * 81
-                or actor.get("simulator_seed")
-                != int(_required_env("DAGGER_SIMULATOR_SEED"))
+                or actor.get("simulator_seed") != production_config.get("seed")
                 or h200.get("render_student_worker_count") != 8
                 or h200.get("boundary_contract")
                 != f"roborender.dagger.rtx.{wire_protocol}"
@@ -427,6 +502,11 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                 ),
                 initial_checkpoint_sha256=student["initial_checkpoint_sha256"],
                 wire_contract_version=f"roborender.dagger.rtx.{wire_protocol}",
+                total_windows=(
+                    PRODUCTION_VALIDATION_INTERVAL
+                    if production_stop_at_learner_barrier
+                    else production_total_windows
+                ),
             )
             if production_stop_at_learner_barrier:
                 if (
@@ -437,28 +517,7 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                     raise RuntimeError(
                         "bounded v4 learner-barrier config gate failed"
                     )
-            continuation_path_raw = os.environ.get(
-                "DAGGER_PRODUCTION_CONTINUATION", ""
-            )
-            if continuation_path_raw:
-                continuation_path = Path(continuation_path_raw)
-                continuation_bytes = continuation_path.read_bytes()
-                continuation_sha = hashlib.sha256(continuation_bytes).hexdigest()
-                if continuation_sha != _required_env(
-                    "DAGGER_PRODUCTION_CONTINUATION_SHA256"
-                ):
-                    raise RuntimeError("production continuation manifest SHA-256 mismatch")
-                production_continuation = ProductionContinuationSegment.from_mapping(
-                    json.loads(continuation_bytes)
-                )
-                if (
-                    production_continuation.run_id != run_id
-                    or production_continuation.config_sha256 != production_config_sha
-                    or production_continuation.start_global_window != window_index
-                ):
-                    raise RuntimeError(
-                        "production continuation manifest/run/window identity mismatch"
-                    )
+            if production_continuation is not None:
                 verify_continuation_history(
                     production_continuation,
                     continuation_path,
@@ -489,9 +548,36 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
                     production_continuation,
                     (int(value) for value in runtime.seqs.tolist()),
                 )
-            elif window_index != 0:
+            production_segment_end_window = (
+                min(
+                    production_continuation.end_global_window_exclusive,
+                    production_total_windows,
+                )
+                if production_continuation is not None
+                else 1
+                if production_stop_at_learner_barrier
+                else min(PRODUCTION_VALIDATION_INTERVAL, production_total_windows)
+            )
+            if production_segment_end_window <= window_index:
                 raise RuntimeError(
-                    "nonzero production window requires an immutable continuation manifest"
+                    "production segment starts at or beyond the configured window budget"
+                )
+            expected_production_ack = (
+                "I_ACKNOWLEDGE_ONE_NATIVE_81_STEP_WINDOW_TO_LEARNER_BARRIER"
+                if production_stop_at_learner_barrier
+                else "I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS"
+                if window_index == 0
+                else "I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_WINDOW_BUDGET"
+                if (
+                    production_segment_end_window == production_total_windows
+                    and production_total_windows % PRODUCTION_VALIDATION_INTERVAL != 0
+                )
+                else "I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_VALIDATION"
+            )
+            if os.environ.get("DAGGER_NATIVE_STEP_ACK") != expected_production_ack:
+                raise RuntimeError(
+                    "native stepping is fail-closed; DAGGER_NATIVE_STEP_ACK lacks "
+                    "the exact production-segment acknowledgement"
                 )
         # A capacity probe is intentionally not resumable.  Reopening a partial
         # native process would lack a certified simulator/recurrent-state restore.
@@ -535,18 +621,10 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             )
 
         production_execution_steps = (
-            (
-                production_continuation.end_global_window_exclusive
-                - production_continuation.start_global_window
-            )
-            * 81
-            if production_continuation is not None
-            else (81 if production_stop_at_learner_barrier else PRODUCTION_WINDOW_COUNT * 81)
+            (production_segment_end_window - window_index) * 81
         )
         production_telemetry_steps = (
-            production_continuation.end_global_window_exclusive * 81
-            if production_continuation is not None
-            else (81 if production_stop_at_learner_barrier else PRODUCTION_WINDOW_COUNT * 81)
+            production_total_windows * 81
         )
         total_vector_steps = (
             capacity_steps
@@ -558,16 +636,12 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             else 1
         )
         raw_wandb_enabled = os.environ.get("DAGGER_COLLECTION_WANDB_ENABLED", "0")
-        if raw_wandb_enabled not in {"0", "1"}:
-            raise RuntimeError("DAGGER_COLLECTION_WANDB_ENABLED must be 0 or 1")
-        collection_wandb_enabled = raw_wandb_enabled == "1"
-        if collection_wandb_enabled and not (
-            mode == "single-window"
-            or (mode == "production" and production_stop_at_learner_barrier)
-        ):
-            raise RuntimeError(
-                "collection-side W&B is restricted to a bounded one-window run"
-            )
+        collection_wandb_enabled = authorize_collection_wandb(
+            mode=mode,
+            raw_enabled=raw_wandb_enabled,
+            run_id=run_id,
+            production_logging=production_logging,
+        )
         wandb_mirror = None
         phase_telemetry = None
         batch_transport = None
@@ -873,8 +947,12 @@ class NativeDaggerRTXServiceTrainer(TRLDistillTrainerVideoGen):
             ),
             "capacity_steps": capacity_steps if capacity_mode else None,
             "chunk_persistence": not capacity_mode,
-            "restart_continuation_allowed": False if mode in {"capacity-probe", "production"} else None,
-            "telemetry_path": str(telemetry_path) if telemetry_path is not None else None,
+            "restart_continuation_allowed": (
+                False if mode in {"capacity-probe", "production"} else None
+            ),
+            "telemetry_path": (
+                str(telemetry_path) if telemetry_path is not None else None
+            ),
             "collection_wandb": wandb_summary,
             "asset_verification": asset_rows,
             "transaction": result,

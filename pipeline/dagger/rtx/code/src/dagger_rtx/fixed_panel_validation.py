@@ -659,8 +659,7 @@ class DurableOutcomeJournal:
         (self.root / "pending").mkdir(parents=True, exist_ok=True, mode=0o700)
         (self.root / "acked").mkdir(parents=True, exist_ok=True, mode=0o700)
         attestation = {
-            "schema": "roborender.raven_success_validation_attestation.v1",
-            "assignment_path": str(assignment.path),
+            "schema": "roborender.raven_success_validation_attestation.v2",
             "assignment_sha256": assignment.assignment_sha256,
             "evaluation_id": assignment.evaluation_id,
             "run_id": assignment.run_id,
@@ -783,7 +782,7 @@ class DurableOutcomeJournal:
             or report.get("total") != EXPECTED_EPISODES
             or (
                 self.assignment.round_id > 0
-                and report.get("purpose") != "validation"
+                and report.get("purpose") not in {"validation", "test"}
             )
         ):
             raise FixedPanelValidationError("remote evaluation immutable identity mismatch")

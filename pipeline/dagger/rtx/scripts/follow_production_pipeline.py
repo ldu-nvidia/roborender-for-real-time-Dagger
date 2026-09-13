@@ -42,6 +42,33 @@ class CoordinatorUnavailable(RuntimeError):
     """The optional read-only H200 status request is temporarily unavailable."""
 
 
+def configure_cardinality(config: Mapping[str, Any]) -> int:
+    """Bind display totals to the immutable training budget, not validation cadence."""
+
+    execution = config.get("execution")
+    validation = config.get("validation")
+    total = execution.get("window_count") if isinstance(execution, Mapping) else None
+    interval = (
+        validation.get("interval_iterations")
+        if isinstance(validation, Mapping)
+        else None
+    )
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < 40
+        or interval != 40
+    ):
+        raise ProgressError(
+            "immutable config must request at least 40 windows with validation cadence 40"
+        )
+    global TOTAL_WINDOWS, TOTAL_VECTOR_STEPS, TOTAL_TRANSITIONS
+    TOTAL_WINDOWS = total
+    TOTAL_VECTOR_STEPS = WINDOW_STEPS * total
+    TOTAL_TRANSITIONS = TOTAL_VECTOR_STEPS * BATCH_SIZE
+    return total
+
+
 PHASE_LABELS = {
     "capture_teacher": "ISAAC  | collect 3-view conditions + teacher/Homie actions",
     "prepare_encode_and_persist": "UPLOAD | package 28 synchronized condition records",
@@ -328,11 +355,14 @@ def build_view(
         stage, raw = _coordinator_stage(coordinator or {}, iteration)
         metric = _validation_metric(coordinator or {})
         if metric is not None:
-            return View(run_id, iteration, TOTAL_WINDOWS, WINDOW_STEPS, durable, "H200 validation: complete", "healthy", f"goal_reached_rate={metric}", True)
+            return View(run_id, iteration, min(iteration, TOTAL_WINDOWS), WINDOW_STEPS, durable, "H200 validation: complete", "healthy", f"goal_reached_rate={metric}", True)
         if not stage:
-            stage, raw = "RTX collection 40/40 complete; awaiting H200 validation status", "status unavailable"
+            stage, raw = (
+                f"RTX segment through iteration {iteration} complete; awaiting H200 validation status",
+                "status unavailable",
+            )
         failed = stage == "H200: fail-closed"
-        return View(run_id, iteration, TOTAL_WINDOWS, WINDOW_STEPS, durable, stage, "FAILED" if failed else "healthy", raw, failed, failed)
+        return View(run_id, iteration, min(iteration, TOTAL_WINDOWS), WINDOW_STEPS, durable, stage, "FAILED" if failed else "healthy", raw, failed, failed)
     if driver_phase not in {"WINDOW_RUNNING", "CREATED"}:
         return View(run_id, iteration, window, local_step, durable, f"RTX driver: {driver_phase}", "healthy")
     if not progress:
@@ -414,6 +444,7 @@ def main(argv: list[str] | None = None) -> int:
     coordinator = None
     if args.config is not None:
         config, config_sha = load_config(args.config, args.run_id)
+        configure_cardinality(config)
         coordinator = CoordinatorReader(
             args.coordinator_url, args.token_file, args.run_id, config, config_sha
         )

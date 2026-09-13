@@ -21,6 +21,50 @@ class WandbPhaseMirrorError(RuntimeError):
     """The pre-initialized Raven W&B run does not match this collection."""
 
 
+def authorize_collection_wandb(
+    *,
+    mode: str,
+    raw_enabled: str,
+    run_id: str,
+    production_logging: Mapping[str, Any] | None = None,
+) -> bool:
+    """Validate collection logging against the immutable execution contract."""
+
+    if raw_enabled not in {"0", "1"}:
+        raise WandbPhaseMirrorError(
+            "DAGGER_COLLECTION_WANDB_ENABLED must be 0 or 1"
+        )
+    enabled = raw_enabled == "1"
+    if mode == "production":
+        if not isinstance(production_logging, Mapping) or type(
+            production_logging.get("rtx_collection_wandb")
+        ) is not bool:
+            raise WandbPhaseMirrorError(
+                "production logging.rtx_collection_wandb must be boolean"
+            )
+        configured = production_logging["rtx_collection_wandb"]
+        if enabled != configured:
+            raise WandbPhaseMirrorError(
+                "DAGGER_COLLECTION_WANDB_ENABLED differs from immutable "
+                "production config"
+            )
+        if enabled and (
+            production_logging.get("wandb_project") != "dagger"
+            or production_logging.get("wandb_run_name") != run_id
+        ):
+            raise WandbPhaseMirrorError(
+                "production collection W&B requires immutable project dagger "
+                "and run name equal to run_id"
+            )
+        return enabled
+    if enabled and mode != "single-window":
+        raise WandbPhaseMirrorError(
+            "collection-side W&B is restricted to single-window or immutable "
+            "production config authorization"
+        )
+    return enabled
+
+
 def _metric_component(value: str) -> str:
     cleaned = _SAFE_METRIC_COMPONENT.sub("_", value).strip("_")
     return cleaned or "unnamed"

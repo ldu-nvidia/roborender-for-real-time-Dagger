@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from dagger_rtx.phase_telemetry import PhaseBoundaryTelemetry
-from dagger_rtx.wandb_phase_mirror import WandbPhaseMirror, WandbPhaseMirrorError
+from dagger_rtx.wandb_phase_mirror import (
+    WandbPhaseMirror,
+    WandbPhaseMirrorError,
+    authorize_collection_wandb,
+)
 from conftest import PROJECT_ROOT
 
 
@@ -138,6 +142,53 @@ def test_rejects_mismatched_preinitialized_raven_run():
         WandbPhaseMirror(client, run_id="wandb-phase-run")
 
 
+def test_production_collection_wandb_requires_matching_immutable_config():
+    logging = {
+        "rtx_collection_wandb": True,
+        "wandb_project": "dagger",
+        "wandb_run_name": "production-run",
+    }
+    assert authorize_collection_wandb(
+        mode="production",
+        raw_enabled="1",
+        run_id="production-run",
+        production_logging=logging,
+    )
+
+    with pytest.raises(WandbPhaseMirrorError, match="differs from immutable"):
+        authorize_collection_wandb(
+            mode="production",
+            raw_enabled="0",
+            run_id="production-run",
+            production_logging=logging,
+        )
+    with pytest.raises(WandbPhaseMirrorError, match="run name equal to run_id"):
+        authorize_collection_wandb(
+            mode="production",
+            raw_enabled="1",
+            run_id="different-run",
+            production_logging=logging,
+        )
+
+
+@pytest.mark.parametrize("mode", ["capture-only", "isolated-one-step", "capacity-probe"])
+def test_nonproduction_collection_wandb_remains_fail_closed(mode):
+    with pytest.raises(WandbPhaseMirrorError, match="restricted"):
+        authorize_collection_wandb(
+            mode=mode,
+            raw_enabled="1",
+            run_id="test-run",
+        )
+
+
+def test_single_window_collection_wandb_remains_authorized():
+    assert authorize_collection_wandb(
+        mode="single-window",
+        raw_enabled="1",
+        run_id="test-run",
+    )
+
+
 def test_launcher_wandb_is_opt_in_owner_only_and_uses_stable_raven_identity():
     launcher = (PROJECT_ROOT / "scripts" / "launch_native_raven.sh").read_text(
         encoding="utf-8"
@@ -146,6 +197,9 @@ def test_launcher_wandb_is_opt_in_owner_only_and_uses_stable_raven_identity():
     assert "--wandb-netrc" in launcher
     assert "W&B netrc must be owned by the invoking user" in launcher
     assert "W&B netrc must be mode 0400 or 0600" in launcher
+    assert '[[ $mode == single-window || $mode == production ]]' in launcher
+    assert "production W&B flag differs from immutable config" in launcher
+    assert "production W&B run name must match run_id" in launcher
     assert "dst=/dagger-runtime/home/.netrc,readonly" in launcher
     assert "DAGGER_COLLECTION_WANDB_ENABLED=\"$wandb_enabled\"" in launcher
     assert "wandb_hydra_args=(\n    use_wandb=true" in launcher

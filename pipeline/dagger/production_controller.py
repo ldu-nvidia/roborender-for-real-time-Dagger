@@ -30,6 +30,12 @@ from pipeline.dagger.services.contracts import CANONICAL_BETA, file_sha256
 CONTROL_GET_ATTEMPTS = 5
 CONTROL_GET_INITIAL_BACKOFF_SECONDS = 1.0
 
+RAVEN_FIDELITY_CONTRACT = {
+    "raytraced_native_augmentation": True,
+    "full_batch_sync_batchnorm": True,
+    "random_initial_episode_lengths": True,
+}
+
 
 def get_with_transport_retry(
     client: ServiceClient,
@@ -94,9 +100,39 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("Raven rollout windows must contain 81 steps")
     if actor.get("transitions_per_iteration") != 28 * 81:
         raise ValueError("transitions_per_iteration must equal 28*81")
+    raven_fidelity = config.get("raven_fidelity")
+    if raven_fidelity is not None and raven_fidelity != RAVEN_FIDELITY_CONTRACT:
+        raise ValueError(
+            "raven_fidelity must either be absent for a legacy continuation or "
+            f"equal {RAVEN_FIDELITY_CONTRACT!r}"
+        )
     validation = config.get("validation", {})
     if validation.get("interval_iterations") != 40:
         raise ValueError("production success validation cadence must be 40 iterations")
+    execution = config.get("execution")
+    expected_execution_keys = {
+        "window_count",
+        "stop_after_actor_barriers",
+        "wait_for_checkpoint_advance",
+        "learner_submission_authorized",
+        "validation_authorized",
+    }
+    total_windows = execution.get("window_count") if isinstance(execution, dict) else None
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != expected_execution_keys
+        or isinstance(total_windows, bool)
+        or not isinstance(total_windows, int)
+        or total_windows < validation["interval_iterations"]
+        or execution.get("stop_after_actor_barriers") is not False
+        or execution.get("wait_for_checkpoint_advance") is not True
+        or execution.get("learner_submission_authorized") is not True
+        or execution.get("validation_authorized") is not True
+    ):
+        raise ValueError(
+            "production execution must authorize learning/validation and request "
+            "an integer window_count at least as large as the validation interval"
+        )
     if validation.get("minimum_validation_epochs") != 10:
         raise ValueError("minimum_validation_epochs must be 10")
     if validation.get("maximum_validation_epochs") != 40:
@@ -193,6 +229,8 @@ class Controller:
         if len(chunk_ids) != len(set(chunk_ids)):
             raise RuntimeError("a learner chunk was admitted by multiple actor barriers")
 
+        raven_exact = self.config.get("raven_fidelity") == RAVEN_FIDELITY_CONTRACT
+        learner_batch = len(self.actor_ids) if raven_exact else 7
         self.learner.post("/v1/jobs", {
             "job_id": (
                 f"{self.run_id}-dagger-{self.round_id}-iteration-{iteration_id:04d}"
@@ -205,7 +243,12 @@ class Controller:
                 "learning_rate": self.config["student"]["learning_rate"],
                 "max_grad_norm": self.config["student"]["max_gradient_norm"],
                 "num_mini_batches": self.config["student"]["mini_batches_per_iteration"],
-                "microbatch_environments": 7,
+                # Preserve Raven's complete local environment batch in every
+                # temporal policy forward. This matters because the ResNet
+                # contains SyncBatchNorm: four B=7 forwards are not equivalent
+                # to B=28 even when their losses form the same global mean.
+                "microbatch_environments": learner_batch,
+                "raven_exact_full_batch": raven_exact,
                 "seed": self.config["seed"],
                 "iteration_id": iteration_id,
                 "deep_validation_samples": 0,
@@ -226,6 +269,8 @@ class Controller:
                     "renderer_worker_count": self.config["h200"][
                         "render_student_worker_count"
                     ],
+                    "raven_exact_raytraced_augmentation": raven_exact,
+                    "raven_random_initial_episode_lengths": raven_exact,
                 },
             },
         })
@@ -286,7 +331,25 @@ class Controller:
         iteration = status["iterations"][-1]
         state = run["status"]
         action = "wait"
-        if state == "ready_for_learning":
+        current_barriers = [
+            barrier
+            for barrier in status["barriers"]
+            if barrier.get("round_id") == self.round_id
+            and barrier.get("iteration_id") == iteration["iteration_id"]
+        ]
+        total_windows = self.config["execution"]["window_count"]
+        if iteration["iteration_id"] > total_windows:
+            if (
+                iteration["iteration_id"] != total_windows + 1
+                or state != "collecting"
+                or current_barriers
+            ):
+                raise RuntimeError(
+                    "coordinator crossed the immutable production window budget "
+                    "in a nonempty or unexpected state"
+                )
+            action = "collection_budget_complete"
+        elif state == "ready_for_learning":
             self._submit_learning(iteration, status)
             action = "learner_submitted"
         elif state == "awaiting_validation":
@@ -296,12 +359,6 @@ class Controller:
             action = "validation_finalized"
         elif state in {"learner_failed"}:
             raise RuntimeError(f"production run failed closed: {state}")
-        current_barriers = [
-            barrier
-            for barrier in status["barriers"]
-            if barrier.get("round_id") == self.round_id
-            and barrier.get("iteration_id") == iteration["iteration_id"]
-        ]
         return {
             "run_id": self.run_id,
             "round_id": self.round_id,
@@ -310,6 +367,7 @@ class Controller:
             "action": action,
             "actor_barriers": len(current_barriers),
             "expected_actor_barriers": len(self.actor_ids),
+            "total_windows": total_windows,
         }
 
 
@@ -337,7 +395,11 @@ def main() -> int:
     while True:
         report = controller.tick()
         print(json.dumps(report, sort_keys=True), flush=True)
-        if args.once or report["status"] == "round_complete":
+        if (
+            args.once
+            or report["status"] == "round_complete"
+            or report["action"] == "collection_budget_complete"
+        ):
             return 0
         time.sleep(args.poll_seconds)
 

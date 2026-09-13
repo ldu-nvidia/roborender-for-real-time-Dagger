@@ -79,3 +79,31 @@ action standard deviation; global gradient norm capped at `1.0`.
 The learner receives only the train index. Validation is read exclusively by
 the parameter-free selection loop, and the test index is not referenced by
 the launcher or trainer.
+
+## Resume training
+
+Pass `--resume-checkpoint` to continue in a new immutable output directory.
+Resume strictly restores the policy, AdamW moments, epoch, global step, prior
+validation history, best-checkpoint selection state, and—when available—the
+Python, NumPy, PyTorch CPU/CUDA, and DataLoader-generator RNG states. It rejects
+changed policy specifications, bootstrap provenance, train/validation split
+hashes, or learning rates. `--max-epochs` is the final epoch ceiling, not the
+number of additional epochs.
+
+The original 2026-09-07 checkpoints predate RNG snapshots. They remain safely
+resumable, but their future chunk shuffle cannot be byte-identical to the
+stopped process; the trainer uses and records
+`legacy_deterministic_epoch_seed`. Every checkpoint written by the updated
+trainer contains the complete RNG snapshot and supports exact future resume.
+
+Example chronological continuation from the latest epoch-40 checkpoint through
+at most epoch 100 (use `best_validation.pt` instead only when intentionally
+branching from the selected epoch-36 weights):
+
+```bash
+pipeline/bc_training/train_raven_bc_h200.sh \
+  --resume-checkpoint checkpoints/students/BC/bc_3view_production_20260907/last.pt \
+  --run-name bc_3view_resume_epoch40_to100 \
+  --max-epochs 100 \
+  --wandb-run-name BC-resume-epoch40-to100
+```

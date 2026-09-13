@@ -209,8 +209,9 @@ def test_episode_latch_timeout_and_failure_are_distinct(tmp_path):
 
 
 class FakeEvaluationService:
-    def __init__(self, assignment: FixedPanelAssignment):
+    def __init__(self, assignment: FixedPanelAssignment, *, purpose: str = "validation"):
         self.assignment = assignment
+        self.purpose = purpose
         self.requests: dict[str, dict] = {}
         self.calls = 0
 
@@ -242,7 +243,7 @@ class FakeEvaluationService:
                 "checkpoint_sha256": self.assignment.checkpoint_sha256,
                 "scenario_manifest_sha256": self.assignment.scenario_manifest_sha256,
                 "observation_mode": OBSERVATION_MODE,
-                "purpose": "validation",
+                "purpose": self.purpose,
                 "metric": METRIC,
                 "status": "complete" if completed == 256 else "collecting",
                 "completed": completed,
@@ -364,6 +365,32 @@ def test_exact_256_outcomes_finalize_local_and_remote_summary(tmp_path):
     assert summary["views"] == ["head_color", "hand_left", "hand_right"]
 
 
+def test_standalone_test_purpose_is_accepted_without_changing_assignment_schema(tmp_path):
+    assignment = load_assignment(tmp_path)
+
+    class TestPurposeService(FakeEvaluationService):
+        def get_evaluation(self, evaluation_id):
+            response = super().get_evaluation(evaluation_id)
+            response["evaluation"]["purpose"] = "test"
+            return response
+
+    service = TestPurposeService(assignment)
+    journal = DurableOutcomeJournal(tmp_path / "ledger", assignment)
+    report = journal.verify_remote(service, require_complete=False)
+    assert report["purpose"] == "test"
+    assert "purpose" not in json.loads(assignment.path.read_bytes())
+
+
+def test_standalone_test_evaluation_accepts_test_purpose(tmp_path):
+    assignment = load_assignment(tmp_path)
+    service = FakeEvaluationService(assignment, purpose="test")
+    journal = DurableOutcomeJournal(tmp_path / "ledger", assignment)
+    for case in assignment.episodes:
+        journal.submit(outcome(case, False), service)
+    report = journal.verify_remote(service, require_complete=True)
+    assert report["purpose"] == "test"
+
+
 def test_authenticated_client_sends_bearer_and_canonical_payload(tmp_path):
     token = tmp_path / "token"
     token.write_text("test-secret\n", encoding="utf-8")
@@ -441,7 +468,7 @@ def test_launcher_uses_hydra_append_syntax_for_keys_absent_from_base_eval():
     for override in (
         "+trainer._target_=dagger_rtx.fixed_panel_raven.FixedPanelEvalTrainer",
         "+env._target_=dagger_rtx.fixed_panel_raven.FixedPanelWalkStandPlaceGraspTurnHomie",
-        "+simulator._target_=dagger_rtx.fixed_panel_raven.NormalizedIsaacSim",
+        "+simulator._target_=dagger_rtx.fixed_panel_raven.IsaacSim",
         "+algo.config.init_at_random_ep_len=false",
         "+algo.config.use_dagger=false",
         "+env.config.domain_rand.image_augmentation.enabled=false",

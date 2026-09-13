@@ -135,7 +135,8 @@ class CoordinatorHTTPControl:
             or run.get("rollout_steps") != spec.rollout_steps
             or tuple(run.get("actor_ids", ())) != spec.actor_ids
             or run.get("initial_checkpoint_sha256") != spec.initial_checkpoint_sha256
-            or run.get("validation_interval_iterations") != spec.total_windows
+            or run.get("validation_interval_iterations")
+            != spec.validation_interval_windows
         ):
             raise ProductionDriverError("coordinator run identity diverged")
         return value
@@ -325,7 +326,7 @@ class CoordinatorHTTPControl:
     ) -> WindowAdvanceGate:
         completed_iteration_id = completed_window_index + 1
         validation_boundary = (
-            completed_iteration_id % spec.total_windows == 0
+            completed_iteration_id % spec.validation_interval_windows == 0
         )
         deadline = self._monotonic() + self.wait_timeout_s
         while True:

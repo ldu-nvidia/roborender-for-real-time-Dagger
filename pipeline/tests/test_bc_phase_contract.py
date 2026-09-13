@@ -15,7 +15,12 @@ from bc_collection.materialize_raven_bc_chunks import (
     materialize_environment,
 )
 from bc_training.create_bc_splits import create_splits
-from bc_training.train_bc_h200 import BCChunks, EarlyStopping
+from bc_training.train_bc_h200 import (
+    BCChunks,
+    EarlyStopping,
+    infer_resume_validation_state,
+    load_resume_state,
+)
 from bc_rendering.render_bc_teacher_worker import (
     RAVEN_STUDENT_RESOLUTION,
     VIEW_SLOTS,
@@ -424,6 +429,70 @@ class BcPhaseContractTest(unittest.TestCase):
         self.assertFalse(saturated)
         self.assertEqual(stop.best_epoch, 1)
         self.assertEqual(stop.bad_validations, 0)
+
+    def test_bc_resume_restores_model_optimizer_epoch_and_history(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "prior"
+            source.mkdir()
+            checkpoint_path = source / "best_validation.pt"
+            state_path = source / "validation_state.json"
+            spec = {"policy": "tiny-test"}
+
+            original = torch.nn.Linear(2, 1)
+            optimizer = torch.optim.AdamW(original.parameters(), lr=2e-4, weight_decay=0.0)
+            loss = original(torch.ones(1, 2)).square().mean()
+            loss.backward()
+            optimizer.step()
+            torch.save({
+                "policy_state_dict": original.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": 2,
+                "global_step": 8,
+                "validation_mse": 0.5,
+                "policy_spec": spec,
+                "bootstrap_sha256": "bootstrap",
+                "train_split_sha256": "train",
+                "validation_split_sha256": "validation",
+            }, checkpoint_path)
+            state_path.write_text(json.dumps({"history": [
+                {"epoch": 0, "global_step": 0, "mse": 1.0},
+                {"epoch": 1, "global_step": 4, "mse": 0.8},
+                {"epoch": 2, "global_step": 8, "mse": 0.5},
+                # Must be discarded when resuming an older selected checkpoint.
+                {"epoch": 3, "global_step": 12, "mse": 0.6},
+            ]}))
+
+            restored = torch.nn.Linear(2, 1)
+            restored_optimizer = torch.optim.AdamW(
+                restored.parameters(), lr=2e-4, weight_decay=0.0
+            )
+            generator = torch.Generator().manual_seed(42)
+            stopper = EarlyStopping()
+            checkpoint, history, rng_mode = load_resume_state(
+                checkpoint_path,
+                state_path,
+                policy=restored,
+                optimizer=restored_optimizer,
+                train_generator=generator,
+                spec=spec,
+                bootstrap_sha256="bootstrap",
+                train_split_sha256="train",
+                validation_split_sha256="validation",
+                stopper=stopper,
+                seed=42,
+                expected_learning_rate=2e-4,
+            )
+            self.assertEqual(checkpoint["epoch"], 2)
+            self.assertEqual([record["epoch"] for record in history], [0, 1, 2])
+            self.assertEqual(rng_mode, "legacy_deterministic_epoch_seed")
+            self.assertEqual(stopper.best_epoch, 2)
+            self.assertTrue(restored_optimizer.state)
+            for expected, actual in zip(original.parameters(), restored.parameters()):
+                self.assertTrue(torch.equal(expected, actual))
+            self.assertEqual(infer_resume_validation_state(checkpoint_path), state_path)
 
 
 if __name__ == "__main__":

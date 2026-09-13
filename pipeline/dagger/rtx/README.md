@@ -77,7 +77,8 @@ The active wrapper delegates to the pinned Raven checkout rather than
 reimplementing its scientific logic:
 
 - `get_conditioning_views` for synchronized depth and robot RGB;
-- `get_policy_view_stack` for ray-traced policy observations;
+- current `obs_dict["vision_obs"]` for Raven-augmented ray-traced policy
+  observations (the raw camera is not reread after Raven has augmented it);
 - `_h5v4_control` for Image3F depth controls;
 - `policy_step` for the privileged 11-D teacher plus 15-D Homie tail; and
 - Raven's vector `env.step(actor_state)` for the irreversible transition.
@@ -87,7 +88,7 @@ Those paths are deployment bindings, not source-tree locations. Missing or
 changed origins fail before Isaac is initialized.
 
 The policy view order is `head_color`, `hand_left`, `hand_right`. Ray-traced
-tiles are Raven-native float32 `[0,1]` arrays at 108×192. Generated episodes
+tiles are Raven-native augmented float32 `[0,1]` arrays at 108×192. Generated episodes
 send 240×416 `h5_v4` depth and textured robot-on-black controls; H200 combines
 them with a fixed three-view episode anchor.
 
@@ -107,6 +108,9 @@ rtx/
 ├── pyproject.toml
 └── uv.lock
 ```
+
+`config/raven_fidelity.v1.fragment.json` contains the exact all-or-nothing
+fidelity object required in every fresh production run config.
 
 Generated `runtime/`, `logs/`, `staging/`, credentials, and local configs are
 ignored.
@@ -144,7 +148,10 @@ pipeline/dagger/rtx/scripts/launch_native_raven.sh \
 Stepping modes require explicit acknowledgement strings. Run the launcher with
 no arguments to see the complete syntax. Production additionally requires an
 immutable config beneath `rtx/config/`, its SHA-256, exact live gateway PIDs,
-the pinned physical GPU1 UUID, and the external token file. GPU0 is rejected.
+the pinned physical GPU1 UUID, the external token file, and the complete
+three-key `raven_fidelity` object documented in the parent README. GPU0 is
+rejected. The fidelity gate also enables Raven's randomized initial episode
+and staged-task clocks before the first environment step.
 
 ## Validation evidence
 

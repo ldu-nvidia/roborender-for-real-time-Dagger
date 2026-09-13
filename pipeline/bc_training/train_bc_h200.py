@@ -195,6 +195,7 @@ def save_checkpoint(
     mse: float,
     per_action_mse: list[float],
     metadata: dict,
+    train_generator: torch.Generator,
 ) -> None:
     payload = {
         "policy_state_dict": policy.state_dict(),
@@ -203,6 +204,13 @@ def save_checkpoint(
         "global_step": global_step,
         "validation_mse": mse,
         "validation_per_action_mse": per_action_mse,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all(),
+            "train_generator": train_generator.get_state(),
+        },
         **metadata,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -229,6 +237,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-split", type=Path, default=root / "data/BC/splits/validation.json")
     parser.add_argument("--bootstrap", type=Path, default=root / "checkpoints/students/bootstrap/g1_3view_student_bootstrap_v1.pt")
     parser.add_argument("--policy-spec", type=Path, default=root / "checkpoints/students/bootstrap/g1_3view_student_bootstrap_v1.policy_spec.json")
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Resume model, AdamW, epoch, and global step from a BC checkpoint.",
+    )
+    parser.add_argument(
+        "--resume-validation-state",
+        type=Path,
+        default=None,
+        help="Prior validation_state.json; inferred from --resume-checkpoint when omitted.",
+    )
     parser.add_argument("--output-root", type=Path, default=root / "checkpoints/students/BC")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--chunk-batch-size", type=int, default=4)
@@ -246,6 +266,100 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-group", default="BC")
     parser.add_argument("--wandb-run-name", default="BC")
     return parser.parse_args()
+
+
+def infer_resume_validation_state(checkpoint: Path) -> Path:
+    """Locate the immutable run state associated with a BC checkpoint."""
+    if checkpoint.parent.name == "validation_checkpoints":
+        return checkpoint.parent.parent / "validation_state.json"
+    return checkpoint.parent / "validation_state.json"
+
+
+def load_resume_state(
+    checkpoint_path: Path,
+    validation_state_path: Path,
+    *,
+    policy,
+    optimizer,
+    train_generator: torch.Generator,
+    spec: dict,
+    bootstrap_sha256: str,
+    train_split_sha256: str,
+    validation_split_sha256: str,
+    stopper: EarlyStopping,
+    seed: int,
+    expected_learning_rate: float,
+) -> tuple[dict, list[dict], str]:
+    """Strictly restore a prior BC optimizer/checkpoint and selection history."""
+    checkpoint_path = checkpoint_path.resolve()
+    validation_state_path = validation_state_path.resolve()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    required = {
+        "policy_state_dict", "optimizer_state_dict", "epoch", "global_step",
+        "validation_mse", "policy_spec", "bootstrap_sha256",
+        "train_split_sha256", "validation_split_sha256",
+    }
+    missing = sorted(required - checkpoint.keys())
+    if missing:
+        raise ValueError(f"resume checkpoint is missing fields: {missing}")
+    expected = {
+        "bootstrap_sha256": bootstrap_sha256,
+        "train_split_sha256": train_split_sha256,
+        "validation_split_sha256": validation_split_sha256,
+    }
+    for key, value in expected.items():
+        if checkpoint[key] != value:
+            raise ValueError(f"resume checkpoint {key} does not match this run")
+    if checkpoint["policy_spec"] != spec:
+        raise ValueError("resume checkpoint policy specification does not match")
+    epoch = int(checkpoint["epoch"])
+    global_step = int(checkpoint["global_step"])
+    if epoch < 0 or global_step < 0:
+        raise ValueError("resume checkpoint has invalid epoch/global_step")
+    policy.load_state_dict(checkpoint["policy_state_dict"], strict=True)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    restored_rates = {float(group["lr"]) for group in optimizer.param_groups}
+    if restored_rates != {float(expected_learning_rate)}:
+        raise ValueError(
+            "resume optimizer learning rate disagrees with --learning-rate: "
+            f"checkpoint={sorted(restored_rates)} requested={expected_learning_rate}"
+        )
+
+    state = json.loads(validation_state_path.read_text())
+    source_history = state.get("history")
+    if not isinstance(source_history, list) or not source_history:
+        raise ValueError("resume validation state has no history")
+    history = [record for record in source_history if int(record["epoch"]) <= epoch]
+    if not history or int(history[-1]["epoch"]) != epoch:
+        raise ValueError("resume validation history does not contain checkpoint epoch")
+    if int(history[-1]["global_step"]) != global_step:
+        raise ValueError("resume checkpoint global step disagrees with validation history")
+    if not math.isclose(
+        float(history[-1]["mse"]), float(checkpoint["validation_mse"]),
+        rel_tol=1e-7, abs_tol=1e-9,
+    ):
+        raise ValueError("resume checkpoint MSE disagrees with validation history")
+    for record in history:
+        stopper.update(int(record["epoch"]), float(record["mse"]))
+
+    rng = checkpoint.get("rng_state")
+    if rng is None:
+        # Legacy checkpoints predate resumable RNG snapshots. This is deterministic,
+        # but cannot reproduce the exact future shuffle of the interrupted process.
+        random.seed(seed + epoch)
+        np.random.seed(seed + epoch)
+        torch.manual_seed(seed + epoch)
+        torch.cuda.manual_seed_all(seed + epoch)
+        train_generator.manual_seed(seed + epoch)
+        rng_mode = "legacy_deterministic_epoch_seed"
+    else:
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch_cpu"])
+        torch.cuda.set_rng_state_all(rng["torch_cuda"])
+        train_generator.set_state(rng["train_generator"])
+        rng_mode = "exact_checkpoint_restore"
+    return checkpoint, history, rng_mode
 
 
 def main() -> None:
@@ -299,6 +413,50 @@ def main() -> None:
     )
     trainable = [parameter for parameter in policy.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=0.0)
+    stopper = EarlyStopping(
+        min_epochs=args.min_epochs,
+        patience=args.patience,
+        relative_improvement=args.relative_improvement,
+    )
+    history: list[dict] = []
+    start_epoch = 0
+    global_step = 0
+    resume_checkpoint = None
+    resume_rng_mode = "fresh_run"
+    resume_checkpoint_sha256 = None
+    resume_state_path = None
+    if args.resume_checkpoint is not None:
+        resume_path = args.resume_checkpoint.resolve()
+        resume_state_path = (
+            args.resume_validation_state.resolve()
+            if args.resume_validation_state is not None
+            else infer_resume_validation_state(resume_path).resolve()
+        )
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume checkpoint is missing: {resume_path}")
+        if not resume_state_path.is_file():
+            raise FileNotFoundError(f"resume validation state is missing: {resume_state_path}")
+        resume_checkpoint, history, resume_rng_mode = load_resume_state(
+            resume_path,
+            resume_state_path,
+            policy=policy,
+            optimizer=optimizer,
+            train_generator=generator,
+            spec=spec,
+            bootstrap_sha256=sha256_file(args.bootstrap.resolve()),
+            train_split_sha256=sha256_file(args.train_split.resolve()),
+            validation_split_sha256=sha256_file(args.validation_split.resolve()),
+            stopper=stopper,
+            seed=args.seed,
+            expected_learning_rate=args.learning_rate,
+        )
+        start_epoch = int(resume_checkpoint["epoch"])
+        global_step = int(resume_checkpoint["global_step"])
+        resume_checkpoint_sha256 = sha256_file(resume_path)
+        if args.max_epochs <= start_epoch:
+            raise ValueError(
+                f"--max-epochs ({args.max_epochs}) must exceed resumed epoch ({start_epoch})"
+            )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_name = args.run_name or f"bc_3view_{timestamp}"
@@ -316,6 +474,14 @@ def main() -> None:
         "validation_split": str(args.validation_split.resolve()),
         "validation_split_sha256": sha256_file(args.validation_split.resolve()),
         "selection": "minimum complete-validation MSE",
+        "resume": {
+            "checkpoint": str(args.resume_checkpoint.resolve()) if args.resume_checkpoint else None,
+            "checkpoint_sha256": resume_checkpoint_sha256,
+            "validation_state": str(resume_state_path) if resume_state_path else None,
+            "start_epoch": start_epoch,
+            "start_global_step": global_step,
+            "rng_restore_mode": resume_rng_mode,
+        },
     }
     config = {**vars(args), "output": output, "device": torch.cuda.get_device_name(0)}
     atomic_json(output / "run_config.json", {key: str(value) if isinstance(value, Path) else value for key, value in config.items()})
@@ -336,49 +502,70 @@ def main() -> None:
         wandb.define_metric("train/*", step_metric="global_step")
         wandb.define_metric("validation/*", step_metric="epoch")
 
-    stopper = EarlyStopping(
-        min_epochs=args.min_epochs,
-        patience=args.patience,
-        relative_improvement=args.relative_improvement,
-    )
-    history: list[dict] = []
-    global_step = 0
     started = time.time()
     initial_mse, initial_per_action = validate(policy, validation_loader, device, mean, std, action_dim)
-    stopper.update(0, initial_mse)
-    initial_checkpoint = validation_checkpoints / "epoch_0000_step_000000.pt"
-    initial = {
-        "epoch": 0,
-        "global_step": 0,
-        "mse": initial_mse,
-        "per_action_mse": initial_per_action,
-        "improved": True,
-        "checkpoint": str(initial_checkpoint),
-    }
-    history.append(initial)
-    save_checkpoint(
-        initial_checkpoint, policy, optimizer, 0, 0, initial_mse, initial_per_action, metadata
+    if resume_checkpoint is None:
+        stopper.update(0, initial_mse)
+    elif not math.isclose(
+        initial_mse, float(resume_checkpoint["validation_mse"]),
+        rel_tol=1e-5, abs_tol=1e-7,
+    ):
+        raise RuntimeError(
+            "resumed policy validation MSE does not reproduce its checkpoint: "
+            f"stored={resume_checkpoint['validation_mse']} observed={initial_mse}"
+        )
+    initial_checkpoint = validation_checkpoints / (
+        f"epoch_{start_epoch:04d}_step_{global_step:06d}.pt"
     )
-    update_checkpoint_alias(initial_checkpoint, output / "best_validation.pt")
+    if resume_checkpoint is None:
+        history.append({
+            "epoch": 0,
+            "global_step": 0,
+            "mse": initial_mse,
+            "per_action_mse": initial_per_action,
+            "improved": True,
+            "checkpoint": str(initial_checkpoint),
+        })
+    save_checkpoint(
+        initial_checkpoint, policy, optimizer, start_epoch, global_step,
+        initial_mse, initial_per_action, metadata, generator,
+    )
+    if stopper.best_epoch == start_epoch:
+        update_checkpoint_alias(initial_checkpoint, output / "best_validation.pt")
+    else:
+        best_record = next(
+            record for record in history if int(record["epoch"]) == stopper.best_epoch
+        )
+        source_best = Path(best_record["checkpoint"]).resolve()
+        if not source_best.is_file():
+            raise FileNotFoundError(f"prior best validation checkpoint is missing: {source_best}")
+        imported_best = validation_checkpoints / source_best.name
+        update_checkpoint_alias(source_best, imported_best)
+        update_checkpoint_alias(imported_best, output / "best_validation.pt")
     update_checkpoint_alias(initial_checkpoint, output / "last.pt")
     if wandb_run is not None:
         baseline_metrics = {
-            "epoch": 0,
-            "global_step": 0,
+            "epoch": start_epoch,
+            "global_step": global_step,
             "validation/mse": initial_mse,
-            "validation/best_mse": initial_mse,
-            "validation/bad_checks": 0,
-            "validation/improved": 1,
+            "validation/best_mse": stopper.best_mse,
+            "validation/bad_checks": stopper.bad_validations,
+            "validation/improved": int(stopper.best_epoch == start_epoch),
             "validation/saturated": 0,
+            "validation/resumed": int(resume_checkpoint is not None),
         }
         baseline_metrics.update(
             {f"validation/mse_action_{index:02d}": value for index, value in enumerate(initial_per_action)}
         )
         wandb_run.log(baseline_metrics)
-    print(f"validation epoch=0 mse={initial_mse:.8f}", flush=True)
+    print(
+        f"validation epoch={start_epoch} mse={initial_mse:.8f} "
+        f"resume={resume_checkpoint is not None} rng={resume_rng_mode}",
+        flush=True,
+    )
 
     stop_reason = "max_epochs"
-    for epoch in range(1, args.max_epochs + 1):
+    for epoch in range(start_epoch + 1, args.max_epochs + 1):
         policy.train()
         total_squared = 0.0
         total_elements = 0
@@ -425,6 +612,7 @@ def main() -> None:
             validation_mse,
             per_action,
             metadata,
+            generator,
         )
         if improved:
             update_checkpoint_alias(validation_checkpoint, output / "best_validation.pt")

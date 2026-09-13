@@ -30,13 +30,14 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _spec() -> ProductionRunSpec:
+def _spec(*, total_windows: int = 40) -> ProductionRunSpec:
     return ProductionRunSpec(
         run_id=RUN_ID,
         config_sha256=CONFIG_SHA,
         actor_prefix=ACTOR_PREFIX,
         actor_ids=tuple(f"{ACTOR_PREFIX}-lane-{lane:03d}" for lane in range(28)),
         initial_checkpoint_sha256=INITIAL_SHA,
+        total_windows=total_windows,
     )
 
 
@@ -438,7 +439,7 @@ def test_crash_continuation_is_fresh_and_runs_global_windows_one_through_39(tmp_
 
 
 def test_post_validation_segment_preserves_global_iterations_41_through_80(tmp_path):
-    spec = _spec()
+    spec = _spec(total_windows=80)
     candidate = _sha("candidate-40")
     segment = _segment(40, candidate, "post_validation")
     runner = _Runner(spec)
@@ -458,6 +459,52 @@ def test_post_validation_segment_preserves_global_iterations_41_through_80(tmp_p
     assert result["next_window_index"] == 80
     assert result["current_iteration_id"] == 80
     assert len(result["completed_windows"]) == 40
+
+
+def test_50_window_budget_stops_first_segment_at_validation_then_runs_41_through_50(
+    tmp_path,
+):
+    spec = _spec(total_windows=50)
+
+    first_runner = _Runner(spec)
+    first_result = ProductionMultiWindowDriver(
+        first_runner,
+        _Control(spec),
+        tmp_path / "segment-1",
+        spec,
+        process_instance_id="fifty-window-first-segment",
+    ).run()
+    assert first_runner.calls == list(range(40))
+    assert first_result["next_window_index"] == 40
+    assert first_result["current_iteration_id"] == 40
+
+    checkpoint_40 = _sha("candidate-40")
+    segment = _segment(40, checkpoint_40, "post_validation")
+    second_runner = _Runner(spec)
+    second_control = _Control(spec)
+    second_result = ProductionMultiWindowDriver(
+        second_runner,
+        second_control,
+        tmp_path / "segment-2",
+        spec,
+        continuation=segment,
+        process_instance_id="fifty-window-second-segment",
+    ).run()
+
+    assert second_runner.calls == list(range(40, 50))
+    assert second_control.barrier_calls[0][0] == 40
+    assert second_control.barrier_calls[-1][0] == 49
+    assert second_control.advance_calls[-1][0] == 49
+    assert second_result["end_window_index_exclusive"] == 50
+    assert second_result["next_window_index"] == 50
+    assert second_result["current_iteration_id"] == 51
+    assert len(second_result["completed_windows"]) == 10
+
+
+@pytest.mark.parametrize("invalid_total", [0, 39, True])
+def test_production_spec_rejects_budget_below_validation_interval(invalid_total):
+    with pytest.raises(ValueError, match="total_windows"):
+        _spec(total_windows=invalid_total)
 
 
 def test_production_spec_rejects_any_actor_or_gpu_substitution():
@@ -504,3 +551,4 @@ def test_generic_launcher_has_no_historical_one_run_identity_constants():
         assert "36138c34d68378b26265a9ff1f0e854ca1f6bc4c4bb5e582a2a7a9301f9fea33" not in source
         assert "tuple(range(18720, 18728))" not in source
         assert "production_config.get(\"seed\") != 4242" not in source
+        assert "I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_WINDOW_BUDGET" in source

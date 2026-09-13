@@ -50,6 +50,7 @@ PRODUCTION_WIRE_CONTRACTS = frozenset(
     }
 )
 PRODUCTION_WINDOW_COUNT = 40
+PRODUCTION_VALIDATION_INTERVAL = 40
 PRODUCTION_BATCH_SIZE = 28
 PRODUCTION_ROUND_ID = 1
 PRODUCTION_BETA = 0.75
@@ -195,6 +196,9 @@ class ProductionContinuationSegment:
     RNG state.  It explicitly records that those states start fresh while the
     H200 run, iteration, checkpoint, actor routes, and global window numbering
     continue.  Each segment stops at the next 40-update validation boundary.
+    The driver additionally clamps that boundary to the immutable run budget,
+    so a post-validation continuation for a 50-window run covers only windows
+    40..49 rather than silently extending to window 79.
     """
 
     segment_id: str
@@ -316,7 +320,7 @@ class ProductionContinuationSegment:
 
     @property
     def end_global_window_exclusive(self) -> int:
-        interval = PRODUCTION_WINDOW_COUNT
+        interval = PRODUCTION_VALIDATION_INTERVAL
         return ((self.start_global_window // interval) + 1) * interval
 
     def as_dict(self) -> dict[str, Any]:
@@ -420,6 +424,109 @@ def _read_regular_file(path: Path, label: str) -> bytes:
         raise ProductionRestartUnsafe(f"could not read {label}: {path}") from exc
 
 
+def _is_late_checkpoint_advance_predecessor(
+    state: Mapping[str, Any],
+    segment: ProductionContinuationSegment,
+) -> bool:
+    """Recognize one fully sealed window whose remote learner recovered later.
+
+    The persistent owner normally advances ``next_window_index`` only after
+    ``wait_for_window_advance`` returns.  If H200 reports ``learner_failed`` at
+    that point, the local state truthfully remains one cursor behind even
+    though every transition, final commit, compact seal, and actor barrier is
+    already durable.  H200 may subsequently repair and retry that *same*
+    learner job without replaying Isaac.  A fresh simulator continuation is
+    safe only for this exact checkpoint-boundary shape; all mid-window and
+    partially sealed states continue to fail closed.
+
+    The continuation's separately hash-bound zero-activity evidence and live
+    coordinator attestation prove that the next iteration is empty and bound
+    to ``expected_checkpoint_sha256``.  This predicate proves the local half:
+    the preceding window was complete before the remote-only failure.
+    """
+
+    start = segment.start_global_window
+    previous_window = start - 1
+    spec = state.get("spec")
+    pending_window = state.get("pending_window")
+    pending_barriers = state.get("pending_barriers")
+    completed = state.get("completed_windows")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (spec, pending_window, pending_barriers)
+    ) or not isinstance(completed, list):
+        return False
+    actor_ids = spec.get("actor_ids")
+    if not isinstance(actor_ids, list) or len(actor_ids) != PRODUCTION_BATCH_SIZE:
+        return False
+    if len(set(actor_ids)) != PRODUCTION_BATCH_SIZE or any(
+        not isinstance(actor_id, str) for actor_id in actor_ids
+    ):
+        return False
+    state_start = state.get("start_window_index")
+    if (
+        isinstance(state_start, bool)
+        or not isinstance(state_start, int)
+        or state_start < 0
+        or state_start > previous_window
+    ):
+        return False
+    completed_count = previous_window - state_start
+    if len(completed) != completed_count or any(
+        not isinstance(row, Mapping)
+        or row.get("window_index") != state_start + offset
+        for offset, row in enumerate(completed)
+    ):
+        return False
+
+    rollout_window_id = f"window-{previous_window:06d}"
+    input_checkpoint = state.get("current_input_checkpoint_sha256")
+    seals = pending_window.get("seal_sha256")
+    expected_chunks = [
+        f"d{PRODUCTION_ROUND_ID}-{actor_id}-{rollout_window_id}"
+        for actor_id in actor_ids
+    ]
+    return (
+        state.get("phase") == "CRASH_UNCERTAIN"
+        and state.get("next_window_index") == previous_window
+        and state.get("current_iteration_id") == start
+        and state.get("running_window_index") == previous_window
+        and state.get("running_rollout_window_id") == rollout_window_id
+        and state.get("window_checkpoint_sha256") == input_checkpoint
+        and state.get("error_type") == "ProductionDriverError"
+        and state.get("error_message") == "H200 learner failed closed"
+        and state.get("uncertain_reason")
+        == (
+            f"checkpoint advance after window {previous_window} raised "
+            "ProductionDriverError; simulator/recurrent/RNG state cannot be "
+            "reconstructed or replayed"
+        )
+        and pending_window.get("window_index") == previous_window
+        and pending_window.get("rollout_window_id") == rollout_window_id
+        and pending_window.get("transition_batches") == CHUNK_LENGTH
+        and pending_window.get("physical_transition_rows")
+        == CHUNK_LENGTH * PRODUCTION_BATCH_SIZE
+        and pending_window.get("sealed_lane_count") == PRODUCTION_BATCH_SIZE
+        and pending_window.get("remote_acknowledgement_count")
+        == PRODUCTION_BATCH_SIZE
+        and isinstance(seals, list)
+        and len(seals) == PRODUCTION_BATCH_SIZE
+        and all(
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest)
+            for digest in seals
+        )
+        and pending_barriers.get("iteration_id") == start
+        and pending_barriers.get("checkpoint_sha256") == input_checkpoint
+        and pending_barriers.get("actor_ids") == actor_ids
+        and pending_barriers.get("chunk_ids") == expected_chunks
+        and pending_barriers.get("arrived") == PRODUCTION_BATCH_SIZE
+        and pending_barriers.get("expected") == PRODUCTION_BATCH_SIZE
+        and pending_barriers.get("ready_for_learning") is True
+    )
+
+
 def verify_predecessor_state_file(
     segment: ProductionContinuationSegment,
     supplied_path: Path,
@@ -445,12 +552,16 @@ def verify_predecessor_state_file(
     except json.JSONDecodeError as exc:
         raise ProductionRestartUnsafe("predecessor production state is invalid JSON") from exc
     spec = state.get("spec")
+    cursor_matches = state.get("next_window_index") == segment.start_global_window
+    late_checkpoint_advance = _is_late_checkpoint_advance_predecessor(
+        state, segment
+    )
     if (
         state.get("schema") != PRODUCTION_STATE_SCHEMA
         or not isinstance(spec, Mapping)
         or spec.get("run_id") != segment.run_id
         or spec.get("config_sha256") != segment.config_sha256
-        or state.get("next_window_index") != segment.start_global_window
+        or (not cursor_matches and not late_checkpoint_advance)
     ):
         raise ProductionRestartUnsafe("predecessor production state identity mismatch")
     expected_phases = (
@@ -600,9 +711,35 @@ def verify_episode_namespace_capacity(
         )
 
 
+def resolve_production_simulator_seed(
+    configured_seed: Any,
+    launched_seed: Any,
+    continuation: ProductionContinuationSegment | None,
+    window_index: int,
+) -> int:
+    """Bind a native segment to either the run seed or its fresh continuation seed."""
+
+    for value, name in (
+        (configured_seed, "configured simulator seed"),
+        (launched_seed, "launched simulator seed"),
+        (window_index, "window index"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ContractError(f"{name} must be a non-negative integer")
+    if continuation is None:
+        if window_index != 0 or launched_seed != configured_seed:
+            raise ContractError("initial production simulator seed mismatch")
+        return configured_seed
+    if continuation.start_global_window != window_index:
+        raise ContractError("continuation simulator seed window mismatch")
+    if launched_seed != continuation.simulator_seed:
+        raise ContractError("continuation simulator seed mismatch")
+    return continuation.simulator_seed
+
+
 @dataclass(frozen=True)
 class ProductionRunSpec:
-    """Immutable identity and cardinality of one 40-update production run."""
+    """Immutable identity and cardinality of one production training budget."""
 
     run_id: str
     config_sha256: str
@@ -626,8 +763,15 @@ class ProductionRunSpec:
             raise ContractError("production is frozen to round_id=1 and beta=0.75")
         if self.num_envs != PRODUCTION_BATCH_SIZE:
             raise ContractError("production is frozen to exactly B=28")
-        if self.total_windows != PRODUCTION_WINDOW_COUNT:
-            raise ContractError("production is frozen to exactly 40 rollout windows")
+        if (
+            isinstance(self.total_windows, bool)
+            or not isinstance(self.total_windows, int)
+            or self.total_windows < PRODUCTION_VALIDATION_INTERVAL
+        ):
+            raise ContractError(
+                "production total_windows must be an integer at least as large "
+                "as the 40-iteration validation interval"
+            )
         if self.rollout_steps != CHUNK_LENGTH:
             raise ContractError("each production window must contain exactly 81 steps")
         if self.wire_contract_version not in PRODUCTION_WIRE_CONTRACTS:
@@ -661,6 +805,12 @@ class ProductionRunSpec:
     @property
     def digest(self) -> str:
         return sha256_bytes(canonical_json(self.as_dict()))
+
+    @property
+    def validation_interval_windows(self) -> int:
+        """Canonical Raven fixed-panel cadence, independent of run budget."""
+
+        return PRODUCTION_VALIDATION_INTERVAL
 
 
 @dataclass(frozen=True)
@@ -753,7 +903,7 @@ class ProductionControl(Protocol):
 
 
 class ProductionMultiWindowDriver:
-    """Run exactly 40 sequential Raven windows in one initialized process."""
+    """Run one persistent Raven segment to validation or budget boundary."""
 
     def __init__(
         self,
@@ -790,10 +940,14 @@ class ProductionMultiWindowDriver:
             continuation.start_global_window if continuation is not None else 0
         )
         self.end_window_index_exclusive = (
-            continuation.end_global_window_exclusive
+            min(continuation.end_global_window_exclusive, spec.total_windows)
             if continuation is not None
-            else PRODUCTION_WINDOW_COUNT
+            else min(spec.validation_interval_windows, spec.total_windows)
         )
+        if self.start_window_index >= self.end_window_index_exclusive:
+            raise ContractError(
+                "production segment starts at or beyond the immutable window budget"
+            )
         self.clock_ns = clock_ns
         self.process_instance_id = process_instance_id or (
             f"pid-{os.getpid()}-{uuid.uuid4().hex}"
@@ -974,11 +1128,27 @@ class ProductionMultiWindowDriver:
         if not isinstance(gate, WindowAdvanceGate):
             raise ProductionDriverError("control returned an invalid advance gate type")
         expected_completed_iteration = completed_window_index + 1
-        final_window = (
-            completed_window_index + 1 == self.end_window_index_exclusive
+        final_window = completed_window_index + 1 == self.end_window_index_exclusive
+        validation_boundary = (
+            expected_completed_iteration % self.spec.validation_interval_windows == 0
         )
-        expected_next_iteration = None if final_window else expected_completed_iteration + 1
-        valid_statuses = {"awaiting_validation", "validating"} if final_window else {"collecting"}
+        budget_boundary = expected_completed_iteration == self.spec.total_windows
+        if final_window and validation_boundary:
+            expected_next_iteration = None
+            valid_statuses = {"awaiting_validation", "validating"}
+        elif final_window and budget_boundary:
+            # The learner has advanced the exact final requested window.  The
+            # coordinator may expose an empty next collecting iteration, but
+            # this immutable RTX owner must not prepare it.
+            expected_next_iteration = expected_completed_iteration + 1
+            valid_statuses = {"collecting"}
+        elif final_window:
+            raise ProductionDriverError(
+                "production segment endpoint is neither validation nor budget"
+            )
+        else:
+            expected_next_iteration = expected_completed_iteration + 1
+            valid_statuses = {"collecting"}
         if (
             gate.run_id != self.spec.run_id
             or gate.config_sha256 != self.spec.config_sha256
@@ -1082,9 +1252,10 @@ class ProductionMultiWindowDriver:
         lifecycle_started = False
         primary_exc: BaseException | None = None
         try:
-            # One recurrent/history lifecycle spans all 3,240 vector steps.
-            # Episode resets still flow through Raven's _process_env_step; an
-            # 81-step boundary never resets Isaac, cameras, model state, or RNG.
+            # One recurrent/history lifecycle spans this segment only.  At a
+            # validation boundary Isaac closes so the fixed-panel evaluator can
+            # own GPU1; an attested fresh segment resumes afterward. Episode
+            # resets still flow through Raven's _process_env_step.
             lifecycle_started = True
             self.runner.lifecycle.begin()
             self._transition("READY", rollout_lifecycle_initialization_count=1)
@@ -1199,13 +1370,15 @@ class ProductionMultiWindowDriver:
                     }
                 )
                 final_window = window_index + 1 == self.end_window_index_exclusive
-                if not final_window:
+                if not final_window or gate.next_iteration_id is not None:
                     active_checkpoint = output_checkpoint
                 self._transition(
                     "COMPLETE" if final_window else "READY",
                     next_window_index=window_index + 1,
                     current_iteration_id=(
-                        gate.completed_iteration_id if final_window else gate.next_iteration_id
+                        gate.next_iteration_id
+                        if gate.next_iteration_id is not None
+                        else gate.completed_iteration_id
                     ),
                     current_input_checkpoint_sha256=active_checkpoint,
                     final_candidate_checkpoint_sha256=(
@@ -1231,8 +1404,6 @@ class ProductionMultiWindowDriver:
                     if primary_exc is None:
                         self._fail_closed("persistent rollout lifecycle cleanup", finish_exc)
                         raise
-                    # Preserve the primary fail-closed cause without silently
-                    # discarding the secondary cleanup failure.
                     self.state["cleanup_error_type"] = type(finish_exc).__name__
                     self.state["cleanup_error_message"] = str(finish_exc)[:512]
                     self.state["updated_time_ns"] = int(self.clock_ns())

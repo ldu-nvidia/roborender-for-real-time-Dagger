@@ -131,16 +131,21 @@ def backward_global_mse_in_environment_microbatches(
     target: torch.Tensor,
     *,
     microbatch_environments: int,
+    full_environment_batch_per_timestep: bool = False,
 ) -> float:
     """Backpropagate one whole-window MSE without materializing one giant CNN graph.
 
     A Raven rollout tensor is environment-major: ``[B, T, ...]``.  The policy
     internally flattens ``B*T`` images before its CNN, so a B=28, T=81 window
     otherwise asks cuDNN to process 2,268 tall three-view frames in one call.
-    Splitting only the environment dimension bounds that working set.  Every
-    microbatch's squared-error *sum* is divided by the element count of the
-    complete window before backward, so all microbatches together produce one
-    global-mean MSE gradient and exactly one later optimizer step.
+    The three-view policy makes a single B*T ResNet call unsafe at B=28,T=81:
+    an early ResNet activation exceeds the CUDA pooling kernel's 32-bit index
+    range.  Raven-fidelity mode therefore preserves the complete environment
+    batch seen by SyncBatchNorm (B=28) and iterates over time.  Each timestep's
+    squared-error sum is divided by the element count of the complete window,
+    so the 81 backwards still produce one global-mean MSE gradient and exactly
+    one later optimizer step.  Legacy mode continues to split only the
+    environment dimension.
     """
     if vision.ndim != 5 or actor.ndim != 3 or target.ndim != 3:
         raise ValueError("learner tensors must be environment-major [B,T,...]")
@@ -153,6 +158,31 @@ def backward_global_mse_in_environment_microbatches(
     if total_elements < 1:
         raise ValueError("empty learner target")
     squared_error_sum = torch.zeros((), device=target.device, dtype=torch.float64)
+    if full_environment_batch_per_timestep:
+        if microbatch_environments != target.shape[0]:
+            raise ValueError(
+                "full-environment timestep batching requires the complete "
+                "environment batch"
+            )
+        for time_index in range(target.shape[1]):
+            prediction = policy({
+                # Preserve Raven's explicit sequence axis. VisionActorObjPred
+                # expects state and vision tensors to have matching ranks, while
+                # a length-one slice still limits the CNN batch to B images.
+                "vision_obs": vision[:, time_index : time_index + 1],
+                "actor_obs": actor[:, time_index : time_index + 1],
+            })["actions"]
+            timestep_target = target[:, time_index : time_index + 1]
+            micro_sum = torch.nn.functional.mse_loss(
+                prediction, timestep_target, reduction="sum"
+            )
+            if not bool(torch.isfinite(micro_sum)):
+                raise RuntimeError("non-finite DAgger training loss")
+            (micro_sum / total_elements).backward()
+            squared_error_sum += micro_sum.detach().to(torch.float64)
+            del prediction, timestep_target, micro_sum
+        return float((squared_error_sum / total_elements).item())
+
     for start in range(0, target.shape[0], microbatch_environments):
         stop = min(start + microbatch_environments, target.shape[0])
         prediction = policy({
@@ -252,6 +282,7 @@ def main() -> None:
         "iteration_id", "wandb_mode", "wandb_project", "wandb_group", "wandb_run_name",
         "wandb_run_id", "wandb_resume", "wandb_extra_config",
         "deep_validation_samples", "microbatch_environments",
+        "raven_exact_full_batch",
     }
     unknown = set(parameters) - allowed
     if unknown:
@@ -265,10 +296,11 @@ def main() -> None:
     # receipts.  Production should not rescan large immutable chunks before
     # each one-step update.
     deep_validation_samples = int(parameters.get("deep_validation_samples", 0))
-    # B=28 is four environment microbatches of seven.  This mirrors Raven's
-    # four-way environment minibatch sizing for the same actor while retaining
-    # this service contract's single whole-window optimizer update.
+    # Legacy runs used B=7 gradient accumulation. Raven-fidelity runs pass
+    # B=28 so every temporal forward shares the complete environment batch's
+    # SyncBatchNorm statistics while avoiding an unsafe B*T three-view CNN call.
     microbatch_environments = int(parameters.get("microbatch_environments", 7))
+    raven_exact_full_batch = parameters.get("raven_exact_full_batch", False)
     if learning_rate <= 0 or max_grad_norm <= 0 or num_mini_batches != 1:
         raise ValueError("Raven DAgger requires positive LR/clip and num_mini_batches=1")
     if iteration_id < 1:
@@ -277,6 +309,8 @@ def main() -> None:
         raise ValueError("deep_validation_samples must be non-negative")
     if microbatch_environments < 1:
         raise ValueError("microbatch_environments must be positive")
+    if type(raven_exact_full_batch) is not bool:
+        raise ValueError("raven_exact_full_batch must be boolean")
     wandb_extra_config = parameters.get("wandb_extra_config", {})
     if not isinstance(wandb_extra_config, dict):
         raise ValueError("wandb_extra_config must be an object")
@@ -287,6 +321,8 @@ def main() -> None:
         "image3f_adapter_sha256", "image3f_engine_sha256",
         "student_action_probability", "teacher_action_probability",
         "renderer_worker_count",
+        "raven_exact_full_batch", "raven_exact_raytraced_augmentation",
+        "raven_random_initial_episode_lengths",
     }
     unknown_wandb_extra = set(wandb_extra_config) - allowed_wandb_extra
     if unknown_wandb_extra:
@@ -332,6 +368,12 @@ def main() -> None:
             deep_validation_samples=deep_validation_samples, sample_seed=f"{seed}:train",
         )
         train_vision, train_actor, train_target = load_batch(train_paths, device, spec)
+        if raven_exact_full_batch and microbatch_environments != train_vision.shape[0]:
+            raise ValueError(
+                "Raven-fidelity learner requires the full environment batch per timestep: "
+                f"microbatch_environments={microbatch_environments}, "
+                f"batch={train_vision.shape[0]}"
+            )
         load_timing["train_frames"] = len(train_paths) * 81
 
     checkpoint_root = args.result.parent / "candidate_checkpoints"
@@ -360,6 +402,7 @@ def main() -> None:
             "max_grad_norm": max_grad_norm,
             "num_mini_batches": num_mini_batches,
             "microbatch_environments": microbatch_environments,
+            "raven_exact_full_batch": raven_exact_full_batch,
             "deep_validation_samples": deep_validation_samples,
             "seed": seed,
             "iteration_id": iteration_id,
@@ -398,6 +441,7 @@ def main() -> None:
                 train_actor,
                 train_target,
                 microbatch_environments=microbatch_environments,
+                full_environment_batch_per_timestep=raven_exact_full_batch,
             )
             finite_gradients = True
             nonzero_gradients = False

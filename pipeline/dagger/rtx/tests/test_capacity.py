@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -503,6 +504,276 @@ def test_launcher_is_valid_bash():
         ["bash", "-n", str(PROJECT / "scripts/launch_native_raven.sh")],
         check=True,
     )
+
+
+@pytest.mark.parametrize(
+    "fidelity",
+    [
+        None,
+        {"raytraced_native_augmentation": True},
+        {
+            "raytraced_native_augmentation": True,
+            "full_batch_sync_batchnorm": False,
+            "random_initial_episode_lengths": True,
+        },
+    ],
+    ids=["missing", "partial", "false-member"],
+)
+def test_fresh_production_fails_closed_without_exact_raven_fidelity(
+    tmp_path, fidelity
+):
+    run_id = f"fidelity-gate-{tmp_path.name}"
+    pids = list(range(1, 9))
+    config = {
+        "run_id": run_id,
+        "round_id": 1,
+        "seed": 424242,
+        "rtx_actor": {"simulator_seed": 424242, "videogen_seed": 42},
+        "h200": {
+            "boundary_contract": "roborender.dagger.rtx.v4",
+            "gateway_ports": list(range(18720, 18728)),
+            "expected_gateway_pids": pids,
+            "expected_gateway_instance_ids": [f"{index:064x}" for index in pids],
+        },
+        "student": {"initial_checkpoint_sha256": "a" * 64},
+        "execution": {
+            "window_count": 40,
+            "stop_after_actor_barriers": False,
+            "wait_for_checkpoint_advance": True,
+            "learner_submission_authorized": True,
+            "validation_authorized": True,
+        },
+        "validation": {"interval_iterations": 40},
+        "logging": {"rtx_collection_wandb": False, "wandb_run_name": run_id},
+    }
+    if fidelity is not None:
+        config["raven_fidelity"] = fidelity
+
+    # The launcher deliberately accepts production configs only from its
+    # source-controlled config root. Use a uniquely named ephemeral input and
+    # always remove it; no runtime/GPU gate can be reached in this test.
+    config_path = PROJECT / "config" / f".pytest-{run_id}.json"
+    config_bytes = json.dumps(config, sort_keys=True).encode("utf-8")
+    config_path.write_bytes(config_bytes)
+    token = _token(tmp_path)
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                str(PROJECT / "scripts/launch_native_raven.sh"),
+                "production",
+                "28",
+                run_id,
+                "1",
+                f"{run_id}-g1",
+                "0",
+                str(token),
+                "I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS",
+                "--gpu",
+                "1",
+                "--wire-protocol",
+                "v4",
+                "--expected-h200-pid",
+                "1",
+                "--expected-h200-pids",
+                ",".join(str(pid) for pid in pids),
+                "--production-config",
+                str(config_path),
+                "--production-config-sha256",
+                hashlib.sha256(config_bytes).hexdigest(),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    finally:
+        config_path.unlink(missing_ok=True)
+
+    assert result.returncode == 2
+    assert (
+        "new production launches require the complete Raven-fidelity contract"
+        in result.stderr
+    )
+
+
+def test_launcher_wires_exact_raven_fidelity_into_native_hydra_overrides():
+    source = (PROJECT / "scripts/launch_native_raven.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'raven_fidelity = value.get("raven_fidelity")' in source
+    assert '[[ $raven_fidelity_enabled == 1 ]]' in source
+    assert "init_at_random_ep_len=true" in source
+    assert "raven_exact_raytraced_augmentation=true" in source
+    assert (
+        '"algo.config.init_at_random_ep_len=$init_at_random_ep_len"' in source
+    )
+    assert (
+        '"++algo.config.raven_exact_raytraced_augmentation='
+        '$raven_exact_raytraced_augmentation"' in source
+    )
+    assert 'actor.get("runtime_root", "")' in source
+    assert (
+        'expected_production_runtime_root="/mnt/data2/ldu/'
+        'roborender-runtime/$run_id"' in source
+    )
+    assert 'readonly RUN="$production_runtime_root/D$round_id/$actor_prefix"' in source
+    assert 'production runtime filesystem requires at least 10 GiB free' in source
+    assert 'preflight_output="$production_runtime_root/preflight-launch-$TAG.json"' in source
+
+
+@pytest.mark.parametrize(
+    "runtime_root",
+    [None, "/mnt/data1/ldu/roborender-runtime/wrong", "/mnt/data2/ldu/roborender-runtime/wrong"],
+    ids=["missing", "wrong-filesystem", "wrong-run"],
+)
+def test_fresh_production_fails_closed_without_exact_data2_runtime_root(
+    tmp_path, runtime_root
+):
+    run_id = f"runtime-root-gate-{tmp_path.name}"
+    pids = list(range(1, 9))
+    actor = {"simulator_seed": 424242, "videogen_seed": 42}
+    if runtime_root is not None:
+        actor["runtime_root"] = runtime_root
+    config = {
+        "run_id": run_id,
+        "round_id": 1,
+        "seed": 424242,
+        "rtx_actor": actor,
+        "h200": {
+            "boundary_contract": "roborender.dagger.rtx.v4",
+            "gateway_ports": list(range(18720, 18728)),
+            "expected_gateway_pids": pids,
+            "expected_gateway_instance_ids": [f"{index:064x}" for index in pids],
+        },
+        "student": {"initial_checkpoint_sha256": "a" * 64},
+        "execution": {
+            "window_count": 50,
+            "stop_after_actor_barriers": False,
+            "wait_for_checkpoint_advance": True,
+            "learner_submission_authorized": True,
+            "validation_authorized": True,
+        },
+        "validation": {"interval_iterations": 40},
+        "logging": {"rtx_collection_wandb": False, "wandb_run_name": run_id},
+        "raven_fidelity": {
+            "raytraced_native_augmentation": True,
+            "full_batch_sync_batchnorm": True,
+            "random_initial_episode_lengths": True,
+        },
+    }
+    config_path = PROJECT / "config" / f".pytest-{run_id}.json"
+    config_bytes = json.dumps(config, sort_keys=True).encode("utf-8")
+    config_path.write_bytes(config_bytes)
+    token = _token(tmp_path)
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                str(PROJECT / "scripts/launch_native_raven.sh"),
+                "production",
+                "28",
+                run_id,
+                "1",
+                f"{run_id}-g1",
+                "0",
+                str(token),
+                "I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS",
+                "--gpu",
+                "1",
+                "--wire-protocol",
+                "v4",
+                "--expected-h200-pid",
+                "1",
+                "--expected-h200-pids",
+                ",".join(str(pid) for pid in pids),
+                "--production-config",
+                str(config_path),
+                "--production-config-sha256",
+                hashlib.sha256(config_bytes).hexdigest(),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    finally:
+        config_path.unlink(missing_ok=True)
+
+    assert result.returncode == 2
+    assert "production runtime_root must equal" in result.stderr
+
+
+@pytest.mark.parametrize("invalid_window_count", [0, 39, True])
+def test_launcher_rejects_production_budget_below_validation_interval(
+    tmp_path, invalid_window_count
+):
+    run_id = f"window-budget-gate-{tmp_path.name}"
+    pids = list(range(1, 9))
+    config = {
+        "run_id": run_id,
+        "round_id": 1,
+        "seed": 424242,
+        "rtx_actor": {"simulator_seed": 424242, "videogen_seed": 42},
+        "h200": {
+            "boundary_contract": "roborender.dagger.rtx.v4",
+            "gateway_ports": list(range(18720, 18728)),
+            "expected_gateway_pids": pids,
+            "expected_gateway_instance_ids": [f"{index:064x}" for index in pids],
+        },
+        "student": {"initial_checkpoint_sha256": "a" * 64},
+        "execution": {
+            "window_count": invalid_window_count,
+            "stop_after_actor_barriers": False,
+            "wait_for_checkpoint_advance": True,
+            "learner_submission_authorized": True,
+            "validation_authorized": True,
+        },
+        "validation": {"interval_iterations": 40},
+        "logging": {"rtx_collection_wandb": False, "wandb_run_name": run_id},
+        "raven_fidelity": {
+            "raytraced_native_augmentation": True,
+            "full_batch_sync_batchnorm": True,
+            "random_initial_episode_lengths": True,
+        },
+    }
+    config_path = PROJECT / "config" / f".pytest-{run_id}.json"
+    config_bytes = json.dumps(config, sort_keys=True).encode("utf-8")
+    config_path.write_bytes(config_bytes)
+    token = _token(tmp_path)
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                str(PROJECT / "scripts/launch_native_raven.sh"),
+                "production",
+                "28",
+                run_id,
+                "1",
+                f"{run_id}-g1",
+                "0",
+                str(token),
+                "I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS",
+                "--gpu",
+                "1",
+                "--wire-protocol",
+                "v4",
+                "--expected-h200-pid",
+                "1",
+                "--expected-h200-pids",
+                ",".join(str(pid) for pid in pids),
+                "--production-config",
+                str(config_path),
+                "--production-config-sha256",
+                hashlib.sha256(config_bytes).hexdigest(),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    finally:
+        config_path.unlink(missing_ok=True)
+
+    assert result.returncode == 2
+    assert "request >=40 authorized windows" in result.stderr
 
 
 def test_launcher_is_hard_bound_to_physical_gpu1_uuid_and_rejects_gpu0():

@@ -104,7 +104,9 @@ if [[ -e $output_root && $resume != 1 ]]; then
   echo "output root already exists; use a fresh path or explicit --resume" >&2
   exit 3
 fi
-install -d -m 0700 "$output_root" "$output_root/cohorts" "$output_root/outcome-ledger"
+install -d -m 0700 "$output_root" "$output_root/cohorts" \
+  "$output_root/outcome-ledger" "$output_root/inputs/stage" \
+  "$output_root/cache/isaac-kit-cache" "$output_root/cache/isaac-kit-data"
 exec > >(tee -a "$output_root/launcher.log") 2>&1
 
 common=(
@@ -161,6 +163,8 @@ for row in "${cohort_rows[@]}"; do
     --mount "type=bind,src=$token_file,dst=/run/secrets/dagger-evaluation.token,readonly" \
     --mount "type=bind,src=$METRICS_ADAPTER,dst=/opt/eval_agent_metrics_adapter.py,readonly" \
     --mount "type=bind,src=$PROVEN_ISAAC_APPS,dst=/workspace/isaaclab/apps" \
+    --mount "type=bind,src=$output_root/cache/isaac-kit-cache,dst=/isaac-sim/kit/cache" \
+    --mount "type=bind,src=$output_root/cache/isaac-kit-data,dst=/isaac-sim/kit/data" \
     --mount "type=bind,src=$CACHE/rank-cache,dst=/persistent-cache" \
     --mount "type=bind,src=$CACHE/optix-cache,dst=/var/tmp/OptixCache" \
     --workdir /workspace/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real \
@@ -212,7 +216,7 @@ for row in "${cohort_rows[@]}"; do
       +num_envs=64 +seed="$seed" +headless=true \
       +trainer._target_=dagger_rtx.fixed_panel_raven.FixedPanelEvalTrainer \
       +env._target_=dagger_rtx.fixed_panel_raven.FixedPanelWalkStandPlaceGraspTurnHomie \
-      +simulator._target_=dagger_rtx.fixed_panel_raven.NormalizedIsaacSim \
+      +simulator._target_=dagger_rtx.fixed_panel_raven.IsaacSim \
       +algo.config.init_at_random_ep_len=false \
       algo.config.eval.num_eval_episodes=64 \
       +algo.config.eval.eval_num_envs_episodes=true \
@@ -223,7 +227,6 @@ for row in "${cohort_rows[@]}"; do
       +env.config.reset_from_dataset.use_motion_file_dir=false \
       "+env.config.reset_from_dataset.motion_files=$motion_paths" \
       +env.config.reset_from_dataset.motion_assignment_offset=0 \
-      +simulator.config.render_results=true \
       +env.config.save_rendering_dir="/eval/cohorts/$cohort_id/runtime/renderings" \
       +use_wandb=false \
       +eval_output_dir="/eval/cohorts/$cohort_id/results" \

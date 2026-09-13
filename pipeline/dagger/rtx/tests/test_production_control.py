@@ -23,13 +23,14 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _spec() -> ProductionRunSpec:
+def _spec(*, total_windows: int = 40) -> ProductionRunSpec:
     return ProductionRunSpec(
         run_id=RUN_ID,
         config_sha256=CONFIG_SHA,
         actor_prefix=PREFIX,
         actor_ids=tuple(f"{PREFIX}-lane-{lane:03d}" for lane in range(28)),
         initial_checkpoint_sha256=INITIAL_SHA,
+        total_windows=total_windows,
     )
 
 
@@ -224,3 +225,42 @@ def test_wait_accepts_intermediate_advance_and_final_validation(tmp_path, monkey
     assert gate.next_iteration_id is None
     assert gate.status == "validating"
     assert gate.output_checkpoint_sha256 == final_candidate
+
+
+def test_50_window_budget_keeps_validation_at_40_and_accepts_final_iteration_50(
+    tmp_path, monkeypatch
+):
+    spec = _spec(total_windows=50)
+    control = _control(tmp_path)
+    candidate_50 = _sha("candidate-50")
+    value = _status(
+        spec,
+        iteration=50,
+        run_status="collecting",
+        checkpoint=candidate_50,
+        completed_status="advanced",
+        candidate=candidate_50,
+        barriers=[{"round_id": 1, "iteration_id": 50}] * 28,
+    )
+    value["iterations"].append(
+        {
+            "run_id": spec.run_id,
+            "round_id": 1,
+            "iteration_id": 51,
+            "input_checkpoint_sha256": candidate_50,
+            "candidate_checkpoint_sha256": None,
+            "status": "collecting",
+        }
+    )
+    monkeypatch.setattr(control, "_status", lambda _: value)
+
+    gate = control.wait_for_window_advance(
+        spec,
+        completed_window_index=49,
+        previous_checkpoint_sha256=_sha("candidate-49"),
+    )
+
+    assert gate.completed_iteration_id == 50
+    assert gate.next_iteration_id == 51
+    assert gate.status == "collecting"
+    assert gate.output_checkpoint_sha256 == candidate_50

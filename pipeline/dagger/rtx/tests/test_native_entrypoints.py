@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ast
 import inspect
+import sys
+import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,7 +69,12 @@ def test_source_attestation_fails_closed_on_a_byte_hash_mismatch(monkeypatch):
 def test_extracted_archive_callback_contains_only_attested_compute_surface():
     extractor = _compile_raw_archive_extractor()
     assert Path(extractor.__code__.co_filename).resolve() == VIDEOGEN_SOURCE.resolve()
-    names = set(extractor.__code__.co_names)
+    pending = [extractor.__code__]
+    names = set()
+    while pending:
+        code = pending.pop()
+        names.update(code.co_names)
+        pending.extend(value for value in code.co_consts if inspect.iscode(value))
     assert {"log", "clip", "round", "resize", "INTER_NEAREST"} <= names
     assert not ({"save", "savez", "open", "makedirs", "storage"} & names)
 
@@ -103,18 +111,92 @@ def test_entrypoint_source_does_not_reimplement_scientific_formulas():
     assert "16383" not in source
 
 
-def test_runtime_initialization_rejects_random_episode_offsets_before_reset():
-    class NeverResetEnv:
-        def reset_all(self):
-            raise AssertionError("invalid configuration must fail before reset")
+def test_runtime_initialization_matches_raven_random_episode_offsets(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(entrypoint_module, "verify_origin_sources", lambda: {})
+    staged_module = types.ModuleType("gr00t.rl.envs.base_task.staged_task_base")
+    staged_module.StagedTaskBase = type("StagedTaskBase", (), {})
+    monkeypatch.setitem(
+        sys.modules, "gr00t.rl.envs.base_task.staged_task_base", staged_module
+    )
 
+    class RandomizedEnv:
+        num_envs = 64
+        max_episode_length = 512
+
+        def __init__(self):
+            self.reset_calls = 0
+            self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.int64)
+
+        def reset_all(self):
+            self.reset_calls += 1
+            return {"actor_obs": torch.zeros(self.num_envs, 1)}
+
+    env = RandomizedEnv()
     trainer = type(
         "Trainer",
         (),
-        {"config": {"init_at_random_ep_len": True}, "env": NeverResetEnv()},
+        {
+            "config": {"init_at_random_ep_len": True},
+            "env": env,
+            "accelerator": SimpleNamespace(device=torch.device("cpu")),
+            "_train_rollout_mode": lambda self: None,
+        },
     )()
-    with pytest.raises(BackendInvariantError, match="init_at_random_ep_len=false"):
-        NativeRavenRuntime.initialize(trainer)
+    runtime = NativeRavenRuntime.initialize(trainer)
+
+    assert env.reset_calls == 1
+    assert runtime.obs_dict["actor_obs"].device.type == "cpu"
+    assert bool((env.episode_length_buf >= 0).all())
+    assert bool((env.episode_length_buf < env.max_episode_length).all())
+    assert torch.unique(env.episode_length_buf).numel() > 1
+
+
+def test_runtime_initialization_randomizes_staged_task_clocks(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(entrypoint_module, "verify_origin_sources", lambda: {})
+
+    class StagedTaskBase:
+        pass
+
+    staged_module = types.ModuleType("gr00t.rl.envs.base_task.staged_task_base")
+    staged_module.StagedTaskBase = StagedTaskBase
+    monkeypatch.setitem(
+        sys.modules, "gr00t.rl.envs.base_task.staged_task_base", staged_module
+    )
+
+    class RandomizedStagedEnv(StagedTaskBase):
+        num_envs = 64
+        max_episode_length = 512
+
+        def __init__(self):
+            self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.int64)
+            self.max_stage_time = torch.tensor([300, 50, 50, 100, 100])
+            self.time_in_stage_buf = torch.zeros(self.num_envs, dtype=torch.int64)
+            self.actual_time_in_stage_buf = torch.full(
+                (self.num_envs,), -1, dtype=torch.int64
+            )
+
+        def reset_all(self):
+            return {"actor_obs": torch.zeros(self.num_envs, 1)}
+
+    env = RandomizedStagedEnv()
+    trainer = type(
+        "Trainer",
+        (),
+        {
+            "config": {"init_at_random_ep_len": True},
+            "env": env,
+            "accelerator": SimpleNamespace(device=torch.device("cpu")),
+            "_train_rollout_mode": lambda self: None,
+        },
+    )()
+    NativeRavenRuntime.initialize(trainer)
+
+    assert bool((env.time_in_stage_buf >= 0).all())
+    assert bool((env.time_in_stage_buf < env.max_stage_time[0]).all())
+    assert torch.unique(env.time_in_stage_buf).numel() > 1
+    assert torch.equal(env.actual_time_in_stage_buf, env.time_in_stage_buf)
 
 
 def test_runtime_initialization_does_not_own_ref_model_rollout_lifecycle():

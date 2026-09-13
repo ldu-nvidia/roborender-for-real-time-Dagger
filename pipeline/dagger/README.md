@@ -60,6 +60,25 @@ another. It is a learning unit, not an episode definition.
 - uniform MSE is applied to student 11-D output versus teacher `[0:11]`;
 - only the current iteration is learned; no BC or previous-window replay.
 
+Fresh production configs must also contain the complete fidelity gate below;
+partial activation is rejected:
+
+```json
+"raven_fidelity": {
+  "raytraced_native_augmentation": true,
+  "full_batch_sync_batchnorm": true,
+  "random_initial_episode_lengths": true
+}
+```
+
+With this gate, ray-traced lanes use Raven's current, already-augmented
+`obs_dict["vision_obs"]` (brightness, contrast, saturation, hue, blur and
+noise), the learner executes one B=28 forward so SyncBatchNorm sees the full
+environment batch, and the initial episode/stage clocks are randomized using
+Raven's retained initialization logic. Configs lacking the gate are accepted
+only by the H200 controller as legacy evidence/continuations; the RTX
+production launcher refuses them for a new run.
+
 The active behavior schedule is in `canonical_round_schedule.v1.json`:
 
 | Round | Teacher | Student |

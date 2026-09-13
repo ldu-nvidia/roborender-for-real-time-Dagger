@@ -50,7 +50,7 @@ def register(args: argparse.Namespace) -> int:
         "evaluation_id": args.evaluation_id,
         "run_id": args.run_id,
         "round_id": args.round_id,
-        "purpose": "validation",
+        "purpose": args.purpose,
         "checkpoint_sha256": args.checkpoint_sha256,
         "scenario_manifest_sha256": digest,
         "scenario_ids": [episode["scenario_id"] for episode in episodes],
@@ -158,6 +158,13 @@ def main() -> int:
     create.add_argument("--evaluation-id", required=True)
     create.add_argument("--run-id", required=True)
     create.add_argument("--round-id", type=int, choices=range(5), required=True)
+    create.add_argument(
+        "--purpose", choices=("validation", "test"), default="validation",
+        help=(
+            "validation advances an awaiting coordinator iteration; test is a "
+            "standalone checkpoint audit and never promotes training state"
+        ),
+    )
     create.add_argument("--checkpoint-sha256", required=True)
     create.add_argument("--panel", type=Path, default=DEFAULT_PANEL)
     create.add_argument("--observation-mode", choices=("raytraced", "generated"), default="raytraced")

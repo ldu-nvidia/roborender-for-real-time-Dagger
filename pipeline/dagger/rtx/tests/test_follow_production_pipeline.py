@@ -165,3 +165,30 @@ def test_script_contains_no_runtime_write_primitives():
     assert "os.replace" not in source
     assert 'connection.request(\n                "GET"' in source
     assert 'connection.request(\n                "POST"' not in source
+
+
+def test_monitor_uses_50_window_budget_independently_of_validation_cadence():
+    try:
+        assert MODULE.configure_cardinality(
+            {
+                "execution": {"window_count": 50},
+                "validation": {"interval_iterations": 40},
+            }
+        ) == 50
+        state = driver(iteration=41, completed=40)
+        state["spec"]["total_windows"] = 50
+        view = MODULE.build_view(
+            RUN_ID,
+            progress(step=40 * 81, durable=40 * 81),
+            state,
+        )
+        rendered = MODULE.format_view(view)
+        assert "iter 41/50" in rendered
+        assert "window 41/50" in rendered
+    finally:
+        MODULE.configure_cardinality(
+            {
+                "execution": {"window_count": 40},
+                "validation": {"interval_iterations": 40},
+            }
+        )

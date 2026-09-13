@@ -1,0 +1,7 @@
+{
+  "raven_fidelity": {
+    "raytraced_native_augmentation": true,
+    "full_batch_sync_batchnorm": true,
+    "random_initial_episode_lengths": true
+  }
+}

@@ -350,14 +350,63 @@ class NativeRavenBatchComposition:
 
         policy_stack = None
         if any(bool(value) for value in self._raytraced):
-            policy_stack = _as_numpy(
-                self.trainer.env.simulator.get_policy_view_stack(),
-                "native raytraced policy stack",
-            )
             expected = (
                 b, len(RAVEN_VIEW_ORDER) * self.profile.policy_h,
                 self.profile.policy_w, 3,
             )
+            exact_augmentation = bool(
+                getattr(self.trainer, "config", {}).get(
+                    "raven_exact_raytraced_augmentation", False
+                )
+            )
+            if exact_augmentation:
+                # Raven builds obs_dict before image-DAgger relabeling.  Its
+                # ray-traced lanes retain that already-augmented vision_obs;
+                # rereading get_policy_view_stack() here silently bypassed the
+                # brightness/contrast/saturation/hue/blur/noise pipeline.
+                if "vision_obs" not in current.obs_dict:
+                    raise BackendInvariantError(
+                        "Raven-fidelity capture requires current vision_obs"
+                    )
+                # Raven's trainer config is ``config.algo.config``.  Camera
+                # and domain-randomization settings belong to the BaseTask
+                # environment config retained as ``trainer.env.config``.
+                env_config = self.trainer.env.config
+                augmentation = env_config.domain_rand.image_augmentation
+                if not bool(augmentation.enabled):
+                    raise BackendInvariantError(
+                        "Raven-fidelity capture requires native image augmentation enabled"
+                    )
+                normalized = _as_numpy(
+                    current.obs_dict["vision_obs"],
+                    "augmented native vision_obs",
+                ).reshape(expected)
+                cameras = env_config.simulator.config.cameras
+                mean = np.asarray(cameras.image_mean, dtype=np.float32).reshape(1, 1, 1, 3)
+                std = np.asarray(cameras.image_std, dtype=np.float32).reshape(1, 1, 1, 3)
+                if mean.shape != (1, 1, 1, 3) or std.shape != (1, 1, 1, 3):
+                    raise BackendInvariantError("Raven camera normalization must have 3 channels")
+                if not bool(np.isfinite(std).all()) or bool((std <= 0).any()):
+                    raise BackendInvariantError("Raven camera std must be finite and positive")
+                # The wire contract is float32 [0,1], while vision_obs is
+                # normalized.  H200 applies the same normalization exactly
+                # once before student inference.
+                policy_stack = np.ascontiguousarray(
+                    normalized.astype(np.float32, copy=False) * std + mean
+                )
+                if bool((policy_stack < -1e-6).any()) or bool((policy_stack > 1 + 1e-6).any()):
+                    raise BackendInvariantError(
+                        "augmented Raven vision_obs denormalizes outside [0,1]"
+                    )
+                policy_stack = np.ascontiguousarray(
+                    np.clip(policy_stack, 0.0, 1.0), dtype=np.float32
+                )
+            else:
+                # Compatibility path for immutable legacy continuations.
+                policy_stack = _as_numpy(
+                    self.trainer.env.simulator.get_policy_view_stack(),
+                    "native raytraced policy stack",
+                )
             if policy_stack.shape != expected or policy_stack.dtype != np.float32:
                 raise BackendInvariantError(f"native policy stack must be {expected} float32")
             if not bool(np.isfinite(policy_stack).all()) or bool((policy_stack < 0).any()) or bool((policy_stack > 1).any()):

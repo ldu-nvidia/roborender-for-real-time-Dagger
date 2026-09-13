@@ -196,10 +196,6 @@ class NativeRavenRuntime:
 
         verify_origin_sources()
         config = getattr(trainer, "config", {})
-        if bool(config.get("init_at_random_ep_len", False)):
-            raise BackendInvariantError(
-                "native DAgger service requires init_at_random_ep_len=false"
-            )
         import torch
 
         trainer._train_rollout_mode()
@@ -207,6 +203,25 @@ class NativeRavenRuntime:
         # owner.  Initializing either here would create an unmatched second
         # initialization outside that begin/clear boundary.
         obs_dict = trainer.env.reset_all()
+        if bool(config.get("init_at_random_ep_len", False)):
+            # Match Raven's TRLPPOTrainer initialization verbatim: the first
+            # observation is reset normally, then every vector lane receives
+            # an independent episode clock.  Staged tasks additionally start
+            # at an independently sampled stage clock.  This broadens the
+            # initial state/phase distribution without fabricating a reset or
+            # stepping Isaac outside the exactly-once owner.
+            trainer.env.episode_length_buf = torch.randint_like(
+                trainer.env.episode_length_buf,
+                high=int(trainer.env.max_episode_length),
+            )
+            from gr00t.rl.envs.base_task.staged_task_base import StagedTaskBase
+
+            if isinstance(trainer.env, StagedTaskBase):
+                trainer.env.time_in_stage_buf[:] = torch.randint_like(
+                    trainer.env.time_in_stage_buf,
+                    high=int(trainer.env.max_stage_time[0]),
+                )
+                trainer.env.actual_time_in_stage_buf[:] = trainer.env.time_in_stage_buf
         device = trainer.accelerator.device
         obs_dict = {name: value.to(device) for name, value in obs_dict.items()}
         cur_dones = torch.zeros(trainer.env.num_envs, device=device)

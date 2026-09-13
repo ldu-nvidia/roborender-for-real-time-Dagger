@@ -13,6 +13,23 @@
     "absolute_paths",
     "sm90_h200_engine"
   ],
+  "raven_fidelity": {
+    "raytraced_native_augmentation": true,
+    "raytraced_augmentation_source": "current_obs_dict.vision_obs_after_env_image_augmentation",
+    "augmentation_operations": [
+      "brightness",
+      "contrast",
+      "saturation",
+      "hue",
+      "gaussian_blur",
+      "gaussian_noise"
+    ],
+    "full_batch_sync_batchnorm": true,
+    "learner_environment_batch": 28,
+    "learner_environment_microbatches": 1,
+    "random_initial_episode_lengths": true,
+    "random_initial_stage_clocks_for_staged_tasks": true
+  },
   "rounds": {
     "count": 4,
     "warm_start_previous_round": true,

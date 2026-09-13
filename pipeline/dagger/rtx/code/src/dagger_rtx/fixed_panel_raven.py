@@ -9,6 +9,7 @@ Raven's stock deterministic ``action_mean`` evaluation.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
 import inspect
 import json
 import logging
@@ -44,6 +45,31 @@ from gr00t.rl.utils.teleop_reset_lib.motion_loader_wsppt import MotionLoaderWSPP
 from gr00t.rl.data.tasks.walk_stand_place_grasp_turn_homie.scenario_cfg import (
     isaacsim as _scenario_isaacsim,
 )
+from gr00t.rl.isaac_utils.playground.utils import usd_utils as _usd_utils
+
+# When this adapter is imported after SimulationApp startup, Raven's material
+# preloader returns ``pxr.Vt.StringArray`` values.  IsaacLab's configclass
+# immediately deep-copies these fields, but pxr arrays deliberately do not
+# support Python pickling.  Preserve the exact ordered paths as plain strings,
+# which is the field's native configuration type.
+_scenario_isaacsim.table_top_material_prim_paths = [
+    str(value) for value in _scenario_isaacsim.table_top_material_prim_paths
+]
+_scenario_isaacsim.leg_material_prim_paths = [
+    str(value) for value in _scenario_isaacsim.leg_material_prim_paths
+]
+
+# IsaacSim loads the task scenario a second time from its source path under a
+# short-lived module name.  Normalize the preloader's return type as well so
+# that dynamically loaded copy receives the same ordered plain-string paths.
+_ORIGINAL_PRELOAD_MATERIALS = _usd_utils.preload_materials
+
+
+def _preload_material_paths(*args: Any, **kwargs: Any) -> list[str]:
+    return [str(value) for value in _ORIGINAL_PRELOAD_MATERIALS(*args, **kwargs)]
+
+
+_usd_utils.preload_materials = _preload_material_paths
 
 
 PINNED_ISAACSIM_SHA256 = "1d03ebca26f8c5f64d65d2146e79bbf8ceab6af2b83dfb65afa690b784b1073f"
@@ -182,6 +208,45 @@ class FixedPanelWalkStandPlaceGraspTurnHomie(_PinnedWalkStandPlaceGraspTurnHomie
 class NormalizedIsaacSim(_PinnedIsaacSim):
     """Proven exact-once ImageNet normalization for the three-view RGB stack."""
 
+    def __init__(self, *args: Any, **kwargs: Any):
+        # Raven's IsaacSim loads the task scenario again with
+        # ``spec_from_file_location`` rather than reusing the canonical module.
+        # Bind that exact, hash-attested copy to the sealed table metadata hook.
+        scenario_path = Path(inspect.getsourcefile(_scenario_isaacsim) or "").resolve(
+            strict=True
+        )
+        original_exec_module = importlib.machinery.SourceFileLoader.exec_module
+        bound = False
+
+        def exec_module(loader: Any, module: Any) -> None:
+            nonlocal bound
+            original_exec_module(loader, module)
+            loader_path = Path(str(getattr(loader, "path", ""))).resolve()
+            if loader_path != scenario_path:
+                return
+            if file_sha256(loader_path) != PINNED_SCENARIO_SHA256:
+                raise FixedPanelValidationError(
+                    "dynamically loaded Raven scenario source hash mismatch"
+                )
+            module.get_table_grid_meta_data = _fixed_panel_table_grid_meta_data
+            module.table_top_material_prim_paths = [
+                str(value) for value in module.table_top_material_prim_paths
+            ]
+            module.leg_material_prim_paths = [
+                str(value) for value in module.leg_material_prim_paths
+            ]
+            bound = True
+
+        importlib.machinery.SourceFileLoader.exec_module = exec_module
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            importlib.machinery.SourceFileLoader.exec_module = original_exec_module
+        if not bound:
+            raise FixedPanelValidationError(
+                "Raven did not load the hash-attested fixed-panel scenario"
+            )
+
     def get_policy_view_stack(self):
         raw = super().get_policy_view_stack()
         if raw is None:
@@ -225,6 +290,13 @@ class NormalizedIsaacSim(_PinnedIsaacSim):
                 "mean": float(normalized.float().mean().item()),
             }
         return normalized
+
+
+# Raven's stock evaluator starts SimulationApp only when the configured target's
+# final component is literally ``IsaacSim``.  Preserve the certified normalized
+# subclass while satisfying that startup gate; Hydra resolves this alias only
+# after SimulationApp is live.
+IsaacSim = NormalizedIsaacSim
 
 
 def _tensor_digest(state: Mapping[str, Any]) -> str:
@@ -649,5 +721,6 @@ class FixedPanelEvalTrainer(TRLDistillTrainerVideoGen):
 __all__ = [
     "FixedPanelEvalTrainer",
     "FixedPanelWalkStandPlaceGraspTurnHomie",
+    "IsaacSim",
     "NormalizedIsaacSim",
 ]

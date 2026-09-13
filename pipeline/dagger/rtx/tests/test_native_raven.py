@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -210,7 +211,9 @@ class VectorTrainer(CaptureOnlyTrainer):
         self._id_use_raytraced[env_index] = env_index == 0
 
 
-def make_capture_only_entrypoints(calls, profile, *, bad_homie=False):
+def make_capture_only_entrypoints(
+    calls, profile, *, bad_homie=False, vision_obs=None
+):
     def prepare_episode_slots(trainer, batch):
         calls.append(f"prepare_episode_slots:{batch}")
         assert batch == 1
@@ -221,9 +224,12 @@ def make_capture_only_entrypoints(calls, profile, *, bad_homie=False):
     def read_current_batch(keys):
         calls.append("read_current_batch")
         assert len(keys) == 1
+        obs_dict = {"native": "opaque"}
+        if vision_obs is not None:
+            obs_dict["vision_obs"] = vision_obs
         return NativeCurrentBatch(
             keys=tuple(keys),
-            obs_dict={"native": "opaque"},
+            obs_dict=obs_dict,
             cur_dones=np.array([False]),
             arrays={
                 "actor_obs": np.zeros((1, profile.actor_obs), np.float32),
@@ -283,6 +289,29 @@ def make_capture_only_entrypoints(calls, profile, *, bad_homie=False):
         build_action_state=forbidden_action_state,
         decode_env_step=forbidden_decode,
     )
+
+
+def enable_exact_raytraced_fidelity(trainer, *, enabled=True):
+    mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+    # Raven passes only config.algo.config to the trainer.  Environment
+    # domain-randomization and camera settings live on BaseTask.config.
+    trainer.config = type(
+        "Config",
+        (dict,),
+        {"__getattr__": dict.__getitem__},
+    )({"raven_exact_raytraced_augmentation": True})
+    trainer.env.config = SimpleNamespace(
+        simulator=SimpleNamespace(
+            config=SimpleNamespace(
+                cameras=SimpleNamespace(image_mean=mean, image_std=std)
+            )
+        ),
+        domain_rand=SimpleNamespace(
+            image_augmentation=SimpleNamespace(enabled=enabled)
+        ),
+    )
+    return mean, std
 
 
 def make_vector_entrypoints(calls, profile):
@@ -462,6 +491,97 @@ def test_b1_raytraced_capture_fetches_policy_stack_once_in_online_order(tiny_pro
     assert capture.arrays["raytraced_rgb__hand_left"].mean() == 0.25
     assert capture.arrays["raytraced_rgb__hand_right"].mean() == 0.5
     assert trainer.env.step_calls == 0
+
+
+def test_b1_raven_fidelity_uses_augmented_current_vision_without_camera_reread(
+    tiny_profile,
+):
+    calls: list[str] = []
+    trainer = CaptureOnlyTrainer(calls, tiny_profile, use_raytraced=True)
+    mean, std = enable_exact_raytraced_fidelity(trainer)
+    assert set(trainer.config) == {"raven_exact_raytraced_augmentation"}
+    assert trainer.env.config.domain_rand.image_augmentation.enabled is True
+    assert trainer.env.config.simulator.config.cameras.image_mean is mean
+    raw = np.concatenate(
+        [
+            np.full(
+                (1, tiny_profile.policy_h, tiny_profile.policy_w, 3),
+                value,
+                np.float32,
+            )
+            for value in (0.1, 0.4, 0.8)
+        ],
+        axis=1,
+    )
+    normalized = (raw - mean.reshape(1, 1, 1, 3)) / std.reshape(1, 1, 1, 3)
+    composition = build_native_raven_batch(
+        trainer,
+        make_capture_only_entrypoints(
+            calls, tiny_profile, vision_obs=normalized
+        ),
+        shape_profile=tiny_profile,
+    )
+    key = make_key()
+    composition.bind_episodes({0: key})
+    (capture,) = composition.capture_batch([key])
+
+    assert "get_policy_view_stack" not in calls
+    assert capture.arrays["raytraced_rgb__head_color"].mean() == pytest.approx(0.1)
+    assert capture.arrays["raytraced_rgb__hand_left"].mean() == pytest.approx(0.4)
+    assert capture.arrays["raytraced_rgb__hand_right"].mean() == pytest.approx(0.8)
+
+
+def test_b1_raven_fidelity_rejects_missing_augmented_current_vision(tiny_profile):
+    calls: list[str] = []
+    trainer = CaptureOnlyTrainer(calls, tiny_profile, use_raytraced=True)
+    enable_exact_raytraced_fidelity(trainer)
+    composition = build_native_raven_batch(
+        trainer,
+        make_capture_only_entrypoints(calls, tiny_profile),
+        shape_profile=tiny_profile,
+    )
+    key = make_key()
+    composition.bind_episodes({0: key})
+
+    with pytest.raises(
+        BackendInvariantError,
+        match="Raven-fidelity capture requires current vision_obs",
+    ):
+        composition.capture_batch([key])
+    assert "get_policy_view_stack" not in calls
+
+
+def test_b1_raven_fidelity_rejects_disabled_native_augmentation(tiny_profile):
+    calls: list[str] = []
+    trainer = CaptureOnlyTrainer(calls, tiny_profile, use_raytraced=True)
+    mean, std = enable_exact_raytraced_fidelity(trainer, enabled=False)
+    raw = np.full(
+        (
+            1,
+            len(RAVEN_VIEW_ORDER) * tiny_profile.policy_h,
+            tiny_profile.policy_w,
+            3,
+        ),
+        0.5,
+        np.float32,
+    )
+    normalized = (raw - mean.reshape(1, 1, 1, 3)) / std.reshape(1, 1, 1, 3)
+    composition = build_native_raven_batch(
+        trainer,
+        make_capture_only_entrypoints(
+            calls, tiny_profile, vision_obs=normalized
+        ),
+        shape_profile=tiny_profile,
+    )
+    key = make_key()
+    composition.bind_episodes({0: key})
+
+    with pytest.raises(
+        BackendInvariantError,
+        match="native image augmentation enabled",
+    ):
+        composition.capture_batch([key])
+    assert "get_policy_view_stack" not in calls
 
 
 def test_b2_native_batch_is_synchronized_mixed_source_and_steps_once(tiny_profile):

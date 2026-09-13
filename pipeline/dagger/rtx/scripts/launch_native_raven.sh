@@ -12,7 +12,9 @@ usage: launch_native_raven.sh MODE NUM_ENVS RUN_ID ROUND_ID ACTOR_PREFIX WINDOW_
     single-window:     I_ACKNOWLEDGE_ONE_NATIVE_81_STEP_WINDOW
     capacity-probe:    I_ACKNOWLEDGE_TEN_NATIVE_VECTOR_STEPS (default), or
                        I_ACKNOWLEDGE_THREE_NATIVE_VECTOR_STEPS with --probe-steps 3
-    production:        I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS, or
+    production:        I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS,
+                       I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_VALIDATION,
+                       I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_WINDOW_BUDGET, or
                        I_ACKNOWLEDGE_ONE_NATIVE_81_STEP_WINDOW_TO_LEARNER_BARRIER
   OPTIONS:
     --gpu 1                      physical RTX GPU (fixed: 1; GPU0 is forbidden)
@@ -155,7 +157,8 @@ case "$mode" in
     elif [[ $window_index == 0 ]]; then
       [[ $step_ack == I_ACKNOWLEDGE_FORTY_NATIVE_81_STEP_WINDOWS ]] || usage
     else
-      [[ $step_ack == I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_VALIDATION ]] || usage
+      [[ $step_ack == I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_VALIDATION \
+         || $step_ack == I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_WINDOW_BUDGET ]] || usage
     fi
     ;;
   *) usage ;;
@@ -250,8 +253,8 @@ fi
 wandb_enabled=0
 wandb_netrc_real=
 if [[ -n $wandb_netrc ]]; then
-  [[ $mode == single-window || ( $mode == production && $stop_at_learner_barrier == 1 ) ]] || {
-    echo "--wandb-netrc is valid only for bounded one-window collection" >&2
+  [[ $mode == single-window || $mode == production ]] || {
+    echo "--wandb-netrc is valid only for single-window or production collection" >&2
     exit 2
   }
   [[ -f $wandb_netrc && ! -L $wandb_netrc ]] || {
@@ -299,9 +302,13 @@ h200_activity_evidence_real=
 h200_activity_evidence_container=
 simulator_seed=0
 videogen_seed=42
+raven_fidelity_enabled=0
+init_at_random_ep_len=false
+raven_exact_raytraced_augmentation=false
 production_config_real=
 production_config_container=
 production_config_sha256=
+production_runtime_root=
 gateway_ports_csv=18620,18621,18622,18623,18624,18625,18626,18627
 expected_gateway_instance_ids_csv=
 episode_serial_base=0
@@ -338,6 +345,7 @@ h200 = value.get("h200", {})
 student = value.get("student", {})
 execution = value.get("execution", {})
 logging = value.get("logging", {})
+raven_fidelity = value.get("raven_fidelity")
 print(value.get("run_id", ""))
 print(value.get("round_id", ""))
 print(value.get("seed", ""))
@@ -377,9 +385,32 @@ print("1" if (
     and value.get("seed") == actor.get("simulator_seed")
     and type(actor.get("videogen_seed")) is int
 ) else "0")
+print("1" if raven_fidelity == {
+    "raytraced_native_augmentation": True,
+    "full_batch_sync_batchnorm": True,
+    "random_initial_episode_lengths": True,
+} else "0")
+print(execution.get("window_count", ""))
+print("1" if (
+    set(execution) == {
+        "window_count",
+        "stop_after_actor_barriers",
+        "wait_for_checkpoint_advance",
+        "learner_submission_authorized",
+        "validation_authorized",
+    }
+    and type(execution.get("window_count")) is int
+    and execution["window_count"] >= 40
+    and execution.get("stop_after_actor_barriers") is False
+    and execution.get("wait_for_checkpoint_advance") is True
+    and execution.get("learner_submission_authorized") is True
+    and execution.get("validation_authorized") is True
+) else "0")
+print("1" if value.get("validation", {}).get("interval_iterations") == 40 else "0")
+print(actor.get("runtime_root", ""))
 PY
   )
-  [[ ${#production_fields[@]} -eq 16 ]] || {
+  [[ ${#production_fields[@]} -eq 21 ]] || {
     echo "could not parse immutable production config" >&2; exit 2;
   }
   [[ ${production_fields[0]} == "$run_id" && ${production_fields[1]} == "$round_id" ]] || {
@@ -387,14 +418,29 @@ PY
   }
   simulator_seed=${production_fields[3]}
   videogen_seed=${production_fields[4]}
+  raven_fidelity_enabled=${production_fields[16]}
+  production_window_count=${production_fields[17]}
   gateway_ports_csv=${production_fields[6]}
   expected_gateway_instance_ids_csv=${production_fields[8]}
+  production_runtime_root=${production_fields[20]}
   [[ ${production_fields[5]} == "roborender.dagger.rtx.$wire_protocol" ]] || {
     echo "production boundary contract differs from --wire-protocol" >&2; exit 2;
   }
   [[ ${production_fields[10]} == "$stop_at_learner_barrier" ]] || {
     echo "one-window learner-barrier policy differs from immutable config" >&2; exit 2;
   }
+  [[ ${production_fields[11]} == "$wandb_enabled" ]] || {
+    echo "production W&B flag differs from immutable config" >&2; exit 2;
+  }
+  if (( wandb_enabled )) && [[ ${production_fields[12]} != "$run_id" ]]; then
+    echo "production W&B run name must match run_id" >&2; exit 2;
+  fi
+  if (( ! stop_at_learner_barrier )); then
+    [[ ${production_fields[18]} == 1 && ${production_fields[19]} == 1 ]] || {
+      echo "production config must request >=40 authorized windows with validation cadence 40" >&2
+      exit 2
+    }
+  fi
   if (( stop_at_learner_barrier )); then
     [[ $window_index == 0 && ${production_fields[15]} == 1 ]] || {
       echo "bounded v4 smoke requires immutable integer seed bindings" >&2; exit 2;
@@ -408,12 +454,6 @@ PY
     [[ ${production_fields[9]} =~ ^[0-9a-f]{64}$ ]] || {
       echo "bounded v4 smoke checkpoint identity is not a lowercase SHA-256" >&2; exit 2;
     }
-    [[ ${production_fields[11]} == "$wandb_enabled" ]] || {
-      echo "bounded v4 smoke W&B flag differs from immutable config" >&2; exit 2;
-    }
-    if (( wandb_enabled )) && [[ ${production_fields[12]} != "$run_id" ]]; then
-      echo "bounded v4 smoke W&B run name must match run_id" >&2; exit 2;
-    fi
     [[ $wire_protocol == v4 ]] || {
       echo "bounded learner-barrier smoke requires v4" >&2; exit 2;
     }
@@ -421,6 +461,56 @@ PY
   [[ $round_id == 1 && $num_envs == 28 ]] || {
     echo "production requires round1 and B=28" >&2; exit 2;
   }
+  [[ $raven_fidelity_enabled == 1 ]] || {
+    echo "new production launches require the complete Raven-fidelity contract" >&2
+    exit 2
+  }
+  expected_production_runtime_root="/mnt/data2/ldu/roborender-runtime/$run_id"
+  [[ $production_runtime_root == "$expected_production_runtime_root" ]] || {
+    echo "production runtime_root must equal $expected_production_runtime_root" >&2
+    exit 2
+  }
+  readonly PRODUCTION_RUNTIME_BASE=/mnt/data2/ldu/roborender-runtime
+  [[ -d /mnt/data2/ldu && ! -L /mnt/data2/ldu ]] || {
+    echo "trusted /mnt/data2/ldu runtime parent is unavailable or is a symlink" >&2
+    exit 2
+  }
+  if [[ -e $PRODUCTION_RUNTIME_BASE ]]; then
+    [[ -d $PRODUCTION_RUNTIME_BASE && ! -L $PRODUCTION_RUNTIME_BASE ]] || {
+      echo "production runtime base must be a real directory" >&2
+      exit 2
+    }
+    [[ $(stat -c %u "$PRODUCTION_RUNTIME_BASE") == $(id -u) ]] || {
+      echo "production runtime base must be owned by the invoking user" >&2
+      exit 2
+    }
+  else
+    install -d -m 0700 "$PRODUCTION_RUNTIME_BASE"
+  fi
+  [[ $(stat -c %a "$PRODUCTION_RUNTIME_BASE") == 700 ]] || {
+    echo "production runtime base must have mode 0700" >&2
+    exit 2
+  }
+  production_runtime_available_bytes=$(df -B1 --output=avail "$PRODUCTION_RUNTIME_BASE" | tail -n 1)
+  production_runtime_available_bytes=${production_runtime_available_bytes//[[:space:]]/}
+  [[ $production_runtime_available_bytes =~ ^[0-9]+$ \
+     && $production_runtime_available_bytes -ge 10737418240 ]] || {
+    echo "production runtime filesystem requires at least 10 GiB free" >&2
+    exit 2
+  }
+  if [[ -e $production_runtime_root ]]; then
+    [[ -d $production_runtime_root && ! -L $production_runtime_root ]] || {
+      echo "production runtime_root must be a real directory" >&2
+      exit 2
+    }
+    [[ $(stat -c %u "$production_runtime_root") == $(id -u) ]] || {
+      echo "production runtime_root must be owned by the invoking user" >&2
+      exit 2
+    }
+  fi
+  install -d -m 0700 "$production_runtime_root"
+  init_at_random_ep_len=true
+  raven_exact_raytraced_augmentation=true
   [[ $actor_prefix == "$run_id-g1" && ( $wire_protocol == v3 || $wire_protocol == v4 ) && $rpc_workers == 8 ]] || {
     echo "production actor prefix or eight-gateway protocol mismatch" >&2; exit 2;
   }
@@ -428,7 +518,7 @@ PY
     [[ -z $continuation_manifest ]] || {
       echo "fresh window-0 production must not carry a continuation manifest" >&2; exit 2;
     }
-    readonly RUN="$ROOT/runtime/production-runs/$run_id/D$round_id/$actor_prefix"
+    readonly RUN="$production_runtime_root/D$round_id/$actor_prefix"
   else
     [[ -n $continuation_manifest && -f $continuation_manifest && ! -L $continuation_manifest ]] || {
       echo "nonzero production window requires a regular continuation manifest" >&2; exit 2;
@@ -466,9 +556,10 @@ print(value.episode_serial_base)
 print(value.digest)
 print(value.predecessor_state_path)
 print(value.h200_activity_evidence_path or "")
+print(value.end_global_window_exclusive)
 PY
     )
-    [[ ${#segment_fields[@]} -eq 9 ]] || {
+    [[ ${#segment_fields[@]} -eq 10 ]] || {
       echo "could not parse continuation manifest" >&2; exit 2;
     }
     segment_id=${segment_fields[0]}
@@ -481,7 +572,23 @@ PY
     episode_serial_base=${segment_fields[5]}
     predecessor_state_real=${segment_fields[7]}
     h200_activity_evidence_real=${segment_fields[8]}
-    [[ $predecessor_state_real == "$ROOT_REAL/runtime/production-runs/$run_id/"* ]] || {
+    continuation_cadence_end=${segment_fields[9]}
+    continuation_effective_end=$continuation_cadence_end
+    if (( production_window_count < continuation_effective_end )); then
+      continuation_effective_end=$production_window_count
+    fi
+    (( window_index < continuation_effective_end )) || {
+      echo "continuation starts at or beyond the immutable production window budget" >&2; exit 2;
+    }
+    expected_continuation_ack=I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_VALIDATION
+    if (( continuation_effective_end == production_window_count \
+          && production_window_count % 40 != 0 )); then
+      expected_continuation_ack=I_ACKNOWLEDGE_FRESH_PRODUCTION_CONTINUATION_TO_WINDOW_BUDGET
+    fi
+    [[ $step_ack == "$expected_continuation_ack" ]] || {
+      echo "production continuation acknowledgement does not match its exact endpoint" >&2; exit 2;
+    }
+    [[ $predecessor_state_real == "$production_runtime_root/"* ]] || {
       echo "predecessor state must belong to this production run" >&2; exit 2;
     }
     if [[ -n $h200_activity_evidence_real ]]; then
@@ -494,7 +601,7 @@ PY
     if [[ -n $h200_activity_evidence_real ]]; then
       h200_activity_evidence_container=/run/attestations/h200-activity-evidence.json
     fi
-    readonly RUN="$ROOT/runtime/production-runs/$run_id/D$round_id/$actor_prefix/segments/$segment_id"
+    readonly RUN="$production_runtime_root/D$round_id/$actor_prefix/segments/$segment_id"
     [[ ! -e $RUN ]] || {
       echo "continuation runtime already exists; simulator replay is forbidden" >&2; exit 3;
     }
@@ -562,7 +669,11 @@ gpu_name=${gpu_name%${gpu_name##*[![:space:]]}}
 # Reuse the existing read-only asset/GPU/collector gate before initializing
 # Isaac.  It never calls env.reset or env.step.
 [[ -x $HOST_PYTHON ]] || { echo "missing host Python: $HOST_PYTHON" >&2; exit 2; }
-preflight_args=(--gpu "$GPU" --output "$ROOT/logs/preflight-launch-$TAG.json")
+preflight_output="$ROOT/logs/preflight-launch-$TAG.json"
+if [[ $mode == production ]]; then
+  preflight_output="$production_runtime_root/preflight-launch-$TAG.json"
+fi
+preflight_args=(--gpu "$GPU" --output "$preflight_output")
 if [[ -n $capacity_group_id ]]; then
   preflight_args+=(--capacity-group-id "$capacity_group_id")
 fi
@@ -571,11 +682,11 @@ fi
 if [[ $mode != capture-only ]]; then
   ready_json=$(curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${H200_BASE_PORT}/ready")
   READY_JSON="$ready_json" WIRE_PROTOCOL="$wire_protocol" \
-    H200_BASE_PORT="$H200_BASE_PORT" \
+    READY_H200_BASE_PORT="$H200_BASE_PORT" \
     EXPECTED_H200_PID="$expected_h200_pid" "$HOST_PYTHON" - <<'PY'
 import json, os
 value = json.loads(os.environ["READY_JSON"])
-port = os.environ["H200_BASE_PORT"]
+port = os.environ["READY_H200_BASE_PORT"]
 if value.get("ok") is not True or value.get("role") != "render_student":
     raise SystemExit(f"H200 {port} readiness role mismatch")
 expected_pid = os.environ["EXPECTED_H200_PID"]
@@ -852,7 +963,8 @@ docker run --rm --name "$NAME" --gpus "device=$GPU_UUID" "${capacity_labels[@]}"
   "algo.config.num_steps_per_env=$native_steps" \
   algo.config.num_mini_batches=1 \
   algo.config.num_learning_epochs=0 \
-  algo.config.init_at_random_ep_len=false \
+  "algo.config.init_at_random_ep_len=$init_at_random_ep_len" \
+  "++algo.config.raven_exact_raytraced_augmentation=$raven_exact_raytraced_augmentation" \
   algo.config.rollout_with_teacher_num_steps=0 \
   algo.config.enforce_teacher_rollout=false \
   algo.config.ratio_teacher_rollout=0.0 \
