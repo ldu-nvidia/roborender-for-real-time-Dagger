@@ -1,0 +1,89 @@
+{
+  "schema": "roborender.dagger.rtx.assets.v1",
+  "raven_root": "/home/ldu/BC_render/rtx_BC_transfer",
+  "raven_commit": "94d79851d9c471b1210be81c75116d9bea835a4d",
+  "large_assets_are_referenced_not_copied": true,
+  "artifacts": [
+    {
+      "role": "raven_videogen_trainer",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/trl/trainer/distill_trainer_videogen.py",
+      "bytes": 43015,
+      "sha256": "cc7f8aa3de2a9d60324b9294ba5db7ce15f339d59fa168ef1ccab7484d11890b"
+    },
+    {
+      "role": "raven_teacher_homie_trainer",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/trl/trainer/distill_trainer_obj_pred_homie_api.py",
+      "bytes": 37335,
+      "sha256": "3da5a2557ae18a8ba53c4da14d8841b80a609b851b326a21534ee2c5001b7584"
+    },
+    {
+      "role": "isaac_capture",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/simulator/isaacsim/isaacsim.py",
+      "bytes": 127951,
+      "sha256": "1d03ebca26f8c5f64d65d2146e79bbf8ceab6af2b83dfb65afa690b784b1073f"
+    },
+    {
+      "role": "image_dagger_3view_config",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/config/exp/loco_manip/wsdpt_image_dagger_3view.yaml",
+      "bytes": 5510,
+      "sha256": "787c461bb96f9e7f2116322c457b0c944ca12c124094b7f08afe9a3cb2a50b6f"
+    },
+    {
+      "role": "privileged_teacher",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/checkpoints/teachers/robot_policy/g1_privileged_action_teacher_wsdpt_step044500.pt",
+      "bytes": 6805725,
+      "sha256": "943a34fa8b6031dc2f8e3cd3b3424c641f8ba02d680ebb74743e22b31a2bbe38"
+    },
+    {
+      "role": "homie_walk",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/checkpoints/teachers/locomotion/g1_locomotion_walk_controller.pt",
+      "bytes": 9785586,
+      "sha256": "2efa9d39c6ace247d6d68b43452f591cd5b22fb2f5e58dcfd3b6c5d1b30df77e"
+    },
+    {
+      "role": "homie_stand",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/checkpoints/teachers/locomotion/g1_locomotion_stand_controller.pt",
+      "bytes": 9785586,
+      "sha256": "ceb976d2745bdaa99e51ba7141e441dc7a140638ff8e2b0efaf50efd20290054"
+    },
+    {
+      "role": "raven_train_entrypoint",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/train_agent_trl.py",
+      "bytes": 18003,
+      "sha256": "85005db0cab61eea52a01d2d6f4860e868703935bfa78c8576458ccc7882b565"
+    },
+    {
+      "role": "raven_vector_rollout_owner",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/trl/trainer/ppo_trainer.py",
+      "bytes": 96645,
+      "sha256": "f56a1488af7cc007c81e07abd9b1adfc12ab83b5c541ea163381ef9af743ca61"
+    },
+    {
+      "role": "raven_delta_action",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/envs/base_task/delta_action_base.py",
+      "bytes": 6856,
+      "sha256": "eff91a2e5492020bf4d01e41c9e8e90971fdd5647efee6e4d54c4f3148302a85"
+    },
+    {
+      "role": "certified_container_launcher",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/bc_collection/run_raven_bc_rank_container_rtx_impl.sh",
+      "bytes": 4479,
+      "sha256": "3ab0a10d7deaaa19155d3ac54e382ce1bf8a6ae4c3c74e522144376976167eb6"
+    },
+    {
+      "role": "certified_container_sitecustomize",
+      "path": "/home/ldu/BC_render/rtx_BC_transfer/pipeline/bc_collection/image_sitecustomize.py",
+      "bytes": 1086,
+      "sha256": "c2982271707525a5c881c7909e0a7bac2fdc19ffd90d80db9b4941342f4fbdbd"
+    }
+  ],
+  "anchor_pool": {
+    "path": "/mnt/data1/ldu/research/fast_roborender/runtime/hsg_stage_transfer/anchor_pool_2048",
+    "npz_count": 2048,
+    "inventory_sha256": "ee358a97581512a5d03730d06efd5804e53844f517112dc0a845ed86b6dae46f"
+  },
+  "certified_container": {
+    "tag": "roborender-round-actor:isaaclab2.3.0-checkpoint-compat-20260901",
+    "image_id": "sha256:fcaa595df8f175763ac326187a97dc8bbddca55d6bcc3531cdfecd6be1705a43"
+  }
+}

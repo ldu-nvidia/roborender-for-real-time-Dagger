@@ -1,0 +1,115 @@
+{
+  "schema": "roborender.dagger.rtx.boundary-description.v3",
+  "contract_version": "roborender.dagger.rtx.v3",
+  "content_type": "application/vnd.roborender.ndarray-batch.v3",
+  "framing": {
+    "magic_ascii": "RDB3",
+    "prefix_struct": "<4sQ",
+    "header_encoding": "canonical-json-sort-keys-compact-no-nan",
+    "blob_codec": "zlib-1",
+    "compressed_stream": "RFC1950 zlib.compress(raw_blob, level=1)",
+    "descriptor_offsets": "relative-to-uncompressed-global-raw-blob",
+    "descriptor_order": "lexical-array-name-within-lane",
+    "lane_order": "input-vector-order",
+    "raw_blob": "contiguous-little-endian-C-order-no-padding"
+  },
+  "binary_header_top_keys": {
+    "prepare_batch": [
+      "batch_id",
+      "blob_codec",
+      "contract_version",
+      "kind",
+      "lanes",
+      "raw_nbytes",
+      "raw_sha256"
+    ],
+    "anchor_batch": [
+      "anchors",
+      "batch_id",
+      "blob_codec",
+      "contract_version",
+      "kind",
+      "raw_nbytes",
+      "raw_sha256"
+    ]
+  },
+  "descriptor_keys": [
+    "dtype",
+    "name",
+    "nbytes",
+    "offset",
+    "sha256",
+    "shape"
+  ],
+  "digests": {
+    "raw_sha256": "sha256(uncompressed-global-raw-blob)",
+    "wire_digest": "sha256(canonical_json(metadata),then-for-each-lean-array-in-lexical-name-order-canonical_json({name,dtype,shape}),then-raw-C-order-bytes)",
+    "capture_digest": "opaque-full-capture-digest-sent-and-echoed-for-compatibility-but-not-remotely-recomputed-from-the-lean-projection",
+    "per_array_sha256": "sha256(raw-little-endian-C-order-array-bytes)"
+  },
+  "routes": {
+    "anchor_register": "/v3/anchors/register-batch",
+    "prepare": "/v3/steps/prepare-batch",
+    "commit": "/v3/steps/commit-batch"
+  },
+  "prepare_arrays": {
+    "fixed_wire": {
+      "actor_obs": ["float32", [113]],
+      "teacher_action": ["float32", [26]]
+    },
+    "required_local_not_wire": {
+      "homie_action": ["float32", [15]]
+    },
+    "local_invariant": "teacher_action[11:] equals homie_action element-exact",
+    "h200_reconstruction": "homie_action=teacher_action[11:]",
+    "generated_controls_per_view": {
+      "views": ["head_color", "hand_left", "hand_right"],
+      "depth_ctrl": ["uint8", [240, 416]],
+      "rgb_robot": ["uint8", [240, 416, 3]]
+    },
+    "raytraced_per_view": {
+      "views": ["head_color", "hand_left", "hand_right"],
+      "raytraced_rgb": ["float32", [108, 192, 3], "finite-[0,1]"]
+    },
+    "source_exclusivity": {
+      "generated_controls": [
+        "actor_obs",
+        "depth_ctrl__hand_left",
+        "depth_ctrl__hand_right",
+        "depth_ctrl__head_color",
+        "rgb_robot__hand_left",
+        "rgb_robot__hand_right",
+        "rgb_robot__head_color",
+        "teacher_action"
+      ],
+      "raytraced": [
+        "actor_obs",
+        "raytraced_rgb__hand_left",
+        "raytraced_rgb__hand_right",
+        "raytraced_rgb__head_color",
+        "teacher_action"
+      ]
+    }
+  },
+  "anchor_arrays": [
+    "anchor_rgb__head_color",
+    "anchor_rgb__hand_left",
+    "anchor_rgb__hand_right"
+  ],
+  "sharding": {
+    "gateway_urls": [
+      "http://127.0.0.1:18620",
+      "http://127.0.0.1:18621",
+      "http://127.0.0.1:18622",
+      "http://127.0.0.1:18623",
+      "http://127.0.0.1:18624",
+      "http://127.0.0.1:18625",
+      "http://127.0.0.1:18626",
+      "http://127.0.0.1:18627"
+    ],
+    "assignment": "gateway_index=vector_lane_index%8",
+    "prepare": "concurrent-per-shard-then-all-shards-settle-and-original-order-reassembly",
+    "commit": "concurrent-per-shard-then-all-shards-settle-and-original-order-reassembly",
+    "transition_gate": "exactly-one-env.step([B,26])-only-after-all-B-prepare-responses-validate"
+  }
+}

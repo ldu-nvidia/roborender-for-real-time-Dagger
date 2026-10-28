@@ -1,0 +1,18 @@
+{
+  "schema": "roborender.leo-rtx-migration.v1",
+  "hostname": "leo-rtx-6k",
+  "ssh_user": "ldu",
+  "ssh_address": "10.110.17.160",
+  "gpu_bindings": [
+    {"physical_index": 0, "uuid": "GPU-4d58bc2b-43c8-6ff8-e7fd-2348575f0cff"},
+    {"physical_index": 1, "uuid": "GPU-b92877a7-a5e0-9a83-3bc0-d8ede481f35d"}
+  ],
+  "forbidden_gpu_indices": [2],
+  "container_image_id": "sha256:7aa2c5aaf53e55e749c9f63b6430b9554b4ca49928cf35f376a646669da7b509",
+  "repository_root": "/home/ldu/roborender",
+  "raven_root": "/home/ldu/BC_render/rtx_BC_transfer",
+  "anchor_root": "/home/ldu/roborender_assets/anchors/anchor_pool_2048",
+  "scientific_settings": "unchanged from versioned Beta Isaac6 candidate",
+  "production_admitted": false,
+  "note": "Bounded native qualification only. Do not reuse Beta GPU UUIDs or production admission on Leo."
+}

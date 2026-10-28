@@ -1,0 +1,9 @@
+# Diagnostic image, never a production actor or a silent Isaac upgrade.
+# Pass a registry digest (not a floating tag) after pulling the chosen base.
+ARG ISAAC_BASE
+FROM ${ISAAC_BASE}
+USER root
+LABEL org.roborender.role="graphics-qualification-only"
+COPY graphics_probe.py /opt/roborender/graphics_probe.py
+ENV ACCEPT_EULA=Y OMNI_KIT_ALLOW_ROOT=1 PYTHONDONTWRITEBYTECODE=1
+ENTRYPOINT ["/isaac-sim/python.sh", "/opt/roborender/graphics_probe.py"]

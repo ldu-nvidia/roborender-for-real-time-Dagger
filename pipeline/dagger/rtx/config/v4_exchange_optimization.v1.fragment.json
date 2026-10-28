@@ -1,0 +1,21 @@
+{
+  "schema": "roborender.dagger.rtx.v4-exchange-optimization-fragment.v1",
+  "h200": {
+    "readiness_prewarm_probes": 2,
+    "sharding_strategy": "cost_aware_window_pinned",
+    "suppress_success_transport_events": true
+  },
+  "semantics": {
+    "default_if_absent": {
+      "readiness_prewarm_probes": 0,
+      "sharding_strategy": "modulo",
+      "suppress_success_transport_events": false
+    },
+    "mapping_lifetime": "entire client process across sequential finalized windows with identical ordered actors",
+    "next_window_policy": "step zero only after successful finalization; reuse the original actor-to-gateway mapping",
+    "retry_policy": "identical actor-to-gateway mapping and identical finalize request replay",
+    "successful_transport_events_when_suppressed": "one aggregate non-fsynced vector-step record",
+    "successful_transport_events_by_default": "durable per-request records plus the aggregate vector-step record",
+    "transport_errors_and_retries": "forwarded to the durable run telemetry"
+  }
+}

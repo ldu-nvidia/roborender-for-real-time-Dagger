@@ -1,53 +1,130 @@
-# Credentials and local account state
-.env
-.env.*
-!.env.example
-.netrc
-*.pem
-*.key
-*.p12
-*.pfx
-*.kubeconfig
-credentials*.json
-service-account*.json
-.aws/
-.config/gcloud/
+# Upstream source trees are installed separately and patched from vendor/.
+pipeline/GR00T-VisualSim2Real
+IsaacLab/
+roborender-acceleration/
 
-# Python and test state
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-*.egg-info/
-build/
-dist/
-
-# Models, datasets, rollouts, and generated media
-artifacts/
-checkpoints/
-data/
-datasets/
-outputs/
-runtime/
-wandb/
-telemetry/
+# Large immutable model, replay, and evaluation artifacts.
 *.npz
+*.npy
 *.pt
 *.pth
 *.safetensors
 *.onnx
 *.engine
+*.plan
 *.mp4
-*.webm
 *.png
-*.jpg
-*.jpeg
 
-# Local/editor files
-.DS_Store
-.vscode/
-.idea/
+# Canonical experiment data remain local; only its layout documentation is
+# versioned with the source tree.
+data/**
+!data/README.md
+!data/DATA_LAYOUT.md
+
+# Renderer assets and generated builds are local, checksum-pinned artifacts.
+renderer/incoming/
+renderer/anchors/
+renderer/envs/
+renderer/releases/
+renderer/models/
+renderer/artifacts/
+renderer/offline_teacher/source
+renderer/online_image3f/runtime/
+renderer/online_image3f/source/
+renderer/online_image3f/teacache/
+renderer/orchestration/fast_roborender/
+renderer/active
+renderer/validation/
+
+# Local runtime state; canonical campaign artifacts live outside this checkout.
+runtime/
+# Host-specific continuation receipts are audit artifacts, not reusable configs.
+pipeline/dagger/rtx/config/continuations/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-*
+# Container images/build state are deployment products, not repository source.
+containers/
+runs/
+outputs/
+artifacts/
+checkpoints/**
+!checkpoints/
+!checkpoints/README.md
+!checkpoints/**/
+!checkpoints/**/*.md
+!checkpoints/**/*.json
+# Per-run student outputs are local artifacts, including mutable metrics.
+checkpoints/students/BC/*/
+checkpoints/students/dagger_1/*/
+checkpoints/students/dagger_2/*/
+checkpoints/students/dagger_3/*/
+checkpoints/students/dagger_4/*/
+# The root checkpoint layout above is versioned; renderer adapters are not.
+renderer/artifacts/adapters/**
+replay_cache/
+.round_dagger/
+
+# One-time cross-host transfer bundles are deployment staging, not source.
+rtx_BC_transfer/
+rtx_BC_transfer.zip
+
+# Logs and telemetry.
 *.log
+logs_rl/
+logs_eval/
+wandb/
+
+# Source handoff/review archives are derived from a Git tree, never inputs.
+*.tar.gz
+*.tgz
+*.tar
+*.7z
+*.zip.part
+
+# Python environments and caches.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+envs/
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.whl
+
+# Native crash and profiler output.
+/core
+/core.*
+*.prof
+*.trace
+
+# Local credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.kubeconfig
+.kube/
+.netrc
+credentials/
+secrets/
+service-account*.json
+*_credentials.json
+*_secrets.json
+
+# Editor and OS metadata.
+.vscode/
+.DS_Store

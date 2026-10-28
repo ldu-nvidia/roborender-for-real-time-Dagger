@@ -1,0 +1,11 @@
+{
+  "schema": "roborender.rtx.host-deployment.v1",
+  "hostname": "465d6b0-lcedt",
+  "physical_gpu_index": 1,
+  "physical_gpu_uuid": "GPU-0c1949ae-379a-2f2e-0f23-621de2eee409",
+  "image": "roborender-round-actor:isaaclab2.3.0-beta-rebuild-20261008",
+  "image_id": "sha256:02933f537cbddd41ed9c894b7467a46d2b4cd73d4feedbd03b6e23d92e526a97",
+  "raven_root": "/home/ldu/BC_render/rtx_BC_transfer",
+  "anchor_root": "/home/ldu/roborender_assets/anchors/anchor_pool_2048",
+  "cache_root": "/home/ldu/BC_render/BC_collection_data/persistent-cache/roborender-round-actor-isaaclab2.3.0-checkpoint-compat-20260901"
+}

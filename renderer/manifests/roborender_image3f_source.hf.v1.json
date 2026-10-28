@@ -1,0 +1,22 @@
+{
+  "schema": "roborender.renderer.hf_source_snapshot.v1",
+  "role": "online_image3f_portable_deployment_source",
+  "repository": "Ravenh97/roborender_image3f",
+  "repository_type": "model",
+  "revision": "dd0a8f20bbce56aa2cf111356b4c8cd310b3a9fb",
+  "relative_root": "online_image3f/source",
+  "hub_files": 843,
+  "hub_bytes": 729838890,
+  "local_files": 842,
+  "local_bytes": 29843850,
+  "omitted_local_file": "adapter/rgb030-depth030-step-5000.safetensors",
+  "omitted_file_is_canonical_duplicate": true,
+  "canonical_adapter_relative_path": "online_image3f/checkpoints/roborender_online_dagger_image3f_5step_lora_step05000.safetensors",
+  "canonical_adapter_sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588",
+  "source_manifest_sha256": "df99867a80de581065a01c706e23d26375fa90bffbaa8285eb371882fc3b76f7",
+  "published_missing_referenced_paths": [
+    "HANDOFF.md",
+    "assets/fixtures/lag256"
+  ],
+  "verified_utc_date": "2026-09-06"
+}

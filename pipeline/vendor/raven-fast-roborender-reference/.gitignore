@@ -1,0 +1,46 @@
+# ---- vendored / nested repositories (each has its own git history) ----
+GR00T-VisualSim2Real/
+IsaacLab/
+roborender-acceleration/
+Sim2RealGen_Video_Model/
+image3f
+
+# ---- model bundles, datasets, rendered artifacts ----
+videogen_dataset/
+teacher_fullres/
+step_ab_out*/
+image3f_reproduction/
+anchor_pool*/
+*.npz
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine
+*.mp4
+*.png
+
+# ---- run-time state ----
+image3f_queue*/
+*_endpoint*.txt
+diag_*/
+
+# ---- logs ----
+*.log
+logs_archive/
+logs_rl/
+logs_eval/
+wandb/
+slurm-*.out
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- editor / os ----
+.vscode/
+.DS_Store

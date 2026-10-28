@@ -1,0 +1,197 @@
+{
+  "schema": "roborender.repository_layout.v4",
+  "effective_utc_date": "2026-10-09",
+  "source_of_truth": {
+    "repository": "ldu-nvidia/roborender-for-real-time-Dagger",
+    "policy": "verify identical source snapshot during reconciliation; identical Git commit after reviewed commit/push",
+    "intended_push_host": "RTX PRO 6000",
+    "canonical_h200_checkout": "/workspace/project/roborender",
+    "canonical_rtx_checkout": "/home/ldu/roborender"
+  },
+  "external_dependency": {
+    "path": "pipeline/GR00T-VisualSim2Real",
+    "git_commit": "94d79851d9c471b1210be81c75116d9bea835a4d",
+    "materialization": "pipeline/bootstrap_raven_gr00t.sh",
+    "tracked_in_parent_repo": false
+  },
+  "active_contracts": {
+    "bc_collection": {
+      "path": "pipeline/bc_collection/raven_bc_collection_contract.v1.json",
+      "file_sha256": "91db24f61a72f4109ad549e3fcd5a43b74a7c5feb319b70119c8b84a0d9a64d8",
+      "canonical_json_sha256": "9e68006367c4132377eb2c104ab0f9e533fbad7f8a15e47db470090eb1c93287"
+    },
+    "raven_image3f_reference": {
+      "path": "pipeline/dagger/raven_image3f_dagger_contract.v1.json",
+      "file_sha256": "d48a04af49556e32c416bea15449f1bbc3d8c20bab113c12ca1e76c2e0a0bf85",
+      "canonical_json_sha256": "2bdfc2b1537f1804e7213c64f45c895142350bc68ad8c620613af8b1db510294"
+    },
+    "experiment_round_schedule": {
+      "path": "pipeline/dagger/canonical_round_schedule.v1.json",
+      "file_sha256": "a6b10010a602350614176c530dfd3c906455b3fc62bf5df9abc7d59c56926e0d",
+      "canonical_json_sha256": "6748b6c9b65e1d7719f33d36ab66c606452a7e0a680bc97665ad9131cddb7a0f"
+    },
+    "fixed_validation_panel": {
+      "path": "pipeline/dagger/config/fixed_validation_panel.v1.json",
+      "file_sha256": "ad1c3a57896e01f19e260ecb0daead8b508031326e217e134793627df5af8ace",
+      "case_count": 256
+    },
+    "active_cross_host_protocol": "roborender.dagger.rtx.v3",
+    "active_protocol_scope": "bounded RTX beta qualification only; legacy alpha production remains v4/eight-gateway",
+    "optional_rtx_v4_optimization": {
+      "path": "pipeline/dagger/rtx/config/v4_exchange_optimization.v1.fragment.json",
+      "file_sha256": "4f8ffc599110122381102c05bfd34f403c3d5243e86fe4802472c7d3663b6771",
+      "enabled_by_default": false,
+      "requires_h200_multisession_patch": false
+    }
+  },
+  "phase_roots": {
+    "bc_collection": "pipeline/bc_collection",
+    "bc_rendering": "pipeline/bc_rendering",
+    "bc_training": "pipeline/bc_training",
+    "dagger_h200": "pipeline/dagger",
+    "dagger_rtx": "pipeline/dagger/rtx",
+    "evaluation": "pipeline/evaluation",
+    "deployment": "pipeline/deployment",
+    "renderer": "renderer",
+    "checkpoints": "checkpoints",
+    "data": "data",
+    "runtime": "runtime"
+  },
+  "component_classification": {
+    "active": [
+      "pipeline/bc_collection",
+      "pipeline/bc_rendering",
+      "pipeline/bc_training",
+      "pipeline/dagger/services",
+      "pipeline/dagger/rtx",
+      "pipeline/evaluation",
+      "renderer/contracts"
+    ],
+    "compatibility_required": [
+      "RTX v1 per-step boundary",
+      "RTX/H200 v3 lean batch boundary",
+      "v2 binary codec and client tests retained as v3/v4 transport foundation and protocol provenance"
+    ],
+    "provenance_reference_required": [
+      "pipeline/RAVEN_EQUIVALENCE_AUDIT.md",
+      "pipeline/vendor/raven-fast-roborender-reference",
+      "checkpoints",
+      "renderer/manifests"
+    ],
+    "removed_as_superseded": [
+      "pipeline/dagger/rtx/scripts/live_progress_monitor.py",
+      "pipeline/dagger/rtx/scripts/hammer_h200_ready_v3.py",
+      "pipeline/dagger/rtx/scripts/recover_local_committed_batch.py",
+      "pipeline/bc_rendering/export_rendered_bc_supervision.py",
+      "pipeline/launchers",
+      "pipeline/testing"
+    ]
+  },
+  "deployment_bindings": {
+    "rtx_assets": "pipeline/dagger/rtx/config/assets.manifest.json",
+    "fixed_panel_external_assets": "explicit path plus SHA-256 bindings in pipeline/dagger/rtx/scripts/launch_fixed_panel_validation.sh",
+    "container_mount_root": "/workspace/dagger_rtx_server is a stable internal container ABI, not a host checkout",
+    "gateway_ports": "beta qualification 18620-18623; legacy alpha production 18620-18627",
+    "current_profile": "pipeline/deployment/profiles/beta_2rtx_4h200.v1.json",
+    "current_runbook": "pipeline/deployment/WORKING_REPO.md",
+    "end_to_end_contract": "docs/END_TO_END_PIPELINE_CONTRACT.md",
+    "source_verifier": "pipeline/deployment/source_snapshot.py"
+  },
+  "source_only_policy": {
+    "excluded": [
+      "datasets",
+      "checkpoints and model weights",
+      "ONNX and TensorRT engines",
+      "runtime journals and logs",
+      "credentials and bearer tokens",
+      "generated caches"
+    ],
+    "h200_multisession_experiment": "not incorporated; requires independent validation"
+  },
+  "experiment_stages": [
+    "BC",
+    "dagger_1",
+    "dagger_2",
+    "dagger_3",
+    "dagger_4"
+  ],
+  "dagger_teacher_betas": [
+    0.75,
+    0.5,
+    0.25,
+    0.0
+  ],
+  "dagger_student_probabilities": [
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "legacy_alpha_dagger_runtime": {
+    "rtx_physical_gpu": 1,
+    "concurrent_environments": 28,
+    "steps_per_iteration": 81,
+    "transitions_per_iteration": 2268,
+    "chunks_per_iteration": 28,
+    "image3f_h200_workers": 8,
+    "raytraced_episode_probability": 0.5,
+    "replay": "current_iteration_only",
+    "validation_interval_iterations": 40,
+    "validation_metric": "raven_goal_reached_rate",
+    "validation_cases": 256
+  },
+  "beta_qualification_runtime": {
+    "rtx_physical_gpus": [1, 2],
+    "environments_per_gpu": 6,
+    "h200_workers": 4,
+    "steps_per_window": 81,
+    "transitions_per_window": 972,
+    "chunks_per_update": 12,
+    "validated_windows_per_test": 1,
+    "production_promoted": false,
+    "success_evaluation_qualified": false
+  },
+  "services": {
+    "coordinator": 18610,
+    "trajectory": 18611,
+    "registry": 18612,
+    "learner": 18613,
+    "evaluation": 18614,
+    "image3f_workers": "18500-18503",
+    "render_student_gateways_default": "18620-18623",
+    "render_student_gateway_count": 4
+  },
+  "dataset_state": {
+    "bc_root": "data/BC",
+    "isaac_chunks": 2000,
+    "rendered_chunks": 2000,
+    "frames_per_chunk": 81,
+    "paired_filenames": true,
+    "split_counts": {
+      "train": 1600,
+      "validation": 200,
+      "test": 200
+    },
+    "seal": "data/BC/SEALED.json",
+    "dagger_chunks": "runtime-only current-iteration learner chunks"
+  },
+  "artifact_registries": {
+    "checkpoints": {
+      "path": "checkpoints/manifest.json",
+      "sha256": "11ecd84b05bd92716ea5e3afe9b0b43956dbfdf5c77ccbadcd888432313c604e"
+    },
+    "renderer": {
+      "path": "renderer/manifests/registry.v1.json",
+      "sha256": "ece714931818bd128da16b4ef513afc1c5dc46ef3c364b7ee0563c2b2dd12c1b"
+    }
+  },
+  "rules": {
+    "source_tree_identity": "same Git commit on both hosts",
+    "host_local_assets": "excluded from Git and SHA-256 manifested",
+    "sealed_artifact_mutation": "forbidden",
+    "checkpoint_selection": "closed_loop_success_rate",
+    "validation_backpropagation": false,
+    "foreign_architecture_engine_use": "forbidden",
+    "compatibility_symlinks": "only for unavoidable pinned upstream loaders"
+  }
+}

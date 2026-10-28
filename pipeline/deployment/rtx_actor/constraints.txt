@@ -1,0 +1,7 @@
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+numpy==1.26.0
+triton==3.3.0
+packaging==23.2
+flatdict==4.0.1
+opencv-python==4.11.0.86

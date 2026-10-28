@@ -1,0 +1,380 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://roborender.local/contracts/render_student_boundary.v1.schema.json",
+  "title": "RoboRender RTX-H200 per-step boundary",
+  "x-wire-semantics": {
+    "canonical_json": "UTF-8 JSON produced with sorted object keys, separators (comma,colon), allow_nan=false, and no BOM or trailing newline. Requests MUST be byte-canonical; a response parser MAY accept one trailing newline.",
+    "array_envelope": "data_b64 decodes to an explicitly little-endian, C-contiguous ndarray. sha256 is SHA-256(raw C-order bytes); dtype and shape must exactly describe those bytes.",
+    "capture_digest": "SHA-256(canonical_json(metadata) || for each array name in lexicographic order: canonical_json({name,dtype,shape}) || raw C-order bytes).",
+    "anchor_sha256": "In view_order head_color,hand_left,hand_right: SHA-256(concatenation of canonical_json({view,dtype:'uint8',shape}) then raw C-order anchor_rgb bytes for each view).",
+    "observation_digest": "SHA-256(canonical_json({contract_version,step_key,observation_source,prompt,view_order,model_view_map,inputs})). inputs is ordered by view_order; raytraced uses raytraced_rgb__VIEW, generated_controls uses anchor_rgb__VIEW,depth_ctrl__VIEW,rgb_robot__VIEW. Each input item is {name,dtype,shape,sha256(raw C-order bytes)}.",
+    "prepare_receipt": "RTX computes request_digest=SHA-256(canonical_json({step_key,request_id,beta})); prepare_receipt=SHA-256(canonical_json({request_digest,capture_digest})). request_id remains local, so H200 validates syntax, preserves, binds, and echoes this receipt.",
+    "selection_receipt": "SHA-256(canonical_json(prepareResponse with selection_receipt omitted)).",
+    "commit_receipt": "RTX computes commit_digest=SHA-256(canonical_json({step_key,prepare_receipt,selection_id,selected_source,beta,selected_action})); commit_receipt=SHA-256(canonical_json({commit_digest,result:transition})).",
+    "remote_commit_receipt": "SHA-256(canonical_json(commitResponse with remote_commit_receipt omitted))."
+  },
+  "x-idempotency": {
+    "scope": "per route",
+    "required_store": "H200 MUST durably persist (route,idempotency_key) -> (SHA-256(canonical request bytes), exact canonical response bytes) across service/process restart before replying.",
+    "prepare": "Persist request-body digest, one generated selection_draw, and complete response before exposing an effect. Exact retries, including after restart, return the byte-equivalent stored response; reuse with a different body is HTTP 409.",
+    "commit": "Durably bind one selection_id to one idempotency key and complete acknowledgement before replying. Exact post-effect retries, including after restart, return the stored acknowledgement; a changed body or second key for the same selection is HTTP 409.",
+    "ordering": "commit is rejected unless it binds a previously durable prepare selection by step_key, prepare_receipt, selection_id, and selection_receipt."
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!\\.{1,2}$)[A-Za-z0-9._-]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "stepKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id", "round_id", "actor_id", "rollout_window_id",
+        "rollout_step_index", "episode_id", "episode_step_index"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/identifier"},
+        "round_id": {"type": "integer", "minimum": 1, "maximum": 4},
+        "actor_id": {"$ref": "#/$defs/identifier"},
+        "rollout_window_id": {"$ref": "#/$defs/identifier"},
+        "rollout_step_index": {"type": "integer", "minimum": 0, "maximum": 80},
+        "episode_id": {"$ref": "#/$defs/identifier"},
+        "episode_step_index": {"type": "integer", "minimum": 0}
+      }
+    },
+    "arrayEnvelope": {
+      "type": "object",
+      "x-byte-order": "little-endian",
+      "x-memory-order": "C",
+      "x-integrity": "sha256 over decoded raw bytes",
+      "additionalProperties": false,
+      "required": ["dtype", "shape", "sha256", "data_b64"],
+      "properties": {
+        "dtype": {"enum": ["float16", "float32", "uint8", "uint16", "int64", "bool"]},
+        "shape": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 5,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "data_b64": {"type": "string", "contentEncoding": "base64"}
+      }
+    },
+    "f32_3": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [3]}}}]},
+    "f32_11": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [11]}}}]},
+    "f32_15": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [15]}}}]},
+    "f32_26": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [26]}}}]},
+    "f32_113": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [113]}}}]},
+    "f32_226": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [226]}}}]},
+    "f32_516": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [516]}}}]},
+    "depthMetric": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [480, 832]}}}]},
+    "depthRawQ": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "uint16"}, "shape": {"const": [480, 832]}}}]},
+    "depthRaw": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float16"}, "shape": {"const": [240, 416]}}}]},
+    "depthControl": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "uint8"}, "shape": {"const": [240, 416]}}}]},
+    "robotControl": {"allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "uint8"}, "shape": {"const": [240, 416, 3]}}}]},
+    "raytracedPolicyRgb": {
+      "allOf": [{"$ref": "#/$defs/arrayEnvelope"}, {"properties": {"dtype": {"const": "float32"}, "shape": {"const": [108, 192, 3]}}}],
+      "x-decoded-range": "finite float32 values in [0,1]"
+    },
+    "episodeAssignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "use_raytraced", "observation_source", "anchor_sha256", "assignment_source",
+        "raven_source", "raven_commit"
+      ],
+      "properties": {
+        "use_raytraced": {"type": "boolean"},
+        "observation_source": {"enum": ["raytraced", "generated_controls"]},
+        "anchor_sha256": {"$ref": "#/$defs/sha256"},
+        "assignment_source": {"const": "pinned_raven_id_sample_anchor"},
+        "raven_source": {"const": "/home/ldu/BC_render/rtx_BC_transfer"},
+        "raven_commit": {"const": "94d79851d9c471b1210be81c75116d9bea835a4d"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"observation_source": {"const": "raytraced"}}, "required": ["observation_source"]},
+          "then": {"properties": {"use_raytraced": {"const": true}}},
+          "else": {"properties": {"use_raytraced": {"const": false}, "observation_source": {"const": "generated_controls"}}}
+        }
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "step_key", "beta", "view_order", "model_view_map",
+        "observation_source", "prompt", "env_id", "seq", "depth_units",
+        "depth_control_encoding", "robot_control_encoding", "episode_assignment"
+      ],
+      "properties": {
+        "contract_version": {"const": "roborender.dagger.rtx.v1"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "beta": {"enum": [0.75, 0.5, 0.25, 0.0]},
+        "view_order": {"const": ["head_color", "hand_left", "hand_right"]},
+        "model_view_map": {"const": {"ext1": "head_color", "ext2": "hand_left", "wrist": "hand_right"}},
+        "observation_source": {"enum": ["raytraced", "generated_controls"]},
+        "prompt": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "env_id": {"type": "integer"},
+        "seq": {"type": "integer"},
+        "depth_units": {"const": "meter"},
+        "depth_control_encoding": {"const": "raven_h5_v4"},
+        "robot_control_encoding": {"const": "textured_robot_rgb_on_black"},
+        "episode_assignment": {"$ref": "#/$defs/episodeAssignment"}
+      },
+      "allOf": [
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 1}}}}}, "then": {"properties": {"beta": {"const": 0.75}}}},
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 2}}}}}, "then": {"properties": {"beta": {"const": 0.5}}}},
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 3}}}}}, "then": {"properties": {"beta": {"const": 0.25}}}},
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 4}}}}}, "then": {"properties": {"beta": {"const": 0.0}}}},
+        {
+          "if": {"properties": {"observation_source": {"const": "raytraced"}}, "required": ["observation_source"]},
+          "then": {"properties": {"episode_assignment": {"properties": {"observation_source": {"const": "raytraced"}, "use_raytraced": {"const": true}}}}},
+          "else": {"properties": {"episode_assignment": {"properties": {"observation_source": {"const": "generated_controls"}, "use_raytraced": {"const": false}}}}}
+        }
+      ],
+      "x-cross-field-invariants": ["step_key equals enclosing prepareRequest.step_key", "beta equals enclosing prepareRequest.beta"]
+    },
+    "prepareArrays": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actor_obs", "teacher_obs", "critic_obs", "homie_obs", "gt_obj_pos",
+        "teacher_action", "homie_action",
+        "anchor_rgb__head_color", "anchor_rgb__hand_left", "anchor_rgb__hand_right",
+        "depth_metric__head_color", "depth_rawq__head_color", "depth_raw__head_color", "depth_ctrl__head_color", "rgb_robot__head_color",
+        "depth_metric__hand_left", "depth_rawq__hand_left", "depth_raw__hand_left", "depth_ctrl__hand_left", "rgb_robot__hand_left",
+        "depth_metric__hand_right", "depth_rawq__hand_right", "depth_raw__hand_right", "depth_ctrl__hand_right", "rgb_robot__hand_right"
+      ],
+      "properties": {
+        "actor_obs": {"$ref": "#/$defs/f32_113"},
+        "teacher_obs": {"$ref": "#/$defs/f32_226"},
+        "critic_obs": {"$ref": "#/$defs/f32_226"},
+        "homie_obs": {"$ref": "#/$defs/f32_516"},
+        "gt_obj_pos": {"$ref": "#/$defs/f32_3"},
+        "teacher_action": {"$ref": "#/$defs/f32_26"},
+        "homie_action": {"$ref": "#/$defs/f32_15"},
+        "anchor_rgb__head_color": {"$ref": "#/$defs/robotControl"},
+        "anchor_rgb__hand_left": {"$ref": "#/$defs/robotControl"},
+        "anchor_rgb__hand_right": {"$ref": "#/$defs/robotControl"},
+        "depth_metric__head_color": {"$ref": "#/$defs/depthMetric"},
+        "depth_rawq__head_color": {"$ref": "#/$defs/depthRawQ"},
+        "depth_raw__head_color": {"$ref": "#/$defs/depthRaw"},
+        "depth_ctrl__head_color": {"$ref": "#/$defs/depthControl"},
+        "rgb_robot__head_color": {"$ref": "#/$defs/robotControl"},
+        "raytraced_rgb__head_color": {"$ref": "#/$defs/raytracedPolicyRgb"},
+        "depth_metric__hand_left": {"$ref": "#/$defs/depthMetric"},
+        "depth_rawq__hand_left": {"$ref": "#/$defs/depthRawQ"},
+        "depth_raw__hand_left": {"$ref": "#/$defs/depthRaw"},
+        "depth_ctrl__hand_left": {"$ref": "#/$defs/depthControl"},
+        "rgb_robot__hand_left": {"$ref": "#/$defs/robotControl"},
+        "raytraced_rgb__hand_left": {"$ref": "#/$defs/raytracedPolicyRgb"},
+        "depth_metric__hand_right": {"$ref": "#/$defs/depthMetric"},
+        "depth_rawq__hand_right": {"$ref": "#/$defs/depthRawQ"},
+        "depth_raw__hand_right": {"$ref": "#/$defs/depthRaw"},
+        "depth_ctrl__hand_right": {"$ref": "#/$defs/depthControl"},
+        "rgb_robot__hand_right": {"$ref": "#/$defs/robotControl"},
+        "raytraced_rgb__hand_right": {"$ref": "#/$defs/raytracedPolicyRgb"}
+      }
+    },
+    "prepareRequest": {
+      "type": "object",
+      "x-validation": "Decode and validate every array against the production RavenShapeProfile, verify all hashes and finite constraints, then verify capture_digest before invoking renderer/student inference.",
+      "additionalProperties": false,
+      "required": ["contract_version", "idempotency_key", "step_key", "prepare_receipt", "capture_digest", "beta", "metadata", "arrays"],
+      "properties": {
+        "contract_version": {"const": "roborender.dagger.rtx.v1"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "prepare_receipt": {"$ref": "#/$defs/sha256"},
+        "capture_digest": {"$ref": "#/$defs/sha256"},
+        "beta": {"enum": [0.75, 0.5, 0.25, 0.0]},
+        "metadata": {"$ref": "#/$defs/metadata"},
+        "arrays": {"$ref": "#/$defs/prepareArrays"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"metadata": {"properties": {"observation_source": {"const": "raytraced"}}}}},
+          "then": {"properties": {"arrays": {"required": ["raytraced_rgb__head_color", "raytraced_rgb__hand_left", "raytraced_rgb__hand_right"]}}},
+          "else": {"properties": {"arrays": {"not": {"anyOf": [{"required": ["raytraced_rgb__head_color"]}, {"required": ["raytraced_rgb__hand_left"]}, {"required": ["raytraced_rgb__hand_right"]}]}}}}
+        },
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 1}}}}}, "then": {"properties": {"beta": {"const": 0.75}, "metadata": {"properties": {"beta": {"const": 0.75}}}}}},
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 2}}}}}, "then": {"properties": {"beta": {"const": 0.5}, "metadata": {"properties": {"beta": {"const": 0.5}}}}}},
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 3}}}}}, "then": {"properties": {"beta": {"const": 0.25}, "metadata": {"properties": {"beta": {"const": 0.25}}}}}},
+        {"if": {"properties": {"step_key": {"properties": {"round_id": {"const": 4}}}}}, "then": {"properties": {"beta": {"const": 0.0}, "metadata": {"properties": {"beta": {"const": 0.0}}}}}}
+      ],
+      "x-cross-field-invariants": ["metadata.step_key equals step_key", "metadata.observation_source equals metadata.episode_assignment.observation_source", "metadata.episode_assignment.use_raytraced iff observation_source is raytraced", "capture_digest and anchor_sha256 follow x-wire-semantics"]
+    },
+    "prepareResponse": {
+      "type": "object",
+      "x-selection-semantics": "student_action_11 is the deterministic VisionActorObjPred action_mean (never a sampled policy action). Generate and durably persist selection_draw exactly once for an idempotent prepare. selected_source is teacher iff selection_draw < beta; equality selects student. Teacher selected_action exactly equals request teacher_action, otherwise selected_action exactly equals student_action_11 concatenated with request homie_action.",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "idempotency_key", "step_key", "prepare_receipt", "capture_digest",
+        "beta", "selection_id", "selection_draw", "selected_source", "student_action_11",
+        "selected_action", "observation_digest", "selection_receipt"
+      ],
+      "properties": {
+        "contract_version": {"const": "roborender.dagger.rtx.v1"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "prepare_receipt": {"$ref": "#/$defs/sha256"},
+        "capture_digest": {"$ref": "#/$defs/sha256"},
+        "beta": {"enum": [0.75, 0.5, 0.25, 0.0]},
+        "selection_id": {"$ref": "#/$defs/identifier"},
+        "selection_draw": {"type": "number", "minimum": 0, "exclusiveMaximum": 1},
+        "selected_source": {"enum": ["teacher", "student"]},
+        "student_action_11": {"$ref": "#/$defs/f32_11"},
+        "selected_action": {"$ref": "#/$defs/f32_26"},
+        "observation_digest": {"$ref": "#/$defs/sha256"},
+        "selection_receipt": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "episodeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["episode_id", "first_rollout_step_index", "use_raytraced", "observation_source", "anchor_sha256"],
+      "properties": {
+        "episode_id": {"$ref": "#/$defs/identifier"},
+        "first_rollout_step_index": {"type": "integer", "minimum": 0, "maximum": 80},
+        "use_raytraced": {"type": "boolean"},
+        "observation_source": {"enum": ["raytraced", "generated_controls"]},
+        "anchor_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "sealedWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "contract_version", "run_id", "round_id", "actor_id", "rollout_window_id",
+        "row_count", "artifact_role", "learner_complete", "contains_policy_rgb", "authoritative_learner_chunk_owner",
+        "episode_ids_are_per_step", "actual_dones_preserved", "no_previous_round_replay",
+        "view_order", "per_step_identity_fields", "episode_ids", "episode_step_indices", "env_ids",
+        "seqs", "round_ids", "observation_sources", "dones", "timeouts", "rewards", "behavior_sources",
+        "prepare_receipts", "capture_digests", "selection_ids", "commit_digests", "commit_receipts",
+        "path", "bytes", "sha256", "provenance"
+      ],
+      "properties": {
+        "schema": {"const": "roborender.raven.dagger-window.v1"},
+        "contract_version": {"const": "roborender.dagger.rtx.v1"},
+        "run_id": {"$ref": "#/$defs/identifier"},
+        "round_id": {"type": "integer", "minimum": 1, "maximum": 4},
+        "actor_id": {"$ref": "#/$defs/identifier"},
+        "rollout_window_id": {"$ref": "#/$defs/identifier"},
+        "row_count": {"const": 81},
+        "artifact_role": {"const": "rtx_identity_outcome_audit"},
+        "learner_complete": {"const": false},
+        "contains_policy_rgb": {"const": false},
+        "authoritative_learner_chunk_owner": {"const": "h200_render_student_ledger"},
+        "episode_ids_are_per_step": {"const": true},
+        "actual_dones_preserved": {"const": true},
+        "no_previous_round_replay": {"const": true},
+        "view_order": {"const": ["head_color", "hand_left", "hand_right"]},
+        "per_step_identity_fields": {"const": ["episode_ids", "episode_step_indices", "rollout_step_indices", "round_ids", "env_id_per_step", "seq_per_step", "observation_source", "dones", "timeouts", "rewards", "behavior_source", "prepare_receipts", "capture_digests", "selection_ids", "commit_digests", "commit_receipts"]},
+        "episode_ids": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"$ref": "#/$defs/identifier"}},
+        "episode_step_indices": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"type": "integer", "minimum": 0}},
+        "env_ids": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"type": "integer"}},
+        "seqs": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"type": "integer"}},
+        "round_ids": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"type": "integer", "minimum": 1, "maximum": 4}},
+        "observation_sources": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"enum": ["raytraced", "generated_controls"]}},
+        "dones": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"type": "boolean"}},
+        "timeouts": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"type": "boolean"}},
+        "rewards": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"type": "number"}},
+        "behavior_sources": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"enum": ["teacher", "student"]}},
+        "prepare_receipts": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"$ref": "#/$defs/sha256"}},
+        "capture_digests": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"$ref": "#/$defs/sha256"}},
+        "selection_ids": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"$ref": "#/$defs/identifier"}},
+        "commit_digests": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"$ref": "#/$defs/sha256"}},
+        "commit_receipts": {"type": "array", "minItems": 81, "maxItems": 81, "items": {"$ref": "#/$defs/sha256"}},
+        "path": {"const": "sealed.npz"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["raven_root", "raven_commit", "raven_videogen_trainer_sha256", "raven_teacher_homie_trainer_sha256", "isaac_capture_sha256", "image_dagger_config_sha256", "teacher_checkpoint_sha256", "homie_walk_sha256", "homie_stand_sha256", "episode_bindings"],
+          "properties": {
+            "raven_root": {"const": "/home/ldu/BC_render/rtx_BC_transfer"},
+            "raven_commit": {"const": "94d79851d9c471b1210be81c75116d9bea835a4d"},
+            "raven_videogen_trainer_sha256": {"$ref": "#/$defs/sha256"},
+            "raven_teacher_homie_trainer_sha256": {"$ref": "#/$defs/sha256"},
+            "isaac_capture_sha256": {"$ref": "#/$defs/sha256"},
+            "image_dagger_config_sha256": {"$ref": "#/$defs/sha256"},
+            "teacher_checkpoint_sha256": {"$ref": "#/$defs/sha256"},
+            "homie_walk_sha256": {"$ref": "#/$defs/sha256"},
+            "homie_stand_sha256": {"$ref": "#/$defs/sha256"},
+            "episode_bindings": {"type": "array", "minItems": 1, "maxItems": 81, "items": {"$ref": "#/$defs/episodeBinding"}}
+          }
+        }
+      },
+      "x-role": "RTX identity/outcome audit only. It deliberately omits H200 policy RGB and is never a learner-complete chunk.",
+      "x-cross-field-invariants": ["round_ids contains 81 copies of round_id", "final per-step episode identity, outcome, source, and prepare/capture/selection/commit digests match the index-80 commit"]
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reward", "done", "timeout", "metadata"],
+      "properties": {
+        "reward": {"type": "number"},
+        "done": {"type": "boolean"},
+        "timeout": {"type": "boolean"},
+        "metadata": {"type": "object"}
+      }
+    },
+    "commitRequest": {
+      "type": "object",
+      "x-binding": "Must bind an already persisted prepare response by step_key, prepare_receipt, selection_id, and selection_receipt; commit_receipt must bind that selection and transition.",
+      "additionalProperties": false,
+      "required": ["contract_version", "idempotency_key", "step_key", "prepare_receipt", "selection_id", "selection_receipt", "commit_receipt", "transition", "sealed_window"],
+      "properties": {
+        "contract_version": {"const": "roborender.dagger.rtx.v1"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "prepare_receipt": {"$ref": "#/$defs/sha256"},
+        "selection_id": {"$ref": "#/$defs/identifier"},
+        "selection_receipt": {"$ref": "#/$defs/sha256"},
+        "commit_receipt": {"$ref": "#/$defs/sha256"},
+        "transition": {"$ref": "#/$defs/transition"},
+        "sealed_window": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sealedWindow"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"step_key": {"properties": {"rollout_step_index": {"const": 80}}}}},
+          "then": {"properties": {"sealed_window": {"$ref": "#/$defs/sealedWindow"}}},
+          "else": {"properties": {"sealed_window": {"type": "null"}}}
+        }
+      ]
+    },
+    "commitResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "idempotency_key", "step_key", "commit_receipt", "remote_commit_receipt", "status"],
+      "properties": {
+        "contract_version": {"const": "roborender.dagger.rtx.v1"},
+        "idempotency_key": {"$ref": "#/$defs/identifier"},
+        "step_key": {"$ref": "#/$defs/stepKey"},
+        "commit_receipt": {"$ref": "#/$defs/sha256"},
+        "remote_commit_receipt": {"$ref": "#/$defs/sha256"},
+        "status": {"const": "committed"}
+      }
+    }
+  },
+  "x-http": {
+    "origin": "http://127.0.0.1:18620",
+    "authentication": "Authorization: Bearer <token>",
+    "content_type": "application/json",
+    "max_request_bytes": 67108864,
+    "max_response_bytes": 1048576,
+    "routes": {
+      "/v1/steps/prepare": {"method": "POST", "request": "#/$defs/prepareRequest", "response": "#/$defs/prepareResponse"},
+      "/v1/steps/commit": {"method": "POST", "request": "#/$defs/commitRequest", "response": "#/$defs/commitResponse"}
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema": "roborender.beta-site.v1",
+  "repository_root": "/workspace/project/roborender",
+  "source_manifest": "/workspace/project/roborender/runtime/source-releases/RELEASE/source-manifest.json",
+  "rtx_source_root": "/home/ldu/roborender/runtime/source-releases/RELEASE/frozen",
+  "rtx_source_manifest": "/home/ldu/roborender/runtime/source-releases/RELEASE/source-manifest.json",
+  "rtx_repo": "/home/ldu/roborender",
+  "cpu_python": "/usr/bin/python3",
+  "rtx_python": "/home/ldu/dagger_rtx_server/.venv/bin/python",
+  "ssh_config": "/workspace/.ssh/roborender_migration_config",
+  "rtx_ssh_host": "roborender-migration-beta",
+  "broker_ssh_host": "roborender-migration-alpha",
+  "broker_python": "/home/ldu/.local/share/pipx/venvs/leptonai/bin/python",
+  "broker_proxy": "/mnt/data1/ldu/.local/bin/cosmos_ws_ssh.py",
+  "cpu_identity_file": "/workspace/.ssh/roborender_alpha_beta_migration_20261008",
+  "rtx_identity_file": "/home/ldu/.ssh/roborender_beta_h200_20261008",
+  "rtx_proxy_ssh_config": "/home/ldu/.ssh/roborender_alpha_pull_config",
+  "rtx_proxy_ssh_host": "roborender-alpha-source",
+  "netrc_file": "/workspace/projects/attention/setup/secrets/wandb.netrc"
+}

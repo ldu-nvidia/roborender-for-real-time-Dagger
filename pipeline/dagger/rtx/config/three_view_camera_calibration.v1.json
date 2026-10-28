@@ -1,0 +1,37 @@
+{
+  "schema": "roborender.three_view_camera_calibration.v1",
+  "calibration_id": "g1-head-wrists-provisional-20260913",
+  "status": "provisional",
+  "policy_views": [
+    "head_color",
+    "hand_left",
+    "hand_right"
+  ],
+  "camera_resolution": [
+    108,
+    192
+  ],
+  "cameras": {
+    "head_color": {
+      "link": "d435_link",
+      "position": [0.0, 0.035, 0.0],
+      "rotation_wxyz": [0.99955, 0.0, 0.0299955, 0.0]
+    },
+    "hand_left": {
+      "link": "left_wrist_yaw_link",
+      "position": [-0.08, 0.0, -0.06],
+      "rotation_wxyz": [1.0, 0.0, 0.0, 0.0]
+    },
+    "hand_right": {
+      "link": "right_wrist_yaw_link",
+      "position": [-0.08, 0.0, -0.06],
+      "rotation_wxyz": [1.0, 0.0, 0.0, 0.0]
+    }
+  },
+  "evidence": {
+    "native_capture_sha256": null,
+    "visual_review_sha256": null,
+    "projection_check_sha256": null,
+    "certified_at_utc": null
+  }
+}

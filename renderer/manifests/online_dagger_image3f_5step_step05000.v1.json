@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "status": "adapter_installed_and_verified_on_h200",
+  "verified_utc": "2026-09-06T00:00:00Z",
+  "role": "online_dagger_image3f_renderer",
+  "adapter": {
+    "relative_path": "online_image3f/checkpoints/roborender_online_dagger_image3f_5step_lora_step05000.safetensors",
+    "original_filename": "rgb030-depth030-step-5000.safetensors",
+    "bytes": 699995040,
+    "sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588",
+    "training_updates": 5000
+  },
+  "foundation_model": "models/wan21_fun_control_1p3b_foundation",
+  "target": {
+    "gpu": "NVIDIA H200",
+    "compute_capability": "9.0",
+    "architecture": "SM90"
+  },
+  "generated_artifacts": {
+    "onnx_export_key": "15f4dc82f4bf8dfeb1784713d33a1731fd7b42a0ad3c9e4d72c25bd0777c5a68",
+    "tensorrt_engine": "online_image3f/engines/sm90/roborender_online_dagger_image3f_sm90_bf16_3view.engine",
+    "engine_sha256": "9a11777c62e9d8ceb8bc380e4933353de2bd472e8b94716d29a4d1c39c3a70a5",
+    "timing_cache": "online_image3f/teacache/sm90/roborender_online_dagger_image3f_sm90_timing.cache",
+    "timing_cache_sha256": "600c1d878002573381c21e6d097d5a46a71706c3401dbc0c9c60a8d31f6fb9aa"
+  },
+  "contract": "contracts/CONDITIONING_CONTRACT.md"
+}

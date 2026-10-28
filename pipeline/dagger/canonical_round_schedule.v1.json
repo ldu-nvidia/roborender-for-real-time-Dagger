@@ -1,0 +1,36 @@
+{
+  "schema": "roborender.canonical_dagger_round_schedule.v1",
+  "selection": "per_decision_per_environment_bernoulli",
+  "teacher_labels_every_visited_state": true,
+  "legacy_teacher_override": false,
+  "rounds": [
+    {
+      "round": 1,
+      "teacher_probability": 0.75,
+      "student_probability": 0.25
+    },
+    {
+      "round": 2,
+      "teacher_probability": 0.5,
+      "student_probability": 0.5
+    },
+    {
+      "round": 3,
+      "teacher_probability": 0.25,
+      "student_probability": 0.75
+    },
+    {
+      "round": 4,
+      "teacher_probability": 0.0,
+      "student_probability": 1.0
+    }
+  ],
+  "transition_contract": {
+    "observation": "current Image3F-rendered three-view observation",
+    "student_action": "student policy output for the current observation",
+    "teacher_action": "privileged teacher label for the same current Isaac state",
+    "behavior_action": "teacher_action when the Bernoulli selector is true, otherwise student_action",
+    "environment_transition": "Isaac env.step receives behavior_action",
+    "training_target": "teacher_action"
+  }
+}

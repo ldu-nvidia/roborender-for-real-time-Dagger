@@ -1,0 +1,69 @@
+{
+  "schema": "roborender.renderer_registry.v1",
+  "canonical_root": "/workspace/project/roborender/renderer",
+  "verified_utc_date": "2026-09-06",
+  "provenance_rules": "PROVENANCE.md",
+  "artifacts": [
+    {
+      "id": "wan21_fun_control_1p3b_foundation",
+      "status": "active_shared_foundation",
+      "relative_root": "models/wan21_fun_control_1p3b_foundation",
+      "files": [
+        {"path": "Wan2.1_VAE.pth", "bytes": 507609880, "sha256": "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981"},
+        {"path": "diffusion_pytorch_model.safetensors", "bytes": 3129305312, "sha256": "4d51c942b0cfe92821c29b37fdb062756e026280084746ba1cc5d5dba39ee684"},
+        {"path": "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth", "bytes": 4772359047, "sha256": "628c9998b613391f193eb67ff68da9667d75f492911e4eb3decf23460a158c38"},
+        {"path": "models_t5_umt5-xxl-enc-bf16.pth", "bytes": 11361920418, "sha256": "7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d"}
+      ]
+    },
+    {
+      "id": "roborender_offline_bc_video_teacher_50step_lora_step05294",
+      "status": "active",
+      "role": "offline_bc_video_renderer_and_anchor_generator",
+      "relative_path": "offline_teacher/checkpoints/roborender_offline_bc_video_teacher_50step_lora_step05294.safetensors",
+      "bytes": 699995040,
+      "sha256": "3f09aa23a26ddb2da32d027dc5e883c992c820854bc07020d6d254c806afb01b",
+      "detail_manifest": "manifests/offline_bc_video_teacher_50step_step05294.v1.json"
+    },
+    {
+      "id": "roborender_online_dagger_image3f_5step_lora_step05000",
+      "status": "active",
+      "role": "online_dagger_per_frame_renderer",
+      "relative_path": "online_image3f/checkpoints/roborender_online_dagger_image3f_5step_lora_step05000.safetensors",
+      "bytes": 699995040,
+      "sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588",
+      "detail_manifest": "manifests/online_dagger_image3f_5step_step05000.v1.json"
+    },
+    {
+      "id": "roborender_online_anchor_pool_teacher50_2048",
+      "status": "active",
+      "role": "online_renderer_appearance_references",
+      "relative_root": "anchors/roborender_online_anchor_pool_teacher50_2048",
+      "items": 2048,
+      "bytes": 2133788410,
+      "source_revision": "6f640067a7d6799297d4226cb633e239d341bda5",
+      "detail_manifest": "manifests/roborender_anchors.hf.v1.json"
+    },
+    {
+      "id": "roborender_online_dagger_image3f_sm90_bf16_3view",
+      "status": "active_h200_only",
+      "role": "tensorrt_dit_block_stack",
+      "relative_path": "online_image3f/engines/sm90/roborender_online_dagger_image3f_sm90_bf16_3view.engine",
+      "physical_relative_path": "online_image3f/runtime/assets/generated/engines/sm90_028945bead2e2305/image3f_dit_block_stack_reference_bf16.engine",
+      "bytes": 3086893788,
+      "sha256": "9a11777c62e9d8ceb8bc380e4933353de2bd472e8b94716d29a4d1c39c3a70a5",
+      "gpu_architecture": "SM90",
+      "adapter_sha256": "c68de259ce5ee8e4df5a45296be8328242b3ebba351990df1d86f4e3a7a2d588",
+      "engine_key": "028945bead2e23054ca00f1ca3b7ee41a05b4f24c4599d7eb0ab75c5fce28a14"
+    },
+    {
+      "id": "roborender_online_dagger_image3f_sm90_timing",
+      "status": "active_h200_only",
+      "role": "tensorrt_timing_cache",
+      "relative_path": "online_image3f/teacache/sm90/roborender_online_dagger_image3f_sm90_timing.cache",
+      "physical_relative_path": "online_image3f/runtime/assets/generated/timing/sm90_028945bead2e2305.cache",
+      "bytes": 13187763,
+      "sha256": "600c1d878002573381c21e6d097d5a46a71706c3401dbc0c9c60a8d31f6fb9aa",
+      "gpu_architecture": "SM90"
+    }
+  ]
+}

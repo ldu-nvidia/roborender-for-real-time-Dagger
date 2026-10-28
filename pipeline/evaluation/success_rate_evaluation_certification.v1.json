@@ -1,0 +1,55 @@
+{
+  "certification_date_utc": "2026-09-09",
+  "certification_scope": "raven_metric_conformant_three_view_closed_loop_evaluation",
+  "certification_status": "pass_with_explicit_reproduction_exclusion",
+  "certified_invariants": {
+    "action_construction": "student_action_mean_11_plus_homie_action_mean_15",
+    "closed_loop_isaac": true,
+    "gradient_enabled": false,
+    "image3f_used_for_raytraced_evaluation": false,
+    "metric": "successful_completed_episodes_divided_by_all_completed_episodes",
+    "policy_action": "deterministic_action_mean",
+    "success_episode_reduction": "logical_or_over_all_timesteps",
+    "success_signal": "infos.grasp_goal_reached",
+    "view_order": [
+      "head_color",
+      "hand_left",
+      "hand_right"
+    ],
+    "view_shape_each_hwc": [
+      108,
+      192,
+      3
+    ],
+    "vision_layout": "vertical",
+    "vision_normalization": "imagenet_mean_std_exactly_once"
+  },
+  "completed_run": {
+    "checkpoint_sha256": "4b7fbc3b10c5a3a6381fd6a89bd5ac779e045fcae8789769d2f0c084f4570a42",
+    "completed_episodes": 300,
+    "metrics_sha256": "b7306d0b56d324248115641a95936f232c45f8854ae7cb004f9afce1d6127dcd",
+    "no_step_attestation_sha256": "93cb486ba136810a4619ec2d3aedee1a802a87e721f9f01919fa36182c620caa",
+    "resolved_config_sha256": "557c3a64e7061553fcd689016b9a18f909ee6a41a173b2ad4bf55778ca0279e6",
+    "success_rate": 0.16333333333333333,
+    "successes": 49,
+    "wilson_95_interval": [
+      0.125806,
+      0.209373
+    ]
+  },
+  "evidence_root_rtx": "/mnt/data1/ldu/research/artifacts/roborender_bc_corrected_norm_b28_20260909T193611Z",
+  "focused_tests": {
+    "deselected": 10,
+    "passed": 7
+  },
+  "historical_reproduction_certified": false,
+  "historical_reproduction_exclusion_reasons": [
+    "historical checkpoint is single-view while current checkpoint is three-view",
+    "historical checkpoint bytes and checkpoint-local resolved config are unavailable",
+    "training dataset and checkpoint lineage differ",
+    "historical result used 150 reported episodes while the completed run used 300",
+    "vector environment count and resulting RNG episode sequence differ"
+  ],
+  "raven_reference_commit": "94d79851d9c471b1210be81c75116d9bea835a4d",
+  "schema": "roborender.success-rate-evaluation-certification.v1"
+}

@@ -1,0 +1,67 @@
+{
+  "schema": "roborender.storage-paths.v1",
+  "hosts": {
+    "cosmos": {
+      "roots": {
+        "source_root": "/workspace/project/roborender",
+        "artifact_root": "/workspace/project/roborender-artifacts",
+        "release_root": "/workspace/project/roborender-artifacts/code_releases",
+        "run_root": "/workspace/project/roborender-artifacts/runs",
+        "cache_root": "/workspace/project/roborender-artifacts/caches",
+        "python_envs": "/workspace/project/roborender-artifacts/python_envs",
+        "render_models": "/workspace/project/roborender-artifacts/render_models",
+        "policy_models": "/workspace/project/roborender-artifacts/policy_models",
+        "student_checkpoints": "/workspace/project/roborender-artifacts/student_checkpoints",
+        "datasets": "/workspace/project/roborender-artifacts/datasets",
+        "catalog": "/workspace/project/roborender-artifacts/catalog"
+      },
+      "artifacts": {
+        "bc_initial_conditions_32": {"root": "catalog", "relative": "bc_initial_conditions/bc-production10000-20261027-074500/manifest.json"},
+        "render_foundation": {"root": "render_models", "relative": "foundation/wan21_control_1p3b"},
+        "offline_bc_adapter": {"root": "render_models", "relative": "offline_bc_50step/adapter.safetensors"},
+        "online_policy_adapter": {"root": "render_models", "relative": "online_policy_image3f/adapter.safetensors"},
+        "online_policy_engine_sm90": {"root": "render_models", "relative": "online_policy_image3f/engines/sm90/image3f_dit_block_stack_reference_bf16.engine"},
+        "render_anchors": {"root": "render_models", "relative": "online_policy_image3f/render_anchors"},
+        "manipulation_teacher": {"root": "policy_models", "relative": "manipulation_teacher/g1_privileged_action_teacher_wsdpt_step044500.pt"},
+        "locomotion_stand": {"root": "policy_models", "relative": "locomotion_controller/g1_locomotion_stand_controller.pt"},
+        "locomotion_walk": {"root": "policy_models", "relative": "locomotion_controller/g1_locomotion_walk_controller.pt"},
+        "legacy_runs": {"root": "run_root", "relative": "legacy_path_bound"},
+        "legacy_releases": {"root": "release_root", "relative": "legacy_path_bound"}
+      }
+    },
+    "leo": {
+      "roots": {
+        "source_root": "/data1/workspaces/roborender/source",
+        "release_root": "/data1/workspaces/roborender/code_releases",
+        "run_root": "/data1/workspaces/roborender/runs",
+        "cache_root": "/data1/workspaces/roborender/caches",
+        "python_envs": "/data1/workspaces/roborender/python_envs",
+        "artifact_root": "/data2/library/roborender",
+        "simulation_assets": "/data1/workspaces/roborender/simulation_assets",
+        "policy_models": "/data2/library/roborender/policy_models",
+        "student_checkpoints": "/data2/library/roborender/student_checkpoints",
+        "datasets": "/data2/library/roborender/datasets",
+        "container_images": "/data2/library/roborender/container_images",
+        "archived_runs": "/data2/library/roborender/archived_runs",
+        "catalog": "/data2/library/roborender/catalog"
+      },
+      "artifacts": {
+        "bc_initial_conditions_32": {"root": "simulation_assets", "relative": "bc_initial_conditions/bc-production10000-20261027-074500/manifest.json"},
+        "bc_runtime_bundle": {"root": "simulation_assets", "relative": "rtx_BC_transfer"},
+        "bc_collection_runs": {"root": "run_root", "relative": "bc-continuous"},
+        "isaac_cache": {"root": "cache_root", "relative": "isaac"},
+        "raven_runtime": {"root": "simulation_assets", "relative": "rtx_BC_transfer/pipeline/GR00T-VisualSim2Real"},
+        "robots": {"root": "simulation_assets", "relative": "rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/data/robots"},
+        "objects": {"root": "simulation_assets", "relative": "rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/data/objects"},
+        "motions": {"root": "simulation_assets", "relative": "rtx_BC_transfer/pipeline/GR00T-VisualSim2Real/gr00t/rl/data/motions"},
+        "render_anchors": {"root": "simulation_assets", "relative": "anchor_pool_2048"},
+        "manipulation_teacher": {"root": "policy_models", "relative": "manipulation_teacher/g1_privileged_action_teacher_wsdpt_step044500.pt"},
+        "locomotion_stand": {"root": "policy_models", "relative": "locomotion_controller/g1_locomotion_stand_controller.pt"},
+        "locomotion_walk": {"root": "policy_models", "relative": "locomotion_controller/g1_locomotion_walk_controller.pt"},
+        "isaac_image_archive": {"root": "container_images", "relative": "isaac_sim/isaac6-7aa2c5aa.tar.zst"},
+        "legacy_runs": {"root": "run_root", "relative": "legacy_path_bound"},
+        "legacy_releases": {"root": "release_root", "relative": "legacy_path_bound"}
+      }
+    }
+  }
+}

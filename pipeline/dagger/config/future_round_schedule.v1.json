@@ -1,0 +1,38 @@
+{
+  "schema": "roborender.dagger.future_round_schedule.v1",
+  "coordinator_run_id": "dagger-r1-raven-fidelity-seed911223830-b28-50iter-20260911T223830Z",
+  "coordinator_config_sha256": "36f9ae2da7a019fb21c3c36fb522d8dbd51f56f21a8abe138c5026315242a6a7",
+  "monitor_interval_seconds": 1200,
+  "rounds": [
+    {
+      "round_id": 2,
+      "teacher_beta": 0.5,
+      "student_action_probability": 0.5,
+      "seed": 911223831,
+      "iterations": 50,
+      "validation_iterations": [50],
+      "wandb_run_id": "dagger-r2-teacher50-seed911223831-b28-50iter",
+      "wandb_run_name": "dagger-r2-teacher50-seed911223831-b28-50iter"
+    },
+    {
+      "round_id": 3,
+      "teacher_beta": 0.25,
+      "student_action_probability": 0.75,
+      "seed": 911223832,
+      "iterations": 50,
+      "validation_iterations": [50],
+      "wandb_run_id": "dagger-r3-teacher25-seed911223832-b28-50iter",
+      "wandb_run_name": "dagger-r3-teacher25-seed911223832-b28-50iter"
+    },
+    {
+      "round_id": 4,
+      "teacher_beta": 0.0,
+      "student_action_probability": 1.0,
+      "seed": 911223833,
+      "iterations": 50,
+      "validation_iterations": [50],
+      "wandb_run_id": "dagger-r4-teacher0-seed911223833-b28-50iter",
+      "wandb_run_name": "dagger-r4-teacher0-seed911223833-b28-50iter"
+    }
+  ]
+}

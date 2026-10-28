@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Foreground-only, loopback-only forwards for the H200 DAgger control plane.
+# The render+student boundary on 18620 is intentionally owned by its separate
+# launcher so either side can be restarted without disturbing the other.
+set -Eeuo pipefail
+
+readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+readonly KEY=${DAGGER_H200_SSH_KEY:-/home/ldu/.ssh/id_ed25519_oci}
+readonly PROXY_PYTHON=${DAGGER_H200_PROXY_PYTHON:-/home/ldu/.local/share/pipx/venvs/leptonai/bin/python}
+readonly PROXY_MODULE_DIR=${DAGGER_H200_PROXY_MODULE_DIR:-/home/ldu/.ssh}
+readonly PROXY_TARGET=${DAGGER_H200_PROXY_TARGET:-ldu-cosmos-h200-dev-2}
+readonly PROXY_PORT=${DAGGER_H200_PROXY_PORT:-2222}
+readonly DESTINATION=${DAGGER_H200_SSH_DESTINATION:-root@cosmos-h200.lepton}
+readonly LOCK=${DAGGER_RTX_CONTROL_LOCK:-$ROOT/runtime/h200-forward-control.lock}
+
+[[ -r "$KEY" ]] || { echo "missing configured SSH identity: $KEY" >&2; exit 2; }
+[[ -x "$PROXY_PYTHON" ]] || { echo "missing configured Lepton proxy Python" >&2; exit 2; }
+install -d -m 0700 "$(dirname "$LOCK")"
+exec 9>"$LOCK"
+flock -n 9 || { echo "the dedicated H200 control forward is already active" >&2; exit 3; }
+
+args=(
+  -NT
+  -i "$KEY"
+  -o IdentitiesOnly=yes
+  -o ExitOnForwardFailure=yes
+  -o ServerAliveInterval=10
+  -o ServerAliveCountMax=3
+  -o TCPKeepAlive=yes
+  -o "ProxyCommand=$PROXY_PYTHON -c 'import sys; sys.path.insert(0,\"$PROXY_MODULE_DIR\"); import lepton_ssh_proxy as p; exec(p.remote_python_source())' $PROXY_TARGET $PROXY_PORT"
+)
+for port in 18610 18611 18612 18613 18614; do
+  args+=( -L "127.0.0.1:${port}:127.0.0.1:${port}" )
+done
+
+exec ssh "${args[@]}" "$DESTINATION"

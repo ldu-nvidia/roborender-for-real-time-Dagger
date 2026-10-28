@@ -1,0 +1,58 @@
+{
+  "schema": "roborender.throughput-candidate.v1",
+  "purpose": "Reference settings from the bounded 2026-10-09 sweep; not a production launch manifest",
+  "benchmark_only": true,
+  "production_promoted": false,
+  "boundary_contract": "roborender.dagger.rtx.v3",
+  "rtx": {
+    "hostname": "465d6b0-lcedt",
+    "physical_gpu_indices": [1, 2],
+    "forbidden_gpu_indices": [0],
+    "actors": 2,
+    "environments_per_actor": 6,
+    "simulator_seeds": [610091, 610092],
+    "cpu_quota_per_actor": 12,
+    "host_memory_limit_gib_per_actor": 23,
+    "container_swap_enabled": false,
+    "minimum_host_available_gib": 6,
+    "maximum_host_swap_growth_mib": 128,
+    "isaac_runtime": "separately_versioned_isaac6_migration_candidate"
+  },
+  "h200": {
+    "resource_shape": "custom.gpu.4xh200",
+    "reservation": "cosmos-solution-architect-xcwtffiq",
+    "allow_burst": false,
+    "render_student_workers": 4,
+    "rpc_fanout_per_actor": 4,
+    "routing": "shared_four_worker_pool",
+    "image3f_engine_batch_size": 1,
+    "image3f_steps": 5,
+    "image3f_cfg": 1.0,
+    "teacache_threshold": 0.3
+  },
+  "rollout": {
+    "teacher_beta": 0.75,
+    "view_order": ["head_color", "hand_left", "hand_right"],
+    "steps_per_window": 81,
+    "total_chunks_per_window": 12,
+    "total_transitions_per_window": 972
+  },
+  "learner": {
+    "device_count": 1,
+    "uses_one_of_the_four_h200s_after_collection": true,
+    "raven_exact_full_batch": true,
+    "microbatch_environments": 12,
+    "activation_checkpointing": false,
+    "num_mini_batches": 1,
+    "learning_rate": 0.0002,
+    "max_grad_norm": 1.0,
+    "save_model_checkpoint": true
+  },
+  "evidence_run": "rtx-beta-migration-sweep-b6-m23-f4-window-1009-1843",
+  "limits": [
+    "One simultaneous 81-step window and one real optimizer update, not a long-duration production soak",
+    "Observation mixtures differ across environment counts; no causal speedup or quality equivalence is claimed",
+    "The production v4/eight-gateway launcher has not been converted to this four-worker profile",
+    "Isaac6 physics equivalence and success-rate evaluation remain separate gates"
+  ]
+}

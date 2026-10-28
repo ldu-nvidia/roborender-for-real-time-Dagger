@@ -1,0 +1,41 @@
+# Separate migration candidate. Never substitute this for the certified 5.1 image.
+ARG ISAAC_BASE=nvcr.io/nvidia/isaac-sim@sha256:68735a60b6c15c85e0dd0098570c6d2cc79e928f2d068ce2790aa43284ac165d
+FROM ${ISAAC_BASE}
+USER root
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+LABEL org.roborender.runtime="isaac6-lab3-migration-candidate" \
+      org.roborender.production-qualified="false" \
+      org.roborender.isaaclab-commit="28a37cecdd433c22d9eabd6a5954add9f13a8951"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git build-essential cmake ffmpeg libglib2.0-0 libgl1 && \
+    rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch v3.0.0-beta2 https://github.com/isaac-sim/IsaacLab.git /workspace/isaaclab && \
+    test "$(git -C /workspace/isaaclab rev-parse HEAD)" = 28a37cecdd433c22d9eabd6a5954add9f13a8951 && \
+    ln -s /isaac-sim /workspace/isaaclab/_isaac_sim
+RUN /isaac-sim/python.sh -m venv --system-site-packages /opt/round-dagger-rtx
+ENV PATH=/opt/round-dagger-rtx/bin:${PATH}
+COPY constraints.isaac6.txt /opt/roborender/constraints.isaac6.txt
+RUN python -m pip install pip==26.1.2 setuptools==80.9.0 wheel==0.45.1 toml && \
+    python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
+      torch==2.10.0 torchvision==0.25.0
+# PhysX + Kit only. Do not pull [all]: that includes unrelated Newton/teleop
+# engines and the upstream beta's stale optional Isaac 5.1 dependency.
+RUN python -m pip install --extra-index-url https://pypi.nvidia.com \
+      --constraint /opt/roborender/constraints.isaac6.txt \
+      -e /workspace/isaaclab/source/isaaclab \
+      -e /workspace/isaaclab/source/isaaclab_physx \
+      -e /workspace/isaaclab/source/isaaclab_ov \
+      -e /workspace/isaaclab/source/isaaclab_assets \
+      -e /workspace/isaaclab/source/isaaclab_visualizers && \
+    python -m pip install --constraint /opt/roborender/constraints.isaac6.txt \
+      accelerate==1.10.1 datasets==4.0.0 docstring-parser==0.16 \
+      loguru==0.7.3 onnxruntime==1.22.1 plotly==6.3.0 PyJWT==2.10.1 trl==0.17.0 \
+      hydra-core==1.3.2 rich ipdb termcolor wandb scipy tensorboard \
+      opencv-python-headless==4.11.0.86 joblib easydict lxml numpy-stl timm \
+      h5py imageio imageio-ffmpeg jsonschema
+RUN python -m pip install --constraint /opt/roborender/constraints.isaac6.txt tensordict==0.11.0
+RUN python -c 'import torch, torchvision, numpy, isaaclab; assert torch.__version__ == "2.10.0+cu128"; assert torchvision.__version__ == "0.25.0+cu128"; print(torch.__version__, numpy.__version__, isaaclab.__file__)' && \
+    python -m pip freeze > /opt/roborender/isaac6-python-freeze.txt
+COPY actor_exec.sh /usr/local/bin/roborender-round-actor-rtx
+RUN chmod 0555 /usr/local/bin/roborender-round-actor-rtx
+ENTRYPOINT ["/usr/local/bin/roborender-round-actor-rtx"]

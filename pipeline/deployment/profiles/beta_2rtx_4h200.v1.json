@@ -1,0 +1,71 @@
+{
+  "schema": "roborender.deployment-profile.v1",
+  "profile_id": "beta-2rtx-4h200-b6-v1",
+  "tested_candidate": "pipeline/deployment/throughput/candidate_beta_2rtx_4h200.json",
+  "tested_candidate_sha256": "372fc2b169e26354a7c52ccea044c99e7178d1388736713ba32669f3a118c75d",
+  "source_of_truth": "same source snapshot on CPU access pod and RTX beta; Git remote after reviewed commit/push",
+  "rtx_gpu_uuids": {
+    "1": "GPU-0c1949ae-379a-2f2e-0f23-621de2eee409",
+    "2": "GPU-0540f144-9826-ba8f-140d-af4f95a475ce"
+  },
+  "rtx_image_id": "sha256:7aa2c5aaf53e55e749c9f63b6430b9554b4ca49928cf35f376a646669da7b509",
+  "checkpoint": {
+    "relative_path": "checkpoints/students/BC/bc_3view_autoregressive_v1_20260914T044707Z/best_validation.pt",
+    "sha256": "053b5386172373c8bbc1518bfc360b2371221979b54eb53e76ad15b55eba8718",
+    "epoch": 41,
+    "global_step": 4100
+  },
+  "runtime_qualification": {
+    "environments_per_actor": 6,
+    "windows": 3,
+    "status": "passed",
+    "host_memory_limit_gib_per_actor": 21,
+    "compact_host_heap": true,
+    "run_id": "rtx-beta-migration-runtime-pair-heap-1011-prod1",
+    "source_sha256": "bd118df69c8459772db43a0d456225cd456467ad5e621e4d0a5d3c274c9a3cd7",
+    "config_sha256": "83c68116c4634428079889deac7fb910fad8bb6eeb511029443f32034c5e455e",
+    "reason": "Three concurrent persistent B6+ B6 windows and three full B12 learner updates passed on 2026-10-12; native-boundary CPU heap trimming and limited glibc arenas avoided the earlier container OOM"
+  },
+  "success_evaluation": {
+    "status": "passed",
+    "run_id": "success-beta-panel-256-v4-seq-20261011-prod1",
+    "panel_id": "beta-isaac6-b5-heldout-256-v4",
+    "panel_sha256": "eec00069af8e4d5387ea86c0026abebf79024db7cb01a7f0764efd910dfa4ed9",
+    "source_sha256": "6544b028e56940b0808e440172d0e56039588bf8c0f1d880422cfe00c928f0b5",
+    "physical_gpu_index": 1,
+    "native_batch_size": 5,
+    "completed_episodes_per_checkpoint": 256,
+    "observation_mode": "raytraced_3view",
+    "optimizer_steps": 0,
+    "parallel_arms": false,
+    "legacy_b64_panel_equivalent": false,
+    "quality_improvement_certified": false,
+    "result_sha256": "9addbd02a2e8d0ced39d7190884143534ab539706b4c437a71bf36e0a5be7ad7",
+    "bc_successes": 0,
+    "candidate_successes": 11,
+    "candidate_checkpoint_sha256": "a33e4c8d39c209c0d16a654fb527bc5cd776db7631e4f09819a03514cd80cd3f",
+    "paired_initial_state_cohorts": 52,
+    "accounting_disagreements": 0,
+    "verified_run_url": "https://wandb.ai/nvidia/dagger/runs/success-beta-panel-256-v4-seq-20261011-prod1"
+  },
+  "logging": {
+    "project": "dagger",
+    "mode_for_next_live_qualification": "online",
+    "bc_name": "BC",
+    "dagger_name_template": "dagger-r{round_id}-teacher{teacher_percent}-beta-b12-{timestamp}",
+    "training_metric": "train/iteration_mse",
+    "success_metric": "validation/goal_reached_rate",
+    "benchmark_logged_online": true,
+    "verified_runtime_run_url": "https://wandb.ai/nvidia/dagger/runs/beta-runtime-aab388ed504b4b54"
+  },
+  "qualification": {
+    "single_window_and_optimizer": true,
+    "bc_resume_and_teacher_render": true,
+    "persistent_multi_window": true,
+    "four_worker_production_controller": false,
+    "beta_success_evaluation": true,
+    "isaac6_distribution_comparison": false,
+    "live_wandb": true,
+    "independent_beta_management": false
+  }
+}

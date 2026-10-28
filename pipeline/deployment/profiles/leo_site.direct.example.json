@@ -1,0 +1,18 @@
+{
+  "schema": "roborender.leo-site.v1",
+  "repository_root": "/workspace/project/roborender",
+  "source_manifest": "/workspace/project/roborender/runtime/source-releases/RELEASE/source-manifest.json",
+  "rtx_source_root": "/home/ldu/roborender/runtime/source-releases/RELEASE/frozen",
+  "rtx_source_manifest": "/home/ldu/roborender/runtime/source-releases/RELEASE/source-manifest.json",
+  "rtx_repo": "/home/ldu/roborender",
+  "cpu_python": "/workspace/project/roborender/runtime/test-venv-system/bin/python",
+  "rtx_python": "/home/ldu/roborender/.venv/bin/python",
+  "ssh_config": "/workspace/.ssh/roborender_leo_access_config",
+  "rtx_ssh_host": "roborender-leo-direct",
+  "broker_ssh_host": "roborender-leo-direct",
+  "broker_python": "/home/ldu/.local/share/roborender-cloud/venv-compatible/bin/python",
+  "broker_proxy": "/home/ldu/roborender/runtime/source-releases/RELEASE/frozen/pipeline/deployment/connectivity/cloud_proxy.py",
+  "cpu_identity_file": "/workspace/.ssh/roborender_leo_access_20261013",
+  "rtx_identity_file": "/home/ldu/.ssh/roborender_leo_h200_20261013",
+  "netrc_file": "/workspace/projects/attention/setup/secrets/wandb.netrc"
+}

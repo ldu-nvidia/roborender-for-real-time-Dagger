@@ -1,0 +1,18 @@
+{
+  "schema": "roborender.beta-site.v2",
+  "repository_root": "/workspace/project/roborender",
+  "source_manifest": "/workspace/project/roborender/runtime/source-releases/RELEASE/source-manifest.json",
+  "rtx_source_root": "/home/ldu/roborender/runtime/source-releases/RELEASE/frozen",
+  "rtx_source_manifest": "/home/ldu/roborender/runtime/source-releases/RELEASE/source-manifest.json",
+  "rtx_repo": "/home/ldu/roborender",
+  "cpu_python": "/usr/bin/python3",
+  "rtx_python": "/home/ldu/dagger_rtx_server/.venv/bin/python",
+  "ssh_config": "/workspace/.ssh/roborender_beta_access_config",
+  "rtx_ssh_host": "roborender-beta-direct",
+  "broker_ssh_host": "roborender-beta-direct",
+  "broker_python": "/home/ldu/.local/share/roborender-cloud/venv-compatible/bin/python",
+  "broker_proxy": "/home/ldu/roborender/runtime/source-releases/RELEASE/frozen/pipeline/deployment/connectivity/cloud_proxy.py",
+  "cpu_identity_file": "/workspace/.ssh/roborender_alpha_beta_migration_20261008",
+  "rtx_identity_file": "/home/ldu/.ssh/roborender_beta_h200_20261008",
+  "netrc_file": "/workspace/projects/attention/setup/secrets/wandb.netrc"
+}

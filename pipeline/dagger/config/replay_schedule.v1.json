@@ -1,0 +1,27 @@
+{
+  "schema": "roborender.dagger.replay_schedule.v1",
+  "rationale": "Keep half of every B=28 update on the newest policy distribution while retaining corrected BC support and increasing historical DAgger coverage as student control rises.",
+  "activation_gate": "Every selected BC NPZ must carry render_contract=raven_three_view_autoregressive_v1 and valid five-field chain provenance. The pre-correction pool is rejected.",
+  "total_chunks_per_update": 28,
+  "bc_train_manifest": "/workspace/project/roborender/data/BC/splits_autoregressive_v1/train.json",
+  "bc_train_manifest_sha256": "AUTO",
+  "empty_pool_fallback": "bc_then_current",
+  "rounds": [
+    {
+      "round_id": 1,
+      "fractions": {"current_dagger": 0.50, "bc": 0.50, "prior_dagger": 0.00}
+    },
+    {
+      "round_id": 2,
+      "fractions": {"current_dagger": 0.50, "bc": 0.25, "prior_dagger": 0.25}
+    },
+    {
+      "round_id": 3,
+      "fractions": {"current_dagger": 0.50, "bc": 0.20, "prior_dagger": 0.30}
+    },
+    {
+      "round_id": 4,
+      "fractions": {"current_dagger": 0.50, "bc": 0.15, "prior_dagger": 0.35}
+    }
+  ]
+}
